@@ -1,0 +1,255 @@
+/* Shared queue remove affordance (unify-queue-remove U2).
+ *
+ * The one home for the queue remove (✕) styling, linked by BOTH the guest
+ * (app/templates/guest/index.html) and admin (app/templates/admin/dashboard.html)
+ * templates — same pattern as static/browse/rail.css. The shared playback
+ * module (static/playback/index.js) renders these classes from a per-page
+ * remove plan, so the chip + album bar look and sit identically on both pages.
+ *
+ * Tokens used (--danger, --bg, --surface2, etc.) are defined in each template's
+ * :root; the two danger derivations the remove affordance needs live here so the
+ * file is self-contained. */
+:root {
+  --danger-dim: rgba(248, 113, 113, .14);
+  --danger-strong: #ef4444;
+}
+
+/* Single-row remove: a danger chip in the right-aligned actions slot. */
+.qi-actions { display: flex; gap: .4rem; align-items: center; flex-shrink: 0; }
+.qi-remove {
+  min-width: 34px; height: 34px; padding: 0 .5rem;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; border-radius: 8px; cursor: pointer; flex-shrink: 0;
+  background: var(--danger-dim); color: var(--danger);
+  font-size: 1rem; line-height: 1;
+  transition: background .14s ease, color .14s ease;
+}
+.qi-remove:hover, .qi-remove:focus-visible { background: var(--danger-strong); color: #fff; outline: none; }
+.qi-remove:focus-visible { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--danger); }
+
+/* Album-as-unit remove: one full-height danger bar spanning the album's
+ * contiguous rows down the right edge — its height equals the album's footprint,
+ * so the blast radius is unmistakable. Rows get right padding to clear the bar. */
+.album-group { position: relative; }
+/* Pad the whole row so its rightmost element (guest: qi-info; admin: the
+ * play-next/✕ actions) clears the absolute bar, regardless of layout. */
+.album-group .album { box-shadow: inset 3px 0 0 var(--danger); background: rgba(248, 113, 113, .05); padding-right: 48px; }
+.album-remove {
+  position: absolute; top: 6px; right: 6px; bottom: 6px; width: 42px;
+  display: flex; align-items: center; justify-content: center;
+  border: none; border-radius: 8px; cursor: pointer;
+  background: var(--danger-dim); color: var(--danger);
+  font-size: 1.15rem; line-height: 1;
+  transition: background .14s ease, color .14s ease;
+}
+.album-remove:hover, .album-remove:focus-visible { background: var(--danger-strong); color: #fff; outline: none; }
+.album-remove:focus-visible { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--danger); }
+
+/* Idle "add music" nudge (2026-06-17 plan 006 U2). Rendered by the shared
+ * playback module (static/playback/index.js) in the now-view idle state — shown
+ * only when nothing is playing AND the queue is empty AND the page wired
+ * onFindMusic (guest → Search). A <button> for keyboard/screen-reader access.
+ * Hidden on desktop (>=960px), where the Now pane is docked beside a visible
+ * Search pane, so the nudge would be redundant. The explicit [hidden] rule is
+ * required: .np-nudge's own display:block would otherwise out-rank the UA
+ * [hidden] rule (equal specificity, author wins) and the toggle would no-op. */
+.np-nudge {
+  display: block; margin: .55rem auto 0; padding: .5rem 1.1rem;
+  border: 1px solid var(--border); border-radius: 999px; cursor: pointer;
+  background: var(--surface2); color: var(--accent-ui, var(--accent));
+  font-size: .82rem; font-weight: 600; line-height: 1;
+  transition: background .14s ease, color .14s ease;
+}
+.np-nudge:hover, .np-nudge:focus-visible { background: var(--accent-ui, var(--accent)); color: var(--on-accent, #fff); outline: none; }
+.np-nudge:focus-visible { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent-ui, var(--accent)); }
+.np-nudge[hidden] { display: none; }
+@media (min-width: 960px) { .np-nudge { display: none; } }
+
+/* ── Now Playing → Lyrics (2026-06-17 plan 008; reserved-slot redesign 2026-06-18) ──
+ * Rendered by the shared playback module (static/playback/index.js) in the
+ * now-view, so it lands identically on guest, admin, and the desktop docked
+ * pane (CLAUDE.md shared-UI standard).
+ *
+ * RESERVED SLOT: the LRCLIB fetch resolves ~7s into a song, so a naive button
+ * would pop in mid-track and shove the progress bar + queue down (jerk). Instead
+ * the slot (.np-lyrics-slot) holds a FIXED height for the whole life of the
+ * now-view — including when nothing is playing (the slot is just empty) — so the
+ * button (or "Instrumental" tag, or — on a miss / idle — nothing) simply fades
+ * into already-held space and the now-view never reflows: not mid-song, and not
+ * on idle↔playing transitions. The button is a width-twin of the Surprise Me
+ * dock so the two actions read as siblings. */
+.np-lyrics { margin: .55rem 0 .1rem; }
+.np-lyrics[hidden] { display: none; }   /* scaffold's initial pre-JS state; JS shows it on first paint */
+
+/* The reserved slot: fixed height = the button's box, so searching / found /
+ * instrumental / miss / idle all occupy the same space — no collapse, no grow. */
+.np-lyrics-slot {
+  min-height: 40px;
+  display: flex; align-items: center;
+  padding: 0 .75rem;
+}
+.np-lyrics-slot[hidden] { display: none; }   /* hidden only while the panel is expanded */
+
+/* The button — a twin of .jp-surprise-dock (width, radius, accent-dim fill) so
+ * the Lyrics and Surprise Me actions read as siblings. */
+.np-lyrics-pill {
+  width: 100%; padding: .6rem 1rem;
+  border: 1px solid var(--border); border-radius: 10px; cursor: pointer;
+  background: var(--accent-dim); color: var(--accent-ui, var(--accent));
+  font: inherit; font-size: .9rem; font-weight: 700; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center; gap: .4rem;
+  transition: background .14s ease, color .14s ease, transform .12s ease;
+  animation: npLyrIn .3s ease;        /* fade into the reserved space */
+}
+.np-lyrics-pill:hover { background: color-mix(in srgb, var(--accent) 26%, transparent); }
+.np-lyrics-pill:active { transform: scale(.985); }
+.np-lyrics-pill:focus-visible { outline: 2px solid var(--accent-ui, var(--accent)); outline-offset: 2px; }
+.np-lyrics-pill[hidden] { display: none; }
+
+/* Instrumental indicator (R9) — same footprint as the button, static + muted. */
+.np-lyrics-tag {
+  width: 100%; padding: .6rem 1rem; border-radius: 10px;
+  border: 1px dashed var(--border);
+  color: var(--text-dim, var(--muted, currentColor));
+  font-size: .85rem; font-weight: 600; font-style: italic; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  opacity: .85; animation: npLyrIn .3s ease;
+}
+.np-lyrics-tag[hidden] { display: none; }
+
+/* Contribute prompt (2026-06-23): a quiet link in the otherwise-empty slot on a
+ * confirmed no-match. Same footprint as the tag (dashed, muted, italic) so it
+ * occupies the reserved slot without reflow, but pointer + accent-on-hover so it
+ * reads as an action that leaves to LRCLIB. */
+.np-lyrics-contribute {
+  width: 100%; padding: .6rem 1rem; border-radius: 10px;
+  border: 1px dashed var(--border);
+  color: var(--text-dim, var(--muted, currentColor));
+  font-size: .85rem; font-weight: 600; font-style: italic; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  text-align: center; text-decoration: none; cursor: pointer;
+  opacity: .85; animation: npLyrIn .3s ease;
+}
+.np-lyrics-contribute:hover,
+.np-lyrics-contribute:focus-visible {
+  opacity: 1; color: var(--accent-ui, var(--accent));
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  outline: none;
+}
+.np-lyrics-contribute[hidden] { display: none; }
+
+@keyframes npLyrIn { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .np-lyrics-pill, .np-lyrics-tag, .np-lyrics-contribute { animation: none; } }
+
+/* Inline expanded panel — replaces the reserved slot on tap, inset to match it. */
+.np-lyrics-panel {
+  margin: 0 .75rem; text-align: left;
+  border: 1px solid var(--border); border-radius: 12px;
+  background: var(--surface2);
+  overflow: hidden;
+}
+.np-lyrics-panel[hidden] { display: none; }
+.np-lyrics-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: .45rem .35rem .45rem .8rem;
+  border-bottom: 1px solid var(--border);
+}
+.np-lyrics-title {
+  font-size: .76rem; font-weight: 700; letter-spacing: .03em;
+  text-transform: uppercase; color: var(--text-dim, var(--muted, currentColor));
+}
+.np-lyrics-collapse {
+  min-width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; border-radius: 8px; cursor: pointer;
+  background: transparent; color: var(--text-dim, var(--muted, currentColor));
+  font-size: .95rem; line-height: 1;
+  transition: background .14s ease, color .14s ease;
+}
+.np-lyrics-collapse:hover, .np-lyrics-collapse:focus-visible {
+  background: var(--surface); color: var(--accent-ui, var(--accent)); outline: none;
+}
+
+/* Scrollable body. position:relative anchors offsetTop for the U4 auto-scroll
+ * (the active-line centering reads active.offsetTop relative to this box). */
+.np-lyrics-body {
+  position: relative;
+  max-height: min(46vh, 360px); overflow-y: auto;
+  padding: .7rem .9rem;
+  font-size: .92rem; line-height: 1.6;
+  -webkit-overflow-scrolling: touch;
+}
+.np-lyrics-plain { white-space: pre-wrap; color: var(--text, currentColor); }
+
+/* Synced (karaoke) lines — dim by default; the active line lights to accent.
+ * The highlight is driven by the shared position tick (U4), not a new clock. */
+.np-lyric-line {
+  padding: .12rem 0;
+  color: var(--text-dim, var(--muted, currentColor));
+  opacity: .65;
+  transition: color .18s ease, opacity .18s ease, font-weight .18s ease;
+}
+.np-lyric-line.active {
+  color: var(--accent-ui, var(--accent));
+  opacity: 1; font-weight: 700;
+}
+
+/* ── Closing Time banner (2026-06-24 plan U5) ──────────────────────────────
+ * Single-source overlay shown on guest AND admin when Closing Time fires —
+ * the song has played out, the queue is frozen, and the room gets the send-off.
+ * Fixed dimmed backdrop + centered card, themed via the active scheme vars. */
+.closing-time-overlay {
+  position: fixed; inset: 0; z-index: 9999;
+  display: flex; align-items: center; justify-content: center;
+  padding: 1.5rem;
+  background: rgba(0, 0, 0, .72);
+  -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px);
+  animation: closing-fade-in .45s ease;
+}
+.closing-time-overlay[hidden] { display: none; }
+.closing-time-card {
+  max-width: 36rem; width: 100%; text-align: center;
+  background: var(--surface, #15171c);
+  border: 1px solid var(--accent, #c8a24a);
+  border-radius: 14px;
+  padding: 2.1rem 1.6rem;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, .5);
+}
+.closing-time-emoji { font-size: 2.6rem; line-height: 1; margin-bottom: .8rem; }
+.closing-time-msg {
+  font-size: 1.45rem; line-height: 1.45; font-weight: 700;
+  color: var(--text, #f0e9d6);
+}
+.closing-time-sub {
+  margin-top: .9rem;
+  font-size: .8rem; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--accent, #c8a24a); opacity: .85;
+}
+@keyframes closing-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .closing-time-overlay { animation: none; } }
+
+/* Control-surface (admin) variant: NON-blocking. No dim, no backdrop, and the
+ * container is click-through (pointer-events:none) so the host keeps full use
+ * of the app — only the bar itself is interactive. Pinned to the bottom as a
+ * compact strip with a Resume action; Skip / Skip Back also clear it. */
+.closing-time-overlay.is-control {
+  inset: auto 0 0 0; padding: 1rem;
+  background: none; -webkit-backdrop-filter: none; backdrop-filter: none;
+  pointer-events: none; animation: none;
+}
+.closing-time-overlay.is-control .closing-time-card {
+  pointer-events: auto;
+  display: flex; align-items: center; gap: .9rem;
+  width: auto; max-width: min(90vw, 40rem); text-align: left;
+  padding: .7rem .9rem .7rem 1.1rem;
+}
+.closing-time-overlay.is-control .closing-time-emoji { font-size: 1.5rem; margin-bottom: 0; }
+.closing-time-overlay.is-control .closing-time-msg { font-size: 1rem; font-weight: 600; }
+.closing-time-overlay.is-control .closing-time-sub { display: none; }
+.closing-time-resume {
+  margin-left: auto; flex-shrink: 0; white-space: nowrap; cursor: pointer;
+  padding: .45rem .9rem; border: none; border-radius: 6px;
+  background: var(--accent, #c8a24a); color: var(--on-accent, #111);
+  font-weight: 600; font-size: .85rem;
+}
+.closing-time-resume:hover { filter: brightness(1.08); }

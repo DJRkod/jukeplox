@@ -1,0 +1,461 @@
+{
+  "reviewer": "testing",
+  "findings": [
+    {
+      "title": "engine fixture monkeypatches wrong targets — DB stubs never fire",
+      "severity": "P1",
+      "file": "tests/test_queue.py",
+      "line": 22,
+      "confidence": 92,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "Patch `app.queue.engine.database.save_queue` and `app.queue.engine.database.load_queue` (the names in the engine module's namespace), not `app.database.save_queue`. Also, `_done` and `_done_list` are defined as plain async functions but used as `lambda: _done()` — the lambda returns a coroutine object that is never awaited, so the no-op silently drops without being called. Replace with `monkeypatch.setattr(eng_module.database, 'save_queue', AsyncMock())` and similar.",
+      "why_it_matters": "The fixture is supposed to stub out DB I/O so tests run without SQLite. Because the patch target is wrong the real `database.save_queue` (which needs an open DB connection) is called instead. Tests may silently pass only because the `asyncio.create_task` wrapping in `_persist` swallows exceptions, masking broken isolation.",
+      "evidence": [
+        "monkeypatch.setattr(db_module, 'save_queue', lambda items: _done())",
+        "engine.py _persist: asyncio.create_task(database.save_queue(...))",
+        "The lambda returns the coroutine object from _done() but never awaits it"
+      ]
+    },
+    {
+      "title": "test_startup_reconnect_calls_discover_then_set_device — known failure asserts behaviour that doesn't exist",
+      "severity": "P1",
+      "file": "tests/test_state.py",
+      "line": 9,
+      "confidence": 98,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": true,
+      "suggested_fix": "Either (a) remove the `backend.discover_devices.assert_awaited_once()` line because `_startup_reconnect` only calls `set_device`, or (b) update the implementation to call `discover_devices` first if that is the intended behaviour. The test is currently documented as a known pre-existing failure but it should not be left in this state — a passing-but-wrong test is as harmful as a failing-but-correct one.",
+      "why_it_matters": "The test name describes a two-step protocol (discover then set_device) but the implementation only calls `set_device`. Leaving the test marked known-failing means the contract is unverified and could silently regress if the test is ever deleted.",
+      "evidence": [
+        "state.py _startup_reconnect: only calls backend.set_device(device_id)",
+        "test asserts: backend.discover_devices.assert_awaited_once()"
+      ]
+    },
+    {
+      "title": "test_set_device_unregisters_old_listener — assertion against wrong object path",
+      "severity": "P2",
+      "file": "tests/test_output_chromecast.py",
+      "line": 241,
+      "confidence": 80,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "The real `set_device` runs `_teardown` in an executor, which calls `_cc.media_controller.unregister_status_listener`. Because `cc1.media_controller` is a plain `MagicMock()` (not `AsyncMock`), `unregister_status_listener` is auto-created. The `assert_called_once_with(old_listener)` is fine, but the test passes `cc2` via `get_chromecasts` mock which is the new device — verify the executor actually runs synchronously inside the test's event loop (it does via `run_in_executor` with the default executor and `asyncio.sleep(0)` is not awaited after `set_device`). Add `await asyncio.sleep(0)` or use `AsyncMock` for the executor to ensure the teardown coroutine completes before the assertion.",
+      "why_it_matters": "The teardown runs in a thread-pool executor. Without flushing the event loop after `await backend.set_device(...)`, the assertion may race and pass vacuously before the executor completes.",
+      "evidence": [
+        "chromecast.py set_device: await asyncio.get_running_loop().run_in_executor(None, _teardown)",
+        "test calls: await backend.set_device('uuid-2') then immediately asserts"
+      ]
+    },
+    {
+      "title": "test_eos_listener_fires_advance — single asyncio.sleep(0) insufficient; marked known-failing",
+      "severity": "P2",
+      "file": "tests/test_output_chromecast.py",
+      "line": 177,
+      "confidence": 95,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": true,
+      "suggested_fix": "Replace `await asyncio.sleep(0)` with a short `asyncio.wait_for` loop or use `asyncio.sleep(0.01)`. The `_on_eos` path calls `asyncio.run_coroutine_threadsafe` which schedules on the running loop from a sync context; `sleep(0)` yields once but the coroutine may not be dispatched yet. A more robust approach: mock `_on_eos` directly and assert it was called, then separately unit-test that `_on_eos` fires `advance_cb` via `run_coroutine_threadsafe`.",
+      "why_it_matters": "This test is currently listed as a known pre-existing failure but the root cause is a brittle timing assumption, not a Python 3.14 issue per se. It will flake intermittently across all Python versions under load.",
+      "evidence": [
+        "listener.new_media_status(status)  # sync call",
+        "await asyncio.sleep(0)  # one yield — not guaranteed enough",
+        "_on_eos calls asyncio.run_coroutine_threadsafe(self._advance_cb(), self._loop)"
+      ]
+    },
+    {
+      "title": "Volume-clamping test doesn't set a device — set_volume silently skips the Cast call",
+      "severity": "P2",
+      "file": "tests/test_output_chromecast.py",
+      "line": 166,
+      "confidence": 88,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "The test only checks `get_volume()` returns the clamped value, which tests the in-memory `_volume` field — not that clamping happens before the `cast.set_volume` call. Add a variant that attaches a mock `_cast` and asserts `cast.set_volume` is called with the clamped value (0.0 or 1.0), not the raw out-of-range value. Also, `set_volume` persists via `database.set_setting` when `_device_id` is set — this path is untested.",
+      "why_it_matters": "If the clamp logic is applied after the Cast API call (a regression), the test would still pass because it only checks the stored field.",
+      "evidence": [
+        "backend = ChromecastBackend()  # no _cast, no _device_id",
+        "await backend.set_volume(1.5) / assert get_volume() == 1.0",
+        "chromecast.py set_volume: if self._cast and _CAST_AVAILABLE: cast.set_volume(vol)"
+      ]
+    },
+    {
+      "title": "No test for _content_type fallback chain — unknown container and URL-with-no-extension paths uncovered",
+      "severity": "P2",
+      "file": "tests/test_output_chromecast.py",
+      "line": 1,
+      "confidence": 85,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add unit tests for `_content_type` directly: (1) known container overrides URL extension; (2) unknown container falls through to URL extension lookup; (3) neither container nor recognisable extension falls back to `audio/mpeg`. This function is pure and has no dependencies — trivial to test.",
+      "why_it_matters": "`_content_type` is called on every play. An incorrect MIME type causes Cast devices to reject the stream. The fallback chain has three branches, only two of which are exercised implicitly (flac, mp3, aac tests).",
+      "evidence": [
+        "chromecast.py _content_type: three-branch fallback (container → URL ext → mimetypes → audio/mpeg)",
+        "tests only cover flac/mp3/aac via play tests"
+      ]
+    },
+    {
+      "title": "test_get_queue_respects_n_limit mutates global ConnectionManager state",
+      "severity": "P2",
+      "file": "tests/test_api_guest.py",
+      "line": 85,
+      "confidence": 90,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "The test sets `manager.guest_n = 3` on the real singleton `ConnectionManager` imported from `app.events.bus`. The `finally` block resets it to `None`, but if the test raises before the finally, the global is left dirty. Use `monkeypatch.setattr` on the manager instead, or construct a local `ConnectionManager()` and patch `app.events.bus.manager`.",
+      "why_it_matters": "State leakage between tests causes non-deterministic failures when tests run in a different order or in parallel. The try/finally pattern is fragile under exceptions that escape the try body.",
+      "evidence": [
+        "from app.events.bus import manager",
+        "manager.guest_n = 3",
+        "finally: manager.guest_n = None"
+      ]
+    },
+    {
+      "title": "mock_state fixture creates a real QueueEngine — DB persistence tasks fire into void",
+      "severity": "P2",
+      "file": "tests/test_api_admin.py",
+      "line": 35,
+      "confidence": 82,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Patch `app.queue.engine.database.save_queue` with an AsyncMock in the fixture, or use `monkeypatch` to stub it. The current fixture leaves `asyncio.create_task(database.save_queue(...))` firing against an uninitialised database, which may log errors or cause issues in strict asyncio modes.",
+      "why_it_matters": "Each `append`, `remove`, `move`, etc. call in the API tests fires a `create_task` that tries to write to SQLite. Without a real DB this produces background exceptions that are swallowed but pollute test logs and can cause spurious failures in future asyncio strictness modes.",
+      "evidence": [
+        "qe = QueueEngine()  # no DB stub",
+        "engine.py _persist: asyncio.create_task(database.save_queue(...))"
+      ]
+    },
+    {
+      "title": "test_output_devices_scan_runs_once_within_ttl — assertion magic number may be wrong",
+      "severity": "P2",
+      "file": "tests/test_api_admin.py",
+      "line": 333,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "The assertion `len(scan_count) == 4` assumes exactly 4 backends are scanned once. But `mock_state` patches out all 4 backend globals to `None` (via `patch('app.state.direct_backend', None)` etc.) then the test re-patches them inside the `with` block. If the admin route guards against `None` backends, zero scans would occur — verify the two patch scopes don't conflict. Add an assertion that `scan_count > 0` as a floor check, and check that the second GET call to `/admin/output/devices` does NOT produce additional scan calls (the cache hit case).",
+      "why_it_matters": "The test is checking a subtle caching invariant. The magic number 4 will silently pass if backends are skipped entirely (0 scans), and break if a new backend is added. The assertion intent ('second call does not scan') is not explicitly verified.",
+      "evidence": [
+        "mock_state patches: patch('app.state.direct_backend', None), ...",
+        "then test patches: db.discover_devices = counting_discover",
+        "assert len(scan_count) == 4"
+      ]
+    },
+    {
+      "title": "No test for advance() with SHUFFLE mode when shuffle_provider returns None",
+      "severity": "P2",
+      "file": "tests/test_queue.py",
+      "line": 206,
+      "confidence": 90,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add a test: set `end_behavior = SHUFFLE`, set `_shuffle_provider` to an async function returning `None`, call `advance()`, and assert the result is `None` and `state.is_playing is False`.",
+      "why_it_matters": "The `shuffle_provider` can return `None` when Plex is unavailable or the library is empty. The engine has a branch for this (`result = None`), but it is untested — a regression here leaves the engine in a broken state with `_is_playing = False` but no event emitted to stop the output backend.",
+      "evidence": [
+        "engine.py advance(): elif self._end_behavior == QueueEndBehavior.SHUFFLE and self._shuffle_provider:",
+        "    track = await self._shuffle_provider()",
+        "    if track: ... else: result = None"
+      ]
+    },
+    {
+      "title": "No test for queue.advance() emitting now_playing_changed event",
+      "severity": "P2",
+      "file": "tests/test_queue.py",
+      "line": 220,
+      "confidence": 87,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add a test that registers a callback, calls `advance()`, and checks `now_playing_changed` was emitted. The existing event tests only cover `queue_changed` and `lock_changed`.",
+      "why_it_matters": "The `now_playing_changed` event is the trigger for WebSocket NowPlaying broadcasts to all clients. If this event silently stopped firing, no client would know the track changed.",
+      "evidence": [
+        "engine.py advance(): await self._emit('now_playing_changed')",
+        "test_queue.py: only tests 'queue_changed' and 'lock_changed' emission"
+      ]
+    },
+    {
+      "title": "No test for set_paused / set_stopped events or state transitions",
+      "severity": "P2",
+      "file": "tests/test_queue.py",
+      "line": 1,
+      "confidence": 85,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add tests for `set_paused(True)`, `set_paused(False)`, and `set_stopped()`: assert `state.is_paused`, `state.is_playing` flags update correctly, and that `playback_state_changed` / `now_playing_changed` events are emitted.",
+      "why_it_matters": "These are the pause/resume/stop code paths. Regressions here would break playback controls without any test catching it.",
+      "evidence": [
+        "engine.py: set_paused emits 'playback_state_changed'; set_stopped emits 'now_playing_changed'",
+        "No test exercises these methods"
+      ]
+    },
+    {
+      "title": "test_do_advance_runs_when_lock_free — weak assertion; advance() return value not checked",
+      "severity": "P3",
+      "file": "tests/test_state.py",
+      "line": 54,
+      "confidence": 78,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Assert that `queue_engine.advance` was actually awaited (e.g. `st.queue_engine.advance.assert_awaited_once()`) and that when it returns a track, `output_router.play` is called. The current test only asserts 'no exception raised'.",
+      "why_it_matters": "A test that only checks 'no exception' can pass even if `_do_advance` returns immediately without doing anything useful.",
+      "evidence": [
+        "with patch.object(st.queue_engine, 'advance', AsyncMock(return_value=None)): await st._do_advance()",
+        "# Should not raise; returns immediately — that's the only assertion"
+      ]
+    },
+    {
+      "title": "No test for _do_advance retry loop (up to 50 consecutive playback failures)",
+      "severity": "P2",
+      "file": "tests/test_state.py",
+      "line": 1,
+      "confidence": 88,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add a test: patch `output_router.play` to always raise, patch `queue_engine.advance` to return tracks indefinitely, and assert `_do_advance` gives up after 50 iterations and logs an error. Also add a test that after one failure, if the next track succeeds, `_do_advance` returns successfully.",
+      "why_it_matters": "The retry loop is a critical resilience feature. Without tests, a refactor that changes the retry count or exit condition would go undetected.",
+      "evidence": [
+        "state.py _do_advance: for _ in range(50): ... try: await output_router.play(...) except: log and continue"
+      ]
+    },
+    {
+      "title": "No test for _auto_advance_pending guard in _trigger_auto_advance",
+      "severity": "P2",
+      "file": "tests/test_state.py",
+      "line": 1,
+      "confidence": 80,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add a test that fires two `queue_changed` events rapidly (simulating two guests appending simultaneously) and asserts `_do_advance` is called only once, not twice. This validates the `_auto_advance_pending` double-invocation guard.",
+      "why_it_matters": "The guard is specifically called out in the implementation comment. If it regresses, two tracks will start playing simultaneously.",
+      "evidence": [
+        "state.py _on_event: if not _auto_advance_pending: _auto_advance_pending = True; create_task(_trigger_auto_advance())"
+      ]
+    },
+    {
+      "title": "No test for logout / session invalidation API endpoint",
+      "severity": "P2",
+      "file": "tests/test_api_auth.py",
+      "line": 1,
+      "confidence": 85,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add a test for `POST /admin/auth/logout` (or equivalent endpoint): assert it invalidates the session token and the session cookie is cleared in the response.",
+      "why_it_matters": "Logout is a security-critical path. If the session is not invalidated server-side, stolen cookies remain valid indefinitely.",
+      "evidence": [
+        "test_api_auth.py covers: PIN removed, setup, login — no logout test exists"
+      ]
+    },
+    {
+      "title": "No test for wrong password on POST /admin/auth/login/local",
+      "severity": "P2",
+      "file": "tests/test_api_auth.py",
+      "line": 68,
+      "confidence": 90,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add tests: (1) wrong password returns 401; (2) login when no password is set returns 401 or appropriate error.",
+      "why_it_matters": "Only the happy path is tested. A regression in the password check (e.g. always returning True) would go undetected.",
+      "evidence": [
+        "test_login_local_still_works patches verify_password to return True",
+        "No test for verify_password returning False path through the API"
+      ]
+    },
+    {
+      "title": "No test for skip endpoint or concurrent skip+EOS race",
+      "severity": "P2",
+      "file": "tests/test_api_admin.py",
+      "line": 1,
+      "confidence": 82,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add tests for `POST /admin/playback/skip`: (1) skips to next track; (2) concurrent skip while EOS is in-flight — assert `_advance_lock` prevents double-advance (this is the bug fixed by issue #9 per the state.py comment).",
+      "why_it_matters": "The skip/EOS race is explicitly called out in the codebase (`_advance_lock` guard in `_do_advance`). The regression test for it is missing entirely.",
+      "evidence": [
+        "state.py: _advance_lock guards _do_advance against concurrent EOS + skip advancing",
+        "No skip endpoint test exists in test_api_admin.py"
+      ]
+    },
+    {
+      "title": "test_browse_artists_no_plex creates a new app instance — may not respect mock_deps fixture patches",
+      "severity": "P3",
+      "file": "tests/test_api_guest.py",
+      "line": 201,
+      "confidence": 80,
+      "autofix_class": "gated_auto",
+      "owner": "review-fixer",
+      "requires_verification": true,
+      "pre_existing": false,
+      "suggested_fix": "The test creates a fresh `TestClient(app)` inside the test body while also relying on `mock_deps` fixture patches. However it patches `app.state.get_plex_client` inside a `with` block, which should work. The concern is that by creating a new `TestClient`, the app may re-initialize and re-import, potentially getting a different module reference. Verify this test actually produces 503 by checking it doesn't accidentally hit the fixture's non-None plex client. Prefer using the `client` fixture and patching within it.",
+      "why_it_matters": "If the inner `with patch(...)` doesn't apply to the right module binding, the test could silently pass (getting 200 from mock_deps' non-None plex client) while actually testing nothing.",
+      "evidence": [
+        "def test_browse_artists_no_plex(mock_deps):  # fixture provides non-None plex",
+        "    with patch('app.state.get_plex_client', AsyncMock(return_value=None)):",
+        "        from app.main import app; c = TestClient(app, ...)"
+      ]
+    },
+    {
+      "title": "No test for queue history max-size cap (deque maxlen=50 boundary)",
+      "severity": "P3",
+      "file": "tests/test_queue.py",
+      "line": 1,
+      "confidence": 82,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add a test: create an engine with `history_max=3`, advance 4 times, and assert `len(engine.history) == 3` (oldest item dropped). Also test `history_max` setter with existing history.",
+      "why_it_matters": "The deque maxlen cap is the only memory-bounding mechanism for history. A regression would cause unbounded memory growth in long-running sessions.",
+      "evidence": [
+        "engine.py: self._history: deque[QueueItem] = deque(maxlen=history_max)",
+        "No test verifies the cap"
+      ]
+    },
+    {
+      "title": "No test for concurrent append operations (asyncio Lock correctness)",
+      "severity": "P3",
+      "file": "tests/test_queue.py",
+      "line": 1,
+      "confidence": 75,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add a test that fires 10 concurrent `append` calls with `asyncio.gather` and asserts the queue ends up with exactly 10 items in a consistent order.",
+      "why_it_matters": "The asyncio `Lock` in `append` prevents concurrent mutations, but this invariant has no regression test.",
+      "evidence": [
+        "engine.py append: async with self._lock:"
+      ]
+    },
+    {
+      "title": "No test for Plex 500/network-error path in PlexClient",
+      "severity": "P3",
+      "file": "tests/test_plex_client.py",
+      "line": 1,
+      "confidence": 80,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add tests for `get_libraries()` when the server returns 500 or raises a connection error. Assert the client raises an appropriate exception (not `PlexAuthError`, which is for 401).",
+      "why_it_matters": "Network errors are common in a home-server context. The current tests only cover 401 as an error path; 500/timeout paths are unverified.",
+      "evidence": [
+        "test_401_raises_plex_auth_error is the only error-path test for the HTTP client"
+      ]
+    },
+    {
+      "title": "test_search_returns_grouped_results — mock returns tracks for all 3 search types",
+      "severity": "P3",
+      "file": "tests/test_plex_client.py",
+      "line": 260,
+      "confidence": 78,
+      "autofix_class": "advisory",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "The test comment acknowledges the mock returns the same track-format response for all 3 calls (tracks, albums, artists). This means `results.albums` and `results.artists` are likely populated with Track objects parsed as albums/artists, which may or may not be caught by model validation. Consider setting up 3 distinct respx routes for the 3 search type calls, or at least assert that `results.albums` and `results.artists` have the expected shape.",
+      "why_it_matters": "If the client parses album/artist responses with the wrong model, errors will only surface at runtime.",
+      "evidence": [
+        "respx_mock.get('.../search').mock(return_value=...track_item())",
+        "# search hits the endpoint 3 times (tracks, albums, artists) — all return same mock"
+      ]
+    },
+    {
+      "title": "No test for WebSocket endpoint itself — only ConnectionManager unit-tested",
+      "severity": "P2",
+      "file": "tests/test_event_bus.py",
+      "line": 1,
+      "confidence": 85,
+      "autofix_class": "manual",
+      "owner": "human",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add integration tests using FastAPI's WebSocket test client (`TestClient` with `with client.websocket_connect('/ws/guest')` and `with client.websocket_connect('/ws/admin')`) to verify: (1) guest WS receives queue events; (2) admin WS requires auth; (3) disconnected clients are cleaned up.",
+      "why_it_matters": "The ConnectionManager is tested in isolation, but the actual WebSocket route wiring (auth guard for `/ws/admin`, accept/disconnect lifecycle) is unverified. A broken route registration would not be caught.",
+      "evidence": [
+        "test_event_bus.py tests ConnectionManager class directly, never through HTTP/WS"
+      ]
+    },
+    {
+      "title": "No integration test for _make_stream_url proxy logic (STREAM_BASE_URL / BIND_HOST)",
+      "severity": "P3",
+      "file": "tests/test_state.py",
+      "line": 1,
+      "confidence": 80,
+      "autofix_class": "safe_auto",
+      "owner": "review-fixer",
+      "requires_verification": false,
+      "pre_existing": false,
+      "suggested_fix": "Add unit tests for `state._make_stream_url`: (1) when `STREAM_BASE_URL` is set, returns proxy URL; (2) when `BIND_HOST` is a specific IP (not 0.0.0.0), returns proxy URL; (3) otherwise delegates to `client.stream_url()`.",
+      "why_it_matters": "This function determines whether Cast/DLNA devices get the direct Plex URL or the Jukeplox proxy URL. A regression would break playback for devices that can't reach Plex directly.",
+      "evidence": [
+        "state.py _make_stream_url: three-branch logic based on settings.stream_base_url and settings.bind_host"
+      ]
+    }
+  ],
+  "residual_risks": [
+    "The QueueEngine._lock asyncio.Lock is created at module import time; if tests share the module-level `queue_engine` singleton across test functions (rather than using the fixture), lock state can leak between tests.",
+    "test_auth.py plex_oauth tests patch `app.database.set_plex_config` but some branches call `database.save_plex_servers` — if a test path hits the wrong branch, the patch won't catch it and real DB I/O could be attempted.",
+    "The `asyncio_mode = auto` in pyproject.toml means all async test functions run without explicit @pytest.mark.asyncio — this is correct, but any sync test that accidentally returns a coroutine will silently pass without executing the body.",
+    "No test covers the `activate_backend` function in state.py — this is the entry point for switching audio backends at runtime and includes an auto-advance side effect.",
+    "No test covers the `database.increment_play_count` calls in `_do_advance` — if this function doesn't exist or has wrong signature, it will fail silently via `create_task` swallowing the exception.",
+    "The Chromecast `get_position()` method (linear extrapolation from last snapshot) is entirely untested.",
+    "The Chromecast `seek()` method is entirely untested.",
+    "No load/stress tests for the event bus under many simultaneous connections."
+  ],
+  "testing_gaps": [
+    "Skip endpoint (POST /admin/playback/skip) — no test at all",
+    "Logout endpoint — no test at all",
+    "Wrong-password login rejection via API — only happy path tested",
+    "WebSocket route integration (auth guard, connect/disconnect lifecycle) — only ConnectionManager unit tested",
+    "_do_advance retry loop (50-iteration cap, partial-failure recovery)",
+    "_auto_advance_pending double-invocation guard under concurrent queue appends",
+    "_make_stream_url proxy URL logic (STREAM_BASE_URL, BIND_HOST)",
+    "activate_backend() — runtime backend switching with auto-advance side effect",
+    "QueueEngine history maxlen cap enforcement",
+    "QueueEngine.set_paused() and set_stopped() state transitions and event emission",
+    "QueueEngine advance() with SHUFFLE mode when provider returns None",
+    "QueueEngine now_playing_changed event emission from advance()",
+    "_content_type fallback chain for unknown MIME types",
+    "Chromecast set_volume with device attached — verifying clamped value reaches cast.set_volume()",
+    "Chromecast volume persistence (database.set_setting) when device_id is set",
+    "Chromecast get_position() extrapolation logic",
+    "Chromecast seek() method",
+    "Plex server 500/timeout error handling",
+    "database.increment_play_count function (called from _do_advance via create_task)"
+  ]
+}

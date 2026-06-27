@@ -1,0 +1,40 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.env
+data/
+.venv/
+venv/
+# Scratch / local-only artifacts (harness screenshots + Chrome profiles,
+# build logs, code-review JSON output) — never part of the source tree.
+tmp/
+*.log
+correctness.json
+maintainability.json
+testing.json
+# Design mockups — kept locally for reference, not shipped to the release repo
+docs/mockups/
+
+# Internal engineering docs — kept locally, not part of the public/deployable repo.
+# Deployment docs that DO ship: README.md, INSTALL.md, TrueNAS-README.md.
+docs/plans/
+docs/brainstorms/
+docs/solutions/
+docs/install-wizard.md
+
+# Local agent / tooling state
+.claude/
+.compound-engineering/
+CLAUDE.md
+AGENTS.md
+
+# Local runtime state / secrets (belt-and-suspenders — should never be tracked)
+secret.key
+*.db
+*.sqlite
+*.sqlite3

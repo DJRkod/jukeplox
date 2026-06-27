@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jukeplox</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/browse/rail.css?v={{ asset_v }}">
+  <link rel="stylesheet" href="/static/playback/queue.css?v={{ asset_v }}">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root { --accent: #e5a00d; --bg: #0f0f0f; --surface: #1a1a1a; --surface2: #242424; --text: #eee; --muted: #888; --danger: #f87171; --accent-ui: #e5a00d; --on-accent: #111; --accent-grad: #e5a00d; --accent-strong: #c98a0b; --accent-dim: rgba(229,160,13,.13); --sax-filter: none; --border: rgba(255,255,255,.14); --divider: rgba(255,255,255,.08); }
+    html, body { height: 100%; color: var(--text); font-family: system-ui, sans-serif; font-size: 16px; }
+    /* Paint the scheme --bg ONCE as a viewport-anchored backdrop. Painting it on
+       the capped <body> too (max-width:1100px) made body's gradient box differ
+       from html's full-viewport box → a seam at the column edge on desktop. body
+       is now transparent; `fixed` keeps the whole gradient in view (degrades to a
+       seamless scrolling gradient where fixed is unsupported, e.g. iOS). */
+    html { background: var(--bg) fixed; }
+    body { display: flex; flex-direction: column; max-width: 540px; margin: 0 auto; background: transparent; }
+
+    /* Lock banner */
+    #lock-banner { background: #7c2d12; color: #fed7aa; padding: .6rem 1rem; font-size: .85rem; text-align: center; display: none; }
+    #lock-banner.visible { display: block; }
+
+    /* Micro-bar — persistent playback context above the tabs (dock option B).
+       2px progress line rides the bar's bottom edge. */
+    #micro-bar { display: flex; align-items: center; gap: .55rem; padding: .4rem .75rem; background: var(--surface);
+                 position: relative; flex-shrink: 0; cursor: pointer; }
+    .mb-art, .mb-art-placeholder { width: 26px; height: 26px; border-radius: 5px; object-fit: cover;
+                 background: var(--surface2); flex-shrink: 0; display: flex; align-items: center;
+                 justify-content: center; font-size: .8rem; }
+    .mb-art.hidden { display: none; }
+    .mb-text { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: .45rem; }
+    .mb-title { font-size: .82rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .mb-artist { font-size: .72rem; color: var(--muted); white-space: nowrap; overflow: hidden;
+                 text-overflow: ellipsis; flex-shrink: 1; min-width: 0; }
+    .mb-time { font-family: 'Space Mono', ui-monospace, monospace; font-size: .68rem; color: var(--muted); flex-shrink: 0; }
+    .mb-track { position: absolute; left: 0; bottom: 0; height: 2px; width: 100%; background: var(--divider); }
+    .mb-progress { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--accent); z-index: 1; }
+
+    /* Browse / Search tabs */
+    #tabs { display: flex; background: var(--surface); border-bottom: 1px solid var(--border); overflow-x: auto; }
+    /* Inactive tabs: dimmed --text, not --muted — so they stay visible over the
+       dark top of the bright-bg gradient themes (Ladyland/Bloody Pink), where a
+       dark --muted vanished. Matches the admin .ptab fix. */
+    .tab { padding: .7rem 1rem; font-size: .85rem; color: var(--text); opacity: .62; cursor: pointer; white-space: nowrap; border-bottom: 2px solid transparent; }
+    .tab:hover { opacity: .85; }
+    /* Hairline chrome on black uses --accent-ui (the scheme's lifted tone)
+       so deep anchors like A Case of Blue stay visible (U7 polish). */
+    .tab.active { color: var(--text); opacity: 1; border-bottom-color: var(--accent-ui, var(--accent)); }
+    .now-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent-ui, var(--accent));
+               margin-right: .35rem; vertical-align: 1px; opacity: 0; }
+    .now-dot.on { opacity: 1; animation: dotPulse 2s ease-in-out infinite; }
+    @keyframes dotPulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+    /* Content area. #content-frame is the alphabet rail's positioning host
+       (the rail must sibling the scroll container, not live inside it —
+       2026-06-09 rail plan U2); the shared module adds .rail-host to it. */
+    #content-frame { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
+    #content { flex: 1; overflow-y: auto; padding-bottom: env(safe-area-inset-bottom, 1rem); }
+    /* The browse panel (.browse-surface look lives in static/browse/rail.css —
+       shared with admin). Top-flush so the sticky search/wayfind bars pin to the
+       card's top edge; inset on the sides + bottom so the scheme gradient frames
+       it as a card. */
+    #browse-container { margin: 0 .6rem .9rem; padding: 0 .55rem .55rem; }
+    .view { display: none; }
+    .view.active { display: block; animation: viewFadeIn .18s ease; }
+    @keyframes viewFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* Now tab — full playback panel (rendered by the shared playback module) */
+    .np-row { display: flex; gap: 1rem; align-items: center; padding: 1rem; }
+    .np-placeholder { filter: var(--sax-filter, none); width: 96px; height: 96px; border-radius: 10px; background: var(--surface2); display: flex;
+                      align-items: center; justify-content: center; font-size: 2.4rem; flex-shrink: 0; }
+    .np-art { width: 96px; height: 96px; border-radius: 10px; object-fit: cover; background: var(--surface2); flex-shrink: 0; }
+    .np-art.hidden { display: none; }
+    .np-art.hidden + .np-text, .np-text { flex: 1; min-width: 0; }
+    .np-title { font-weight: 700; font-size: 1.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: -.01em; }
+    .np-artist { font-size: .85rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #np-progress { padding: 0 .75rem .45rem; }   /* .75rem inset = flush with Lyrics + Surprise Me (2026-06-18) */
+    /* Progress bar adopts the accent gradient (2026-06-14 scheme expansion).
+       The native range input is kept (seek/keyboard intact); the track paints
+       the FULL var(--accent-grad) with the unplayed remainder dimmed via the
+       JS-published --np-fill, so multi-stop gradients read at any position.
+       Single-color schemes look like a solid accent fill as before. */
+    .np-progress-bar { --np-fill: 0%; width: 100%; display: block; height: 16px;
+      -webkit-appearance: none; appearance: none; background: transparent; cursor: pointer; margin: 0; }
+    .np-progress-bar::-webkit-slider-runnable-track { height: 6px; border-radius: 3px;
+      background: linear-gradient(90deg, transparent 0 var(--np-fill), rgba(0,0,0,.5) var(--np-fill) 100%), var(--accent-grad); }
+    .np-progress-bar::-moz-range-track { height: 6px; border-radius: 3px;
+      background: linear-gradient(90deg, transparent 0 var(--np-fill), rgba(0,0,0,.5) var(--np-fill) 100%), var(--accent-grad); }
+    .np-progress-bar::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px;
+      border-radius: 50%; background: var(--accent-ui, var(--accent)); border: 2px solid var(--bg); margin-top: -4px; }
+    .np-progress-bar::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%;
+      background: var(--accent-ui, var(--accent)); border: 2px solid var(--bg); }
+    .np-progress-bar:disabled { cursor: default; }
+    .np-progress-bar:disabled::-webkit-slider-thumb { opacity: 0; }
+    .np-progress-bar:disabled::-moz-range-thumb { width: 0; border: none; }
+    .np-times { display: flex; justify-content: space-between; font-size: .72rem; color: var(--muted);
+                font-family: 'Space Mono', ui-monospace, monospace; }
+    .pb-label { font-size: .68rem; color: var(--muted); padding: .6rem .75rem .2rem; text-transform: uppercase; letter-spacing: .05em; }
+    .pb-empty { color: var(--muted); font-size: .8rem; padding: .5rem .75rem; display: block; }
+
+    /* Queue vertical list (shared module rows) */
+    .queue-item { display: flex; align-items: center; gap: .65rem; padding: .5rem .75rem; border-bottom: 1px solid var(--divider); }
+    .qi-pos { color: #555; width: 1.2rem; text-align: right; font-size: .8rem; font-family: 'Space Mono', ui-monospace, monospace; flex-shrink: 0; }
+    .qi-art, .qi-art-placeholder { width: 38px; height: 38px; border-radius: 4px; object-fit: cover; background: var(--surface2);
+              flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 1rem; }
+    .qi-info { flex: 1; min-width: 0; }
+    .qi-title { font-size: .88rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .qi-artist { font-size: .76rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* Queue remove (✕ chip + album bar) now lives in the shared stylesheet
+       static/playback/queue.css, linked above and by the admin template — one
+       home for both pages (unify-queue-remove U2). */
+
+    /* History strip (horizontal, shared module) */
+    .strip { overflow-x: auto; display: flex; gap: .5rem; padding: .4rem .75rem .9rem; scrollbar-width: none; }
+    .strip::-webkit-scrollbar { display: none; }
+    .qs-item { flex-shrink: 0; text-align: center; width: 56px; }
+    .qs-item.qs-history { opacity: .55; }
+    .qs-art, .qs-art-placeholder { width: 44px; height: 44px; border-radius: 4px; object-fit: cover; background: var(--surface);
+              margin: 0 auto; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; }
+    /* div.list-art = the 🎷 placeholder only — img.list-art is real artwork
+       and must never be tinted (U7 sweep fix; there is no -placeholder
+       suffix variant of list-art). */
+    .mb-art-placeholder, .qi-art-placeholder, .qs-art-placeholder, div.list-art { filter: var(--sax-filter, none); }
+    .qs-title { font-size: .65rem; color: var(--muted); margin-top: .2rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* Search */
+    #search-bar { padding: .75rem .75rem .5rem; position: sticky; top: 0; background: var(--bg); z-index: 1; }
+    #search-bar input { width: 100%; padding: .65rem 1rem; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: .95rem; }
+    #search-bar input:focus { outline: none; border-color: var(--accent); }
+    /* Clear-× affordance (treatment C) — scheme-following via accent vars */
+    #search-bar .search-field { position: relative; display: flex; align-items: center; }
+    #search-bar .search-field input { padding-right: 2.6rem; }
+    #search-input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+    .search-clear { appearance: none; -webkit-appearance: none; position: absolute; right: .45rem; top: 50%;
+      transform: translateY(-50%) scale(.6); width: 1.6rem; height: 1.6rem; display: grid; place-items: center;
+      border: none; border-radius: 50%; background: var(--accent-dim); color: var(--accent-ui);
+      font-size: .95rem; line-height: 1; cursor: pointer; opacity: 0; pointer-events: none;
+      transition: opacity .16s ease, transform .16s cubic-bezier(.34,1.56,.64,1); }
+    .search-field.has-text .search-clear { opacity: 1; pointer-events: auto; transform: translateY(-50%) scale(1); }
+    .search-clear:hover, .search-clear:focus-visible { background: var(--accent); color: var(--on-accent); outline: none; }
+    .search-clear:active { transform: translateY(-50%) scale(.82) rotate(90deg); }
+    /* flex-wrap: five pills overflow 320px-wide phones without it (the
+       admin rule already wraps). */
+    #search-filter-tabs { display: flex; gap: .4rem; padding: .5rem 0 0; flex-wrap: wrap; }
+    .filter-tab { padding: .28rem .75rem; border-radius: 999px; background: var(--surface2); font-size: .78rem; cursor: pointer; color: var(--accent-ui, var(--accent)); }
+    .filter-tab.active { background: var(--accent-grad, var(--accent)); color: var(--on-accent); }
+    #search-results { padding: 0 .75rem .75rem; }
+
+    /* Most Played count badge (compact: 320px phones must not crowd) */
+    .mp-count { font-family: 'Space Mono', ui-monospace, monospace; font-size: .72rem; color: var(--accent); min-width: 2.4rem; text-align: right; flex-shrink: 0; }
+
+    /* Lists */
+    .list-item { display: flex; align-items: center; gap: .75rem; padding: .7rem .75rem; border-bottom: 1px solid var(--divider); cursor: pointer; transition: background .1s; }
+    .list-item:hover { background: var(--surface); }
+    .list-item:active { background: var(--surface); }
+    .list-art { width: 44px; height: 44px; border-radius: 4px; object-fit: cover; background: var(--surface2); flex-shrink: 0; }
+    .list-info { flex: 1; min-width: 0; }
+    .list-title { font-size: .9rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .list-sub { font-size: .78rem; color: var(--muted); }
+    .list-chevron { color: var(--muted); font-size: .9rem; }
+    /* Theme-tinted kebabs (2026-06-11): --accent-dim chip + --accent-ui glyph
+       reads as themed without 30 loud accent chips per screen; press
+       escalates to the full accent fill. Re-colors live on scheme switch. */
+    .kebab-btn { min-width: 44px; min-height: 44px; display: flex; align-items: center; justify-content: center; background: var(--accent-dim); color: var(--accent-ui, var(--accent)); border-radius: 8px; font-size: 1.25rem; border: none; cursor: pointer; flex-shrink: 0; }
+    .kebab-btn:active { background: var(--accent-grad, var(--accent)); color: var(--on-accent); }
+    /* Tile view (2026-06-15 tile-view plan U2): art-forward grid alternative to
+       the list for artists + releases. Fluid auto-fill adapts the column count
+       to the pane width (phone column → admin pane) with no breakpoints. */
+    .tile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 12px; padding: 12px; align-content: start; }
+    .tile { cursor: pointer; min-width: 0; }
+    .tile-art-wrap { position: relative; width: 100%; aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: var(--surface2); }
+    .tile-art { width: 100%; height: 100%; object-fit: cover; background: var(--surface2); border-radius: 8px; }
+    div.tile-art { filter: var(--sax-filter, none); }   /* 🎷 placeholder tints; img.tile-art (real art) never does */
+    .tile.is-artist .tile-art-wrap, .tile.is-artist .tile-art { border-radius: 50%; }
+    .tile-title { font-size: .82rem; font-weight: 500; margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tile-sub { font-size: .72rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tile.is-artist .tile-title, .tile.is-artist .tile-sub { text-align: center; }
+    /* corner queue affordance: .kebab-btn lineage, repositioned + resized for a
+       tile corner with a surface scrim for legibility over art. */
+    .tile-kebab { position: absolute; top: 5px; right: 5px; width: 30px; height: 30px; min-width: 0; min-height: 0; border-radius: 7px; font-size: 1.05rem; background: color-mix(in srgb, var(--surface) 70%, transparent); backdrop-filter: blur(2px); }
+    /* Release drill-in album art (2026-06-15 release-art plan): cover + title +
+       artist·year. Mobile = stacked hero (cover centered above the tracklist);
+       desktop pane (>=960px) = sticky cover aside left of the tracklist. */
+    .release-aside { display: flex; flex-direction: column; align-items: center; text-align: center; gap: .55rem; padding: 1rem .75rem .5rem; }
+    .ra-cover { position: relative; width: 168px; aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: var(--surface2); box-shadow: 0 4px 14px rgba(0,0,0,.35); flex-shrink: 0; }
+    .ra-cover-img { width: 100%; height: 100%; object-fit: cover; display: flex; align-items: center; justify-content: center; font-size: 2.4rem; }
+    div.ra-cover-img { filter: var(--sax-filter, none); }   /* 🎷 placeholder tints; real img untouched */
+    .ra-htitle .t { font-size: 1.15rem; font-weight: 800; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .ra-htitle .s { font-size: .82rem; color: var(--muted); margin-top: 2px; }
+    /* Release subtitle artist/year links pop in accent at rest (2026-06-20); the
+       shared .name-link:hover underline still applies. Scoped here so list-row
+       name-links stay muted-until-hover (no wall of accent text per screen). */
+    .ra-htitle .s .name-link { color: var(--accent-ui, var(--accent)); font-weight: 600; }
+    /* Kebab matches the cover width on mobile too (2026-06-20) — standardizing
+       the desktop full-art-width bar; desktop pins it to the aside width below. */
+    .release-aside .kebab-btn { width: 168px; max-width: 100%; }
+    @media (min-width: 960px) {
+      .release-view { display: flex; gap: 1.1rem; padding: .6rem .85rem .2rem; align-items: flex-start; }
+      .release-aside { flex-shrink: 0; width: 220px; position: sticky; top: 46px; align-items: stretch; text-align: left; padding: 0; }
+      .release-aside .ra-cover { width: 220px; }
+      .release-aside .kebab-btn { width: 220px; }
+      .release-main { flex: 1; min-width: 0; }
+    }
+    .overflow-menu button:disabled, .overflow-menu button.sheet-disabled { color: #555; cursor: default; }
+    /* Appearance gear + panel (2026-06-11 glow-up U5). The DOM is built by
+       shared.js mountAppearance (single-source component on both pages);
+       this styles it. Gear bottom-right; the undo snack's max-width cap
+       keeps the corner clear at 320px. z-order: under the overflow sheet
+       (1000), above page content. */
+    /* Gear visibility (2026-06-11 gear/rail overlap fix): the corners are
+       crowded on the browse tabs (alphabet rail bottom-right, list content
+       both sides), so the gear shows ONLY on tabs without that furniture —
+       Now + Search on mobile, Search alone on desktop (the docked desktop
+       Now pane never holds .active; the media query makes that literal). */
+    .appearance-gear { position: fixed; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); width: 36px; height: 36px; border-radius: 50%; background: rgba(36,36,36,.8); color: #aaa; border: 1px solid var(--border); font-size: 17px; line-height: 1; display: none; align-items: center; justify-content: center; cursor: pointer; z-index: 900; }
+    .appearance-gear:hover { color: var(--text); }
+    /* A+C hybrid (gear-visibility reqs): desktop FAB everywhere (the rail
+       reserves the corner via rail.css); mobile FAB on Now+Search only,
+       with the docked .appearance-tab covering browse tabs instead. */
+    @media (min-width: 960px) { .appearance-gear { display: flex; } }
+    @media (max-width: 959px) {
+      body:has(#search-view.active) .appearance-gear,
+      body:has(#now-view.active) .appearance-gear { display: flex; }
+    }
+    .appearance-panel { position: fixed; right: 12px; bottom: calc(56px + env(safe-area-inset-bottom, 0px)); width: 224px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; box-shadow: 0 8px 28px rgba(0,0,0,.6); z-index: 950; display: none; }
+    .appearance-panel.open { display: block; }
+    .appearance-tab { display: none; position: sticky; right: 0; margin-left: auto; flex-shrink: 0; background: var(--surface); border: none; color: #aaa; font-size: 1rem; padding: .6rem .9rem; cursor: pointer; box-shadow: -8px 0 10px -4px rgba(0,0,0,.8); }
+    .appearance-tab:active { color: var(--accent-ui, var(--accent)); }
+    @media (max-width: 959px) {
+      body:not(:has(#now-view.active)):not(:has(#search-view.active)) .appearance-tab { display: block; }
+    }
+    .appearance-panel h4 { font-size: .62rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 0 0 8px; }
+    .ap-swatches { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
+    .ap-swatch { height: 30px; border-radius: 6px; border: 1px solid rgba(0,0,0,.33); cursor: pointer; padding: 0; }
+    /* Active scheme highlighted in place (gear panel no longer hides it). */
+    .ap-swatch.on { outline: 2px solid var(--accent-ui, var(--accent)); outline-offset: 1px; }
+    .ap-rails { display: flex; gap: 7px; margin-bottom: 10px; }
+    .ap-rail-icon { flex: 1; height: 32px; border-radius: 6px; background: var(--surface2); color: #999; border: none; display: flex; align-items: center; justify-content: center; font-size: 10px; cursor: pointer; padding: 0; }
+    .ap-rail-icon.on { outline: 2px solid var(--accent-ui, var(--accent)); color: var(--accent-ui, var(--accent)); }
+    /* Tile-view U3: List/Tile view picker in the gear panel. */
+    .ap-views { display: flex; gap: 7px; margin-bottom: 10px; }
+    .ap-view-btn { flex: 1; height: 32px; border-radius: 6px; background: var(--surface2); color: #999; border: none; display: flex; align-items: center; justify-content: center; gap: 4px; font-size: .72rem; cursor: pointer; padding: 0; }
+    .ap-view-btn.on { outline: 2px solid var(--accent-ui, var(--accent)); color: var(--accent-ui, var(--accent)); }
+    .ap-hostdef { display: block; width: 100%; background: none; border: none; color: var(--accent-ui, var(--accent)); font-size: .68rem; text-align: center; cursor: pointer; padding: 4px 0 0; }
+    .ap-hostdef:disabled { color: #555; cursor: default; }
+    /* Scheme-switch crossfade (mockup variant B, 1.2s): the shared engine
+       wraps live scheme changes in document.startViewTransition; this
+       stretches the default ~0.25s crossfade. Browsers without View
+       Transitions never enter this path (instant switch). */
+    ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 1.2s; }
+    .back-btn { display: flex; align-items: center; gap: .4rem; padding: .7rem .75rem; font-size: .9rem; color: var(--accent); cursor: pointer; border-bottom: 1px solid var(--divider); }
+    /* Wayfinding bar (2026-06-10 nav plan U3; locked mockup variant B):
+       sticky origin link + tappable trail, replaces per-view back-btn rows
+       in drilled views. Rules identical in both templates. */
+    /* Non-sticky: the drill-in wayfinder scrolls away with the content like the
+       top-level sort headers, so the transparent bar never overlays album rows
+       (it has no opaque backing on the 72%-translucent .browse-surface). */
+    .wayfind-bar { display: flex; align-items: center; gap: .5rem; padding: .55rem .75rem; background: var(--bg); border-bottom: 1px solid var(--divider); white-space: nowrap; overflow: hidden; }
+    .wf-origin { color: var(--accent); font-size: .85rem; cursor: pointer; flex-shrink: 0; }
+    .wf-div { color: #444; flex-shrink: 0; }
+    .wf-trail { flex: 1; font-size: .78rem; color: var(--muted); display: flex; align-items: center; gap: .3rem; min-width: 0; overflow: hidden; }
+    .wf-sep { color: #555; flex-shrink: 0; }
+    .wf-crumb { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .wf-crumb.wf-here { color: var(--text); cursor: default; }
+    /* Name links (2026-06-10 nav plan U4): artist/release text in rows is
+       tappable with its own hit zone; affordance on press/hover only. */
+    .name-link { cursor: pointer; }
+    .name-link:hover, .name-link:active { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+    .name-link-self { opacity: .45; cursor: default; }
+    .section-header { display: flex; align-items: center; justify-content: space-between; padding: .5rem .75rem; }
+    .section-header h3 { font-size: .8rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    /* Search result category labels (Artists/Albums/Tracks/Genres) wear the
+       accent, matching the "More matches" divider — one accented subheader
+       family under Search. Scoped to .cat-head so drill-in album/disc/year
+       headers stay muted and consistent across every entry path. */
+    .section-header.cat-head h3 { color: var(--accent); }
+    /* Tiered search (plan 2026-06-14-005): the "More matches" divider marks
+       where hub hits end and the broader literal title-substring tier begins;
+       the sentinel is the scroll target that auto-pulls the next broad page. */
+    .more-head { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; padding: .85rem .75rem .5rem; margin-top: .4rem; border-top: 1px solid var(--border); }
+    .more-head h3 { font-size: .8rem; color: var(--accent); text-transform: uppercase; letter-spacing: .06em; }
+    .more-head .hint { font-size: .72rem; color: var(--muted); }
+    .search-sentinel { height: 1px; }
+    .search-sentinel.loading { height: 2.75rem; display: flex; align-items: center; justify-content: center; }
+    .search-sentinel.loading::after { content: ''; width: 1.1rem; height: 1.1rem; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: sentSpin .7s linear infinite; }
+    @keyframes sentSpin { to { transform: rotate(360deg); } }
+    /* (.overflow-btn retired 2026-06-11 — the album-header trigger now wears
+       .kebab-btn like every other contextual menu trigger.) */
+    .overflow-menu { position: fixed; bottom: 0; left: 0; right: 0; max-width: 540px; margin: 0 auto; background: var(--surface); border-radius: 12px 12px 0 0; padding: 1rem; z-index: 100; display: none; box-shadow: 0 -4px 20px rgba(0,0,0,.5); max-height: 85vh; overflow-y: auto; }
+    .overflow-menu.visible { display: block; }
+    .overflow-menu button { display: block; width: 100%; padding: .75rem; font-size: .95rem; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; border-bottom: 1px solid var(--border); }
+    .overflow-menu button:last-child { border: none; color: var(--muted); }
+    .overflow-overlay { position: fixed; inset: 0; z-index: 99; display: none; }
+    .overflow-overlay.visible { display: block; }
+
+    /* Toast */
+    .toast { position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%); background: var(--surface2); color: var(--text); padding: .65rem 1.25rem; border-radius: 8px; font-size: .85rem; white-space: nowrap; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 9999; }
+    .toast.show { opacity: 1; }
+    .loading { padding: 2rem; text-align: center; color: var(--muted); font-size: .85rem; }
+    /* Genre/year chips + Show More now live in the shared static/browse/rail.css
+       (single source for guest + admin; gradient-gloss treatment 2026-06-17). */
+    /* (Alpha index bar rules removed in U3; replaced by shared static/browse/rail.css) */
+    /* Multi-source track badge and picker */
+    .source-add { color: var(--accent); font-weight: bold; font-size: 1.1rem; }
+    .kebab-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* ── Desktop two-pane (2026-06-09 rail plan U6, R11/R13/R14) ──────────
+       At wide widths the Now panel docks as a persistent left pane and the
+       library fills the rest at window height. Pure CSS relocation of the
+       same shared-module-rendered DOM: #content flips from a vertical
+       scroller to a horizontal flex row; #browse-container becomes the
+       scroll container (the rail re-anchors to it via the shared module's
+       breakpoint listener). The Now tab and micro-bar are redundant when
+       the panel is always visible — hidden at this width; mobile keeps the
+       shipped micro-bar + Now-tab layout untouched. */
+    @media (min-width: 960px) {
+      body { max-width: 1280px; }   /* parity with admin main (the tabs bar + content extend to the same width) */
+      #micro-bar { display: none; }
+      #tabs .tab[data-view="now-view"] { display: none; }
+      #content { display: flex; overflow: hidden; padding-bottom: 0; }
+      #now-view {
+        display: block !important;   /* docked pane ignores .view tab state */
+        width: 300px;
+        flex-shrink: 0;
+        overflow-y: auto;
+        border-right: 1px solid var(--border);
+        background: var(--surface);
+        animation: none;
+      }
+      #browse-container { flex: 1 1 auto; min-width: 0; overflow-y: auto; }
+    }
+  </style>
+</head>
+<body>
+
+<div id="lock-banner">🔒 Queuing is currently paused by the host</div>
+
+<!-- Persistent micro-bar (shared playback module renders its contents) -->
+<div id="micro-bar" title="Tap to open Now Playing"></div>
+
+<div id="tabs">
+  <div class="tab" data-view="now-view"><span class="now-dot" id="now-dot"></span>Now</div>
+  <div class="tab active" data-view="search-view">Search</div>
+  <div class="tab" data-view="artists-view">Artists</div>
+  <div class="tab" data-view="albums-view">Albums</div>
+  <div class="tab" data-view="genres-view">Genres</div>
+  <div class="tab" data-view="years-view">Years</div>
+  <div class="tab" data-view="mostplayed-view">Most Played</div>
+  <div class="tab" data-view="recentlyadded-view">Recently Added</div>
+  <div class="tab" data-view="highestrated-view">Highest Rated</div>
+</div>
+
+<div id="content-frame">
+<div id="content">
+  <!-- Now tab: full playback panel (outside #browse-container — not a browse view) -->
+  <div id="now-view" class="view">
+    <div id="np-panel"></div>
+    <div id="np-progress"></div>
+    <div class="pb-label">Up next</div>
+    <div id="queue-list"></div>
+    <div class="pb-label">Recently played</div>
+    <div id="history-strip" class="strip"></div>
+  </div>
+
+  <div id="browse-container" class="browse-surface" role="region" aria-label="Browse music">
+    <!-- Search -->
+    <div id="search-view" class="view active">
+      <div id="search-bar">
+        <div class="search-field">
+          <input type="search" id="search-input" placeholder="Search tracks, albums, artists, genres…">
+          <button class="search-clear" type="button" aria-label="Clear search">✕</button>
+        </div>
+        <div id="search-filter-tabs">
+          <span class="filter-tab active" data-filter="all">All</span>
+          <span class="filter-tab" data-filter="artists">Artists</span>
+          <span class="filter-tab" data-filter="tracks">Tracks</span>
+          <span class="filter-tab" data-filter="albums">Albums</span>
+          <span class="filter-tab" data-filter="genres">Genres</span>
+        </div>
+      </div>
+      <div id="search-results"></div>
+    </div>
+
+    <!-- Artists -->
+    <div id="artists-view" class="view">
+      <div id="artists-list"><div class="loading">Loading…</div></div>
+    </div>
+
+    <!-- Albums -->
+    <div id="albums-view" class="view">
+      <div id="albums-list"><div class="loading">Loading…</div></div>
+    </div>
+
+    <!-- Genres -->
+    <div id="genres-view" class="view">
+      <div id="genres-list"><div class="loading">Loading…</div></div>
+    </div>
+
+    <!-- Years -->
+    <div id="years-view" class="view">
+      <div id="years-list"><div class="loading">Loading…</div></div>
+    </div>
+
+    <!-- Most Played (2026-06-10 most-played plan U2) -->
+    <div id="mostplayed-view" class="view">
+      <div id="mostplayed-list"><div class="loading">Loading…</div></div>
+    </div>
+
+    <!-- Recently Added (plan 006) -->
+    <div id="recentlyadded-view" class="view">
+      <div id="recentlyadded-list"><div class="loading">Loading…</div></div>
+    </div>
+
+    <!-- Highest Rated (2026-06-26 ratings-and-tags plan U7) -->
+    <div id="highestrated-view" class="view">
+      <div id="highestrated-list"><div class="loading">Loading…</div></div>
+    </div>
+  </div>
+</div>
+</div><!-- /#content-frame -->
+
+<div class="toast" id="toast"></div>
+<div class="overflow-overlay" id="overflow-overlay"></div>
+<div class="overflow-menu" id="overflow-menu">
+  <div id="queue-album-area"></div>
+  <button id="close-menu-btn">Cancel</button>
+</div>
+
+<script src="/static/shared.js?v={{ asset_v }}"></script>
+<script src="/static/browse/index.js?v={{ asset_v }}"></script>
+<script src="/static/playback/index.js?v={{ asset_v }}"></script>
+<script src="/static/guest/app.js?v={{ asset_v }}"></script>
+</body>
+</html>
