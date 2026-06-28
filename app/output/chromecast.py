@@ -48,7 +48,7 @@ def _clean_chromecast_dbus_name(avahi_label: str, txt: dict[str, str]) -> str:
     return stripped.replace("-", " ")
 
 from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
-from app.plex.models import Track
+from app.models import Track
 
 _CAST_AVAILABLE = False
 # pychromecast >= 14 changed wait() to return None on success and raise RequestTimeout

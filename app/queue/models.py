@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 
-from app.plex.models import Track
+from app.models import Track
 
 
 class QueueEndBehavior(str, Enum):

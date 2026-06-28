@@ -1,4 +1,4 @@
-"""Plex stream proxy — serves media to Cast/DLNA devices that can't reach Plex directly.
+"""Source stream proxy — serves media to Cast/DLNA devices that can't reach the source directly.
 
 When the upstream content-type is ``audio/ogg`` (Ogg Vorbis or Ogg Opus),
 the stream is transcoded to FLAC via ffmpeg on the fly.  Originally added
@@ -59,21 +59,32 @@ async def proxy_plex_stream(key: str, request: Request):
         raise HTTPException(status_code=403, detail="Stream key not authorized")
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
 
-    plex_url = client.stream_url(key)
+    # Source-aware resolution (U4): the owning provider returns a StreamTarget
+    # that is either a remote URL (proxied over HTTP, with any auth headers the
+    # provider needs injected server-side so no credential rides the URL to LAN
+    # devices) or a local filesystem path (served range-aware from disk).
+    target = client.resolve_stream(key)
+    if getattr(target, "path", None):
+        # Local-file source. The provider enforces path containment (U12); the
+        # key already passed is_authorized_stream_key above.
+        return FileResponse(target.path)
+
+    source_url = getattr(target, "url", None) or ""
+    extra_headers = dict(getattr(target, "headers", None) or {})
     _log.debug("stream proxy: key=%s", key)
 
     # OGG-family sources are transcoded to a cached, seekable FLAC and served
-    # range-aware from that one file. The part extension is authoritative (Plex
-    # parts always carry the true container ext — 2026-06-14 learning), so we
-    # decide here WITHOUT opening Plex and NEVER forward the client's
-    # FLAC-coordinate Range to the smaller Ogg upstream. (Forwarding it 416s
-    # against Plex, and re-transcoding per Range request made the Cast assemble
-    # its buffer from many independent transcodes — the 2026-06-17 416-spam /
-    # repeated-transcode / mid-playback ERROR.)
-    if transcodes_to_flac(plex_url):
-        return await _serve_transcoded_flac(key, plex_url)
+    # range-aware from that one file. The part extension is authoritative (parts
+    # carry the true container ext — 2026-06-14 learning), so we decide here
+    # WITHOUT opening the source and NEVER forward the client's FLAC-coordinate
+    # Range to the smaller Ogg upstream. (Forwarding it 416s, and re-transcoding
+    # per Range request made the Cast assemble its buffer from many independent
+    # transcodes — the 2026-06-17 416-spam / repeated-transcode / mid-playback
+    # ERROR.)
+    if transcodes_to_flac(source_url):
+        return await _serve_transcoded_flac(key, source_url, extra_headers)
 
     # Non-Ogg: open the upstream, forwarding Range for native byte-seeking.
     http_client = httpx.AsyncClient(
@@ -81,25 +92,25 @@ async def proxy_plex_stream(key: str, request: Request):
         follow_redirects=True,
     )
     range_header = request.headers.get("range")
+    req_headers = dict(extra_headers)
+    if range_header:
+        req_headers["Range"] = range_header
     try:
-        plex_req = http_client.build_request(
-            "GET", plex_url,
-            headers={"Range": range_header} if range_header else {},
-        )
-        plex_resp = await http_client.send(plex_req, stream=True)
+        upstream_req = http_client.build_request("GET", source_url, headers=req_headers)
+        upstream_resp = await http_client.send(upstream_req, stream=True)
     except Exception:
         await http_client.aclose()
-        raise HTTPException(status_code=502, detail="Plex stream unavailable")
+        raise HTTPException(status_code=502, detail="Stream source unavailable")
 
-    content_type = plex_resp.headers.get("content-type", "application/octet-stream")
-    # Rare: an Ogg part Plex serves without an .ogg-family extension — the
+    content_type = upstream_resp.headers.get("content-type", "application/octet-stream")
+    # Rare: an Ogg part served without an .ogg-family extension — the
     # content-type is the only signal. Transcode it too (cached, no Range).
     if content_type.lower().startswith("audio/ogg"):
-        await plex_resp.aclose()
+        await upstream_resp.aclose()
         await http_client.aclose()
-        return await _serve_transcoded_flac(key, plex_url)
+        return await _serve_transcoded_flac(key, source_url, extra_headers)
 
-    return _stream_passthrough(plex_resp, http_client)
+    return _stream_passthrough(upstream_resp, http_client)
 
 
 def _stream_passthrough(plex_resp, http_client: httpx.AsyncClient) -> StreamingResponse:
@@ -252,22 +263,22 @@ _cache_lock = asyncio.Lock()                            # guards the OrderedDict
 _transcode_inflight: "dict[str, asyncio.Future]" = {}  # key -> in-flight transcode task
 
 
-async def _fetch_and_transcode(plex_url: str) -> str:
+async def _fetch_and_transcode(plex_url: str, headers: dict | None = None) -> str:
     """Fetch the FULL upstream Ogg (no Range) and transcode it to a seekable
     temp FLAC file. The client's Range is never forwarded — FLAC byte offsets
     don't map to Ogg offsets, and a FLAC-coordinate Range 416s against the
-    smaller Ogg source."""
+    smaller Ogg source. Any provider auth headers are injected server-side."""
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
         follow_redirects=True,
     )
     try:
         plex_resp = await http_client.send(
-            http_client.build_request("GET", plex_url), stream=True
+            http_client.build_request("GET", plex_url, headers=headers or {}), stream=True
         )
     except Exception:
         await http_client.aclose()
-        raise HTTPException(status_code=502, detail="Plex stream unavailable")
+        raise HTTPException(status_code=502, detail="Stream source unavailable")
     try:
         return await _transcode_to_flac_file(plex_resp)
     finally:
@@ -275,7 +286,7 @@ async def _fetch_and_transcode(plex_url: str) -> str:
         await http_client.aclose()
 
 
-async def _get_or_transcode(key: str, plex_url: str) -> str:
+async def _get_or_transcode(key: str, plex_url: str, headers: dict | None = None) -> str:
     """Return a cached transcoded FLAC path for *key*, transcoding once on miss.
 
     Concurrent requests for the SAME key coalesce onto one transcode (a per-key
@@ -294,7 +305,7 @@ async def _get_or_transcode(key: str, plex_url: str) -> str:
             _TRANSCODE_CACHE.pop(key, None)
         task = _transcode_inflight.get(key)
         if task is None:
-            task = asyncio.ensure_future(_fetch_and_transcode(plex_url))
+            task = asyncio.ensure_future(_fetch_and_transcode(plex_url, headers))
             _transcode_inflight[key] = task
             task.add_done_callback(lambda _t, k=key: _transcode_inflight.pop(k, None))
 
@@ -316,11 +327,11 @@ async def _get_or_transcode(key: str, plex_url: str) -> str:
     return new_path
 
 
-async def _serve_transcoded_flac(key: str, plex_url: str):
+async def _serve_transcoded_flac(key: str, plex_url: str, headers: dict | None = None):
     """Serve the cached, seekable FLAC for *key* via a range-aware FileResponse
     (Content-Length + Accept-Ranges + 206). Transcodes once on cache miss."""
     try:
-        path = await _get_or_transcode(key, plex_url)
+        path = await _get_or_transcode(key, plex_url, headers)
     except HTTPException:
         raise
     except FileNotFoundError:

@@ -15,7 +15,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from app import database
-from app.plex.models import Track
+from app.models import Track
 from app.queue.models import PlaybackState, QueueEndBehavior, QueueItem
 
 

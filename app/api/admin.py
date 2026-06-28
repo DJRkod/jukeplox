@@ -74,7 +74,7 @@ def _serialize_libraries(libraries: list, enabled_keys: set) -> list:
 async def list_libraries():
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libraries = await client.get_libraries()
     enabled_keys = {lib["section_key"] for lib in await database.get_enabled_libraries()}
     return _serialize_libraries(libraries, enabled_keys)
@@ -84,7 +84,7 @@ async def list_libraries():
 async def enable_library(key: str):
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libraries = await client.get_libraries()
     lib = next((l for l in libraries if l.key == key), None)
     if not lib:
@@ -112,7 +112,7 @@ async def plex_rescan():
     """Invalidate in-memory Plex caches and return the refreshed library list."""
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     client.invalidate_cache()
     state.trigger_genre_refresh()
     state.trigger_credit_refresh()
@@ -434,7 +434,7 @@ async def admin_append_to_queue(body: AdminQueueAppendRequest):
         validate_plex_id(body.album_id)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     q = state.queue_engine
     if body.track_id:
         track = await client.get_track(body.track_id)
@@ -714,7 +714,7 @@ async def playback_no_audio():
         await state.output_router.stop()
         client = await state.get_plex_client()
         if client is None:
-            raise HTTPException(status_code=502, detail="No Plex client configured")
+            raise HTTPException(status_code=502, detail="No media source configured")
         url = state._make_stream_url(current.track.stream_key, client)
         try:
             await state.output_router.play(url, current.track)
@@ -791,7 +791,7 @@ async def playback_previous():
     """
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=409, detail="No Plex client available")
+        raise HTTPException(status_code=409, detail="No media source available")
     state._advance_gen += 1  # invalidate any pending EOS _do_advance task
     async with state._advance_lock:
         prev_item = await state.queue_engine.skip_back()

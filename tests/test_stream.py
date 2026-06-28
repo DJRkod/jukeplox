@@ -150,7 +150,7 @@ async def test_serve_transcoded_flac_returns_range_capable_file_response(tmp_pat
     flac = tmp_path / "out.flac"
     flac.write_bytes(b"fLaC" + b"\0" * 4096)
 
-    async def _fake_get_or_transcode(key, plex_url):
+    async def _fake_get_or_transcode(key, plex_url, headers=None):
         return str(flac)
 
     monkeypatch.setattr(s, "_get_or_transcode", _fake_get_or_transcode)
@@ -169,7 +169,7 @@ async def test_get_or_transcode_caches_one_transcode_per_key(tmp_path, monkeypat
     s._TRANSCODE_CACHE.clear()
     calls = {"n": 0}
 
-    async def _fake_fetch(plex_url):
+    async def _fake_fetch(plex_url, headers=None):
         calls["n"] += 1
         p = tmp_path / f"f{calls['n']}.flac"
         p.write_bytes(b"fLaC")
@@ -199,7 +199,7 @@ async def test_get_or_transcode_coalesces_same_key_parallelizes_distinct(tmp_pat
     inflight = {"n": 0, "peak": 0}
     calls = {"n": 0}
 
-    async def _fake_fetch(plex_url):
+    async def _fake_fetch(plex_url, headers=None):
         calls["n"] += 1
         inflight["n"] += 1
         inflight["peak"] = max(inflight["peak"], inflight["n"])
@@ -235,7 +235,7 @@ async def test_get_or_transcode_evicts_and_unlinks_lru(tmp_path, monkeypatch):
     monkeypatch.setattr(s, "_TRANSCODE_CACHE_MAX", 2)
     seq = {"n": 0}
 
-    async def _fake_fetch(plex_url):
+    async def _fake_fetch(plex_url, headers=None):
         p = tmp_path / f"{seq['n']}.flac"
         seq["n"] += 1
         p.write_bytes(b"fLaC")
@@ -345,3 +345,51 @@ async def test_transcode_adds_seektable(tmp_path):
         assert "SEEKTABLE" in blocks, blocks
     finally:
         os.unlink(out_path)
+
+
+# ── U4: source-aware proxy resolution (resolve_stream branching) ──────────────
+
+
+def test_proxy_serves_local_path_target(tmp_path):
+    """A local-file source resolves to a StreamTarget(path=...); the proxy serves
+    it via FileResponse (range-aware from disk) rather than the httpx URL path."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.sources.base import StreamTarget
+
+    f = tmp_path / "song.flac"
+    f.write_bytes(b"fLaC-local-bytes")
+    reg = MagicMock()
+    reg.resolve_stream = MagicMock(return_value=StreamTarget(path=str(f)))
+
+    with patch("app.state.is_authorized_stream_key", return_value=True), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=reg)):
+        r = TestClient(app).get("/api/stream", params={"key": "local:song"})
+    assert r.status_code == 200
+    assert r.content == b"fLaC-local-bytes"
+
+
+def test_proxy_no_source_returns_source_neutral_503():
+    """With no source configured the proxy 503s with source-neutral text — no
+    'Plex' leaks to a Jellyfin/local-only operator (R14)."""
+    from unittest.mock import AsyncMock, patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with patch("app.state.is_authorized_stream_key", return_value=True), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=None)):
+        r = TestClient(app).get("/api/stream", params={"key": "x"})
+    assert r.status_code == 503
+    assert "Plex" not in r.text
+    assert r.json()["detail"] == "No media source configured"
+
+
+def test_proxy_rejects_unauthorized_key():
+    from unittest.mock import patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with patch("app.state.is_authorized_stream_key", return_value=False):
+        r = TestClient(app).get("/api/stream", params={"key": "nope"})
+    assert r.status_code == 403

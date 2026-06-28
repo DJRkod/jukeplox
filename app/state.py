@@ -97,7 +97,15 @@ _plex_client_lock = asyncio.Lock()
 
 
 async def get_plex_client():
-    """Return a PlexClient (or MultiPlexClient) built from stored config, or None."""
+    """Return the SourceRegistry of connected media sources, or None when none.
+
+    Retained under the name ``get_plex_client`` for call-site and test-patch
+    continuity during the multi-source transition (U3); ``get_source_registry``
+    is the source-neutral alias new code should use. Plex servers register as
+    ``PlexSource`` providers; future Jellyfin/local sources register the same way.
+    Returns None when no source is configured (callers already degrade on None),
+    so a zero-source install starts and stays safe.
+    """
     global _plex_client
     if _plex_client is not None:
         return _plex_client
@@ -105,26 +113,33 @@ async def get_plex_client():
         if _plex_client is not None:
             return _plex_client
         from app import database
-        from app.plex.client import MultiPlexClient, PlexClient
+        from app.plex.client import PlexClient
+        from app.sources.plex import PlexSource
+        from app.sources.registry import SourceRegistry
+        sources = []
         servers = await database.get_plex_servers()
         if servers:
-            clients = [
-                PlexClient(
+            sources = [
+                PlexSource(PlexClient(
                     server_url=s["server_url"],
                     token=s["token"],
                     client_id=s["client_id"],
                     machine_id=s["machine_id"],
                     server_name=s.get("name", ""),
                     owner=s.get("owner", ""),
-                )
+                ))
                 for s in servers
             ]
-            _plex_client = MultiPlexClient(clients)
         else:
-            # Backward-compat: use legacy single-server config
+            # Backward-compat: legacy single-server config (machine_id "").
             cfg = await database.get_plex_config()
             if cfg:
-                _plex_client = PlexClient(cfg["server_url"], cfg["token"], cfg["client_id"])
+                sources = [PlexSource(
+                    PlexClient(cfg["server_url"], cfg["token"], cfg["client_id"]),
+                    source_id="",
+                )]
+        if sources:
+            _plex_client = SourceRegistry(sources)
         return _plex_client
 
 
@@ -138,6 +153,13 @@ def invalidate_plex_client() -> None:
     # under the lock and discards its result (2026-06-21 plan U4).
     _ondeck = None
     _ondeck_gen += 1
+
+
+# Source-neutral aliases (U3): new code should prefer these names. The legacy
+# ``get_plex_client`` / ``invalidate_plex_client`` names are retained above as the
+# call-site and test-patch surface during the multi-source transition.
+get_source_registry = get_plex_client
+invalidate_source_registry = invalidate_plex_client
 
 
 # ── playback advance ──────────────────────────────────────────────────────────

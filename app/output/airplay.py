@@ -36,7 +36,7 @@ import uuid
 from typing import Any
 
 from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
-from app.plex.models import Track
+from app.models import Track
 
 _log = logging.getLogger(__name__)
 

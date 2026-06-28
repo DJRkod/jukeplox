@@ -6,7 +6,7 @@ is swapped in.
 """
 
 from app.output.base import AbstractOutputBackend, OutputDevice
-from app.plex.models import Track
+from app.models import Track
 
 
 class OutputRouter:

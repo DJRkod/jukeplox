@@ -46,7 +46,7 @@ _assets.register(_templates)  # `asset_v` global → build-derived cache-buster
 from app import state
 from app.lyrics import cache as lyrics_cache
 from app.plex.client import browse_base_key
-from app.plex.models import Album, Artist
+from app.models import Album, Artist
 from app.queue.engine import QueueLockError
 
 router = APIRouter(tags=["guest"])
@@ -493,7 +493,7 @@ async def enabled_libraries() -> list:
 async def browse_artists():
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     from app import database
     # Browse-index plan U3: the persistent index is the data source; the live
     # per-library fan-out is the fallback when the index is empty/cold (R10).
@@ -523,7 +523,7 @@ async def browse_artists():
         if libs and not artists:
             failures = _log_per_lib_failures(libs, results, "artists")
             if failures == len(libs):
-                raise HTTPException(status_code=503, detail="All Plex libraries unreachable")
+                raise HTTPException(status_code=503, detail="All libraries unreachable")
         partial_failure = any(isinstance(b, BaseException) for b in results)
     compiled = await _compiled_rules()
     deduped = _dedup_artists(artists, compiled)
@@ -733,7 +733,7 @@ async def browse_artist_albums(artist_id: str):
         validate_plex_id(artist_id)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     compiled = await _compiled_rules()
     own, appears, artist_norm = await _assemble_artist_releases(artist_id, client, compiled)
     if artist_norm is None:
@@ -755,7 +755,7 @@ async def browse_artist_songs(artist_id: str):
         validate_plex_id(artist_id)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     compiled = await _compiled_rules()
     own, appears, artist_norm = await _assemble_artist_releases(artist_id, client, compiled)
     if artist_norm is None:
@@ -824,7 +824,7 @@ async def browse_artist_songs(artist_id: str):
 async def browse_albums():
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     from app import database
     # Browse-index plan U3: index-first with live fallback (see browse_artists).
     index_rows = await database.get_browse_albums()
@@ -850,7 +850,7 @@ async def browse_albums():
         if libs and not tagged:
             failures = _log_per_lib_failures(libs, results, "albums")
             if failures == len(libs):
-                raise HTTPException(status_code=503, detail="All Plex libraries unreachable")
+                raise HTTPException(status_code=503, detail="All libraries unreachable")
     return _group_albums(tagged, await _compiled_rules(), await _ranked_server_order())
 
 
@@ -1050,7 +1050,7 @@ async def browse_album_tracks(album_id: str):
     validate_plex_id(album_id)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     try:
         tracks = await _resolve_album_tracks(client, album_id)
     except KeyError:
@@ -1073,7 +1073,7 @@ async def browse_genres():
 
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libs = await enabled_libraries()
     results = await asyncio.gather(
         *[client.get_styles_with_counts(lib.key) for lib in libs], return_exceptions=True
@@ -1101,7 +1101,7 @@ async def browse_genres():
 async def browse_genre_albums(style: str = Query(..., min_length=1)):
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libs = await enabled_libraries()
     results = await asyncio.gather(
         *[client.get_albums(lib.key, style=style) for lib in libs], return_exceptions=True
@@ -1117,7 +1117,7 @@ async def browse_genre_albums(style: str = Query(..., min_length=1)):
 async def browse_years():
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libs = await enabled_libraries()
     results = await asyncio.gather(*[client.get_years(lib.key) for lib in libs], return_exceptions=True)
     return sorted({y for batch in results if not isinstance(batch, BaseException) for y in batch}, reverse=True)
@@ -1127,7 +1127,7 @@ async def browse_years():
 async def browse_year_albums(year: int):
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libs = await enabled_libraries()
     results = await asyncio.gather(*[client.get_albums(lib.key, year=year) for lib in libs], return_exceptions=True)
     tagged = [
@@ -1260,7 +1260,7 @@ def _dedup_by_id(items):
 async def search(q: str = Query(..., min_length=1)):
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     from app import database
     from app.normalize import query_variants
     libs = await enabled_libraries()
@@ -1348,7 +1348,7 @@ async def search_broad(
     search_titles call rides the per-server concurrency semaphore."""
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     from app import database
     from app.normalize import query_variants
     want = tuple(t for t in ("track", "album")
@@ -1410,7 +1410,7 @@ async def append_to_queue(body: QueueAppendRequest):
 
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
 
     q = state.queue_engine
 
@@ -1507,7 +1507,7 @@ async def surprise_me(body: SurpriseRequest):
 
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
 
     # Short-circuit a locked queue BEFORE the Plex similarity fan-out — otherwise a
     # locked host still pays unbounded similarity queries per press and only learns
@@ -1644,7 +1644,7 @@ async def art_proxy(path: str = Query(...), w: int | None = None):
         w = None
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
 
     from app.cache import cache
 
