@@ -36,6 +36,21 @@ CREATE TABLE IF NOT EXISTS plex_servers (
     owned       INTEGER          -- 1/0; NULL = unknown (pre-2026-06-11 rows)
 );
 
+CREATE TABLE IF NOT EXISTS jellyfin_sources (
+    source_id   TEXT PRIMARY KEY,   -- registry key namespace ({source_id}:{itemId})
+    server_url  TEXT NOT NULL,
+    name        TEXT NOT NULL,      -- friendly display name for the source picker
+    token       TEXT NOT NULL,      -- AccessToken — credential is TOKEN-ONLY,
+    user_id     TEXT NOT NULL,      -- never the account password (plan R24)
+    device_id   TEXT NOT NULL       -- stable DeviceId minted at connect time
+);
+
+CREATE TABLE IF NOT EXISTS local_sources (
+    source_id TEXT PRIMARY KEY,   -- registry key namespace ({source_id}:{relpath})
+    name      TEXT NOT NULL,      -- friendly display name for the source picker
+    root_dir  TEXT NOT NULL       -- absolute root directory crawled by LocalSource
+);
+
 CREATE TABLE IF NOT EXISTS enabled_libraries (
     section_key TEXT PRIMARY KEY,
     name        TEXT NOT NULL
@@ -149,6 +164,92 @@ CREATE TABLE IF NOT EXISTS browse_album_index (
 );
 CREATE INDEX IF NOT EXISTS idx_browse_album_artist ON browse_album_index (artist_base_key);
 CREATE INDEX IF NOT EXISTS idx_browse_album_identity ON browse_album_index (title_base, artist_base_key);
+
+-- 2026-06-27 multi-source plan U5: track-grained UNIFIED CATALOG. Supersedes
+-- the browse-index (artist+album only) by adding a track table, a STABLE
+-- allocate-once local identity per entity (the `identity` PK), an
+-- external-ID / normalized-hash lookup table (catalog_identity_alias) that
+-- makes identity match-forward across rescans, and a priority-ordered
+-- per-entity holds list (catalog_holds) naming which sources hold each entity
+-- plus the provider-local stream/drill key for each. The browse-index tables
+-- are retained IN PARALLEL until a new source type validates (plan U7 rollback
+-- window). Content tables (artist/album/track/holds) are atomic-replaced per
+-- scan; the alias table is DURABLE (never wiped) so stable identities — and the
+-- ratings/play-counts re-keyed onto them (U7) — survive rebuilds. base_key /
+-- *_base columns hold rule-independent normalization (the rule-aware merge runs
+-- at request time, mirroring the browse-index), so rule edits need no rebuild.
+CREATE TABLE IF NOT EXISTS catalog_artist (
+    identity      TEXT PRIMARY KEY,
+    title         TEXT NOT NULL,
+    base_key      TEXT NOT NULL,
+    thumb         TEXT,
+    release_count INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_artist_base ON catalog_artist (base_key);
+
+CREATE TABLE IF NOT EXISTS catalog_album (
+    identity        TEXT PRIMARY KEY,
+    title           TEXT NOT NULL,
+    title_base      TEXT NOT NULL,
+    artist          TEXT NOT NULL,
+    artist_base_key TEXT NOT NULL,
+    year            INTEGER,
+    thumb           TEXT,
+    subtype         TEXT,
+    added_at        INTEGER,
+    track_count     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_album_artist ON catalog_album (artist_base_key);
+CREATE INDEX IF NOT EXISTS idx_catalog_album_identity ON catalog_album (title_base, artist_base_key);
+
+CREATE TABLE IF NOT EXISTS catalog_track (
+    identity        TEXT PRIMARY KEY,
+    title           TEXT NOT NULL,
+    title_base      TEXT NOT NULL,
+    artist          TEXT NOT NULL,
+    artist_base_key TEXT NOT NULL,
+    album           TEXT,
+    album_identity  TEXT,
+    album_artist    TEXT,
+    duration_ms     INTEGER,
+    disc_number     INTEGER,
+    track_number    INTEGER,
+    genre           TEXT,
+    year            INTEGER,
+    thumb           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_track_album ON catalog_track (album_identity);
+CREATE INDEX IF NOT EXISTS idx_catalog_track_identity ON catalog_track (title_base, artist_base_key);
+
+-- Which sources hold each entity, and the provider-local key (stream-key
+-- remainder for tracks; per-source drill key for albums). priority is the
+-- global source-priority rank captured at scan time (lower = higher); fallback
+-- (U9) walks this list. PK is per (entity, source) so one source holds an
+-- entity once.
+CREATE TABLE IF NOT EXISTS catalog_holds (
+    entity_type        TEXT NOT NULL,    -- 'track' | 'album' | 'artist'
+    identity           TEXT NOT NULL,
+    source_id          TEXT NOT NULL,
+    provider_local_key TEXT NOT NULL,
+    priority           INTEGER NOT NULL,
+    server_name        TEXT,
+    PRIMARY KEY (entity_type, identity, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_holds_entity ON catalog_holds (entity_type, identity);
+CREATE INDEX IF NOT EXISTS idx_catalog_holds_source ON catalog_holds (source_id);
+
+-- DURABLE find-or-create lookup: external ID (MusicBrainz etc.) or
+-- normalized-hash key → stable local identity. Never wiped by a scan, so a
+-- late external ID can attach as an alias of an existing identity (U7) and a
+-- vanished-then-returned entity reuses its identity. Lookup keys carry an
+-- entity_type scope so a track and album sharing a raw id never collide.
+CREATE TABLE IF NOT EXISTS catalog_identity_alias (
+    entity_type TEXT NOT NULL,
+    lookup_key  TEXT NOT NULL,
+    identity    TEXT NOT NULL,
+    PRIMARY KEY (entity_type, lookup_key)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_alias_identity ON catalog_identity_alias (entity_type, identity);
 """
 
 
@@ -163,6 +264,7 @@ async def init_db() -> None:
     _db.row_factory = aiosqlite.Row
     await _db.executescript(_SCHEMA)
     await _migrate_columns()
+    await _migrate_seal_credentials()
     await _db.commit()
 
 
@@ -193,6 +295,33 @@ async def _migrate_columns() -> None:
         # shipped) → can't confirm "same release" for cross-server folding, so
         # treated conservatively (no fold). The next crawl populates it.
         await _db.execute("ALTER TABLE browse_album_index ADD COLUMN track_count INTEGER")
+
+
+async def _migrate_seal_credentials() -> None:
+    """One-time upgrade: re-seal any plaintext credential rows at rest (U17/R24).
+
+    Runs on every init_db but is idempotent — already-sealed rows are skipped, so
+    after the first upgrade it's a few cheap SELECTs over tiny tables. Reads the
+    RAW stored value (not via the opening accessors) and rewrites it sealed. A
+    leaked pre-U17 DB still has plaintext tokens until this runs once."""
+    from app.sources import secrets
+
+    async def _reseal(select_sql: str, update_sql: str, key_col: str) -> None:
+        async with _db.execute(select_sql) as cur:
+            rows = [(r[key_col], r["token"]) async for r in cur]
+        for key, tok in rows:
+            if tok and not secrets.is_sealed(tok):
+                await _db.execute(update_sql, (secrets.seal(tok), key))
+
+    await _reseal(
+        "SELECT id, token FROM plex_config",
+        "UPDATE plex_config SET token = ? WHERE id = ?", "id")
+    await _reseal(
+        "SELECT machine_id, token FROM plex_servers",
+        "UPDATE plex_servers SET token = ? WHERE machine_id = ?", "machine_id")
+    await _reseal(
+        "SELECT source_id, token FROM jellyfin_sources",
+        "UPDATE jellyfin_sources SET token = ? WHERE source_id = ?", "source_id")
 
 
 async def close_db() -> None:
@@ -242,18 +371,24 @@ async def delete_setting(key: str) -> None:
 # ── plex config ───────────────────────────────────────────────────────────────
 
 async def get_plex_config() -> dict | None:
+    from app.sources import secrets
     async with _conn().execute("SELECT * FROM plex_config WHERE id = 1") as cur:
         row = await cur.fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        d = dict(row)
+        d["token"] = secrets.open_secret(d.get("token"))  # U17: opened for use
+        return d
 
 
 async def set_plex_config(server_url: str, token: str, client_id: str) -> None:
+    from app.sources import secrets
     db = _conn()
     await db.execute(
         "INSERT INTO plex_config (id, server_url, token, client_id) VALUES (1, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET "
         "server_url = excluded.server_url, token = excluded.token, client_id = excluded.client_id",
-        (server_url, token, client_id),
+        (server_url, secrets.seal(token), client_id),  # U17: sealed at rest (R24)
     )
     await db.commit()
 
@@ -261,6 +396,7 @@ async def set_plex_config(server_url: str, token: str, client_id: str) -> None:
 # ── plex servers (multi-server support) ──────────────────────────────────────
 
 async def save_plex_servers(servers: list[dict]) -> None:
+    from app.sources import secrets
     db = _conn()
     await db.execute("BEGIN")
     try:
@@ -272,7 +408,8 @@ async def save_plex_servers(servers: list[dict]) -> None:
             await db.execute(
                 "INSERT OR REPLACE INTO plex_servers (machine_id, server_url, name, owner, token, client_id, owned) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (s["machine_id"], s["server_url"], s["name"], s["owner"], s["token"], s["client_id"],
+                (s["machine_id"], s["server_url"], s["name"], s["owner"],
+                 secrets.seal(s["token"]), s["client_id"],  # U17: sealed at rest (R24)
                  None if owned is None else int(bool(owned))),
             )
         await db.commit()
@@ -282,8 +419,73 @@ async def save_plex_servers(servers: list[dict]) -> None:
 
 
 async def get_plex_servers() -> list[dict]:
+    from app.sources import secrets
     async with _conn().execute("SELECT * FROM plex_servers") as cur:
+        rows = [dict(row) async for row in cur]
+    for r in rows:
+        r["token"] = secrets.open_secret(r.get("token"))  # U17: opened for use
+    return rows
+
+
+# ── jellyfin sources (multi-source plan U10) ─────────────────────────────────
+
+async def get_jellyfin_sources() -> list[dict]:
+    from app.sources import secrets
+    async with _conn().execute("SELECT * FROM jellyfin_sources") as cur:
+        rows = [dict(row) async for row in cur]
+    for r in rows:
+        r["token"] = secrets.open_secret(r.get("token"))  # U17: opened for use
+    return rows
+
+
+async def save_jellyfin_source(
+    source_id: str, server_url: str, name: str, token: str, user_id: str, device_id: str,
+) -> None:
+    """Upsert one Jellyfin source. Stores the AccessToken + UserId only — the
+    account password is never accepted here (plan R24: credential token-only).
+    The token is sealed at rest via app.sources.secrets (U17)."""
+    from app.sources import secrets
+    db = _conn()
+    await db.execute(
+        "INSERT INTO jellyfin_sources (source_id, server_url, name, token, user_id, device_id) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(source_id) DO UPDATE SET "
+        "server_url = excluded.server_url, name = excluded.name, token = excluded.token, "
+        "user_id = excluded.user_id, device_id = excluded.device_id",
+        (source_id, server_url, name, secrets.seal(token), user_id, device_id),  # U17 (R24)
+    )
+    await db.commit()
+
+
+async def delete_jellyfin_source(source_id: str) -> None:
+    db = _conn()
+    await db.execute("DELETE FROM jellyfin_sources WHERE source_id = ?", (source_id,))
+    await db.commit()
+
+
+# ── local file sources (multi-source plan U11) ───────────────────────────────
+
+async def get_local_sources() -> list[dict]:
+    async with _conn().execute("SELECT * FROM local_sources") as cur:
         return [dict(row) async for row in cur]
+
+
+async def save_local_source(source_id: str, name: str, root_dir: str) -> None:
+    """Upsert one local-files source (a crawled root directory). Read-only — no
+    credential, no media writes (plan R6)."""
+    db = _conn()
+    await db.execute(
+        "INSERT INTO local_sources (source_id, name, root_dir) VALUES (?, ?, ?) "
+        "ON CONFLICT(source_id) DO UPDATE SET name = excluded.name, root_dir = excluded.root_dir",
+        (source_id, name, root_dir),
+    )
+    await db.commit()
+
+
+async def delete_local_source(source_id: str) -> None:
+    db = _conn()
+    await db.execute("DELETE FROM local_sources WHERE source_id = ?", (source_id,))
+    await db.commit()
 
 
 # ── enabled libraries ─────────────────────────────────────────────────────────
@@ -414,6 +616,44 @@ async def increment_play_count(entity_type: str, entity_id: str) -> None:
     await db.commit()
 
 
+async def decrement_play_count(entity_type: str, entity_id: str) -> None:
+    """Decrement a play count, floored at zero (never negative); a no-op when the
+    row is absent. The inverse of one ``increment_play_count`` — used by
+    ``state.unrecord_play`` to roll back a single play (admin play-data curation)."""
+    db = _conn()
+    await db.execute(
+        "UPDATE play_counts SET count = MAX(count - 1, 0) "
+        "WHERE entity_type = ? AND entity_id = ?",
+        (entity_type, entity_id),
+    )
+    await db.commit()
+
+
+async def set_play_count(entity_type: str, entity_id: str, count: int) -> None:
+    """Set an absolute play count (catalog identity re-key migration, plan U7).
+    ``increment_play_count`` is the normal path; this exists so the migration can
+    copy a counted track's total onto its catalog identity."""
+    db = _conn()
+    await db.execute(
+        "INSERT INTO play_counts (entity_type, entity_id, count) VALUES (?, ?, ?) "
+        "ON CONFLICT(entity_type, entity_id) DO UPDATE SET count = excluded.count",
+        (entity_type, entity_id, int(count)),
+    )
+    await db.commit()
+
+
+async def delete_play_count(entity_type: str, entity_id: str) -> None:
+    """Remove a play-count row. Used by the catalog reconcile (migrate.py) to
+    drop a stale keyed row once its count has been folded onto the live identity,
+    so the leaderboard no longer shows the same song once per retained key."""
+    db = _conn()
+    await db.execute(
+        "DELETE FROM play_counts WHERE entity_type = ? AND entity_id = ?",
+        (entity_type, entity_id),
+    )
+    await db.commit()
+
+
 async def set_play_track_meta(track_id: str, metadata: dict) -> None:
     """Upsert display metadata for a counted track (most-played plan U1).
     Fresh metadata wins — a re-played track self-corrects stale rows."""
@@ -423,6 +663,14 @@ async def set_play_track_meta(track_id: str, metadata: dict) -> None:
         "ON CONFLICT(track_id) DO UPDATE SET metadata_json = excluded.metadata_json",
         (track_id, _json.dumps(metadata)),
     )
+    await db.commit()
+
+
+async def delete_play_track_meta(track_id: str) -> None:
+    """Remove a captured-metadata row. Reconcile cleanup for a stale key whose
+    play-count row was folded onto the live identity (avoids orphan meta rows)."""
+    db = _conn()
+    await db.execute("DELETE FROM play_track_meta WHERE track_id = ?", (track_id,))
     await db.commit()
 
 
@@ -455,6 +703,22 @@ async def get_top_played_tracks(limit: int | None = 100) -> list[dict]:
                     meta = None
             rows.append({"track_id": row["track_id"], "count": row["count"], "metadata": meta})
         return rows
+
+
+async def get_all_play_track_meta() -> dict[str, dict]:
+    """Every counted track's captured display metadata, as ``{track_id: dict}``.
+    Used by the catalog identity re-key migration (plan U7) to carry Most-Played
+    display rows onto the new identities."""
+    async with _conn().execute("SELECT track_id, metadata_json FROM play_track_meta") as cur:
+        out: dict[str, dict] = {}
+        async for row in cur:
+            try:
+                data = _json.loads(row["metadata_json"]) if row["metadata_json"] else None
+            except (ValueError, TypeError):
+                data = None
+            if isinstance(data, dict):
+                out[row["track_id"]] = data
+        return out
 
 
 async def get_play_count(entity_type: str, entity_id: str) -> int:
@@ -759,6 +1023,24 @@ async def get_artist_exclusions() -> list[str]:
 
 async def set_artist_exclusions(names: list[str]) -> None:
     await set_setting("artist_exclusions", _json.dumps(names))
+
+
+async def get_source_priority() -> list[str]:
+    """Admin-defined global source priority order — source_ids, highest priority
+    first (multi-source plan U9/R12). Empty when unset, in which case scan/
+    registry order applies. Used to order a track's holds snapshot at enqueue."""
+    raw = await get_setting("source_priority")
+    if not raw:
+        return []
+    try:
+        data = _json.loads(raw)
+        return [str(x) for x in data] if isinstance(data, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
+async def set_source_priority(source_ids: list[str]) -> None:
+    await set_setting("source_priority", _json.dumps([str(s) for s in source_ids]))
 
 
 async def get_random_length_bounds() -> tuple[int | None, int | None]:

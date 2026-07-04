@@ -15,7 +15,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from app import database
-from app.plex.models import Track
+from app.models import Track
 from app.queue.models import PlaybackState, QueueEndBehavior, QueueItem
 
 
@@ -214,6 +214,30 @@ class QueueEngine:
             self._queue.pop(position)
             await self._persist()
         await self._emit("queue_changed")
+
+    async def remove_history_entry(self, track_id: str, added_at: str) -> QueueItem | None:
+        """Admin play-data curation (plan U3): remove ONE history entry matching
+        BOTH ``(track_id, added_at)`` — the first match from the head (most-recent)
+        — and return it, or ``None`` when nothing matches. ``added_at`` is not
+        guaranteed unique across a batch-append/restore, so the head-first
+        tie-break removes exactly one entry (the endpoint un-counts once). The
+        returned item lets the caller read ``item.track.album`` /
+        ``item.track.artist`` for the count roll-back. Persists and emits
+        ``queue_changed`` so every screen's history strip repaints."""
+        removed: QueueItem | None = None
+        async with self._lock:
+            remaining: list[QueueItem] = []
+            for item in self._history:  # deque iterates head (newest) → tail (oldest)
+                if removed is None and item.track_id == track_id and item.added_at == added_at:
+                    removed = item
+                    continue
+                remaining.append(item)
+            if removed is None:
+                return None
+            self._history = deque(remaining, maxlen=self._history_max)
+            await self._persist_history()
+        await self._emit("queue_changed")
+        return removed
 
     async def move(self, from_pos: int, to_pos: int) -> None:
         async with self._lock:

@@ -17,7 +17,7 @@ services:
     # group_add:             # uncomment with /dev/snd so the container may open the card
     #   - audio
     environment:
-      BIND_HOST: "0.0.0.0"   # set to your LAN IP (e.g. 192.168.0.70) so Cast/DLNA can reach the stream proxy
+      BIND_HOST: "0.0.0.0"   # set to your LAN IP (e.g. 192.168.1.50) so Cast/DLNA can reach the stream proxy
       # PORT: "70"           # HTTP listen port (default 80). Under host networking this is the host port
                              # directly — set a free one if 80 is taken (e.g. the TrueNAS web UI uses 80).
       # Desktop audio instead of /dev/snd (replace 1000 with `id -u`); also add the

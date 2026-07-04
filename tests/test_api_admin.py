@@ -32,6 +32,177 @@ def test_playback_pause_requires_auth(anon_client, mock_session):
     assert resp.status_code == 401
 
 
+# ── Multi-source Sources panel (U14) ──────────────────────────────────────────
+
+def test_sources_endpoints_require_auth(anon_client, mock_session):
+    # Security (R26): every source op rejects an unauthenticated request.
+    assert anon_client.get("/admin/sources").status_code == 401
+    assert anon_client.post("/admin/sources/jellyfin", json={}).status_code == 401
+    assert anon_client.delete("/admin/sources/jellyfin/x").status_code == 401
+    assert anon_client.post("/admin/sources/local", json={}).status_code == 401
+    assert anon_client.delete("/admin/sources/local/x").status_code == 401
+    assert anon_client.post("/admin/sources/rescan").status_code == 401
+    assert anon_client.get("/admin/scan-status").status_code == 401  # U15 (R26)
+
+
+def test_scan_status_returns_snapshot(client, mock_state):
+    # U15: the admin scan badge reads the shared scan_status snapshot.
+    snap = {"sources": 1, "scanning": True, "scanned": False, "empty": True}
+    with patch("app.state.scan_status", AsyncMock(return_value=snap)):
+        resp = client.get("/admin/scan-status")
+    assert resp.status_code == 200
+    assert resp.json() == snap
+
+
+def test_list_sources_combines_plex_and_jellyfin(client, mock_state):
+    with patch("app.api.admin.database.get_plex_servers",
+               AsyncMock(return_value=[{"machine_id": "m1", "name": "Home Plex"}])), \
+         patch("app.api.admin.database.get_jellyfin_sources",
+               AsyncMock(return_value=[{"source_id": "jf-1", "name": "Den Jelly"}])), \
+         patch("app.api.admin.database.get_local_sources", AsyncMock(return_value=[])):
+        resp = client.get("/admin/sources")
+    assert resp.status_code == 200
+    srcs = resp.json()["sources"]
+    assert {"source_id": "m1", "type": "plex", "name": "Home Plex"} in srcs
+    assert {"source_id": "jf-1", "type": "jellyfin", "name": "Den Jelly"} in srcs
+
+
+def test_connect_jellyfin_success_saves_token_only_and_scans(client, mock_state):
+    # Covers AE5: connect via the form → validated, saved, scan starts.
+    save = AsyncMock()
+    with patch("app.sources.jellyfin.authenticate",
+               AsyncMock(return_value={"token": "tok", "user_id": "u1",
+                                       "server_id": "srv9"})), \
+         patch("app.api.admin.database.save_jellyfin_source", save), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()) as scan, \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.post("/admin/sources/jellyfin", json={
+            "server_url": "http://jf.local:8096", "username": "admin",
+            "password": "secret", "name": "Den"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source_id"] == "jf-srv9" and body["name"] == "Den"
+    save.assert_awaited_once()
+    kwargs = save.call_args.kwargs
+    assert kwargs["token"] == "tok" and kwargs["user_id"] == "u1"
+    assert not ({"password", "pw"} & set(kwargs))  # token-only persisted (R24)
+    scan.assert_called_once()
+
+
+def test_connect_jellyfin_bad_credentials_not_saved(client, mock_state):
+    # Error path (R21): auth rejected → categorized inline, source not saved.
+    from app.sources.jellyfin import JellyfinAuthError
+    save = AsyncMock()
+    with patch("app.sources.jellyfin.authenticate",
+               AsyncMock(side_effect=JellyfinAuthError("nope"))), \
+         patch("app.api.admin.database.save_jellyfin_source", save):
+        resp = client.post("/admin/sources/jellyfin", json={
+            "server_url": "http://jf.local:8096", "username": "admin",
+            "password": "bad"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "auth_rejected"
+    save.assert_not_awaited()
+
+
+def test_connect_jellyfin_unreachable_not_saved(client, mock_state):
+    # Error path (R21): unreachable server → categorized inline, source not saved.
+    import httpx
+    save = AsyncMock()
+    with patch("app.sources.jellyfin.authenticate",
+               AsyncMock(side_effect=httpx.ConnectError("boom"))), \
+         patch("app.api.admin.database.save_jellyfin_source", save):
+        resp = client.post("/admin/sources/jellyfin", json={
+            "server_url": "http://nope.local:8096", "username": "admin",
+            "password": "x"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "unreachable"
+    save.assert_not_awaited()
+
+
+def test_remove_jellyfin_source(client, mock_state):
+    dele = AsyncMock()
+    with patch("app.api.admin.database.delete_jellyfin_source", dele), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.delete("/admin/sources/jellyfin/jf-1")
+    assert resp.status_code == 200
+    dele.assert_awaited_once_with("jf-1")
+
+
+def test_rescan_sources_triggers_refresh(client, mock_state):
+    with patch("app.state.trigger_catalog_refresh", MagicMock()) as scan, \
+         patch("app.state.trigger_browse_index_refresh", MagicMock()):
+        resp = client.post("/admin/sources/rescan")
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    scan.assert_called_once()
+
+
+def test_list_sources_includes_local(client, mock_state):
+    with patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_plex_config", AsyncMock(return_value=None)), \
+         patch("app.api.admin.database.get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_local_sources",
+               AsyncMock(return_value=[{"source_id": "local-abc", "name": "Vinyl Rips"}])):
+        resp = client.get("/admin/sources")
+    assert resp.status_code == 200
+    assert {"source_id": "local-abc", "type": "local", "name": "Vinyl Rips"} in resp.json()["sources"]
+
+
+def test_connect_local_success_saves_and_scans(client, mock_state, tmp_path):
+    # Covers AE1 onboarding: a real readable directory → validated, saved, scan.
+    music = tmp_path / "music"
+    music.mkdir()
+    save = AsyncMock()
+    with patch("app.api.admin.database.save_local_source", save), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()) as scan, \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.post("/admin/sources/local", json={"root_dir": str(music), "name": "My Music"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["type"] == "local" and body["name"] == "My Music"
+    assert body["source_id"].startswith("local-")
+    save.assert_awaited_once()
+    kwargs = save.call_args.kwargs
+    import os
+    assert kwargs["root_dir"] == os.path.realpath(str(music))  # canonical root stored
+    scan.assert_called_once()
+
+
+def test_connect_local_missing_dir_not_saved(client, mock_state, tmp_path):
+    # Error path (R21): a non-existent directory → categorized inline, not saved.
+    save = AsyncMock()
+    with patch("app.api.admin.database.save_local_source", save):
+        resp = client.post("/admin/sources/local",
+                           json={"root_dir": str(tmp_path / "nope")})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "dir_not_found"
+    save.assert_not_awaited()
+
+
+def test_connect_local_derives_stable_id_from_path(client, mock_state, tmp_path):
+    # Reconnecting the same directory yields the same source_id (upsert, not dup).
+    music = tmp_path / "music"
+    music.mkdir()
+    ids = []
+    with patch("app.api.admin.database.save_local_source", AsyncMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        for _ in range(2):
+            r = client.post("/admin/sources/local", json={"root_dir": str(music)})
+            ids.append(r.json()["source_id"])
+    assert ids[0] == ids[1]
+
+
+def test_remove_local_source(client, mock_state):
+    dele = AsyncMock()
+    with patch("app.api.admin.database.delete_local_source", dele), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.delete("/admin/sources/local/local-abc")
+    assert resp.status_code == 200
+    dele.assert_awaited_once_with("local-abc")
+
+
 # ── Surprise Me settings (2026-06-17 plan U3) ────────────────────────────────
 
 def test_settings_rejects_invalid_surprise_mode(client, mock_state):
@@ -1102,6 +1273,25 @@ async def test_get_output_active_includes_mdns_status(client, mock_state):
         resp = client.get("/admin/output/active")
     assert resp.status_code == 200
     assert "mdns_status" in resp.json()
+
+
+# ── Libraries serializer: per-source-type indicator (ce-debug 2026-06-29) ─────
+
+def test_serialize_libraries_emits_source_type_and_server_name():
+    from app.api.admin import _serialize_libraries
+    libs = [
+        Library(key="m1:1", title="Music", type="artist", owner="Alice",
+                server_name="Home", source_type="plex"),
+        Library(key="jf:9", title="Music", type="artist",
+                server_name="Den", source_type="jellyfin"),
+    ]
+    out = _serialize_libraries(libs, {"m1:1"})
+    assert out[0]["source_type"] == "plex"
+    assert out[0]["server_name"] == "Home"
+    assert out[0]["enabled"] is True
+    assert out[1]["source_type"] == "jellyfin"
+    assert out[1]["server_name"] == "Den"
+    assert out[1]["enabled"] is False  # only m1:1 enabled
 
 
 # ── Admin queue append bypasses lock (U2) ─────────────────────────────────────
@@ -2503,3 +2693,52 @@ def test_settings_persists_visibility_and_facet_flags(client, mock_state):
     assert persisted.get("tags_visible_to_guests") == "0"
     assert persisted.get("facet_years") == "0"
     assert persisted.get("facet_highestrated") == "1"
+
+
+# ── Play-data curation endpoints (2026-07-03 plan U4) ────────────────────────
+
+def test_curation_endpoints_require_auth(anon_client, mock_session):
+    # AE6: both mutations reject an unauthenticated request.
+    assert anon_client.post("/admin/history/remove-play",
+                            json={"track_id": "t1", "added_at": "x"}).status_code == 401
+    assert anon_client.post("/admin/most-played/remove",
+                            json={"track_id": "t1"}).status_code == 401
+
+
+def test_remove_play_uncounts_then_removes_entry(client, mock_state):
+    qe, _ = mock_state
+    from app.queue.models import QueueItem
+    qe._history.appendleft(QueueItem(track=make_track("t1"), added_at="ts-1"))
+    with patch("app.state.unrecord_play", AsyncMock()) as un:
+        resp = client.post("/admin/history/remove-play",
+                           json={"track_id": "t1", "added_at": "ts-1"})
+    assert resp.status_code == 200 and resp.json() == {"ok": True}
+    un.assert_awaited_once_with("t1", "B", "A")          # album/artist from the entry
+    assert all(h.track_id != "t1" for h in qe.history)   # entry removed
+
+
+def test_remove_play_absent_entry_404_and_no_uncount(client, mock_state):
+    with patch("app.state.unrecord_play", AsyncMock()) as un:
+        resp = client.post("/admin/history/remove-play",
+                           json={"track_id": "t1", "added_at": "nope"})
+    assert resp.status_code == 404
+    un.assert_not_awaited()                              # no mutation on a miss
+
+
+def test_remove_play_uncount_failure_leaves_history_intact(client, mock_state):
+    qe, _ = mock_state
+    from app.queue.models import QueueItem
+    qe._history.appendleft(QueueItem(track=make_track("t1"), added_at="ts-1"))
+    with patch("app.state.unrecord_play", AsyncMock(side_effect=RuntimeError("db"))):
+        with pytest.raises(RuntimeError):
+            client.post("/admin/history/remove-play",
+                        json={"track_id": "t1", "added_at": "ts-1"})
+    # Least-harm order: un-count runs first; its failure leaves the entry in place.
+    assert any(h.track_id == "t1" for h in qe.history)
+
+
+def test_remove_from_most_played_purges_track(client, mock_state):
+    with patch("app.state.purge_play_track", AsyncMock()) as purge:
+        resp = client.post("/admin/most-played/remove", json={"track_id": "t1"})
+    assert resp.status_code == 200 and resp.json() == {"ok": True}
+    purge.assert_awaited_once_with("t1")

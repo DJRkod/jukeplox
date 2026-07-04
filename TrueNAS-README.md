@@ -16,7 +16,7 @@ Apps → **Discover Apps** → **Custom App**. Set:
 
 ## 2. Container
 
-- **Environment Variables** → add `BIND_HOST` = your TrueNAS LAN IP (e.g. `192.168.0.70`). Lets Chromecast/DLNA fetch audio through Jukeplox. *(Skip only if you use AirPlay exclusively.)*
+- **Environment Variables** → add `BIND_HOST` = your TrueNAS LAN IP (e.g. `192.168.1.50`). Lets Chromecast/DLNA fetch audio through Jukeplox. *(Skip only if you use AirPlay exclusively.)*
 - **Restart Policy** → **Unless Stopped** — so it recovers from a crash. The default ("No") leaves Jukeplox down until you restart it by hand.
 
 ## 3. Network

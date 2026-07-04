@@ -182,6 +182,10 @@ const playbackHandle = mountPlayback({
     onSeek: (ms) => api('POST', '/admin/playback/seek', { position_ms: ms }),
   },
   queue: { el: '#queue-list', decorateRow: decorateQueueRow, removePlan: adminRemovePlan },
+  // History strip is READ-ONLY on both pages. The admin "remove this play"
+  // affordance moved off the shared strip into the Setup → Recent Plays panel
+  // (see renderRecentPlays below), so the strip passes no removePlan hook and
+  // the shared module renders no ✕ for anyone.
   history: { el: '#history-strip' },
   toast: showToast,
   // Closing Time (2026-06-24): admin is a control surface — render the banner
@@ -219,6 +223,7 @@ async function refreshQueueState() {
   try {
     const state = await api('GET', '/admin/queue');
     playbackHandle.applyQueue(state.queue, state.history);
+    setRecentPlaysData(state.history);
     syncLock(state.is_locked);
     _historyEmpty = !(state.history && state.history.length);
     _syncPrevEnabled();
@@ -375,8 +380,10 @@ function connectWS() {
     if (msg.type === 'now_playing_changed') playbackHandle.applyNowPlaying(msg);
     else if (msg.type === 'playback_state_changed') playbackHandle.applyPlaybackState(msg);
     else if (msg.type === 'closing_time') playbackHandle.applyClosingTime(msg);
+    else if (msg.type === 'track_skipped') playbackHandle.showSkipped(msg);
     else if (msg.type === 'queue_changed') {
       playbackHandle.applyQueue(msg.queue, msg.history);
+      setRecentPlaysData(msg.history);
       syncLock(msg.is_locked);
       _historyEmpty = !(msg.history && msg.history.length);
       _syncPrevEnabled();
@@ -909,6 +916,235 @@ document.querySelectorAll('#browse .tab').forEach(tab => {
   });
 });
 
+// ── Sources (multi-source connect / remove / rescan / priority, plan U14) ────
+
+const sourcesList = document.getElementById('sources-list');
+const jfConnectError = document.getElementById('jf-connect-error');
+const SOURCE_TYPE_LABELS = { plex: 'Plex', jellyfin: 'Jellyfin', local: 'Local' };
+let _currentSources = [];
+
+function renderSourcesList(sources) {
+  _currentSources = sources.slice();
+  if (!sources.length) {
+    sourcesList.innerHTML = '<p style="color:#555;font-size:.85rem">No sources connected yet.</p>';
+    return;
+  }
+  sourcesList.innerHTML = '';
+  // Secondary-button treatment for the inline controls (matches the dark chrome).
+  const sbtn = 'class="btn btn-sm" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);min-width:32px"';
+  sources.forEach((src, i) => {
+    const row = document.createElement('div');
+    row.className = 'lib-item';
+    row.style.justifyContent = 'space-between';
+    const label = SOURCE_TYPE_LABELS[src.type] || src.type;
+    const up = i > 0
+      ? `<button ${sbtn} data-dir="up" data-id="${esc(src.source_id)}" title="Higher priority">▲</button>` : '';
+    const down = i < sources.length - 1
+      ? `<button ${sbtn} data-dir="down" data-id="${esc(src.source_id)}" title="Lower priority">▼</button>` : '';
+    // Plex disconnect stays in the Plex flow; non-Plex sources (Jellyfin, local)
+    // are removable here, routed to their own endpoint by src.type (U11/U14).
+    const remove = src.type !== 'plex'
+      ? `<button class="btn btn-sm" data-remove="${esc(src.source_id)}" style="background:var(--surface2);color:var(--danger);border:1px solid var(--border)">Remove</button>` : '';
+    row.innerHTML =
+      `<span><span style="color:#888;font-size:.75em;text-transform:uppercase;letter-spacing:.04em;margin-right:.5rem">${esc(label)}</span>${esc(src.name)}</span>` +
+      `<span style="display:flex;gap:.35rem">${up}${down}${remove}</span>`;
+    row.querySelectorAll('[data-dir]').forEach(b =>
+      b.addEventListener('click', () => moveSourcePriority(b.dataset.id, b.dataset.dir)));
+    const rm = row.querySelector('[data-remove]');
+    if (rm) rm.addEventListener('click', () => removeSource(src.type, rm.dataset.remove));
+    sourcesList.appendChild(row);
+  });
+  syncSurpriseSourceNote();
+}
+
+// U13 capability-degradation note: when a non-Plex source is connected, Surprise
+// Me falls back to whole-library random (the Plex similarity options don't apply
+// to a mixed/Jellyfin/local library). Surface that in the Surprise Me settings.
+function syncSurpriseSourceNote() {
+  const note = document.getElementById('surprise-source-note');
+  if (!note) return;
+  const mixed = _currentSources.some(s => s.type && s.type !== 'plex');
+  note.style.display = mixed ? '' : 'none';
+}
+
+async function loadSources() {
+  try {
+    const data = await api('GET', '/admin/sources');
+    let sources = data.sources || [];
+    // Render in saved-priority order (highest first); unknown ids fall after.
+    try {
+      const pr = await api('GET', '/admin/sources/priority');
+      const order = pr.order || [];
+      if (order.length) {
+        sources = sources.slice().sort((a, b) => {
+          const ia = order.indexOf(a.source_id), ib = order.indexOf(b.source_id);
+          return (ia === -1 ? 1e9 : ia) - (ib === -1 ? 1e9 : ib);
+        });
+      }
+    } catch {}
+    renderSourcesList(sources);
+  } catch {
+    sourcesList.innerHTML = '<p style="color:#f87171;font-size:.85rem">Could not load sources.</p>';
+  }
+  renderSourceScanStatus();
+}
+
+// U15 admin scan-status badge: surfaces the catalog scan state under the Sources
+// list — "Scanning…" while a crawl runs, and a distinct "no music found" when a
+// finished scan returned nothing (vs the zero-source "No sources connected"
+// which the sources list itself shows). Hidden when the library is populated.
+async function renderSourceScanStatus() {
+  const el = document.getElementById('sources-scan-status');
+  if (!el) return;
+  let s;
+  try { s = await api('GET', '/admin/scan-status'); } catch { el.style.display = 'none'; return; }
+  let msg = '';
+  if (s.scanning) {
+    msg = 'Scanning sources… the library will populate as it runs.';
+  } else if (s.sources > 0 && s.scanned && s.empty) {
+    msg = 'Scan complete, but no music was found — the connected sources returned nothing.';
+  }
+  el.textContent = msg;
+  el.style.display = msg ? '' : 'none';
+}
+
+async function connectJellyfin() {
+  const btn = document.getElementById('btn-connect-jellyfin');
+  const url = document.getElementById('jf-url').value.trim();
+  const user = document.getElementById('jf-user').value.trim();
+  const pass = document.getElementById('jf-pass').value;
+  const name = document.getElementById('jf-name').value.trim();
+  jfConnectError.style.display = 'none';
+  if (!url || !user) {
+    jfConnectError.textContent = 'Server URL and username are required.';
+    jfConnectError.style.display = '';
+    return;
+  }
+  btn.disabled = true; btn.textContent = 'Connecting…';
+  try {
+    const resp = await fetch('/admin/sources/jellyfin', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ server_url: url, username: user, password: pass, name }),
+    });
+    if (!resp.ok) {
+      let cat = 'unreachable', msg = '';
+      try { const e = await resp.json(); if (e.detail) { cat = e.detail.category || cat; msg = e.detail.message || ''; } } catch {}
+      jfConnectError.textContent = cat === 'auth_rejected'
+        ? 'Jellyfin rejected the username/password.'
+        : (cat === 'unreachable' ? 'Could not reach the Jellyfin server. Check the URL.'
+                                 : (msg || 'Could not connect.'));
+      jfConnectError.style.display = '';
+      return;
+    }
+    ['jf-url', 'jf-user', 'jf-pass', 'jf-name'].forEach(id => { document.getElementById(id).value = ''; });
+    document.getElementById('jf-connect-form').style.display = 'none';
+    showToast('Jellyfin connected — scanning…');
+    loadSources();
+  } catch {
+    jfConnectError.textContent = 'Could not reach the Jellyfin server. Check the URL.';
+    jfConnectError.style.display = '';
+  } finally { btn.disabled = false; btn.textContent = 'Connect'; }
+}
+
+async function connectLocal() {
+  // Mirrors connectJellyfin: a directory path (read-only, no credential). The
+  // error element is looked up inline (no module-level const) to keep the
+  // per-page top-level surface unchanged for the discipline allowlist.
+  const btn = document.getElementById('btn-connect-local');
+  const err = document.getElementById('local-connect-error');
+  const dir = document.getElementById('local-dir').value.trim();
+  const name = document.getElementById('local-name').value.trim();
+  err.style.display = 'none';
+  if (!dir) {
+    err.textContent = 'A folder path is required.';
+    err.style.display = '';
+    return;
+  }
+  btn.disabled = true; btn.textContent = 'Connecting…';
+  try {
+    const resp = await fetch('/admin/sources/local', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root_dir: dir, name }),
+    });
+    if (!resp.ok) {
+      let msg = 'Could not connect to that folder.';
+      try { const e = await resp.json(); if (e.detail && e.detail.message) msg = e.detail.message; } catch {}
+      err.textContent = msg;
+      err.style.display = '';
+      return;
+    }
+    ['local-dir', 'local-name'].forEach(id => { document.getElementById(id).value = ''; });
+    document.getElementById('local-connect-form').style.display = 'none';
+    showToast('Local folder connected — scanning…');
+    loadSources();
+  } catch {
+    err.textContent = 'Could not connect to that folder.';
+    err.style.display = '';
+  } finally { btn.disabled = false; btn.textContent = 'Connect'; }
+}
+
+async function removeSource(type, sourceId) {
+  if (!confirm('Remove this source? Its tracks leave the library.')) return;
+  try {
+    await api('DELETE', `/admin/sources/${type}/${encodeURIComponent(sourceId)}`);
+    showToast('Source removed');
+    loadSources();
+  } catch { showToast('Failed to remove source'); }
+}
+
+async function rescanSources() {
+  const btn = document.getElementById('btn-rescan-sources');
+  if (btn) { btn.disabled = true; btn.textContent = 'Rescanning…'; }
+  try { await api('POST', '/admin/sources/rescan'); showToast('Rescanning all sources…'); }
+  catch { showToast('Rescan failed'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = 'Rescan Sources'; } }
+}
+
+function moveSourcePriority(sourceId, dir) {
+  const byId = {};
+  _currentSources.forEach(s => { byId[s.source_id] = s; });
+  const ids = _currentSources.map(s => s.source_id);
+  const i = ids.indexOf(sourceId);
+  if (i === -1) return;
+  const j = dir === 'up' ? i - 1 : i + 1;
+  if (j < 0 || j >= ids.length) return;
+  ids.splice(j, 0, ids.splice(i, 1)[0]);
+  renderSourcesList(ids.map(id => byId[id]));  // optimistic reorder
+  api('POST', '/admin/sources/priority', { order: ids })
+    .then(() => showToast('Priority updated'))
+    .catch(() => { showToast('Failed to save priority'); loadSources(); });
+}
+
+// "Connect Jellyfin" reveals the inline form (mirrors the Plex connect button);
+// Cancel hides it. Submit ("Connect") + Rescan wire to the module functions.
+document.getElementById('btn-connect-jellyfin-toggle').addEventListener('click', () => {
+  const form = document.getElementById('jf-connect-form');
+  const open = form.style.display !== 'none';
+  form.style.display = open ? 'none' : '';
+  jfConnectError.style.display = 'none';
+  if (!open) document.getElementById('jf-url').focus();
+});
+document.getElementById('btn-cancel-jellyfin').addEventListener('click', () => {
+  document.getElementById('jf-connect-form').style.display = 'none';
+  jfConnectError.style.display = 'none';
+});
+document.getElementById('btn-connect-jellyfin').addEventListener('click', connectJellyfin);
+document.getElementById('btn-rescan-sources').addEventListener('click', rescanSources);
+
+// "Connect Local Folder" reveals its inline form; Cancel hides it; Connect submits.
+document.getElementById('btn-connect-local-toggle').addEventListener('click', () => {
+  const form = document.getElementById('local-connect-form');
+  const open = form.style.display !== 'none';
+  form.style.display = open ? 'none' : '';
+  document.getElementById('local-connect-error').style.display = 'none';
+  if (!open) document.getElementById('local-dir').focus();
+});
+document.getElementById('btn-cancel-local').addEventListener('click', () => {
+  document.getElementById('local-connect-form').style.display = 'none';
+  document.getElementById('local-connect-error').style.display = 'none';
+});
+document.getElementById('btn-connect-local').addEventListener('click', connectLocal);
+
 // ── Libraries ──────────────────────────────────────────────────────────────
 
 const libraryList = document.getElementById('library-list');
@@ -920,7 +1156,16 @@ function renderLibraryList(libs) {
     const row = document.createElement('div');
     row.className = 'lib-item';
     const id = `lib-${lib.key}`;
-    const ownerTag = lib.owner ? ` <span style="color:#666;font-size:.8em">(${esc(lib.owner)})</span>` : '';
+    // Per-source-type indicator (ce-debug 2026-06-29): "(Plex — owner)" /
+    // "(Jellyfin — server)" so same-named libraries across sources are
+    // distinguishable. Disambiguator keeps the existing inner value (Plex owner
+    // username), falling back to server_name (Jellyfin carries no owner).
+    const typeLabels = { plex: 'Plex', jellyfin: 'Jellyfin', local: 'Local' };
+    const tl = typeLabels[lib.source_type] || (lib.source_type
+      ? lib.source_type.charAt(0).toUpperCase() + lib.source_type.slice(1) : '');
+    const disambig = lib.owner || lib.server_name || '';
+    const inner = [tl, disambig].filter(Boolean).join(' — ');
+    const ownerTag = inner ? ` <span style="color:#666;font-size:.8em">(${esc(inner)})</span>` : '';
     const encodedKey = encodeURIComponent(lib.key);
     row.innerHTML = `<input type="checkbox" id="${id}" data-key="${encodedKey}" ${lib.enabled ? 'checked' : ''}><label for="${id}">${esc(lib.title)}${ownerTag}</label>`;
     row.querySelector('input').addEventListener('change', async function() {
@@ -1056,6 +1301,121 @@ function renderSurpriseRecent(data) {
   const parts = Object.keys(tally).map(k => `${k} ×${tally[k]}`);
   el.textContent = parts.length ? parts.join(' · ') : 'No suggestions yet';
 }
+
+// ── Recent Plays curation panel (2026-07-03 plan; Direction A) ───────────────
+// Admin-only Setup chrome to prune recent plays. Fed by the SAME history array
+// that drives the shared read-only strip — captured from refreshQueueState() and
+// the queue_changed WS event via setRecentPlaysData(). Pages 10-at-a-time client-
+// side over the ~50-entry live buffer the /admin/queue payload already carries;
+// removal reuses POST /admin/history/remove-play (the shipped inverse chokepoint).
+// Row rendering lives here (not the shared playback module) because this is a
+// distinct admin management surface, like renderSourcesList / renderSurpriseRecent.
+let _recentPlaysData = [];
+let _recentPlaysPage = 0;
+let _recentPlaysGen = 0;
+let _recentPlaysExpanded = false;
+
+function _playedAgo(iso) {
+  const t = Date.parse(iso);
+  if (!t) return '';
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 45) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return m + ' min ago';
+  const h = Math.round(m / 60);
+  if (h < 24) return h + (h === 1 ? ' hr ago' : ' hrs ago');
+  const d = Math.round(h / 24);
+  return d + (d === 1 ? ' day ago' : ' days ago');
+}
+
+// Store the latest history and refresh the panel. The count badge updates even
+// when collapsed (it sits on the always-visible header); rows render only when
+// expanded. Bumping the generation lets an in-flight removal detect a newer
+// snapshot and skip its optimistic paint.
+function setRecentPlaysData(history) {
+  _recentPlaysData = Array.isArray(history) ? history : [];
+  _recentPlaysGen++;
+  renderRecentPlays();
+}
+
+function renderRecentPlays() {
+  const badge = document.getElementById('recent-plays-count');
+  const list = document.getElementById('recent-plays-list');
+  const pager = document.getElementById('recent-plays-pager');
+  if (!badge || !list || !pager) return;
+  const n = _recentPlaysData.length;
+  badge.textContent = n + (n === 1 ? ' play' : ' plays');
+  if (!_recentPlaysExpanded) return;  // build rows only when the panel is open
+  if (n === 0) {
+    list.innerHTML = '<div class="rp-empty">No plays recorded yet.</div>';
+    pager.innerHTML = '';
+    return;
+  }
+  const perPage = 10;
+  const maxPage = Math.max(0, Math.ceil(n / perPage) - 1);
+  if (_recentPlaysPage > maxPage) _recentPlaysPage = maxPage;  // clamp after a shrink
+  const start = _recentPlaysPage * perPage;
+  const rows = _recentPlaysData.slice(start, start + perPage);
+  list.innerHTML = rows.map((it) =>
+    '<div class="rp-row">'
+    + artImg(it.thumb, 'rp-art')
+    + `<div class="rp-meta"><div class="rp-t">${esc(it.title)}</div>`
+    + `<div class="rp-s">${esc(it.artist)}</div></div>`
+    + `<div class="rp-when">${esc(_playedAgo(it.added_at))}</div>`
+    + '<button type="button" class="rp-x" title="Remove this play">✕</button>'
+    + '</div>').join('');
+  list.querySelectorAll('.rp-x').forEach((btn, i) => {
+    const it = rows[i];
+    btn.setAttribute('aria-label', 'Remove ' + (it.title || 'this play') + ' from history');
+    btn.addEventListener('click', () => removeRecentPlay(it.track_id || it.id, it.added_at));
+  });
+  pager.innerHTML =
+    `<button type="button" class="rp-nav" aria-label="Newer page"${_recentPlaysPage === 0 ? ' disabled' : ''}>‹ Newer</button>`
+    + `<span class="rp-lbl">Page ${_recentPlaysPage + 1} of ${maxPage + 1}</span>`
+    + `<button type="button" class="rp-nav" aria-label="Older page"${_recentPlaysPage >= maxPage ? ' disabled' : ''}>Older ›</button>`;
+  const [prev, next] = pager.querySelectorAll('.rp-nav');
+  if (prev) prev.addEventListener('click', () => { if (_recentPlaysPage > 0) { _recentPlaysPage--; _recentPlaysGen++; renderRecentPlays(); } });
+  if (next) next.addEventListener('click', () => { if (_recentPlaysPage < maxPage) { _recentPlaysPage++; _recentPlaysGen++; renderRecentPlays(); } });
+}
+
+function toggleRecentPlays() {
+  const sec = document.getElementById('recent-plays');
+  if (!sec) return;
+  _recentPlaysExpanded = sec.classList.toggle('rp-collapsed') === false;
+  const head = document.getElementById('recent-plays-head');
+  if (head) head.setAttribute('aria-expanded', String(_recentPlaysExpanded));
+  _recentPlaysGen++;
+  renderRecentPlays();
+}
+
+// Remove one play. Raw fetch (admin api() throws on non-2xx and can't surface a
+// 404): 2xx → optimistic filter + repaint (the queue_changed broadcast re-confirms;
+// per the realtime-ui learning, write-then-render beats waiting on the event);
+// 404 (already gone) → refetch the snapshot; any other status → toast. No confirm.
+async function removeRecentPlay(trackId, addedAt) {
+  const gen = _recentPlaysGen;
+  let resp;
+  try {
+    resp = await fetch('/admin/history/remove-play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ track_id: trackId, added_at: addedAt }),
+    });
+  } catch { showToast('Could not remove play'); return; }
+  if (resp.status === 404) { refreshQueueState(); return; }
+  if (!resp.ok) { showToast('Could not remove play'); return; }
+  if (gen !== _recentPlaysGen) return;  // a newer snapshot already superseded us
+  _recentPlaysData = _recentPlaysData.filter(
+    (x) => !((x.track_id || x.id) === trackId && x.added_at === addedAt));
+  renderRecentPlays();
+}
+
+// Wire the collapse toggle (the header is a <button> in the admin template, so
+// Enter/Space fire click natively; this script runs at end of body).
+(() => {
+  const head = document.getElementById('recent-plays-head');
+  if (head) head.addEventListener('click', toggleRecentPlays);
+})();
 
 async function loadSettings() {
   try {
@@ -1430,6 +1790,7 @@ document.getElementById('logout-link').addEventListener('click', async (e) => {
   }
   await playbackHandle.resume();   // authoritative position + np refresh
   loadDevices();
+  loadSources();
   loadLibraries();
   loadSettings();
   loadRuleEditors();

@@ -176,6 +176,22 @@ class ClosingTimeEvent:
 
 
 @dataclass
+class TrackSkippedEvent:
+    """A queued track was skipped because every holder failed to stream (R22,
+    plan U16). Broadcast so the shared playback module flashes a transient
+    "Skipped …" toast on guest + admin. ``sources_tried`` (the provider source
+    ids attempted) is populated on the ADMIN broadcast only — a diagnostic the
+    host can act on; the guest broadcast omits it (None) and shows just the
+    title."""
+    type: str = "track_skipped"
+    track_title: str = ""
+    sources_tried: list | None = None
+
+    def to_json(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class AirPlayProtocolChangedEvent:
     """Per-device AirPlay protocol decision changed (cliap2 vs cliraop).
 

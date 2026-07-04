@@ -420,7 +420,7 @@ async def test_play_proxied_ogg_advertises_flac(cast_mock):
     track = Track(id="t", title="S", artist="A", album="B", duration_ms=1000,
                   stream_key="/library/parts/89497/1/file.ogg")
     await backend.play(
-        "http://192.168.0.70/api/stream?key=k%3A%2Flibrary%2Fparts%2F89497%2F1%2Ffile.ogg",
+        "http://192.168.1.50/api/stream?key=k%3A%2Flibrary%2Fparts%2F89497%2F1%2Ffile.ogg",
         track,
     )
     args = cc.media_controller.play_media.call_args

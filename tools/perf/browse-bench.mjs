@@ -18,7 +18,7 @@ const COUNT = parseInt(process.argv[2] || '20000', 10);
 const HEADED = process.argv.includes('headed');   // real compositor (for paint/scroll costs)
 const IMAGES = process.argv.includes('images');   // serve real art so <img> load+decode is measured
 const REAL = process.argv.includes('real');       // drive a live instance instead of the synthetic harness
-const REAL_URL = (process.argv.find((a) => /^https?:\/\//.test(a)) || 'http://192.168.0.70/');
+const REAL_URL = (process.argv.find((a) => /^https?:\/\//.test(a)) || 'http://192.168.1.50/');
 
 // Injected into a LIVE jukeplox page (real DOM/data/art). Opens Albums, waits for
 // the list, then taps far rail letters — capturing main-thread long-tasks AND

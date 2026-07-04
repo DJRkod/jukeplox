@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 
-from app.plex.models import Track
+from app.models import Track
 
 
 class QueueEndBehavior(str, Enum):
@@ -56,6 +56,9 @@ class QueueItem:
                 "thumb": self.track.thumb,
                 "stream_key": self.track.stream_key,
                 "server_name": self.track.server_name,
+                # Multi-source plan U9: persist the holds snapshot so play-time
+                # fallback survives a restart/restore.
+                "holds": self.track.holds,
             }),
             "added_at": self.added_at,
         }
@@ -74,6 +77,7 @@ class QueueItem:
             thumb=meta.get("thumb"),
             stream_key=meta.get("stream_key", ""),
             server_name=meta.get("server_name", ""),
+            holds=meta.get("holds", []) or [],
         )
         return cls(track=track, added_at=data["added_at"])
 

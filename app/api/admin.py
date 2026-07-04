@@ -65,6 +65,13 @@ def _serialize_libraries(libraries: list, enabled_keys: set) -> list:
             "type": lib.type,
             "enabled": lib.key in enabled_keys,
             "owner": lib.owner,
+            # Per-source-type indicator for the Libraries list (ce-debug
+            # 2026-06-29): the frontend renders "(Plex — <name>)" / "(Jellyfin —
+            # <name>)" so same-named libraries across source types are
+            # distinguishable. server_name is the Jellyfin disambiguator (it
+            # carries no owner).
+            "source_type": getattr(lib, "source_type", "") or "",
+            "server_name": getattr(lib, "server_name", "") or "",
         }
         for lib in libraries
     ]
@@ -74,7 +81,7 @@ def _serialize_libraries(libraries: list, enabled_keys: set) -> list:
 async def list_libraries():
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libraries = await client.get_libraries()
     enabled_keys = {lib["section_key"] for lib in await database.get_enabled_libraries()}
     return _serialize_libraries(libraries, enabled_keys)
@@ -84,7 +91,7 @@ async def list_libraries():
 async def enable_library(key: str):
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libraries = await client.get_libraries()
     lib = next((l for l in libraries if l.key == key), None)
     if not lib:
@@ -93,6 +100,7 @@ async def enable_library(key: str):
     client.invalidate_cache()
     await state.invalidate_ondeck()  # enabled-library set changed (plan U4)
     state.trigger_browse_index_refresh()  # browse-index plan U6/R9
+    state.trigger_catalog_refresh()  # multi-source catalog (plan U6)
     return {"ok": True}
 
 
@@ -104,6 +112,7 @@ async def disable_library(key: str):
         client.invalidate_cache()
     await state.invalidate_ondeck()  # enabled-library set changed (plan U4)
     state.trigger_browse_index_refresh()  # browse-index plan U6/R9
+    state.trigger_catalog_refresh()  # multi-source catalog (plan U6)
     return {"ok": True}
 
 
@@ -112,14 +121,177 @@ async def plex_rescan():
     """Invalidate in-memory Plex caches and return the refreshed library list."""
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     client.invalidate_cache()
     state.trigger_genre_refresh()
     state.trigger_credit_refresh()
     state.trigger_browse_index_refresh()  # browse-index plan U6/R7
+    state.trigger_catalog_refresh()  # multi-source catalog (plan U6)
     libraries = await client.get_libraries()
     enabled_keys = {lib["section_key"] for lib in await database.get_enabled_libraries()}
     return _serialize_libraries(libraries, enabled_keys)
+
+
+class SourcePriorityRequest(BaseModel):
+    order: list[str] = Field(default_factory=list, max_length=64)
+
+
+@router.get("/sources/priority")
+async def get_source_priority():
+    """The global source-priority order (highest first) — multi-source plan U9/R12."""
+    return {"order": await database.get_source_priority()}
+
+
+@router.post("/sources/priority")
+async def set_source_priority(body: SourcePriorityRequest):
+    """Persist the global source-priority order. Effective at the NEXT enqueue's
+    holds snapshot and stream resolution — no rescan needed (R12). Admin-gated by
+    the router-level require_admin (R26). The drag-reorder UI is U14."""
+    await database.set_source_priority(body.order)
+    return {"ok": True, "order": body.order}
+
+
+# ── Multi-source Sources panel (plan U14) ─────────────────────────────────────
+
+class JellyfinConnectRequest(BaseModel):
+    server_url: str = Field(min_length=1, max_length=512)
+    username: str = Field(min_length=1, max_length=256)
+    password: str = Field(default="", max_length=512)
+    name: str = Field(default="", max_length=128)
+
+
+class LocalConnectRequest(BaseModel):
+    root_dir: str = Field(min_length=1, max_length=4096)
+    name: str = Field(default="", max_length=128)
+
+
+def _hostname(url: str) -> str:
+    from urllib.parse import urlparse
+    try:
+        return urlparse(url if "://" in url else f"http://{url}").hostname or ""
+    except Exception:
+        return ""
+
+
+def _source_error(category: str, message: str) -> HTTPException:
+    # R21: a categorized, legible failure; the source is NOT saved. The frontend
+    # surfaces ``category`` (unreachable / auth_rejected) inline.
+    return HTTPException(status_code=400, detail={"category": category, "message": message})
+
+
+@router.get("/sources")
+async def list_sources():
+    """Connected media sources for the Sources panel + the priority list (U14).
+
+    Each entry is ``{source_id, type, name}``. Plex servers come from
+    ``plex_servers`` (or the legacy single-server config); Jellyfin from
+    ``jellyfin_sources``; local-files directories from ``local_sources`` (U11)."""
+    out: list[dict] = []
+    for s in await database.get_plex_servers():
+        out.append({"source_id": s["machine_id"], "type": "plex",
+                    "name": s.get("name") or "Plex"})
+    if not out:
+        cfg = await database.get_plex_config()
+        if cfg:
+            out.append({"source_id": "", "type": "plex", "name": "Plex"})
+    for j in await database.get_jellyfin_sources():
+        out.append({"source_id": j["source_id"], "type": "jellyfin",
+                    "name": j.get("name") or "Jellyfin"})
+    for l in await database.get_local_sources():
+        out.append({"source_id": l["source_id"], "type": "local",
+                    "name": l.get("name") or "Local"})
+    return {"sources": out}
+
+
+@router.get("/scan-status")
+async def scan_status():
+    """Catalog scan state for the admin Sources scan badge (plan U15/R20):
+    ``{sources, scanning, scanned, empty}`` — same snapshot the guest onboarding
+    states read, so admin and guest agree on one source of truth. Admin-gated by
+    the router-level require_admin (R26)."""
+    return await state.scan_status()
+
+
+@router.post("/sources/jellyfin")
+async def connect_jellyfin(body: JellyfinConnectRequest):
+    """Connect a Jellyfin source by account sign-in (R5). Validated by signing in;
+    on success the credential is saved TOKEN-ONLY (R24) and a catalog scan kicks
+    off. A bad URL/credentials surfaces an inline-categorized error and the source
+    is NOT saved (R21). Admin-gated by the router-level require_admin (R26)."""
+    from app.sources import jellyfin as jf
+    device_id = jf.new_device_id()
+    try:
+        creds = await jf.authenticate(
+            body.server_url, body.username, body.password, device_id=device_id)
+    except jf.JellyfinAuthError as e:
+        raise _source_error("auth_rejected", str(e) or "Jellyfin rejected the credentials")
+    except Exception:
+        raise _source_error("unreachable", "Could not reach the Jellyfin server")
+    # Stable id across reconnects: prefer the server's id, else the device id.
+    source_id = f"jf-{creds.get('server_id') or device_id}"
+    name = body.name.strip() or _hostname(body.server_url) or "Jellyfin"
+    await database.save_jellyfin_source(
+        source_id=source_id, server_url=body.server_url.rstrip("/"), name=name,
+        token=creds["token"], user_id=creds["user_id"], device_id=device_id)
+    state.invalidate_plex_client()   # rebuild the registry with the new source
+    state.trigger_catalog_refresh()  # crawl it into the unified catalog
+    return {"ok": True, "source_id": source_id, "name": name, "type": "jellyfin"}
+
+
+@router.delete("/sources/jellyfin/{source_id}")
+async def remove_jellyfin(source_id: str):
+    """Remove a Jellyfin source and re-resolve the registry/catalog (U14/R7)."""
+    await database.delete_jellyfin_source(source_id)
+    state.invalidate_plex_client()
+    state.trigger_catalog_refresh()
+    return {"ok": True}
+
+
+@router.post("/sources/local")
+async def connect_local(body: LocalConnectRequest):
+    """Connect a local-files source by directory path (R6). Validated by checking
+    the directory exists and is readable; on success it is saved and a catalog
+    scan kicks off. A missing/unreadable directory surfaces an inline-categorized
+    error and the source is NOT saved (R21). Admin-gated by require_admin (R26).
+
+    The realpath is stored (canonical root for LocalSource's containment) and a
+    stable source_id is derived from it, so reconnecting the same directory
+    updates the existing source rather than duplicating it."""
+    import hashlib
+    import os
+    real = os.path.realpath(body.root_dir.strip())
+    if not os.path.isdir(real):
+        raise _source_error("dir_not_found", "That folder does not exist")
+    if not os.access(real, os.R_OK):
+        raise _source_error("unreadable", "That folder is not readable")
+    source_id = f"local-{hashlib.sha1(real.encode('utf-8')).hexdigest()[:12]}"
+    name = body.name.strip() or os.path.basename(real.rstrip("/\\")) or "Local Music"
+    await database.save_local_source(source_id=source_id, name=name, root_dir=real)
+    state.invalidate_plex_client()   # rebuild the registry with the new source
+    state.trigger_catalog_refresh()  # crawl it into the unified catalog
+    return {"ok": True, "source_id": source_id, "name": name, "type": "local"}
+
+
+@router.delete("/sources/local/{source_id}")
+async def remove_local(source_id: str):
+    """Remove a local-files source and re-resolve the registry/catalog (R7)."""
+    await database.delete_local_source(source_id)
+    state.invalidate_plex_client()
+    state.trigger_catalog_refresh()
+    return {"ok": True}
+
+
+@router.post("/sources/rescan")
+async def rescan_sources():
+    """Re-crawl every connected source into the catalog (U14/R7). Invalidates
+    in-memory caches and triggers the catalog (+ Plex browse-index) refresh;
+    effective without a restart."""
+    client = await state.get_plex_client()
+    if client:
+        client.invalidate_cache()
+    state.trigger_browse_index_refresh()
+    state.trigger_catalog_refresh()
+    return {"ok": True}
 
 
 @router.get("/plex/index-status")
@@ -434,7 +606,7 @@ async def admin_append_to_queue(body: AdminQueueAppendRequest):
         validate_plex_id(body.album_id)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     q = state.queue_engine
     if body.track_id:
         track = await client.get_track(body.track_id)
@@ -714,7 +886,7 @@ async def playback_no_audio():
         await state.output_router.stop()
         client = await state.get_plex_client()
         if client is None:
-            raise HTTPException(status_code=502, detail="No Plex client configured")
+            raise HTTPException(status_code=502, detail="No media source configured")
         url = state._make_stream_url(current.track.stream_key, client)
         try:
             await state.output_router.play(url, current.track)
@@ -791,7 +963,7 @@ async def playback_previous():
     """
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=409, detail="No Plex client available")
+        raise HTTPException(status_code=409, detail="No media source available")
     state._advance_gen += 1  # invalidate any pending EOS _do_advance task
     async with state._advance_lock:
         prev_item = await state.queue_engine.skip_back()
@@ -1210,6 +1382,47 @@ async def set_track_tags(body: TrackTagsRequest):
         raise HTTPException(status_code=422, detail="too many tags in request")
     stored = await database.set_tags(body.track_id, body.tags)
     return {"track_id": body.track_id, "tags": stored}
+
+
+# ── Play-data curation: prune plays / remove from Most Played (2026-07-03 U4) ─
+# Admin-only (router-level require_admin). Mutates the LOCAL play stores only.
+
+class RemovePlayRequest(BaseModel):
+    track_id: str
+    # added_at is matched by string equality against the in-memory history deque
+    # (not parsed or queried), so a length cap is sufficient (mirrors QueueUndoRequest).
+    added_at: str = Field(..., max_length=64)
+
+
+class RemoveFromMostPlayedRequest(BaseModel):
+    track_id: str
+
+
+@router.post("/history/remove-play")
+async def remove_play(body: RemovePlayRequest):
+    """Undo one recent play (R2/R3): roll back its contribution to the track,
+    album, and artist counts, then remove the history entry. Un-count first
+    (awaited) is the least-harm order — a DB failure leaves both stores unchanged.
+    404 when the entry is no longer in the current history (stale strip)."""
+    validate_plex_id(body.track_id)
+    q = state.queue_engine
+    entry = next((i for i in q.history
+                  if i.track_id == body.track_id and i.added_at == body.added_at), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="History entry not found")
+    await state.unrecord_play(body.track_id, entry.track.album, entry.track.artist)
+    await q.remove_history_entry(body.track_id, body.added_at)
+    return {"ok": True}
+
+
+@router.post("/most-played/remove")
+async def remove_from_most_played(body: RemoveFromMostPlayedRequest):
+    """Remove a track from Most Played (R5/R6): delete its accumulated count, its
+    re-mint sibling keys, and their captured meta. Track-scoped — album/artist
+    name-keyed aggregates are untouched."""
+    validate_plex_id(body.track_id)
+    await state.purge_play_track(body.track_id)
+    return {"ok": True}
 
 
 # ── Surprise Me: source-attribution readout (2026-06-17 plan U6) ─────────────

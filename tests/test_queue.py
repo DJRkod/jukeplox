@@ -513,3 +513,60 @@ async def test_close_out_with_empty_queue_leaves_queue_empty(engine):
     assert engine.state.current is None
     assert list(engine.queue) == []
     assert engine.history[0].track_id == "cur"
+
+
+# ── admin history removal (play-data curation plan U3) ───────────────────────
+
+def _hist_item(track_id, added_at, album="Album", artist="Artist"):
+    from app.queue.models import QueueItem
+    t = make_track(track_id)
+    t.album = album
+    t.artist = artist
+    return QueueItem(track=t, added_at=added_at)
+
+
+async def test_remove_history_entry_removes_match_and_returns_it(engine):
+    from collections import deque
+    engine._history = deque([
+        _hist_item("t2", "2026-07-03T00:00:02+00:00"),
+        _hist_item("t1", "2026-07-03T00:00:01+00:00", album="Broken", artist="NIN"),
+    ])
+    events = []
+
+    async def cb(event, payload):
+        events.append(event)
+
+    engine.add_callback(cb)
+    removed = await engine.remove_history_entry("t1", "2026-07-03T00:00:01+00:00")
+    assert removed is not None
+    assert removed.track.album == "Broken" and removed.track.artist == "NIN"
+    assert [h.track_id for h in engine.history] == ["t2"]
+    assert events.count("queue_changed") == 1
+
+
+async def test_remove_history_entry_not_found_returns_none(engine):
+    from collections import deque
+    engine._history = deque([_hist_item("t1", "A")])
+    events = []
+
+    async def cb(event, payload):
+        events.append(event)
+
+    engine.add_callback(cb)
+    removed = await engine.remove_history_entry("t1", "MISMATCH")
+    assert removed is None
+    assert [h.track_id for h in engine.history] == ["t1"]   # untouched
+    assert events.count("queue_changed") == 0               # no emit on no-op
+
+
+async def test_remove_history_entry_tie_break_removes_head_only(engine):
+    from collections import deque
+    # Two entries share BOTH track_id and added_at → remove exactly one (head-most).
+    engine._history = deque([
+        _hist_item("t1", "SAME", album="head"),
+        _hist_item("t1", "SAME", album="tail"),
+    ])
+    removed = await engine.remove_history_entry("t1", "SAME")
+    assert removed.track.album == "head"
+    assert len(engine.history) == 1
+    assert engine.history[0].track.album == "tail"

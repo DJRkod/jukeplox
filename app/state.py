@@ -40,11 +40,21 @@ def _log_task_exc(task: asyncio.Task) -> None:
 
 
 def is_authorized_stream_key(key: str) -> bool:
-    """Return True only if key matches a track that Jukeplox loaded into the queue."""
+    """Return True only if key matches a track Jukeplox loaded into the queue.
+
+    Multi-source plan U9: a queued track may carry several holder keys (its holds
+    snapshot), and play-time fallback can stream from any of them — so every
+    holder key is authorized, not just the primary ``stream_key``."""
     items = list(queue_engine.queue) + list(queue_engine.history)
     if queue_engine.state.current:
         items.append(queue_engine.state.current)
-    return any(item.track.stream_key == key for item in items)
+    for item in items:
+        if item.track.stream_key == key:
+            return True
+        for h in (getattr(item.track, "holds", None) or []):
+            if h.get("key") == key:
+                return True
+    return False
 
 
 from app.output.router import OutputRouter
@@ -97,7 +107,15 @@ _plex_client_lock = asyncio.Lock()
 
 
 async def get_plex_client():
-    """Return a PlexClient (or MultiPlexClient) built from stored config, or None."""
+    """Return the SourceRegistry of connected media sources, or None when none.
+
+    Retained under the name ``get_plex_client`` for call-site and test-patch
+    continuity during the multi-source transition (U3); ``get_source_registry``
+    is the source-neutral alias new code should use. Plex servers register as
+    ``PlexSource`` providers; future Jellyfin/local sources register the same way.
+    Returns None when no source is configured (callers already degrade on None),
+    so a zero-source install starts and stays safe.
+    """
     global _plex_client
     if _plex_client is not None:
         return _plex_client
@@ -105,26 +123,62 @@ async def get_plex_client():
         if _plex_client is not None:
             return _plex_client
         from app import database
-        from app.plex.client import MultiPlexClient, PlexClient
+        from app.plex.client import PlexClient
+        from app.sources.plex import PlexSource
+        from app.sources.registry import SourceRegistry
+        sources = []
         servers = await database.get_plex_servers()
         if servers:
-            clients = [
-                PlexClient(
+            sources = [
+                PlexSource(PlexClient(
                     server_url=s["server_url"],
                     token=s["token"],
                     client_id=s["client_id"],
                     machine_id=s["machine_id"],
                     server_name=s.get("name", ""),
                     owner=s.get("owner", ""),
-                )
+                ))
                 for s in servers
             ]
-            _plex_client = MultiPlexClient(clients)
         else:
-            # Backward-compat: use legacy single-server config
+            # Backward-compat: legacy single-server config (machine_id "").
             cfg = await database.get_plex_config()
             if cfg:
-                _plex_client = PlexClient(cfg["server_url"], cfg["token"], cfg["client_id"])
+                sources = [PlexSource(
+                    PlexClient(cfg["server_url"], cfg["token"], cfg["client_id"]),
+                    source_id="",
+                )]
+        # Jellyfin sources (U10): additive — appended AFTER Plex so the native
+        # Plex pipeline stays primary (lower scan priority index). The loop is
+        # empty on a Plex-only install, so the registry is byte-identical there
+        # (AE6); a Jellyfin-only install still builds a registry. Connecting a
+        # non-Plex source is what flips the catalog floor on (guest._catalog_active
+        # keys on source_type, not source count).
+        jellyfin = await database.get_jellyfin_sources()
+        if jellyfin:
+            from app.sources.jellyfin import JellyfinSource
+            sources += [
+                JellyfinSource(
+                    server_url=j["server_url"], token=j["token"], user_id=j["user_id"],
+                    source_id=j["source_id"], server_name=j["name"], device_id=j["device_id"],
+                )
+                for j in jellyfin
+            ]
+        # Local-files sources (U11): same additive/gated posture as Jellyfin —
+        # appended after Plex/Jellyfin, empty loop on installs without one, so a
+        # Plex-only registry stays byte-identical (AE6). A connected local source
+        # is non-Plex, so it flips the catalog floor on (guest._catalog_active).
+        local = await database.get_local_sources()
+        if local:
+            from app.sources.local import LocalSource
+            sources += [
+                LocalSource(
+                    root_dir=l["root_dir"], source_id=l["source_id"], server_name=l["name"],
+                )
+                for l in local
+            ]
+        if sources:
+            _plex_client = SourceRegistry(sources)
         return _plex_client
 
 
@@ -138,6 +192,13 @@ def invalidate_plex_client() -> None:
     # under the lock and discards its result (2026-06-21 plan U4).
     _ondeck = None
     _ondeck_gen += 1
+
+
+# Source-neutral aliases (U3): new code should prefer these names. The legacy
+# ``get_plex_client`` / ``invalidate_plex_client`` names are retained above as the
+# call-site and test-patch surface during the multi-source transition.
+get_source_registry = get_plex_client
+invalidate_source_registry = invalidate_plex_client
 
 
 # ── playback advance ──────────────────────────────────────────────────────────
@@ -209,6 +270,61 @@ async def _on_dacp_volume_change(session, value: float, absolute: bool) -> None:
         _log.warning("DACP: VolumeChangedEvent broadcast failed", exc_info=True)
 
 
+async def catalog_active() -> bool:
+    """True when a non-Plex source is connected, so source-neutral paths (random,
+    Surprise Me, genres) serve the merged catalog floor instead of Plex's native
+    pipeline (plan U8/U13).
+
+    Mirrors ``guest._catalog_active`` (which delegates here) — gated on source
+    TYPE, not count: an all-Plex registry stays native regardless of how many
+    servers it spans (AE6 parity), and the floor takes over the moment any
+    Jellyfin/local source joins. Defensive: only a real registry exposing a
+    ``sources`` list can activate it — any other client shape (mocks, a legacy
+    single client) reads as native."""
+    reg = await get_plex_client()
+    srcs = getattr(reg, "sources", None)
+    if not isinstance(srcs, list) or not srcs:
+        return False
+    return any(getattr(s, "source_type", "plex") != "plex" for s in srcs)
+
+
+def _row_within_band(row, min_ms, max_ms) -> bool:
+    """Inclusive [min_ms, max_ms] band test on a catalog track row's
+    ``duration_ms``, mirroring ``surprise._within_length``: a missing/zero
+    duration always passes (we never silently drop a track whose length we
+    can't read). Both bounds None → always True."""
+    dur = row.get("duration_ms") or 0
+    if not dur:
+        return True
+    if min_ms is not None and dur < min_ms:
+        return False
+    if max_ms is not None and dur > max_ms:
+        return False
+    return True
+
+
+async def _catalog_shuffle(min_ms, max_ms):
+    """Whole-library random off the unified catalog — the source-neutral floor
+    (plan U13).
+
+    The Plex artist→album→track traversal below can't reach Jellyfin/local
+    content, so once a non-Plex source is connected the random floor draws from
+    the catalog's track rows instead. Band handling mirrors ``_shuffle_provider``:
+    when a min/max is in effect, filter rows to the band and pick one at random;
+    if none qualify, fall back to an unfiltered pick so the floor never
+    dead-ends. Returns a fully-built ``Track`` (carrying its priority-ordered
+    holds for play-time fallback) or None when the catalog is empty."""
+    from app.catalog import store, views
+    rows = await store.get_all_tracks()
+    if not rows:
+        return None
+    if min_ms is not None or max_ms is not None:
+        in_band = [r for r in rows if _row_within_band(r, min_ms, max_ms)]
+        if in_band:
+            rows = in_band
+    return await views._track(random.choice(rows))
+
+
 async def _shuffle_provider(bounds=_UNSET):
     """Return a random track from enabled libraries (artist→album→track traversal).
 
@@ -235,6 +351,11 @@ async def _shuffle_provider(bounds=_UNSET):
         min_ms, max_ms = await database.get_random_length_bounds()
     else:
         min_ms, max_ms = bounds
+
+    # Source-neutral floor (plan U13): with a non-Plex source connected, the Plex
+    # traversal below can't see Jellyfin/local tracks — draw from the catalog.
+    if await catalog_active():
+        return await _catalog_shuffle(min_ms, max_ms)
 
     # Band-invariant fetches are hoisted out of the retry loop — the client and
     # the enabled-library list don't change between attempts, so re-fetching them
@@ -489,6 +610,74 @@ def record_play(track) -> None:
         _t3.add_done_callback(_log_task_exc)
 
 
+# ── Play-data curation: inverse of record_play (2026-07-03 plan U2) ───────────
+# These are the inverse chokepoint for record_play. Unlike record_play (sync,
+# fire-and-forget so counting never blocks playback), these are async and are
+# AWAITED by the admin handler — the mutation must commit before the endpoint
+# responds. Both resolve the (possibly stale) incoming key to its live catalog
+# identity and act on the WHOLE re-mint sibling set, so the scan-time reconcile's
+# max-fold can't silently revert the mutation (ce-debug 2026-07-03; see
+# docs/solutions/architecture-patterns/reminted-catalog-identity-repair-keys-resolve-display-live.md).
+
+async def _track_play_keys(track_id: str) -> tuple[str, list[str]]:
+    """Return ``(identity, keys)``: the catalog identity ``track_id`` resolves to,
+    and every ``play_counts`` track key that resolves to the same identity (the
+    re-mint sibling set). ``store.find_identity`` is forward-only (key → identity)
+    and cannot enumerate keys resolving TO an identity, so — exactly as
+    ``catalog.migrate.migrate_metadata`` does — siblings are found by iterating all
+    track counts and forward-resolving each."""
+    from app import database
+    from app.catalog import identity as cat_identity
+    target = await cat_identity.identity_for_track_id(track_id) or track_id
+    keys: list[str] = []
+    for row in await database.get_all_play_counts("track"):
+        key = row["entity_id"]
+        resolved = await cat_identity.identity_for_track_id(key) or key
+        if resolved == target:
+            keys.append(key)
+    return target, keys
+
+
+async def unrecord_play(track_id: str, album: str | None, artist: str | None) -> None:
+    """Roll back ONE play — the inverse of ``record_play`` (plan U2, R2/R3).
+
+    Consolidate-then-decrement: fold the track's sibling counts onto its live
+    identity with ``max`` (they are copies of the same plays) and delete the
+    siblings, THEN decrement the single consolidated identity row by one. This
+    avoids both a revert (a higher sibling refolding via ``max`` on the next
+    Rescan) and an over-correction (deleting a sibling that held the real total
+    while the identity row was 0). Album/artist counts are name-keyed; decrement
+    them only when the name is truthy, mirroring ``record_play``'s guards."""
+    from app import database
+    target, keys = await _track_play_keys(track_id)
+    best = 0
+    for key in keys:
+        best = max(best, await database.get_play_count("track", key))
+    await database.set_play_count("track", target, best)
+    for key in keys:
+        if key != target:
+            await database.delete_play_count("track", key)
+            await database.delete_play_track_meta(key)
+    await database.decrement_play_count("track", target)
+    if album:
+        await database.decrement_play_count("album", album)
+    if artist:
+        await database.decrement_play_count("artist", artist)
+
+
+async def purge_play_track(track_id: str) -> None:
+    """Remove a track from Most Played (plan U2, R5/R6): delete the track's
+    ``play_counts`` row AND every re-mint sibling key's row plus their captured
+    ``play_track_meta``. An incomplete sibling sweep would leave a ``count>0`` row
+    that re-surfaces the "removed" track on the leaderboard. Track-scoped — never
+    touches the album/artist name-keyed aggregates."""
+    from app import database
+    _target, keys = await _track_play_keys(track_id)
+    for key in keys:
+        await database.delete_play_count("track", key)
+        await database.delete_play_track_meta(key)
+
+
 # ── Closing Time mode (2026-06-24 plan U2) ───────────────────────────────────
 
 def _norm(s: str | None) -> str:
@@ -590,18 +779,67 @@ async def _do_advance() -> None:
             client = await get_plex_client()
             if not client:
                 return
-            url = _make_stream_url(next_item.track.stream_key, client)
             try:
-                await output_router.play(url, next_item.track)
-                record_play(next_item.track)
-                return
+                if await _play_with_fallback(next_item, client):
+                    return
             except DeviceNotReadyError:
                 _log.warning("_do_advance: output backend has no device connected; halting advance")
                 return
-            except Exception:
-                _log.exception("Playback failed for %r; advancing to next", next_item.track.title)
+            # Every holder for this item failed to stream (R13: 404/gone/auth, or
+            # a removed source that solely held it) — declare it unplayable and
+            # advance to the next queued item, flashing the R22 skip notification.
+            _log.warning("All holders failed for %r; skipping to next item",
+                         next_item.track.title)
+            await _emit_track_skipped(next_item.track)
         _log.error("_do_advance: gave up after %d consecutive playback failures",
                    _MAX_CONSECUTIVE_FAILURES)
+
+
+async def _emit_track_skipped(track) -> None:
+    """Broadcast the R22 skip notification when every holder failed (plan U16).
+
+    Admins get the source ids that were tried (from the U9 holds snapshot) as a
+    diagnostic; guests get title-only (``sources_tried`` omitted on their
+    broadcast). Best-effort — a broadcast failure never blocks the advance."""
+    from app.events.bus import manager
+    from app.events.types import TrackSkippedEvent
+    title = getattr(track, "title", "") or ""
+    tried = [h.get("source_id") for h in (getattr(track, "holds", None) or []) if h.get("source_id")]
+    try:
+        await manager.broadcast_to_admins(
+            TrackSkippedEvent(track_title=title, sources_tried=tried or None))
+        await manager.broadcast_to_guests(
+            TrackSkippedEvent(track_title=title, sources_tried=None))
+    except Exception:
+        _log.warning("track_skipped broadcast failed", exc_info=True)
+
+
+def _holder_keys(track) -> list[str]:
+    """Priority-ordered resolvable stream keys to try for a track: the
+    enqueue-time holds snapshot (multi-source plan U9), else the single
+    ``stream_key`` (single-holder track / pre-snapshot queue item)."""
+    keys = [h["key"] for h in (getattr(track, "holds", None) or []) if h.get("key")]
+    return keys or ([track.stream_key] if track.stream_key else [])
+
+
+async def _play_with_fallback(item, client) -> bool:
+    """Try each holder in priority order; return True once one plays (R12/R13).
+
+    Re-raises ``DeviceNotReadyError`` (no output device → halt the advance, not a
+    holder problem). Returns False when no holder serves, so the caller can skip
+    the item. Records the play onto the (catalog identity) track on success."""
+    from app.output.base import DeviceNotReadyError
+    for key in _holder_keys(item.track):
+        url = _make_stream_url(key, client)
+        try:
+            await output_router.play(url, item.track)
+            record_play(item.track)
+            return True
+        except DeviceNotReadyError:
+            raise
+        except Exception:
+            _log.warning("Holder %s failed for %r; trying next holder", key, item.track.title)
+    return False
 
 
 async def _trigger_auto_advance() -> None:
@@ -653,6 +891,14 @@ async def _refresh_genre_cache() -> None:
     global _genre_refresh_running
     from app import database
     try:
+        # Source-neutral genres (plan U13): in a catalog install, genre counts
+        # come from the merged catalog's track tags (Plex styles is a native
+        # specialization the floor doesn't reach). Recompute + restamp, done.
+        if await catalog_active():
+            from app.catalog import views
+            await database.set_genre_cache(await views.genres())
+            await stamp_cache("genre_cache_computed_at")
+            return
         client = await get_plex_client()
         if not client:
             return
@@ -892,6 +1138,82 @@ def browse_index_building() -> bool:
     """True while a browse-index crawl is in flight — for the admin status
     badge (plan U6). Accessor so callers don't reach into the module global."""
     return _browse_index_refresh_running
+
+
+# ── unified catalog background refresh (2026-06-27 multi-source plan U6) ──────
+# Runs ALONGSIDE the browse-index refresh during Phase B: the catalog is the
+# track-grained, multi-source store U8 switches browse/search onto, but until a
+# new source type validates the browse-index is retained for rollback (plan U7),
+# so both populate from their triggers. Mirrors the browse-index refresh shape
+# (single-flight + don't-wipe guard, the latter living in scan.scan_and_replace).
+
+_catalog_refresh_running = False
+
+
+async def _refresh_catalog() -> None:
+    global _catalog_refresh_running
+    from app import database
+    from app.catalog import scan
+    try:
+        registry = await get_plex_client()
+        if not registry:
+            return
+        # Pass the Plex enabled-library set (possibly empty) — scan filters only
+        # Plex sources by it; non-Plex sources crawl in full.
+        enabled_keys = {lib["section_key"] for lib in await database.get_enabled_libraries()}
+        replaced = await scan.scan_and_replace(registry, enabled_keys)
+        if replaced:
+            await stamp_cache("catalog_computed_at")
+    except Exception:
+        _log.exception("Catalog refresh failed")
+    finally:
+        _catalog_refresh_running = False
+
+
+def trigger_catalog_refresh() -> None:
+    """Fire-and-forget unified-catalog rebuild. Single-flighted (mirrors
+    trigger_browse_index_refresh) so concurrent triggers can't stack full
+    cross-source crawls."""
+    global _catalog_refresh_running
+    if _catalog_refresh_running:
+        return
+    _catalog_refresh_running = True
+    task = asyncio.create_task(_refresh_catalog())
+    task.add_done_callback(_log_task_exc)
+
+
+def catalog_building() -> bool:
+    """True while a catalog crawl is in flight — for the admin scan-status badge
+    (plan U15). Accessor so callers don't reach into the module global."""
+    return _catalog_refresh_running
+
+
+async def scan_status() -> dict:
+    """Snapshot of catalog/scan state for the onboarding + scan-status surfaces
+    (plan U15/R19/R20). Source-neutral and the single source of truth for both
+    the guest empty-state picker and the admin scan badge:
+
+      - ``sources``  number of connected sources (0 = nothing connected → R19
+        zero-source state)
+      - ``scanning`` a catalog crawl is in flight (first scan or a rescan)
+      - ``scanned``  at least one catalog scan has completed (the
+        ``catalog_computed_at`` stamp exists)
+      - ``empty``    the catalog has no tracks
+
+    ``empty``/``scanned`` describe the catalog floor; a native Plex-only install
+    never populates it, so the guest browse consults this only to choose an
+    empty-state message when a browse response itself came back empty (the
+    distinction the four R19/R20 states need)."""
+    from app import database
+    from app.catalog import store
+    reg = await get_plex_client()
+    sources = len(getattr(reg, "sources", []) or []) if reg else 0
+    return {
+        "sources": sources,
+        "scanning": _catalog_refresh_running,
+        "scanned": bool(await database.get_setting("catalog_computed_at")),
+        "empty": await store.is_empty(),
+    }
 
 
 # ── artist grouping map (rule-norm → base_keys; 2026-06-22 plan U1) ──────────

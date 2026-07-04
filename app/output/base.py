@@ -7,7 +7,7 @@ from typing import Any, Protocol, runtime_checkable
 
 AdvanceCallback = Callable[[], Coroutine[Any, Any, Any]]
 
-from app.plex.models import Track
+from app.models import Track
 
 
 # Shared echo-guard window used by every backend that emits volume_changed

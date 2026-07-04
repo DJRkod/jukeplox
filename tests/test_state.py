@@ -7,6 +7,40 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
+async def test_registry_includes_local_source_when_configured():
+    """U11: a stored local source builds a LocalSource into the registry (the
+    additive wiring mirroring U10's Jellyfin path)."""
+    import app.state as st
+    import app.database as db
+    st.invalidate_plex_client()
+    with patch.object(db, "get_plex_servers", AsyncMock(return_value=[])), \
+         patch.object(db, "get_plex_config", AsyncMock(return_value=None)), \
+         patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_local_sources", AsyncMock(return_value=[
+             {"source_id": "local-1", "name": "Vinyl", "root_dir": "/music"}])):
+        reg = await st.get_plex_client()
+    st.invalidate_plex_client()
+    assert reg is not None
+    local = next(s for s in reg.sources if s.source_type == "local")
+    assert local.source_id == "local-1"
+    assert local.server_name == "Vinyl"
+
+
+async def test_registry_none_when_no_sources_at_all():
+    """AE6 additivity: the local loop is empty-safe — a zero-source install still
+    returns None (no registry), exactly as before U11."""
+    import app.state as st
+    import app.database as db
+    st.invalidate_plex_client()
+    with patch.object(db, "get_plex_servers", AsyncMock(return_value=[])), \
+         patch.object(db, "get_plex_config", AsyncMock(return_value=None)), \
+         patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_local_sources", AsyncMock(return_value=[])):
+        reg = await st.get_plex_client()
+    st.invalidate_plex_client()
+    assert reg is None
+
+
 async def test_startup_reconnect_calls_discover_then_set_device():
     """Without a cached address, falls through to discover_devices then set_device."""
     from app.state import _startup_reconnect
@@ -1553,3 +1587,285 @@ async def test_clear_closing_noop_when_inactive(monkeypatch):
     with patch.object(_bus.manager, "broadcast_to_all", bc):
         await st.clear_closing()
     bc.assert_not_awaited()
+
+
+# ── U13: source-neutral random floor + catalog-active predicate ───────────────
+
+async def test_catalog_active_true_with_non_plex_source():
+    import app.state as st
+    reg = MagicMock()
+    reg.sources = [MagicMock(source_type="plex"), MagicMock(source_type="jellyfin")]
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+        assert await st.catalog_active() is True
+
+
+async def test_catalog_active_false_for_plex_only_multiserver():
+    # AE6: one PlexSource PER server, so an all-Plex install has >1 source but
+    # stays native — gated on TYPE, not count.
+    import app.state as st
+    reg = MagicMock()
+    reg.sources = [MagicMock(source_type="plex"), MagicMock(source_type="plex")]
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+        assert await st.catalog_active() is False
+
+
+async def test_catalog_active_false_for_none_or_nonregistry():
+    import app.state as st
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=None)):
+        assert await st.catalog_active() is False
+    # A bare MagicMock's .sources is a Mock, not a list → native.
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=MagicMock())):
+        assert await st.catalog_active() is False
+
+
+async def _seed_shuffle_catalog(tmp_path, monkeypatch, tracks):
+    import app.database as database
+    from app.catalog import store
+    from app.config import Settings
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    await database.init_db()
+    holds = [{"entity_type": "track", "identity": t["identity"], "source_id": "jelly",
+              "provider_local_key": f"jelly:{t['identity']}", "priority": 0,
+              "server_name": "Jelly"} for t in tracks]
+    await store.replace_catalog(artists=[], albums=[], tracks=tracks, holds=holds)
+
+
+async def test_shuffle_provider_routes_to_catalog_when_active(tmp_path, monkeypatch):
+    """The whole-library random floor draws from the catalog (carrying holds for
+    play-time fallback) once a non-Plex source is connected — the Plex traversal
+    can't see Jellyfin/local tracks (U13)."""
+    import app.state as st
+    import app.database as database
+    await _seed_shuffle_catalog(tmp_path, monkeypatch, [
+        {"identity": "t1", "title": "Only", "title_base": "only", "artist": "A",
+         "artist_base_key": "a", "album": "Al", "album_identity": None, "duration_ms": 180000}])
+    try:
+        with patch.object(st, "catalog_active", AsyncMock(return_value=True)):
+            track = await st._shuffle_provider()
+        assert track is not None
+        assert track.id == "t1"
+        assert track.stream_key == "jelly:t1"
+        # Carries the priority-ordered holds so _holder_keys / fallback works.
+        assert [h["key"] for h in track.holds] == ["jelly:t1"]
+    finally:
+        await database.close_db()
+
+
+async def test_catalog_shuffle_band_filters_then_never_dead_ends(tmp_path, monkeypatch):
+    import app.state as st
+    import app.database as database
+    await _seed_shuffle_catalog(tmp_path, monkeypatch, [
+        {"identity": "short", "title": "S", "title_base": "s", "artist": "A",
+         "artist_base_key": "a", "album": "Al", "album_identity": None, "duration_ms": 60000},
+        {"identity": "long", "title": "L", "title_base": "l", "artist": "A",
+         "artist_base_key": "a", "album": "Al", "album_identity": None, "duration_ms": 600000}])
+    try:
+        # In-band [0,120s] → only the short track qualifies (deterministic).
+        t = await st._catalog_shuffle(0, 120000)
+        assert t.id == "short"
+        # Nothing fits [700s, ∞) → never dead-end: an unfiltered pick still returns.
+        t2 = await st._catalog_shuffle(700000, None)
+        assert t2 is not None and t2.id in {"short", "long"}
+    finally:
+        await database.close_db()
+
+
+async def test_catalog_shuffle_empty_catalog_returns_none(tmp_path, monkeypatch):
+    import app.state as st
+    import app.database as database
+    await _seed_shuffle_catalog(tmp_path, monkeypatch, [])
+    try:
+        assert await st._catalog_shuffle(None, None) is None
+    finally:
+        await database.close_db()
+
+
+# ── U15: scan-status snapshot (onboarding + scan states) ──────────────────────
+
+async def _u15_status_db(tmp_path, monkeypatch, scanning):
+    import app.state as st
+    import app.database as database
+    from app.config import Settings
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    monkeypatch.setattr(st, "_catalog_refresh_running", scanning)
+    await database.init_db()
+    return st, database
+
+
+async def test_scan_status_zero_sources(tmp_path, monkeypatch):
+    st, database = await _u15_status_db(tmp_path, monkeypatch, scanning=False)
+    try:
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=None)):
+            status = await st.scan_status()
+        assert status == {"sources": 0, "scanning": False, "scanned": False, "empty": True}
+    finally:
+        await database.close_db()
+
+
+async def test_scan_status_first_scan_building(tmp_path, monkeypatch):
+    st, database = await _u15_status_db(tmp_path, monkeypatch, scanning=True)
+    try:
+        reg = MagicMock(); reg.sources = [MagicMock(source_type="jellyfin")]
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+            status = await st.scan_status()
+        # First scan: a source connected, crawl in flight, nothing stamped/stored.
+        assert status == {"sources": 1, "scanning": True, "scanned": False, "empty": True}
+    finally:
+        await database.close_db()
+
+
+async def test_scan_status_scanned_with_content(tmp_path, monkeypatch):
+    st, database = await _u15_status_db(tmp_path, monkeypatch, scanning=False)
+    from app.catalog import store
+    try:
+        await store.replace_catalog(
+            artists=[], albums=[],
+            tracks=[{"identity": "t1", "title": "X", "title_base": "x", "artist": "A",
+                     "artist_base_key": "a", "album": "Al", "album_identity": None,
+                     "duration_ms": 1000}],
+            holds=[])
+        await database.set_setting("catalog_computed_at", "2026-06-30T00:00:00+00:00")
+        reg = MagicMock(); reg.sources = [MagicMock(source_type="jellyfin")]
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+            status = await st.scan_status()
+        assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": False}
+    finally:
+        await database.close_db()
+
+
+async def test_scan_status_scanned_but_empty(tmp_path, monkeypatch):
+    st, database = await _u15_status_db(tmp_path, monkeypatch, scanning=False)
+    try:
+        await database.set_setting("catalog_computed_at", "2026-06-30T00:00:00+00:00")
+        reg = MagicMock(); reg.sources = [MagicMock(source_type="local")]
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+            status = await st.scan_status()
+        # Distinct from zero-source: a finished scan that found nothing.
+        assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": True}
+    finally:
+        await database.close_db()
+
+
+# ── Play-data curation: unrecord_play / purge_play_track (plan U2) ────────────
+
+async def _curation_db(tmp_path, monkeypatch):
+    import app.database as database
+    from app.config import Settings
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    await database.init_db()
+    return database
+
+
+async def test_unrecord_play_decrements_all_three_counts(tmp_path, monkeypatch):
+    """AE1: removing one play rolls back the track, album, and artist counts."""
+    import app.state as st
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        for _ in range(5):
+            await database.increment_play_count("track", "t1")
+        for _ in range(8):
+            await database.increment_play_count("album", "Broken")
+        for _ in range(12):
+            await database.increment_play_count("artist", "NIN")
+        await st.unrecord_play("t1", "Broken", "NIN")
+        assert await database.get_play_count("track", "t1") == 4
+        assert await database.get_play_count("album", "Broken") == 7
+        assert await database.get_play_count("artist", "NIN") == 11
+    finally:
+        await database.close_db()
+
+
+async def test_unrecord_play_floors_at_zero(tmp_path, monkeypatch):
+    """AE2: nothing seeded → no count goes negative, call still succeeds."""
+    import app.state as st
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await st.unrecord_play("t1", "Broken", "NIN")
+        assert await database.get_play_count("track", "t1") == 0
+        assert await database.get_play_count("album", "Broken") == 0
+        assert await database.get_play_count("artist", "NIN") == 0
+    finally:
+        await database.close_db()
+
+
+async def test_unrecord_play_skips_empty_album_artist(tmp_path, monkeypatch):
+    """A track with an empty album/artist never created an ("album","") row, so
+    the inverse must not touch one (mirrors record_play's truthiness guards)."""
+    import app.state as st
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await database.increment_play_count("track", "t1")
+        await st.unrecord_play("t1", "", None)
+        assert await database.get_play_count("track", "t1") == 0
+        assert await database.get_all_play_counts("album") == []
+        assert await database.get_all_play_counts("artist") == []
+    finally:
+        await database.close_db()
+
+
+async def test_unrecord_play_consolidates_before_decrement(tmp_path, monkeypatch):
+    """Identity row = 0 but a stale sibling holds the real 5 → consolidate to 5,
+    then decrement to 4 (not 0). Prevents the over-correction the naive
+    decrement-then-delete would cause."""
+    import app.state as st
+    from app.catalog import store
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await store.register_alias("track", "I", "I")   # identity self-alias
+        await store.register_alias("track", "S", "I")   # stale sibling → identity
+        await database.set_play_count("track", "S", 5)   # real total on the stale key
+        await st.unrecord_play("I", None, None)
+        assert await database.get_play_count("track", "I") == 4
+        assert await database.get_play_count("track", "S") == 0   # sibling swept
+    finally:
+        await database.close_db()
+
+
+async def test_purge_play_track_is_track_scoped(tmp_path, monkeypatch):
+    """AE4: removing a track from Most Played deletes its count + meta and leaves
+    the shared album/artist name-keyed counts untouched."""
+    import app.state as st
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await database.increment_play_count("track", "t1")
+        await database.set_play_track_meta("t1", {"title": "X", "artist": "A"})
+        await database.increment_play_count("album", "Broken")
+        await database.increment_play_count("artist", "NIN")
+        await st.purge_play_track("t1")
+        assert await database.get_play_count("track", "t1") == 0
+        assert await database.get_all_play_track_meta() == {}
+        assert await database.get_play_count("album", "Broken") == 1
+        assert await database.get_play_count("artist", "NIN") == 1
+    finally:
+        await database.close_db()
+
+
+async def test_purge_play_track_survives_rescan_reconcile(tmp_path, monkeypatch):
+    """AE3 durability: seed a live identity + a stale sibling (real durable state,
+    not a fresh DB), purge, then a follow-up reconcile does NOT restore the count
+    and the track is off the leaderboard."""
+    import app.state as st
+    from app.catalog import store, migrate
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await store.replace_catalog(artists=[], albums=[], tracks=[
+            {"identity": "I", "title": "Wish", "title_base": "wish",
+             "artist": "NIN", "artist_base_key": "nin"}], holds=[])
+        await store.register_alias("track", "I", "I")
+        await store.register_alias("track", "S", "I")
+        await database.set_play_count("track", "I", 13)
+        await database.set_play_count("track", "S", 13)
+        await database.set_play_track_meta("I", {"title": "Wish"})
+        await database.set_play_track_meta("S", {"title": "Wish"})
+        await st.purge_play_track("I")
+        assert await database.get_play_count("track", "I") == 0
+        assert await database.get_play_count("track", "S") == 0
+        await migrate.migrate_metadata()   # a subsequent Rescan
+        assert await database.get_play_count("track", "I") == 0
+        assert [r for r in await database.get_top_played_tracks(None)
+                if r["track_id"] in ("I", "S")] == []
+    finally:
+        await database.close_db()

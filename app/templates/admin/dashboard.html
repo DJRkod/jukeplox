@@ -183,6 +183,14 @@
       border-radius: 6px; padding: .4rem .7rem; font-size: .85rem; }
     #settings input:focus, #settings select:focus { outline: none; border-color: var(--accent); }
     #settings .closing-fields { display: flex; flex-direction: column; gap: .45rem; }
+    /* Sources sub-blocks reuse the Setup subhead + input treatment (multi-source U14). */
+    #libraries .settings-subhead { font-size: .7rem; letter-spacing: .14em; text-transform: uppercase;
+      color: var(--accent); font-weight: 600; opacity: .9; margin: 1.1rem 0 .6rem; }
+    #libraries .settings-subhead:first-of-type { margin-top: .25rem; }
+    #libraries input[type=text], #libraries input[type=password] {
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: .4rem .7rem; font-size: .85rem; }
+    #libraries input:focus { outline: none; border-color: var(--accent); }
     .lib-item { display: flex; align-items: center; gap: .75rem; padding: .4rem 0; }
     .lib-item label { cursor: pointer; font-size: .9rem; color: var(--text); }
     .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: var(--surface2); color: var(--text); padding: .75rem 1.25rem; border-radius: 8px; font-size: .9rem; box-shadow: 0 4px 20px rgba(0,0,0,.4); opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 9999; }
@@ -382,13 +390,12 @@
     .admin-shell .search-field.has-text .search-clear { opacity: 1; pointer-events: auto; transform: translateY(-50%) scale(1); }
     .admin-shell .search-clear:hover, .admin-shell .search-clear:focus-visible { background: var(--accent); color: var(--on-accent); outline: none; }
     .admin-shell .search-clear:active { transform: translateY(-50%) scale(.82) rotate(90deg); }
-    .admin-shell #search-filter-tabs { display: flex; gap: .4rem; margin: .6rem 0; flex-wrap: wrap; }
-    .admin-shell .filter-tab { padding: .25rem .7rem; border-radius: 999px; background: var(--surface2); font-size: .78rem; cursor: pointer; color: var(--accent-ui, var(--accent)); border: none; }
+    /* #search-bar (sticky docked bar) + #search-filter-tabs + .filter-tab now live
+       single-source in static/browse/rail.css (2026-07-02 ce-debug). */
     /* div.list-art = the 🎷 placeholder only — img.list-art is real artwork
        and must never be tinted (U7 sweep fix; there is no -placeholder
        suffix variant of list-art). */
     .np-placeholder, .qi-art-placeholder, .qs-art-placeholder, div.list-art { filter: var(--sax-filter, none); }
-    .admin-shell .filter-tab.active { background: var(--accent-grad, var(--accent)); color: var(--on-accent); }
     /* Viewport-relative caps (2026-06-10 debug): fixed 480/700px ignored the
        window — panes overflowed short desktop windows and forced page-scroll
        rail traversal on phones. The px floors keep the lists usable when the
@@ -415,6 +422,44 @@
     .overflow-menu button:last-child { border-bottom: none; color: var(--muted); }
     .overflow-menu button:disabled { color: #555; cursor: not-allowed; }
     .overflow-menu button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    /* ── Recent Plays curation panel (2026-07-03 plan; Direction A) ──────────
+       Admin-only Setup chrome, collapsed by default. Compact rows + page pager
+       over the ~50-entry live history the /admin/queue payload already carries. */
+    #recent-plays .rp-head { display: flex; align-items: center; gap: .6rem; width: 100%;
+      background: none; border: none; padding: 0; margin: 0; cursor: pointer; text-align: left;
+      font-size: .75rem; color: #888; text-transform: uppercase; letter-spacing: .06em; font-family: inherit; }
+    #recent-plays .rp-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    #recent-plays .rp-chev { transition: transform .15s ease; }
+    #recent-plays.rp-collapsed .rp-chev { transform: rotate(-90deg); }
+    #recent-plays .rp-count { margin-left: auto; font-size: .7rem; color: var(--muted);
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 999px;
+      padding: .1rem .5rem; text-transform: none; letter-spacing: 0; }
+    /* No max-height/overflow: the panel paginates at 10 rows, so the body fits
+       its page (10 rows + pager) without an internal scrollbar — the Setup page
+       scrolls instead. */
+    #recent-plays .rp-body { margin-top: 1rem; }
+    #recent-plays.rp-collapsed .rp-body { display: none; }
+    #recent-plays .rp-row { display: flex; align-items: center; gap: .7rem; padding: .5rem .1rem;
+      border-bottom: 1px solid var(--divider); min-width: 0; }
+    #recent-plays .rp-row:last-child { border-bottom: none; }
+    #recent-plays .rp-art { width: 30px; height: 30px; border-radius: 4px; flex: none;
+      background: var(--surface2); object-fit: cover; }
+    #recent-plays .rp-meta { min-width: 0; flex: 1; }
+    #recent-plays .rp-t { font-size: .9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #recent-plays .rp-s { font-size: .78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #recent-plays .rp-when { font-size: .75rem; color: var(--muted); white-space: nowrap; flex: none; }
+    #recent-plays .rp-x { min-width: 44px; height: 44px; display: grid; place-items: center; flex: none;
+      background: transparent; border: 1px solid transparent; border-radius: 8px; color: var(--muted);
+      cursor: pointer; font-size: 1rem; }
+    #recent-plays .rp-x:hover, #recent-plays .rp-x:focus-visible { background: #7f1d1d; color: #fca5a5;
+      border-color: #7f1d1d; outline: none; }
+    #recent-plays .rp-empty { color: var(--muted); font-size: .85rem; padding: .5rem .1rem; }
+    #recent-plays .rp-pager { display: flex; align-items: center; justify-content: center; gap: .75rem; margin-top: .9rem; }
+    #recent-plays .rp-pager .rp-nav { min-width: 44px; min-height: 44px; background: var(--surface2);
+      color: var(--text); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: .8rem; padding: 0 .7rem; }
+    #recent-plays .rp-pager .rp-nav:disabled { opacity: .35; cursor: default; }
+    #recent-plays .rp-pager .rp-lbl { font-size: .78rem; color: var(--muted); min-width: 9ch; text-align: center; }
   </style>
 </head>
 <body>
@@ -484,16 +529,18 @@
       <div id="browse-container" role="region" aria-label="Browse music">
         <!-- Search pane -->
         <div id="search-view" class="view active">
-          <div class="search-field">
-            <input type="search" id="search-input" placeholder="Search tracks, albums, artists, genres…">
-            <button class="search-clear" type="button" aria-label="Clear search">✕</button>
-          </div>
-          <div id="search-filter-tabs">
-            <button class="filter-tab active" data-filter="all">All</button>
-            <button class="filter-tab" data-filter="artists">Artists</button>
-            <button class="filter-tab" data-filter="tracks">Tracks</button>
-            <button class="filter-tab" data-filter="albums">Albums</button>
-            <button class="filter-tab" data-filter="genres">Genres</button>
+          <div id="search-bar">
+            <div class="search-field">
+              <input type="search" id="search-input" placeholder="Search tracks, albums, artists, genres…">
+              <button class="search-clear" type="button" aria-label="Clear search">✕</button>
+            </div>
+            <div id="search-filter-tabs">
+              <button class="filter-tab active" data-filter="all">All</button>
+              <button class="filter-tab" data-filter="artists">Artists</button>
+              <button class="filter-tab" data-filter="tracks">Tracks</button>
+              <button class="filter-tab" data-filter="albums">Albums</button>
+              <button class="filter-tab" data-filter="genres">Genres</button>
+            </div>
           </div>
           <div id="search-results"><p class="a-loading">Type to search your Plex library.</p></div>
         </div>
@@ -563,15 +610,65 @@
     </section>
 
     <!-- Libraries -->
+    <!-- ── Libraries: connected sources (connect/remove/rescan/priority) +
+         Plex library selection, unified into one panel (multi-source U14) ──── -->
     <section id="libraries">
       <h2>Libraries</h2>
-      <div id="library-list"><p style="color:#555;font-size:.85rem">Loading…</p></div>
-      <div style="margin-top:.75rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+
+      <div class="settings-subhead">Sources</div>
+      <p class="muted" style="font-size:.85rem;color:#888;margin:.25rem 0 .6rem">
+        Connected media sources, highest playback priority first. Reorder with the
+        arrows; the order applies to the next track played.</p>
+      <div id="sources-list"><p style="color:#555;font-size:.85rem">Loading…</p></div>
+      <div id="sources-scan-status" class="muted" style="font-size:.82rem;margin-top:.4rem;display:none"></div>
+      <div style="margin-top:.75rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" id="btn-connect-plex">Connect Plex</button>
-        <button class="btn btn-sm" id="btn-rescan-libs" onclick="adminRescan()" style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Rescan Libraries</button>
-        <span id="index-status" class="muted" style="font-size:.8rem;color:#888"></span>
+        <button class="btn btn-primary btn-sm" id="btn-connect-jellyfin-toggle">Connect Jellyfin</button>
+        <button class="btn btn-primary btn-sm" id="btn-connect-local-toggle">Connect Local Folder</button>
+        <button class="btn btn-sm" id="btn-rescan-sources"
+                style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Rescan Sources</button>
         <span id="plex-connect-spinner" style="display:none;font-size:.85rem;color:#888">Waiting for Plex authorization…</span>
         <span id="plex-connect-error" style="display:none;font-size:.85rem;color:#f87171"></span>
+      </div>
+
+      <!-- Jellyfin connect: revealed by the "Connect Jellyfin" button, mirroring
+           the Plex connect affordance (a button, not an always-open form). -->
+      <div id="jf-connect-form" style="display:none;margin-top:.6rem;padding:.7rem;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
+        <div class="panel-row" style="flex-wrap:wrap;gap:.5rem;align-items:center;margin:0">
+          <input id="jf-url" type="text" placeholder="http://jellyfin.local:8096"
+                 style="flex:1;min-width:220px">
+          <input id="jf-user" type="text" placeholder="Username" autocomplete="username"
+                 style="width:140px">
+          <input id="jf-pass" type="password" placeholder="Password"
+                 autocomplete="current-password" style="width:140px">
+          <input id="jf-name" type="text" placeholder="Name (optional)" style="width:140px">
+          <button class="btn btn-primary btn-sm" id="btn-connect-jellyfin">Connect</button>
+          <button class="btn btn-sm" id="btn-cancel-jellyfin"
+                  style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+        <span id="jf-connect-error" style="display:none;font-size:.85rem;color:#f87171;margin-top:.4rem"></span>
+      </div>
+
+      <!-- Local folder connect: revealed by the "Connect Local Folder" button,
+           mirroring the Jellyfin connect affordance. A directory path (read-only;
+           no credential) — the server scans tagged audio under it. -->
+      <div id="local-connect-form" style="display:none;margin-top:.6rem;padding:.7rem;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
+        <div class="panel-row" style="flex-wrap:wrap;gap:.5rem;align-items:center;margin:0">
+          <input id="local-dir" type="text" placeholder="/music (a folder of tagged audio files)"
+                 style="flex:1;min-width:260px">
+          <input id="local-name" type="text" placeholder="Name (optional)" style="width:140px">
+          <button class="btn btn-primary btn-sm" id="btn-connect-local">Connect</button>
+          <button class="btn btn-sm" id="btn-cancel-local"
+                  style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+        <span id="local-connect-error" style="display:none;font-size:.85rem;color:#f87171;margin-top:.4rem"></span>
+      </div>
+
+      <div class="settings-subhead" style="margin-top:1.1rem">Plex libraries</div>
+      <div id="library-list"><p style="color:#555;font-size:.85rem">Loading…</p></div>
+      <div style="margin-top:.6rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+        <button class="btn btn-sm" id="btn-rescan-libs" onclick="adminRescan()" style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Rescan Libraries</button>
+        <span id="index-status" class="muted" style="font-size:.8rem;color:#888"></span>
       </div>
     </section>
 
@@ -634,6 +731,14 @@
           <option value="heuristic">Genre/artist heuristic only</option>
           <option value="random">Random only</option>
         </select>
+      </div>
+      <div class="panel-row" id="surprise-source-note" style="display:none">
+        <label></label>
+        <div class="field-prose muted" style="font-size:.82rem">
+          A non-Plex source is connected, so Surprise Me uses whole-library random
+          across all your sources. The Plex similarity options above only apply to
+          a Plex-only library.
+        </div>
       </div>
       <div class="panel-row">
         <label>Surprise variety:</label>
@@ -802,6 +907,25 @@
       <div class="panel-row">
         <button class="btn btn-sm" id="btn-add-exclusion">Add Rule</button>
         <button class="btn btn-primary btn-sm" id="btn-save-exclusions">Save Exclusions</button>
+      </div>
+    </section>
+
+    <!-- Recent Plays curation (2026-07-03 plan): admin-only panel to prune recent
+         plays. Collapsed by default; the ✕ that used to sit on the shared history
+         strip lives here now. Rendered by renderRecentPlays in static/admin/app.js
+         (admin Setup chrome — no shared-module fork). -->
+    <section id="recent-plays" class="rp-collapsed">
+      <button type="button" class="rp-head" id="recent-plays-head"
+              aria-expanded="false" aria-controls="recent-plays-list">
+        <span class="rp-chev" aria-hidden="true">▾</span>
+        <span class="rp-title">Recent Plays</span>
+        <span class="rp-count" id="recent-plays-count">0 plays</span>
+      </button>
+      <div class="rp-body">
+        <p class="rule-help">Remove an accidental or test play — it drops from history and its
+          play is un-counted (track, album, and artist each −1).</p>
+        <div id="recent-plays-list"></div>
+        <div class="rp-pager" id="recent-plays-pager"></div>
       </div>
     </section>
 

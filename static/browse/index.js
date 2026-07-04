@@ -1295,9 +1295,15 @@
 
   // ── Queue-append ──────────────────────────────────────────────────────────
 
-  async function addTrack(trackId, title, track) {
+  async function addTrack(trackId, title, track, sourceServerName, sourceLabel) {
     if (_config.isLocked && _config.isLocked()) { _config.toast('Queuing is paused by the host'); return; }
-    const [status, data] = await _api('POST', _queueEndpoint(), { track_id: trackId });
+    // Catalog "Play From Source…" (parity U3): re-POST the same catalog track_id
+    // plus the chosen source's server_name. The server reorders the track's
+    // holds so that source plays first (a preference — U9 play-time fallback
+    // still applies). Absent on a plain tap = default highest-priority source.
+    const body = { track_id: trackId };
+    if (sourceServerName) body.source_server_name = sourceServerName;
+    const [status, data] = await _api('POST', _queueEndpoint(), body);
     if (status === 423) { _config.toast('Queuing is paused by the host'); return; }
     // Flood Control (2026-06-16): when the admin toggle is on, the guest
     // endpoint hard-rejects a re-add of a playing/queued track with 409. Tell
@@ -1307,6 +1313,7 @@
     if (status === 409) { _config.toast("That track's already in the queue"); return; }
     if (status === 200) {
       if (data && data.warning === 'already_in_queue') _config.toast('Already in queue — added anyway');
+      else if (sourceLabel) _config.toast(`Added from ${sourceLabel}`);
       else _config.toast('Added to queue!');
       // Hand the append receipt to the page (remove-own-queued-tracks U4).
       // The guest page persists it so it can show a remove (✕) on this entry
@@ -1322,14 +1329,15 @@
     }
   }
 
-  async function addAlbum(albumId, sourceServerName) {
+  async function addAlbum(albumId, sourceServerName, sourceLabel) {
     if (_config.isLocked && _config.isLocked()) { _config.toast('Queuing is paused by the host'); return; }
     const body = { album_id: albumId };
     if (sourceServerName) body.source_server_name = sourceServerName;
     const [status, data] = await _api('POST', _queueEndpoint(), body);
     if (status === 423) { _config.toast('Queuing is paused by the host'); return; }
     if (status === 200) {
-      _config.toast(`Added ${data.tracks_added} track(s) to queue!`);
+      if (sourceLabel) _config.toast(`Added from ${sourceLabel}: ${data.tracks_added} track(s)`);
+      else _config.toast(`Added ${data.tracks_added} track(s) to queue!`);
       // Album batch receipt → the page stores it as one group so the whole
       // album can be removed as a unit (U4). Guest-only, as above.
       if (data && data.entries && data.entries.length && _config.onQueued) {
@@ -1582,6 +1590,20 @@
       .forEach(row => _applyRatingTags(row));
   }
 
+  // Type-qualified source label for catalog "Play From Source…" entries (parity
+  // U3): "Plex: Home" / "Jellyfin: Den" — disambiguates same-named servers that
+  // a bare name would collide. Falls back to the bare name when no type is
+  // present (native multi-Plex sources carry no source_type).
+  const _SOURCE_TYPE_LABELS = { plex: 'Plex', jellyfin: 'Jellyfin', local: 'Local' };
+  function _typeLabel(t) {
+    return _SOURCE_TYPE_LABELS[t] || (t ? t.charAt(0).toUpperCase() + t.slice(1) : '');
+  }
+  function _sourceLabel(s) {
+    const name = s.server_name || 'Server';
+    const tl = _typeLabel(s.source_type);
+    return tl ? `${tl}: ${name}` : name;
+  }
+
   function _trackKebabItems(t, sources, ctx, row) {
     const items = [];
     const pane = _paneFor(row);
@@ -1598,7 +1620,22 @@
         action: () => browseToAlbum(t.album_id, t.album, { pane }),
       });
     }
-    if (sources && sources.length > 1) {
+    // Per-source override. CATALOG mode (parity U3): the merged track carries its
+    // own holds on `t.sources` = [{server_name, source_type}]; re-POST the single
+    // catalog track_id plus the chosen source (a preference — U9 fallback still
+    // applies), labelled by type. NATIVE mode: each `sources` entry carries its
+    // own distinct per-server track (deduplicateTracks-built); enqueue that copy.
+    const catalogSources = Array.isArray(t.sources) ? t.sources : null;
+    if (catalogSources && catalogSources.length > 1) {
+      items.push({
+        label: 'Play from source…',
+        action: () => _openSheet(catalogSources.map(s => ({
+          label: _sourceLabel(s),
+          disabled: locked,
+          action: () => addTrack(t.track_id || t.id, t.title, t, s.server_name, _sourceLabel(s)),
+        })), row.querySelector('.kebab-btn')),
+      });
+    } else if (sources && sources.length > 1) {
       items.push({
         label: 'Play from source…',
         action: () => _openSheet(sources.map(s => ({
@@ -1606,6 +1643,19 @@
           disabled: locked,
           action: () => addTrack(s.track.track_id || s.track.id, s.track.title, s.track),
         })), row.querySelector('.kebab-btn')),
+      });
+    }
+    // Admin curation (plan U5, R4/R7/R8): remove this track from Most Played.
+    // Scoped to the Most Played context (ctx.mostPlayed) so it never appears on
+    // ordinary browse rows. Inline two-step confirm (a second sheet), never a
+    // native window.confirm — it deletes the accumulated count.
+    if (_config.authMode === 'admin' && ctx && ctx.mostPlayed) {
+      items.push({
+        label: 'Remove from Most Played',
+        action: () => _openSheet([{
+          label: `Confirm: remove “${t.title}” (clears its count)`,
+          action: () => _removeFromMostPlayed(t, row),
+        }], row.querySelector('.kebab-btn')),
       });
     }
     return items;
@@ -1746,15 +1796,24 @@
     const locked = _config.isLocked && _config.isLocked();
     const sources = Array.isArray(album.sources) ? album.sources : [];
     const multi = sources.length > 1;
+    // CATALOG mode (parity U3): catalog album sources carry a source_type. The
+    // catalog enqueue addresses by catalog IDENTITY (album.id), NOT the provider
+    // album id in sources[].album_id (that key belongs to a single backend and
+    // the catalog branch can't resolve it). Native mode keeps addressing by the
+    // chosen server's provider album id, as before.
+    const isCatalog = sources.some(s => s.source_type);
     const items = [{
       label: 'Queue release',
       disabled: locked,
-      // R4: deduplicated releases queue the priority source's id+server;
+      // R4 (native): deduplicated releases queue the priority source's id+server;
       // absent/single sources (incl. appears_on dict rows, which carry no
-      // sources at all) queue exactly as before.
-      action: () => (multi
-        ? addAlbum(sources[0].album_id, sources[0].server_name)
-        : addAlbum(album.id, null)),
+      // sources at all) queue exactly as before. Catalog: queue the identity,
+      // default source = highest priority (no explicit pick).
+      action: () => (isCatalog
+        ? addAlbum(album.id, null)
+        : (multi
+            ? addAlbum(sources[0].album_id, sources[0].server_name)
+            : addAlbum(album.id, null))),
     }];
     if (album.artist) {
       items.push({
@@ -1770,9 +1829,13 @@
       items.push({
         label: 'Play from source…',
         action: () => _openSheet(sources.map(s => ({
-          label: `Play from ${s.server_name || 'Server'}`,
+          label: isCatalog ? _sourceLabel(s) : `Play from ${s.server_name || 'Server'}`,
           disabled: locked,
-          action: () => addAlbum(s.album_id, s.server_name),
+          // Catalog: identity + chosen source (server-side holds reorder).
+          // Native: the chosen server's provider album id.
+          action: () => (isCatalog
+            ? addAlbum(album.id, s.server_name, _sourceLabel(s))
+            : addAlbum(s.album_id, s.server_name)),
         })), anchor),
       });
     }
@@ -2232,6 +2295,28 @@
   let artistsData = null;
   let artistsSort = 'alpha_asc';
 
+  // Onboarding & scan empty states (plan U15/R19/R20). When a top-level browse
+  // list comes back empty, the message depends on WHY: no sources connected at
+  // all (ask the host to connect one), a first scan still building the library,
+  // or a finished scan that found nothing — three distinct states, not one
+  // generic "nothing here". Falls back to the plain "No X found." text if the
+  // status probe fails, so an empty list is never a dead end.
+  async function _renderBrowseEmptyState(el, noun) {
+    let status = null;
+    try { [, status] = await _api('GET', '/api/scan-status'); } catch (_) { /* fall through to plain */ }
+    let msg;
+    if (status && status.sources === 0) {
+      msg = 'No music sources connected yet. Ask the host to connect one in Setup → Libraries.';
+    } else if (status && status.scanning) {
+      msg = 'Your library is being prepared… this can take a minute. Check back shortly.';
+    } else if (status) {
+      msg = 'No music found.';
+    } else {
+      msg = 'No ' + noun + ' found.';
+    }
+    el.innerHTML = '<div class="loading">' + _esc(msg) + '</div>';
+  }
+
   async function loadArtists() {
     if (artistsData) { return renderArtistsList(); }
     const epoch = _artistsPaneEpoch;
@@ -2239,7 +2324,7 @@
     el.innerHTML = '<div class="loading">Loading…</div>';
     const [, data] = await _api('GET', '/api/browse/artists');
     if (epoch !== _artistsPaneEpoch) return;   // a drill claimed the pane mid-fetch
-    if (!data || !data.length) { el.innerHTML = '<div class="loading">No artists found.</div>'; return; }
+    if (!data || !data.length) { return _renderBrowseEmptyState(el, 'artists'); }
     artistsData = data;
     return renderArtistsList();
   }
@@ -2455,7 +2540,7 @@
     el.innerHTML = '<div class="loading">Loading…</div>';
     const [, data] = await _api('GET', '/api/browse/albums');
     if (epoch !== _albumsPaneEpoch) return;   // a drill claimed the pane mid-fetch
-    if (!data || !data.length) { el.innerHTML = '<div class="loading">No albums found.</div>'; return; }
+    if (!data || !data.length) { return _renderBrowseEmptyState(el, 'albums'); }
     albumsData = data;
     return renderAlbumsList();
   }
@@ -3019,13 +3104,28 @@
     _mostPlayedLoaded = true;
     el.innerHTML = '';
     data.forEach(track => {
-      const row = makeTrackRow(track);
+      const row = makeTrackRow(track, { mostPlayed: true });
       const count = document.createElement('span');
       count.className = 'mp-count';
       count.textContent = `${track.play_count}×`;
       row.insertBefore(count, row.firstChild);
       el.appendChild(row);
     });
+  }
+
+  // Admin curation (plan U5): remove a track from Most Played. Non-optimistic —
+  // the row is removed only on a 2xx; on failure the row stays and a toast fires.
+  // Resetting _mostPlayedLoaded re-fetches (and shows the empty state) next visit.
+  async function _removeFromMostPlayed(t, row) {
+    const tid = t.track_id || t.id;
+    const [status] = await _api('POST', '/admin/most-played/remove', { track_id: tid });
+    if (status >= 200 && status < 300) {
+      if (row && row.parentNode) row.parentNode.removeChild(row);
+      _mostPlayedLoaded = false;
+      return true;
+    }
+    _config.toast('Could not remove from Most Played');
+    return false;
   }
 
   // ── Highest Rated leaderboard (2026-06-26 ratings-and-tags plan U7) ─────────
@@ -3238,6 +3338,12 @@
   let lastSearchData = null;
   let lastSearchQuery = '';
   let searchFilter = 'all';
+  // Per-filter-tab scroll memory within a single search (2026-07-01 ce-debug).
+  // Keyed by filter name → scrollTop. Switching tabs rebuilds #search-results in
+  // place; on guest the scroller is the ANCESTOR (#content), so without this an
+  // unvisited tab inherited the prior tab's depth and opened mid-list. Reset on
+  // each new query / clear so tabs never carry a prior search's position.
+  let _searchTabScroll = {};
   // Tiered search (plan 2026-06-14-005). Tier 1 = the hub-search results
   // already on screen; Tier 2 = a broader literal title-substring pass
   // (/api/search/broad) auto-loaded a page at a time as the user scrolls to
@@ -3254,10 +3360,20 @@
   function _wireSearch() {
     document.querySelectorAll('.filter-tab').forEach(tab => {
       tab.addEventListener('click', () => {
+        const nextFilter = tab.dataset.filter;
+        // Remember the OUTGOING tab's depth before the in-place rebuild, then
+        // land the INCOMING tab at its own remembered depth — or the top if it
+        // hasn't been scrolled yet. _scrollOwner resolves the real scroller on
+        // both pages (guest: ancestor #content; admin: #search-results itself),
+        // so the fix is uniform.
+        const outOwner = _scrollOwner(document.getElementById('search-results'));
+        if (outOwner) _searchTabScroll[searchFilter] = outOwner.scrollTop;
         document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
         tab.classList.add('active');
-        searchFilter = tab.dataset.filter;
+        searchFilter = nextFilter;
         if (lastSearchData) renderSearchResults(lastSearchData);
+        const inOwner = _scrollOwner(document.getElementById('search-results'));
+        if (inOwner) inOwner.scrollTop = _searchTabScroll[nextFilter] || 0;
       });
     });
     const input = document.getElementById('search-input');
@@ -3281,6 +3397,7 @@
         document.getElementById('search-results').innerHTML = '';
         lastSearchData = null;
         lastSearchQuery = '';
+        _searchTabScroll = {};
         if (searchAbortController) { searchAbortController.abort(); searchAbortController = null; }
         return;
       }
@@ -3301,6 +3418,8 @@
   async function doSearch(q) {
     if (searchAbortController) searchAbortController.abort();
     searchAbortController = new AbortController();
+    // A new query starts every filter tab fresh at the top.
+    _searchTabScroll = {};
     const el = document.getElementById('search-results');
     el.innerHTML = '<div class="loading">Searching…</div>';
     try {

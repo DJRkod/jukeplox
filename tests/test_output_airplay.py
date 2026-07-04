@@ -647,7 +647,7 @@ async def test_play_spawns_cliraop_for_raop_only_receiver(airplay_module, monkey
     # The WiiM Pro shape from the TrueNAS logs — just am/et/md/cn,
     # no features and no pk. _use_ap2 returns False.
     backend._device_addr["wiim"] = (
-        "42FDF3255868@WiiM Pro-5868", "192.168.1.42", 7000,
+        "A1B2C3D4E5F6@WiiM Pro-E5F6", "192.168.1.42", 7000,
         {"am": "WiiM Pro", "et": "0,1", "md": "0,1,2", "cn": "0,1,2,3"},
     )
     await backend.set_device("wiim")
@@ -1601,14 +1601,14 @@ def test_ensure_deviceid_synthesizes_from_name_prefix(airplay_module):
     """cliap2 logs `airplay: AirPlay device 'X' is missing a device ID`
     when --txt doesn't carry `deviceid`. The avahi-advertised RAOP
     service name follows `<12-hex>@<friendly>` (e.g.
-    `42FDF3255868@WiiM Pro-5868`); extract the MAC and inject as a
+    `A1B2C3D4E5F6@WiiM Pro-E5F6`); extract the MAC and inject as a
     colon-separated `deviceid` so cliap2 has the id its RAOP code
     matches against."""
     out = airplay_module._ensure_deviceid(
-        "42FDF3255868@WiiM Pro-5868",
+        "A1B2C3D4E5F6@WiiM Pro-E5F6",
         {"am": "WiiM Pro", "cn": "0,1,2,3"},
     )
-    assert out["deviceid"] == "42:FD:F3:25:58:68"
+    assert out["deviceid"] == "A1:B2:C3:D4:E5:F6"
     # Other entries preserved.
     assert out["am"] == "WiiM Pro"
     assert out["cn"] == "0,1,2,3"
@@ -1619,7 +1619,7 @@ def test_ensure_deviceid_does_not_overwrite_existing(airplay_module):
     keeps the advertised value — never silently replace the speaker's
     own identity."""
     out = airplay_module._ensure_deviceid(
-        "42FDF3255868@WiiM Pro-5868",
+        "A1B2C3D4E5F6@WiiM Pro-E5F6",
         {"deviceid": "AA:BB:CC:DD:EE:FF", "am": "WiiM Pro"},
     )
     assert out["deviceid"] == "AA:BB:CC:DD:EE:FF"
@@ -1641,7 +1641,7 @@ def test_ensure_deviceid_returns_new_dict_not_mutation(airplay_module):
     """Caller's TXT dict must not be mutated — defensive against future
     callers who pass a shared/cached TXT dict from discovery state."""
     original = {"am": "WiiM Pro"}
-    out = airplay_module._ensure_deviceid("42FDF3255868@WiiM Pro-5868", original)
+    out = airplay_module._ensure_deviceid("A1B2C3D4E5F6@WiiM Pro-E5F6", original)
     assert out is not original
     assert "deviceid" not in original
 
@@ -1718,7 +1718,7 @@ def test_build_cliap2_args_normalises_raw_discovery_txt(airplay_module):
     the contract regardless of how many spawn call sites exist."""
     args = airplay_module._build_cliap2_args(
         binary="/usr/local/bin/cliap2",
-        name="42FDF3255868@WiiM Pro-5868",
+        name="A1B2C3D4E5F6@WiiM Pro-E5F6",
         host="192.168.0.117",
         port=7000,
         txt={"ft": "0x445D0A00,0x1C340", "am": "WiiM Pro", "cn": "0,1"},
@@ -1733,7 +1733,7 @@ def test_build_cliap2_args_normalises_raw_discovery_txt(airplay_module):
     txt_value = args[args.index("--txt") + 1]
     assert '"features=0x445D0A00,0x1C340"' in txt_value
     assert '"model=WiiM Pro"' in txt_value
-    assert '"deviceid=42:FD:F3:25:58:68"' in txt_value
+    assert '"deviceid=A1:B2:C3:D4:E5:F6"' in txt_value
 
 
 @pytest.mark.asyncio
@@ -2047,7 +2047,7 @@ async def test_discover_falls_back_to_dbus(airplay_module, monkeypatch, tmp_path
 
     async def fake_dbus(service_type):
         assert service_type == "_raop._tcp.local"
-        return [("42FDF3255868@WiiM Pro-5868", "192.168.0.50", 7000, None, txt)]
+        return [("A1B2C3D4E5F6@WiiM Pro-E5F6", "192.168.0.50", 7000, None, txt)]
 
     monkeypatch.setattr(mdns_zeroconf, "discover", zc_none)
     monkeypatch.setattr(mdns_dbus, "discover", fake_dbus)
@@ -2055,9 +2055,9 @@ async def test_discover_falls_back_to_dbus(airplay_module, monkeypatch, tmp_path
     backend = airplay_module.AirPlayBackend()
     devices = await backend.discover_devices()
     assert [d.id for d in devices] == ["192.168.0.50:7000"]
-    assert devices[0].name == "WiiM Pro-5868"  # MAC prefix stripped for display
+    assert devices[0].name == "WiiM Pro-E5F6"  # MAC prefix stripped for display
     # Raw avahi name retained in the cache (cliap2 _ensure_deviceid needs it).
-    assert backend._device_addr["192.168.0.50:7000"][0] == "42FDF3255868@WiiM Pro-5868"
+    assert backend._device_addr["192.168.0.50:7000"][0] == "A1B2C3D4E5F6@WiiM Pro-E5F6"
 
 
 # ── U1: _strip_raop_mac_prefix helper + display-name integration ─────────────
@@ -2067,7 +2067,7 @@ def test_strip_raop_mac_prefix_strips_canonical_form(airplay_module):
     """Avahi RAOP service names follow `<12-hex-mac>@<friendly>`; the canonical
     shape strips to just the friendly part so the picker shows clean labels."""
     strip = airplay_module._strip_raop_mac_prefix
-    assert strip("42FDF3255868@WiiM Pro-5868") == "WiiM Pro-5868"
+    assert strip("A1B2C3D4E5F6@WiiM Pro-E5F6") == "WiiM Pro-E5F6"
     assert strip("14EA63E0F446@JBL Charge 5 Wi-Fi SE") == "JBL Charge 5 Wi-Fi SE"
 
 
@@ -2093,12 +2093,12 @@ def test_strip_raop_mac_prefix_handles_empty(airplay_module):
 
 
 def test_strip_raop_mac_prefix_falls_back_when_strip_would_be_empty(airplay_module):
-    """If a name is JUST the prefix (`42FDF3255868@`), stripping would leave
+    """If a name is JUST the prefix (`A1B2C3D4E5F6@`), stripping would leave
     the display name empty — the picker would show a blank entry. Fall back
     to the raw form in that case so the operator can still identify the
     device by its hex id."""
     strip = airplay_module._strip_raop_mac_prefix
-    assert strip("42FDF3255868@") == "42FDF3255868@"
+    assert strip("A1B2C3D4E5F6@") == "A1B2C3D4E5F6@"
 
 
 @pytest.mark.asyncio
@@ -2112,7 +2112,7 @@ async def test_discover_devices_strips_mac_prefix_from_display_name(
 
     from app.output import mdns_zeroconf
 
-    raw_avahi_name = "42FDF3255868@WiiM Pro-5868"
+    raw_avahi_name = "A1B2C3D4E5F6@WiiM Pro-E5F6"
     txt = {"am": "WiiM", "ft": "0x445F8A00,0x1C340"}
 
     async def fake_discover(service_type, aiozc=None):
@@ -2124,7 +2124,7 @@ async def test_discover_devices_strips_mac_prefix_from_display_name(
     devices = await backend.discover_devices()
 
     assert len(devices) == 1
-    assert devices[0].name == "WiiM Pro-5868"
+    assert devices[0].name == "WiiM Pro-E5F6"
     # The raw name MUST survive in _device_addr so cliap2's deviceid
     # synthesis (extracts the 12-hex MAC from the prefix) keeps working.
     cached = backend._device_addr["192.168.1.50:7000"]

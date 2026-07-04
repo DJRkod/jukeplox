@@ -291,6 +291,7 @@ function connectWS() {
     if (msg.type === 'now_playing_changed') playbackHandle.applyNowPlaying(msg);
     else if (msg.type === 'playback_state_changed') playbackHandle.applyPlaybackState(msg);
     else if (msg.type === 'closing_time') playbackHandle.applyClosingTime(msg);
+    else if (msg.type === 'track_skipped') playbackHandle.showSkipped(msg);
     else if (msg.type === 'queue_changed') {
       queueReceipts.prune(msg.queue);
       playbackHandle.applyQueue(msg.queue, msg.history);

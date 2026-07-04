@@ -178,7 +178,7 @@ def test_mime_type_proxied_ogg_advertises_flac():
     the old mismatch by sniffing, but Chromecast does not (2026-06-17) and the
     correct type is required regardless. Route on the part path (stream_key)."""
     from app.output.dlna import _mime_type
-    url = "http://192.168.0.70/api/stream?key=k%2Ffile.ogg"
+    url = "http://192.168.1.50/api/stream?key=k%2Ffile.ogg"
     assert _mime_type(None, url, "/library/parts/1/2/file.ogg") == "audio/flac"
 
 

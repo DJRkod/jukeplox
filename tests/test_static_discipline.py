@@ -127,10 +127,27 @@ ADMIN_ALLOWED = {
     "libraryList", "renderLibraryList", "loadLibraries", "adminRescan",
     "btnConnectPlex", "plexConnectSpinner", "plexConnectError",
     "plexPollInterval", "plexPollTimeout",
+    # Multi-source Sources panel (plan U14): connect/remove/rescan/priority —
+    # admin-only Setup chrome (no shared-module overlap; distinct from queue drag).
+    "sourcesList", "jfConnectError", "SOURCE_TYPE_LABELS", "_currentSources",
+    "renderSourcesList", "loadSources", "connectJellyfin", "connectLocal", "removeSource",
+    "rescanSources", "moveSourcePriority",
+    # Surprise Me capability-degradation note — toggled by source mix (plan U13).
+    "syncSurpriseSourceNote",
+    # Admin Sources scan-status badge (plan U15): scanning / scanned-empty.
+    "renderSourceScanStatus",
     "loadSettings",
     # Surprise "Recent suggestions" readout — shared render path for the GET fetch
     # + the live surprise_recorded WS event (admin-only Setup chrome).
     "renderSurpriseRecent",
+    # Recent Plays curation panel (2026-07-03 plan): admin-only Setup chrome to prune
+    # recent plays. Fed by refreshQueueState + queue_changed history; renders its own
+    # compact rows (a distinct management surface, NOT a shared-module fork — like the
+    # Sources / Surprise-Recent panels), pages client-side over the ~50 live buffer,
+    # and reuses POST /admin/history/remove-play.
+    "_recentPlaysData", "_recentPlaysPage", "_recentPlaysGen", "_recentPlaysExpanded",
+    "_playedAgo", "setRecentPlaysData", "renderRecentPlays", "toggleRecentPlays",
+    "removeRecentPlay",
     # Default-scheme picker (glow-up U6 — Setup chrome over the shared
     # APPEARANCE_SCHEMES table; admin-only by design)
     "defaultScheme", "renderDefaultSchemePicker",

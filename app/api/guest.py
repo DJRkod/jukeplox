@@ -46,7 +46,7 @@ _assets.register(_templates)  # `asset_v` global → build-derived cache-buster
 from app import state
 from app.lyrics import cache as lyrics_cache
 from app.plex.client import browse_base_key
-from app.plex.models import Album, Artist
+from app.models import Album, Artist
 from app.queue.engine import QueueLockError
 
 router = APIRouter(tags=["guest"])
@@ -113,7 +113,17 @@ async def get_queue():
 
 
 def _track_dict(t) -> dict:
-    return {
+    # Per-source list for the "Play From Source…" picker (parity plan U2). Built
+    # from the catalog holds attached by views._track — each carries server_name
+    # + source_type so the frontend renders a type-qualified label and re-POSTs
+    # the chosen source. GUARDED on server_name: the enqueue-time playback holds
+    # ({source_id, key} only, set by _attach_holds) carry no server_name, so
+    # queue/history rows serialized here emit no `sources` (queued-item source
+    # visibility is deferred). Native track dicts have empty holds → no `sources`
+    # → byte-identical (R8). Emitted only when >1 source actually holds the item.
+    src = [{"server_name": h.get("server_name") or "", "source_type": h.get("source_type") or ""}
+           for h in (getattr(t, "holds", None) or []) if h.get("server_name")]
+    d = {
         "track_id": t.id,
         "title": t.title,
         "artist": t.artist,
@@ -139,6 +149,9 @@ def _track_dict(t) -> dict:
         "disc_number": getattr(t, "disc_number", 1) or 1,
         "track_number": getattr(t, "track_number", None),
     }
+    if len(src) > 1:
+        d["sources"] = src
+    return d
 
 
 # ── Lyrics (Now Playing → Lyrics, plan 2026-06-17-008 U2) ─────────────────────
@@ -489,11 +502,38 @@ async def enabled_libraries() -> list:
     return result
 
 
+async def _catalog_active() -> bool:
+    """True when browse/search should serve the merged catalog floor rather than
+    Plex's native pipeline (plan U8/R15).
+
+    The native pipeline is Plex-specific AND already merges multiple Plex servers
+    (cross-server dedup lives there), and the registry holds one ``PlexSource``
+    PER server — so source COUNT is not the signal. It stays in charge whenever
+    every source is Plex, regardless of how many servers (AE6 parity). The
+    catalog floor takes over only once a NON-Plex source (Jellyfin/local) is
+    connected. The predicate lives in ``state.catalog_active`` so the source-
+    neutral random/Surprise/genre paths there (U13) share one definition; this
+    thin wrapper keeps the many guest call sites unchanged."""
+    return await state.catalog_active()
+
+
+@router.get("/api/scan-status")
+async def scan_status():
+    """Catalog/scan state for the guest onboarding empty-states (plan U15/R19/R20):
+    ``{sources, scanning, scanned, empty}``. Public like the rest of browse — it
+    carries no library content, only counts/flags. The browse module consults it
+    only when a list comes back empty, to pick which empty state to show."""
+    return await state.scan_status()
+
+
 @router.get("/api/browse/artists")
 async def browse_artists():
+    if await _catalog_active():
+        from app.catalog import views
+        return await views.artists()
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     from app import database
     # Browse-index plan U3: the persistent index is the data source; the live
     # per-library fan-out is the fallback when the index is empty/cold (R10).
@@ -523,7 +563,7 @@ async def browse_artists():
         if libs and not artists:
             failures = _log_per_lib_failures(libs, results, "artists")
             if failures == len(libs):
-                raise HTTPException(status_code=503, detail="All Plex libraries unreachable")
+                raise HTTPException(status_code=503, detail="All libraries unreachable")
         partial_failure = any(isinstance(b, BaseException) for b in results)
     compiled = await _compiled_rules()
     deduped = _dedup_artists(artists, compiled)
@@ -722,6 +762,9 @@ async def _assemble_artist_releases(artist_id: str, client, compiled):
 
 @router.get("/api/browse/artists/{artist_id}/albums")
 async def browse_artist_albums(artist_id: str):
+    if await _catalog_active():
+        from app.catalog import views
+        return await views.artist_albums(artist_id)
     # Per-track credits plan U3: synthesized acts bypass validate_plex_id on
     # the reserved prefix; the branch carries its own guards — length cap in
     # place of the validator's, and 200 + [] for an unknown name (the frontend's
@@ -733,7 +776,7 @@ async def browse_artist_albums(artist_id: str):
         validate_plex_id(artist_id)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     compiled = await _compiled_rules()
     own, appears, artist_norm = await _assemble_artist_releases(artist_id, client, compiled)
     if artist_norm is None:
@@ -748,6 +791,31 @@ async def browse_artist_songs(artist_id: str):
     contribute all children; appears-on releases (VA comps) are filtered to
     only the tracks crediting this artist. See
     docs/plans/2026-06-17-007-feat-artist-all-songs-plan.md."""
+    if await _catalog_active():
+        # Return the SAME payload shape as the native branch below — the All-Songs
+        # frontend reads data.tracks / data.releases / data.popular_available; a
+        # bare list renders "No songs." (ce-debug 2026-06-29). releases = the
+        # artist's own albums; popularity is a Plex specialization the floor lacks.
+        from app import database
+        from app.catalog import store, views
+        artist = await store.get_artist(artist_id)
+        if not artist:
+            return {"popular_available": False, "releases": [], "tracks": []}
+        releases = [{"id": a["identity"], "title": a["title"], "year": a["year"], "kind": "own"}
+                    for a in await store.get_albums_for_artist(artist["base_key"])]
+        tracks = [{**_track_dict(t), "release": t.album, "release_year": t.year,
+                   "kind": "own", "pop_rank": None}
+                  for t in await views.artist_songs(artist_id)]
+        counts = await database.get_play_counts("track", [t["track_id"] for t in tracks])
+        for t in tracks:
+            t["plays"] = counts.get(t["track_id"], 0)
+        # Popular fold-in (plan U13): popularity is a Plex specialization, but a
+        # Plex-backed artist in a MIXED install should still get it. When this
+        # catalog artist has a Plex hold, decorate the catalog tracks with Plex
+        # popularity ranks; local/Jellyfin-only artists keep popular_available
+        # False (no popularity signal). Same title-matching as the native branch.
+        popular_available = await _decorate_plex_popularity(artist_id, tracks)
+        return {"popular_available": popular_available, "releases": releases, "tracks": tracks}
     if artist_id.startswith("credit:"):
         if len(artist_id) > 256:
             raise HTTPException(status_code=400, detail="Invalid resource ID")
@@ -755,7 +823,7 @@ async def browse_artist_songs(artist_id: str):
         validate_plex_id(artist_id)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     compiled = await _compiled_rules()
     own, appears, artist_norm = await _assemble_artist_releases(artist_id, client, compiled)
     if artist_norm is None:
@@ -820,11 +888,52 @@ async def browse_artist_songs(artist_id: str):
     }
 
 
+async def _decorate_plex_popularity(artist_identity: str, tracks: list[dict]) -> bool:
+    """Rank catalog ``tracks`` by Plex popularity when this artist is Plex-backed
+    (plan U13 fold-in), and report whether any matched.
+
+    Reuses the native All-Songs popularity path: fetch the Plex provider's
+    popular tracks for the artist and rank the local tracks by normalized title.
+    The catalog artist's Plex hold carries the Plex artist key as its
+    ``provider_local_key``; routing ``get_artist_popular_tracks`` through the
+    registry on that key reaches the Plex source. No-op (returns False, leaves
+    ``pop_rank`` None) when the artist has no Plex hold or Plex returns nothing —
+    Jellyfin/local have no popularity signal, so those artists stay
+    ``popular_available`` False (correct degradation, not a regression)."""
+    from app.catalog import store, views
+    types = await views._source_types()
+    holds = await store.get_holds("artist", artist_identity)
+    plex_hold = next((h for h in holds if types.get(h["source_id"]) == "plex"), None)
+    if not plex_hold:
+        return False
+    client = await state.get_plex_client()
+    try:
+        popular = await client.get_artist_popular_tracks(plex_hold["provider_local_key"])
+    except Exception:
+        return False
+    compiled = await _compiled_rules()
+    pop_by_norm: dict[str, int] = {}
+    for p in popular:
+        nk = _norm(p.get("title"), compiled)
+        if nk and nk not in pop_by_norm:
+            pop_by_norm[nk] = len(pop_by_norm)
+    matched = False
+    for t in tracks:
+        rank = pop_by_norm.get(_norm(t["title"], compiled))
+        t["pop_rank"] = rank
+        if rank is not None:
+            matched = True
+    return matched
+
+
 @router.get("/api/browse/albums")
 async def browse_albums():
+    if await _catalog_active():
+        from app.catalog import views
+        return await views.albums()
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     from app import database
     # Browse-index plan U3: index-first with live fallback (see browse_artists).
     index_rows = await database.get_browse_albums()
@@ -850,7 +959,7 @@ async def browse_albums():
         if libs and not tagged:
             failures = _log_per_lib_failures(libs, results, "albums")
             if failures == len(libs):
-                raise HTTPException(status_code=503, detail="All Plex libraries unreachable")
+                raise HTTPException(status_code=503, detail="All libraries unreachable")
     return _group_albums(tagged, await _compiled_rules(), await _ranked_server_order())
 
 
@@ -1047,10 +1156,13 @@ async def _resolve_album_tracks(client, album_id: str, *, source_server_name: st
 
 @router.get("/api/browse/albums/{album_id}/tracks")
 async def browse_album_tracks(album_id: str):
+    if await _catalog_active():
+        from app.catalog import views
+        return [_track_dict(t) for t in await views.album_tracks(album_id)]
     validate_plex_id(album_id)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     try:
         tracks = await _resolve_album_tracks(client, album_id)
     except KeyError:
@@ -1061,19 +1173,32 @@ async def browse_album_tracks(album_id: str):
 @router.get("/api/browse/genres")
 async def browse_genres():
     from app import database
+    catalog = await _catalog_active()
     cached = await database.get_genre_cache()
     if cached:
         # Stale-while-revalidate, but only when actually stale (gentle-on-Plex
         # U2): a warm+fresh cache returns with zero Plex work.
         if not await state.cache_is_fresh("genre_cache_computed_at"):
             state.trigger_genre_refresh()
-        if not await state.cache_is_fresh("credit_cache_computed_at"):
+        # Per-track credits are a Plex specialization (U13 capability
+        # degradation): only refresh that cache in a native (Plex-only) install.
+        if not catalog and not await state.cache_is_fresh("credit_cache_computed_at"):
             state.trigger_credit_refresh()
         return cached
 
+    # Cold cache, catalog floor (U13): compute genres from the merged catalog's
+    # track tags rather than Plex styles, then stamp so the next read is warm.
+    if catalog:
+        from app.catalog import views
+        merged = await views.genres()
+        _t = asyncio.create_task(database.set_genre_cache(merged))
+        _t.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
+        await state.stamp_cache("genre_cache_computed_at")
+        return merged
+
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libs = await enabled_libraries()
     results = await asyncio.gather(
         *[client.get_styles_with_counts(lib.key) for lib in libs], return_exceptions=True
@@ -1099,9 +1224,15 @@ async def browse_genres():
 
 @router.get("/api/browse/genres/albums")
 async def browse_genre_albums(style: str = Query(..., min_length=1)):
+    if await _catalog_active():
+        # Catalog floor (U13): albums whose tracks carry this genre, as Album
+        # objects (with holds) so the shared renderer handles them like any
+        # other catalog album list.
+        from app.catalog import views
+        return await views.genre_albums(style)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libs = await enabled_libraries()
     results = await asyncio.gather(
         *[client.get_albums(lib.key, style=style) for lib in libs], return_exceptions=True
@@ -1117,7 +1248,7 @@ async def browse_genre_albums(style: str = Query(..., min_length=1)):
 async def browse_years():
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libs = await enabled_libraries()
     results = await asyncio.gather(*[client.get_years(lib.key) for lib in libs], return_exceptions=True)
     return sorted({y for batch in results if not isinstance(batch, BaseException) for y in batch}, reverse=True)
@@ -1127,7 +1258,7 @@ async def browse_years():
 async def browse_year_albums(year: int):
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libs = await enabled_libraries()
     results = await asyncio.gather(*[client.get_albums(lib.key, year=year) for lib in libs], return_exceptions=True)
     tagged = [
@@ -1147,6 +1278,36 @@ async def browse_play_counts(type: str = Query(...)):
         raise HTTPException(status_code=400, detail="type must be track, album, or artist")
     from app import database
     return await database.get_all_play_counts(type)
+
+
+async def _refresh_album_drill(rows: list[dict]) -> None:
+    """Re-resolve each leaderboard row's album drill target from the CURRENT
+    catalog, mutating ``row['metadata']`` in place.
+
+    ``play_track_meta`` snapshots ``album_id`` at play time, but album identities
+    are re-clustered on every scan (the album-dedup / self-heal changes re-mint
+    them) and ``catalog_album`` is atomic-replaced — so a snapshot captured before
+    the latest scan points at an album identity that no longer exists. 'Go to
+    Album' then greys out (missing id) or opens a blank release (stale id resolves
+    to zero tracks) — ce-debug 2026-07-03. The track identity (the row key) is
+    stable, so resolve the drill live: for a still-catalogued track, overlay the
+    catalog's current album_id / album / thumb. A track whose source is gone isn't
+    in the catalog → its snapshot is left as the best available; on a Plex-only
+    install (no catalog) ids are stable rating keys and nothing is touched."""
+    if not await _catalog_active():
+        return
+    from app.catalog import store
+    for r in rows:
+        meta = r.get("metadata")
+        if not meta:
+            continue
+        ct = await store.get_track(r["track_id"])
+        if ct is None:
+            continue
+        meta["album_id"] = ct["album_identity"]
+        meta["album"] = ct["album"] or ""
+        if ct.get("thumb") is not None:
+            meta["thumb"] = ct["thumb"]
 
 
 @router.get("/api/most-played")
@@ -1174,6 +1335,7 @@ async def most_played():
                 # Backfill so the next load is pure-DB (fire-and-forget).
                 _bt = asyncio.create_task(database.set_play_track_meta(r["track_id"], r["metadata"]))
                 _bt.add_done_callback(state._log_task_exc)
+    await _refresh_album_drill(rows)
     return [
         {**r["metadata"], "play_count": r["count"]}
         for r in rows if r["metadata"] is not None
@@ -1238,6 +1400,7 @@ async def highest_rated(request: Request):
                 r["metadata"] = _track_dict(t)
                 _bt = asyncio.create_task(database.set_play_track_meta(r["track_id"], r["metadata"]))
                 _bt.add_done_callback(state._log_task_exc)
+    await _refresh_album_drill(rows)
     return [
         {**r["metadata"], "rating": r["stars"], "play_count": r["play_count"]}
         for r in rows if r["metadata"] is not None
@@ -1258,9 +1421,14 @@ def _dedup_by_id(items):
 
 @router.get("/api/search")
 async def search(q: str = Query(..., min_length=1)):
+    if await _catalog_active():
+        from app.catalog import views
+        res = await views.search(q)
+        res["tracks"] = [_track_dict(t) for t in res["tracks"]]
+        return res
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     from app import database
     from app.normalize import query_variants
     libs = await enabled_libraries()
@@ -1348,7 +1516,7 @@ async def search_broad(
     search_titles call rides the per-server concurrency semaphore."""
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     from app import database
     from app.normalize import query_variants
     want = tuple(t for t in ("track", "album")
@@ -1390,6 +1558,77 @@ async def search_broad(
 
 # ── Queue append ──────────────────────────────────────────────────────────────
 
+async def _attach_holds(track, *, chosen_server_name: str | None = None) -> None:
+    """Capture a track's priority-ordered holds snapshot from the catalog onto
+    ``track.holds`` (multi-source plan U9), so play-time fallback has its
+    alternates and the live queue is rescan-immune. No-op when the track isn't
+    catalogued (single-holder install) — playback falls back to ``stream_key``.
+    Best-effort: an error here never blocks the enqueue.
+
+    ``chosen_server_name`` (parity plan U4): when a guest picks "Play From
+    Source: X", promote that source's holder to primary while keeping the rest in
+    priority order as fallback — a preference, not a pin (R3). Only ever passed
+    from the catalog enqueue branch, so the native path is byte-identical (R8):
+    the second sort and the stream_key alignment below are both gated on it."""
+    try:
+        from app import database
+        from app.catalog import identity as cat_identity, store
+        ident = await cat_identity.identity_for_track_id(track.id) or track.id
+        holds = await store.get_holds("track", ident)
+        if not holds:
+            return
+        order = {sid: i for i, sid in enumerate(await database.get_source_priority())}
+        holds.sort(key=lambda h: (order.get(h["source_id"], len(order) + (h.get("priority") or 0)),
+                                  h["source_id"]))
+        if chosen_server_name and chosen_server_name.strip():
+            wanted = chosen_server_name.strip().lower()
+            # Stable partition: chosen source(s) first, the rest keep priority
+            # order. Python's sort is stable, so within each group priority holds.
+            holds.sort(key=lambda h: 0 if (h.get("server_name") or "").strip().lower() == wanted else 1)
+        track.holds = [{"source_id": h["source_id"], "key": h["provider_local_key"]} for h in holds]
+        if chosen_server_name and track.holds:
+            # Align the single-key stream path with the promoted primary so the
+            # holds-empty fallback and any stream_key consumer agree with the
+            # chosen source. Catalog branch only — native never passes a chosen
+            # source, so its stream_key (the per-server id the client returned)
+            # is untouched.
+            track.stream_key = track.holds[0]["key"]
+    except Exception:
+        pass
+
+
+async def _catalog_track(track_id: str):
+    """Build a queue Track for a catalog identity (parity plan U4).
+
+    In catalog mode ``track_id`` is a catalog IDENTITY, not a provider rating
+    key — feeding it to ``client.get_track`` mis-routes (the registry splits on
+    the first ':') and returns a silent empty result. So resolve it from the
+    catalog store directly: ``views._track`` builds the full Track with the
+    primary holder's resolvable stream key. A miss is a real not-found, logged
+    (silent-empty guard) and surfaced as 404."""
+    from app.catalog import store, views
+    row = await store.get_track(track_id)
+    if row is None:
+        _log.warning("Catalog enqueue: track identity %r not in catalog", track_id)
+        raise HTTPException(status_code=404, detail="Track not found")
+    return await views._track(row)
+
+
+async def _catalog_album_tracks(album_id: str) -> list:
+    """Resolve a catalog album IDENTITY to its merged tracks (parity plan U4).
+
+    The native ``_resolve_album_tracks`` resolves through the Plex browse-index
+    keyed on rating keys and can't address a catalog identity (esp. a Jellyfin-
+    only album whose identity is no Plex key — AE8). Resolve from the store. An
+    empty result is logged (silent-empty guard); the caller turns it into a 404."""
+    from app.catalog import store, views
+    rows = await store.get_tracks_for_album(album_id)
+    if not rows:
+        _log.warning("Catalog enqueue: album identity %r has no catalog tracks", album_id)
+        return []
+    return [await views._track(r) for r in rows]
+
+
 class QueueAppendRequest(BaseModel):
     track_id: str | None = None
     album_id: str | None = None
@@ -1410,7 +1649,7 @@ async def append_to_queue(body: QueueAppendRequest):
 
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
 
     q = state.queue_engine
 
@@ -1432,7 +1671,15 @@ async def append_to_queue(body: QueueAppendRequest):
                 raise HTTPException(status_code=409, detail="duplicate_blocked")
         warning = "already_in_queue" if is_dup else None
         try:
-            track = await client.get_track(body.track_id)
+            # Catalog mode: body.track_id is a catalog identity → resolve via the
+            # store and reorder holds for the chosen source (preference). Native
+            # mode: the provider rating key resolves through the registry directly.
+            if await _catalog_active():
+                track = await _catalog_track(body.track_id)
+                await _attach_holds(track, chosen_server_name=body.source_server_name)
+            else:
+                track = await client.get_track(body.track_id)
+                await _attach_holds(track)
             item = await q.append(track)
         except QueueLockError:
             raise HTTPException(status_code=423, detail="queue_locked")
@@ -1445,14 +1692,20 @@ async def append_to_queue(body: QueueAppendRequest):
             result["warning"] = warning
         return result
 
-    # Album — name-resolve across enabled libraries (optionally filtered by
-    # source_server_name) so cross-server shared albums queue correctly.
-    try:
-        tracks = await _resolve_album_tracks(
-            client, body.album_id or "", source_server_name=body.source_server_name,
-        )
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Album not found")
+    # Album. Catalog mode: body.album_id is a catalog identity → resolve to the
+    # merged tracks from the store (works for a Jellyfin-only album whose identity
+    # is no Plex key, AE8). Native mode: name-resolve across enabled libraries
+    # (optionally filtered by source_server_name) for cross-server shared albums.
+    catalog = await _catalog_active()
+    if catalog:
+        tracks = await _catalog_album_tracks(body.album_id or "")
+    else:
+        try:
+            tracks = await _resolve_album_tracks(
+                client, body.album_id or "", source_server_name=body.source_server_name,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Album not found")
 
     if not tracks:
         raise HTTPException(status_code=404, detail="Album not found or no tracks")
@@ -1460,7 +1713,10 @@ async def append_to_queue(body: QueueAppendRequest):
     # All-or-nothing batch append: validate full batch under one lock so a
     # partial album never lands when the queue is at the cap (was: per-track
     # appends could land N tracks then 423 on the N+1th, leaving the queue
-    # holding a half-album).
+    # holding a half-album). In catalog mode the chosen source is promoted to
+    # primary per track (preference); native mode keeps global priority order.
+    for t in tracks:
+        await _attach_holds(t, chosen_server_name=body.source_server_name if catalog else None)
     try:
         items = await q.append_many(tracks)
     except QueueLockError:
@@ -1507,7 +1763,7 @@ async def surprise_me(body: SurpriseRequest):
 
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
 
     # Short-circuit a locked queue BEFORE the Plex similarity fan-out — otherwise a
     # locked host still pays unbounded similarity queries per press and only learns
@@ -1516,6 +1772,13 @@ async def surprise_me(body: SurpriseRequest):
         raise HTTPException(status_code=423, detail="queue_locked")
 
     mode = _resolve_surprise_mode(await database.get_setting("surprise_me_source_mode"))
+    # Capability degradation (plan U13): the smart sources (Plex sonic/similar)
+    # are Plex specializations that can't reason over a merged Jellyfin/local
+    # catalog. With a non-Plex source connected, Surprise Me uses the whole-
+    # library random floor (now catalog-backed); single-source Plex keeps the
+    # full smart chain (AE6). The admin Setup surfaces this with a note (U13).
+    if await _catalog_active():
+        mode = "random"
     diversity = _resolve_surprise_diversity(await database.get_setting("surprise_me_diversity"))
     # Random-pick length band (2026-06-20 plan U2): exclude tracks outside the
     # admin's min/max from the smart sources. (None, None) when unset → no-op.
@@ -1621,9 +1884,31 @@ async def undo_queue_append(body: QueueUndoRequest):
 _ALLOWED_ART_PREFIXES = ("/library/", "/photo/")
 
 
-def _valid_art_path(path: str) -> bool:
+def _nonplex_source_ids(client) -> set:
+    """Source ids of connected NON-Plex providers (U12). Their art keys bypass
+    the Plex ``/library//photo/`` allowlist because the owning provider enforces
+    its own art access — a remote authenticated fetch (Jellyfin) or a
+    realpath-under-root containment check (local files, R23). Returns an empty set
+    for a client without a real source list (e.g. a unit-test MagicMock), so the
+    Plex allowlist behaviour is unchanged there."""
+    srcs = getattr(client, "sources", None)
+    if not isinstance(srcs, (list, tuple)):
+        return set()
+    return {getattr(s, "source_id", None) for s in srcs
+            if getattr(s, "source_type", "plex") != "plex"}
+
+
+def _valid_art_path(path: str, allow_prefixes=()) -> bool:
     if ":" in path and not path.startswith("/"):
         prefix, bare = path.split(":", 1)
+        # A non-Plex source key (Jellyfin item image / local file, U12) skips the
+        # Plex part-path allowlist: the owning provider gates access itself
+        # (Jellyfin fetches a remote URL with its token; LocalSource realpaths the
+        # file and rejects anything outside the configured root). Without this,
+        # every Jellyfin/local art key (bare "Items/…" or a relpath) fails the
+        # "/library//photo/" check and 400s.
+        if prefix in allow_prefixes:
+            return True
         if not _ID_RE.match(prefix):
             return False  # scheme-like prefix is not a valid Plex machine_id
     else:
@@ -1635,16 +1920,16 @@ def _valid_art_path(path: str) -> bool:
 
 @router.get("/api/art")
 async def art_proxy(path: str = Query(...), w: int | None = None):
-    if not _valid_art_path(path):
+    client = await state.get_plex_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="No media source configured")
+    if not _valid_art_path(path, allow_prefixes=_nonplex_source_ids(client)):
         raise HTTPException(status_code=400, detail="Invalid art path")
     # Clamp the requested thumbnail width to a sane range; out-of-range or absent
     # → full image. Plain default (not Query(...)) so direct callers/tests get
     # None rather than the Query sentinel object.
     if not (isinstance(w, int) and 16 <= w <= 2048):
         w = None
-    client = await state.get_plex_client()
-    if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
 
     from app.cache import cache
 

@@ -41,6 +41,9 @@ async def lifespan(app: FastAPI):
     # first guest browse is fast instead of paying the full cross-server crawl.
     # Fire-and-forget + single-flighted; never blocks startup.
     state.trigger_browse_index_refresh()
+    # Multi-source catalog (plan U6): warm the unified catalog at startup too,
+    # alongside the browse index. Fire-and-forget + single-flighted.
+    state.trigger_catalog_refresh()
     # Live device discovery (2026-06-11 plan U2): start the watcher AFTER
     # state.setup() so the backend singletons its register_resolved hooks
     # feed already exist. Fail-soft — a broken watcher must never take the

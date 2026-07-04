@@ -220,3 +220,71 @@ async def test_invalid_path_returns_400_without_cache_lookup(tmp_path, monkeypat
         await guest.art_proxy(path="not-a-valid-plex-path")  # missing colon
     assert exc_info.value.status_code == 400
     cache.get.assert_not_awaited()
+
+
+# ── U12: non-Plex (local / Jellyfin) art bypasses the Plex part-path allowlist ──
+
+def test_valid_art_path_nonplex_prefix_bypasses_allowlist():
+    """A non-Plex source key (Jellyfin item image / local relpath) is allowed when
+    its prefix is a known non-Plex source — the provider enforces art access
+    itself. Without the allowlist (Plex-only install) the same keys are rejected,
+    proving the bypass is scoped to connected non-Plex sources."""
+    from app.api.guest import _valid_art_path
+    # local relpath + Jellyfin "Items/…" both fail the Plex /library//photo/ check
+    assert not _valid_art_path("loc:A/Alb/cover.jpg")
+    assert not _valid_art_path("jf-srv1:Items/abc/Images/Primary")
+    # but pass once their source id is in the non-Plex allowlist
+    assert _valid_art_path("loc:A/Alb/cover.jpg", allow_prefixes={"loc"})
+    assert _valid_art_path("jf-srv1:Items/abc/Images/Primary", allow_prefixes={"jf-srv1"})
+
+
+def test_valid_art_path_plex_allowlist_still_enforced():
+    """The Plex part-path allowlist is unchanged for Plex keys even with a
+    non-Plex source connected (a different prefix in the allowlist does not open
+    Plex traversal)."""
+    from app.api.guest import _valid_art_path
+    assert _valid_art_path("machineabc:/library/metadata/1/thumb/2", allow_prefixes={"loc"})
+    assert not _valid_art_path("machineabc:/etc/passwd", allow_prefixes={"loc"})
+
+
+def test_nonplex_source_ids_safe_for_mock_client():
+    """A unit-test MagicMock client (no real .sources list) yields an empty set,
+    so Plex validation is unchanged in those tests."""
+    from unittest.mock import MagicMock
+    from app.api.guest import _nonplex_source_ids
+    assert _nonplex_source_ids(MagicMock()) == set()
+
+
+async def test_local_art_served_via_provider(tmp_path, monkeypatch):
+    """A local art key bypasses the Plex allowlist and is served by LocalSource's
+    contained fetch_art (covers the proxy delivery half of U12)."""
+    from app.api import guest
+    from app.sources.local import LocalSource
+    from app.sources.registry import SourceRegistry
+    _replace_cache(monkeypatch, tmp_path)
+    (tmp_path / "music" / "A" / "Alb").mkdir(parents=True)
+    (tmp_path / "music" / "A" / "Alb" / "cover.jpg").write_bytes(b"JPEGDATA")
+    reg = SourceRegistry([LocalSource(root_dir=str(tmp_path / "music"), source_id="loc")])
+    monkeypatch.setattr("app.state.get_plex_client", AsyncMock(return_value=reg))
+
+    resp = await guest.art_proxy(path="loc:A/Alb/cover.jpg")
+    assert resp.body == b"JPEGDATA"
+    assert resp.media_type == "image/jpeg"
+
+
+async def test_local_art_traversal_rejected(tmp_path, monkeypatch):
+    """A traversal art key passes the (bypassed) allowlist but is rejected by the
+    provider's realpath containment → 404, with no file read outside the root."""
+    from fastapi import HTTPException
+    from app.api import guest
+    from app.sources.local import LocalSource
+    from app.sources.registry import SourceRegistry
+    _replace_cache(monkeypatch, tmp_path)
+    (tmp_path / "music").mkdir()
+    (tmp_path / "secret.txt").write_bytes(b"TOPSECRET")
+    reg = SourceRegistry([LocalSource(root_dir=str(tmp_path / "music"), source_id="loc")])
+    monkeypatch.setattr("app.state.get_plex_client", AsyncMock(return_value=reg))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await guest.art_proxy(path="loc:../secret.txt")
+    assert exc_info.value.status_code == 404

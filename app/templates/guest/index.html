@@ -128,8 +128,8 @@
     .mb-art-placeholder, .qi-art-placeholder, .qs-art-placeholder, div.list-art { filter: var(--sax-filter, none); }
     .qs-title { font-size: .65rem; color: var(--muted); margin-top: .2rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-    /* Search */
-    #search-bar { padding: .75rem .75rem .5rem; position: sticky; top: 0; background: var(--bg); z-index: 1; }
+    /* Search — #search-bar (sticky docked bar) + #search-filter-tabs + .filter-tab
+       now live single-source in static/browse/rail.css (2026-07-02 ce-debug). */
     #search-bar input { width: 100%; padding: .65rem 1rem; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: .95rem; }
     #search-bar input:focus { outline: none; border-color: var(--accent); }
     /* Clear-× affordance (treatment C) — scheme-following via accent vars */
@@ -144,11 +144,6 @@
     .search-field.has-text .search-clear { opacity: 1; pointer-events: auto; transform: translateY(-50%) scale(1); }
     .search-clear:hover, .search-clear:focus-visible { background: var(--accent); color: var(--on-accent); outline: none; }
     .search-clear:active { transform: translateY(-50%) scale(.82) rotate(90deg); }
-    /* flex-wrap: five pills overflow 320px-wide phones without it (the
-       admin rule already wraps). */
-    #search-filter-tabs { display: flex; gap: .4rem; padding: .5rem 0 0; flex-wrap: wrap; }
-    .filter-tab { padding: .28rem .75rem; border-radius: 999px; background: var(--surface2); font-size: .78rem; cursor: pointer; color: var(--accent-ui, var(--accent)); }
-    .filter-tab.active { background: var(--accent-grad, var(--accent)); color: var(--on-accent); }
     #search-results { padding: 0 .75rem .75rem; }
 
     /* Most Played count badge (compact: 320px phones must not crowd) */

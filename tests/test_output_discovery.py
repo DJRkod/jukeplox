@@ -50,7 +50,7 @@ def test_aggregate_merges_three_protocols_at_same_host():
     post-strip name is overridden by higher-priority sources)."""
     per_backend = {
         "direct": [],
-        "airplay": [OutputDevice(id="192.168.1.50:7000", name="WiiM Pro-5868",
+        "airplay": [OutputDevice(id="192.168.1.50:7000", name="WiiM Pro-E5F6",
                                  backend_type="airplay", id_format="host_port")],
         "chromecast": [OutputDevice(id="uuid:cc-1", name="WiiM Pro",
                                     backend_type="chromecast")],
@@ -242,7 +242,7 @@ def test_aggregate_airplay_arrives_first_dlna_overrides_name():
     lands. Pins the rank-based priority rule."""
     per_backend = {
         "direct": [],
-        "airplay": [OutputDevice(id="192.168.1.50:7000", name="WiiM Pro-5868",
+        "airplay": [OutputDevice(id="192.168.1.50:7000", name="WiiM Pro-E5F6",
                                  backend_type="airplay", id_format="host_port")],
         "chromecast": [],
         "dlna": [OutputDevice(id="uuid:dlna-1", name="WiiM Pro",

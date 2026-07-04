@@ -36,7 +36,7 @@ import uuid
 from typing import Any
 
 from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
-from app.plex.models import Track
+from app.models import Track
 
 _log = logging.getLogger(__name__)
 
@@ -168,7 +168,7 @@ def _strip_raop_mac_prefix(name: str) -> str:
     """Return *name* with the `<12-hex-mac>@` prefix removed for display.
 
     Avahi advertises RAOP service instances as `<12-hex-mac>@<friendly>`
-    (e.g. `42FDF3255868@WiiM Pro-5868`). The MAC prefix is meaningful to
+    (e.g. `A1B2C3D4E5F6@WiiM Pro-E5F6`). The MAC prefix is meaningful to
     cliap2 — `_ensure_deviceid` extracts it to synthesize the `deviceid`
     TXT entry — but it's unreadable noise for the admin device picker.
     The picker consumes this stripped form; `_device_addr` still stores
@@ -312,7 +312,7 @@ def _ensure_deviceid(name: str, txt: dict[str, str]) -> dict[str, str]:
     the TXT dict doesn't include `deviceid`, and the speaker name doesn't
     follow the `<MAC-no-colons>@<friendly>` shape cliap2 expects. On a
     WiiM Pro the avahi-advertised name has the right prefix
-    (`42FDF3255868@WiiM Pro-5868`) but the TXT dict didn't always include
+    (`A1B2C3D4E5F6@WiiM Pro-E5F6`) but the TXT dict didn't always include
     `deviceid` — extract the MAC from the name prefix, format with the
     colon separators cliap2's RAOP code matches against, and inject so
     the warning goes away and the pair-verify path has the id it needs.

@@ -78,6 +78,7 @@ def mock_state(mock_session):
          patch("app.state.output_router", or_), \
          patch("app.state.get_plex_client", AsyncMock(return_value=None)), \
          patch("app.state.trigger_browse_index_refresh", MagicMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
          patch("app.state.trigger_artist_grouping_rebuild", MagicMock()), \
          patch("app.database.get_browse_album_by_id", AsyncMock(return_value=None)), \
          patch("app.database.get_browse_albums_by_identity", AsyncMock(return_value=[])), \

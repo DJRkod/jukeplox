@@ -649,6 +649,17 @@ window.mountPlayback = function mountPlayback(config) {
             + `<div class="qs-title">${_esc(item.title)}</div>`;
           historyRoot.appendChild(div);
         });
+        // Admin curation (plan U6): the page supplies removePlan(items) → per-entry
+        // remove(); the module renders the shared ✕ chip (always-visible via CSS).
+        // Guest passes no removePlan → no ✕, so the affordance is admin-only.
+        if (h.removePlan) {
+          const plan = h.removePlan(items) || [];
+          const rows = Array.from(historyRoot.children);
+          plan.forEach(({ idx, remove }) => {
+            const row = rows[idx];
+            if (row && remove) _ensureActions(row).appendChild(_removeChip('Remove this play', remove));
+          });
+        }
       }
     }
   }
@@ -818,10 +829,52 @@ window.mountPlayback = function mountPlayback(config) {
     }
   }
 
+  // ── Skip notification (plan U16 / R22) ───────────────────────────────
+  // Single-source so it appears identically on guest + admin: a transient,
+  // auto-dismissing toast shown when a queued track is skipped because every
+  // holder failed to stream. Rapid successive skips REPLACE rather than stack
+  // (one element, restarted timer) so a cascade of dead holders can't pile up.
+  const _SKIP_NOTE_MS = 4500;
+  let _skipEl = null;
+  let _skipTimer = null;
+  function _ensureSkipEl() {
+    if (_skipEl) return _skipEl;
+    const el = document.createElement('div');
+    el.className = 'skip-note-overlay';
+    el.hidden = true;
+    el.innerHTML =
+      '<div class="skip-note-card" role="status" aria-live="polite">' +
+      '<span class="skip-note-icon" aria-hidden="true">⏭</span>' +
+      '<span class="skip-note-msg"></span></div>';
+    document.body.appendChild(el);
+    _skipEl = el;
+    return el;
+  }
+  function showSkipped(data) {
+    const title = (data && data.track_title) || '';
+    // Admins additionally see which sources were tried (diagnostic). The guest
+    // broadcast omits sources_tried (null), so this degrades to title-only.
+    const tried = data && Array.isArray(data.sources_tried) ? data.sources_tried : null;
+    let msg = title ? ('Skipped “' + title + '” — unavailable') : 'Skipped an unavailable track';
+    if (tried && tried.length) msg += ' (tried: ' + tried.join(', ') + ')';
+    const el = _ensureSkipEl();
+    el.querySelector('.skip-note-msg').textContent = msg;   // R6: inert text, never innerHTML
+    el.hidden = false;
+    // Reflow so the enter transition runs even when replacing a visible toast.
+    void el.offsetWidth;
+    el.classList.add('is-shown');
+    if (_skipTimer) clearTimeout(_skipTimer);
+    _skipTimer = setTimeout(() => {
+      el.classList.remove('is-shown');
+      el.hidden = true;
+      _skipTimer = null;
+    }, _SKIP_NOTE_MS);
+  }
+
   // Initial paint: idle until the first payload arrives (the "Now" tab dot
   // and micro-bar must not claim playback before state is known).
   _setIdle();
 
   return { applyNowPlaying, applyPlaybackState, applyQueue, applyClosingTime,
-           setIdle: _setIdle, suspend, resume };
+           showSkipped, setIdle: _setIdle, suspend, resume };
 };
