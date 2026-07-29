@@ -182,6 +182,10 @@ const playbackHandle = mountPlayback({
     onSeek: (ms) => api('POST', '/admin/playback/seek', { position_ms: ms }),
   },
   queue: { el: '#queue-list', decorateRow: decorateQueueRow, removePlan: adminRemovePlan },
+  // History strip is READ-ONLY on both pages. The admin "remove this play"
+  // affordance moved off the shared strip into the Setup → Recent Plays panel
+  // (see renderRecentPlays below), so the strip passes no removePlan hook and
+  // the shared module renders no ✕ for anyone.
   history: { el: '#history-strip' },
   toast: showToast,
   // Closing Time (2026-06-24): admin is a control surface — render the banner
@@ -208,6 +212,11 @@ const playbackHandle = mountPlayback({
     isPlaying = playing;
     btnPause.textContent = playing ? '⏸' : '▶';
   },
+  // Supervisor plan U4: every applyOutputSession hydration path (WS event,
+  // snapshot re-pull, resume()'s /api/now-playing refetch) also refreshes the
+  // admin-rich banner — renderOutputSessionBanner degrades to the generic
+  // message when the lean payload omits device/attempt/retry detail.
+  onOutputSession: renderOutputSessionBanner,
 });
 
 // Queue/history snapshot refetch — used on initial load, WS reconnect, and
@@ -219,9 +228,17 @@ async function refreshQueueState() {
   try {
     const state = await api('GET', '/admin/queue');
     playbackHandle.applyQueue(state.queue, state.history);
+    setRecentPlaysData(state.history);
     syncLock(state.is_locked);
     _historyEmpty = !(state.history && state.history.length);
     _syncPrevEnabled();
+    // Output-session resync (supervisor plan U4): a WS gap can drop the
+    // output_session delta, so every snapshot re-pull re-renders the outage
+    // note + admin banner from the mirrored field (same shape as the event).
+    if (state.output_session) {
+      playbackHandle.applyOutputSession(state.output_session);
+      renderOutputSessionBanner(state.output_session);
+    }
     return state;
   } catch { return null; }
 }
@@ -266,6 +283,60 @@ document.getElementById('btn-skip').addEventListener('click', async () => {
   btn.disabled = true;
   try { await api('POST', '/admin/playback/skip'); }
   catch { showToast('Skip failed'); }
+  finally { btn.disabled = false; }
+});
+
+// ── Output-session outage banner (supervisor plan U4, R20) ─────────────────
+// Admin-rich detail layered over the shared lean note (which lives in
+// static/playback/index.js): device name, attempt count, next-retry delay,
+// and the manual Resume affordance. ONE render path for both the
+// output_session WS event and the /admin/queue snapshot's output_session
+// field — the payloads share a shape, mirroring applyDevicesPayload. Kept
+// deliberately minimal (static retry text, no ticking countdown) pending the
+// interaction-state mockups pass the plan defers to.
+function renderOutputSessionBanner(data) {
+  const banner = document.getElementById('output-outage-banner');
+  const msgEl = document.getElementById('output-outage-msg');
+  if (!banner || !msgEl || !data) return;
+  if (!data.held) { banner.style.display = 'none'; return; }
+  const device = data.device_name || data.device_id || 'The output device';
+  let msg;
+  if (data.state === 'reconnecting') {
+    msg = '⚠ “' + device + '” is offline — reconnecting (attempt '
+      + (data.attempts || 1) + ')…';
+  } else if (data.state === 'idle_paused') {
+    const why = {
+      window_expired: 'the resume window expired',
+      flap_guard: 'it kept dropping out (flap guard)',
+      closing_time: 'Closing Time is active',
+      track_identity: 'the held track changed identity',
+      no_media_source: 'no media source is connected',
+    }[data.idle_paused_reason] || 'auto-resume is off';
+    msg = '⚠ “' + device + '” is back but playback stays paused — ' + why
+      + '. Resume continues from where it stopped.';
+  } else if (data.state === 'paused') {
+    msg = '⚠ “' + device + '” reconnected paused (it was paused before the '
+      + 'outage) — Resume continues playback.';
+  } else {
+    msg = '⚠ “' + device + '” is offline — playback paused, queue held';
+    const bits = [];
+    if (data.attempts) bits.push('attempt ' + data.attempts);
+    if (data.next_retry_s) bits.push('retrying in ~' + Math.round(data.next_retry_s) + 's');
+    if (bits.length) msg += ' (' + bits.join(', ') + ')';
+    msg += '.';
+  }
+  msgEl.textContent = msg;
+  banner.style.display = 'flex';   // inline styles lay out msg + Resume in a row
+}
+
+// Resume button: the R17 manual resume (POST /admin/playback/resume routes to
+// the supervisor while held; 409 = device still unreachable, hold intact).
+// Wired once here — renderOutputSessionBanner only mutates text/visibility.
+document.getElementById('btn-outage-resume').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-outage-resume');
+  btn.disabled = true;
+  try { await api('POST', '/admin/playback/resume'); }
+  catch { showToast('Device still unreachable — retrying'); }
   finally { btn.disabled = false; }
 });
 
@@ -375,8 +446,18 @@ function connectWS() {
     if (msg.type === 'now_playing_changed') playbackHandle.applyNowPlaying(msg);
     else if (msg.type === 'playback_state_changed') playbackHandle.applyPlaybackState(msg);
     else if (msg.type === 'closing_time') playbackHandle.applyClosingTime(msg);
+    else if (msg.type === 'output_session') {
+      // Supervisor plan U4: shared lean note via the playback module, then the
+      // admin-rich banner detail (device / attempts / retry / Resume) — the
+      // event body is the same shape as the /admin/queue snapshot field, so
+      // push and pull share one render path (the applyDevicesPayload pattern).
+      playbackHandle.applyOutputSession(msg);
+      renderOutputSessionBanner(msg);
+    }
+    else if (msg.type === 'track_skipped') playbackHandle.showSkipped(msg);
     else if (msg.type === 'queue_changed') {
       playbackHandle.applyQueue(msg.queue, msg.history);
+      setRecentPlaysData(msg.history);
       syncLock(msg.is_locked);
       _historyEmpty = !(msg.history && msg.history.length);
       _syncPrevEnabled();
@@ -576,7 +657,8 @@ function updateDeviceSelect() {
   if (!directDev) {
     directDev = {
       host: '__direct__', name: 'System Audio',
-      protocols: [{ backend: 'direct', device_id: 'default', verified: true, checked_at: null }],
+      // gapless mirrors the server snapshot's Direct capability (plan U5).
+      protocols: [{ backend: 'direct', device_id: 'default', verified: true, checked_at: null, gapless: 'supported' }],
     };
   }
   _appendDeviceOption(sel, directDev);
@@ -665,6 +747,13 @@ function updateConnectionSelect() {
       opt.textContent = (PROTOCOL_LABELS[p.backend] || p.backend) + ' (Checking…)';
       opt.disabled = true;
     }
+    // Gapless capability chip (2026-07-11 supervisor plan U5): a minimal text
+    // badge from the snapshot's per-protocol field — supported / unsupported /
+    // unverified. <option> rows are text-only, so the "chip" is a label suffix
+    // (same idiom as the "(Checking…)" state above); the deliberate visual
+    // pass is deferred to a mockups round. Absent field (degraded payload) →
+    // no suffix, exactly today's label.
+    if (p.gapless) opt.textContent += ' · gapless: ' + p.gapless;
     sel.appendChild(opt);
   }
 
@@ -909,36 +998,224 @@ document.querySelectorAll('#browse .tab').forEach(tab => {
   });
 });
 
-// ── Libraries ──────────────────────────────────────────────────────────────
+// ── Sources (multi-source connect / remove / rescan / priority, plan U14) ────
 
-const libraryList = document.getElementById('library-list');
+const sourcesList = document.getElementById('sources-list');
+const jfConnectError = document.getElementById('jf-connect-error');
+const SOURCE_TYPE_LABELS = { plex: 'Plex', jellyfin: 'Jellyfin', local: 'Local' };
+let _currentSources = [];
+let _currentLibs = [];               // last /admin/plex/libraries payload (grouped by source)
+const _openDrills = new Set();       // source_ids whose "Edit libraries…" panel is expanded
+const _togglingSources = new Set();  // source_ids with an in-flight switch POST (no double-toggle)
+let _loadSourcesGen = 0;             // monotonic guard: a slower loadSources() must not overwrite a fresher render
 
-function renderLibraryList(libs) {
-  if (!libs.length) { libraryList.innerHTML = '<p style="color:#555;font-size:.85rem">No Plex libraries found.</p>'; return; }
-  libraryList.innerHTML = '';
-  libs.forEach(lib => {
-    const row = document.createElement('div');
-    row.className = 'lib-item';
-    const id = `lib-${lib.key}`;
-    const ownerTag = lib.owner ? ` <span style="color:#666;font-size:.8em">(${esc(lib.owner)})</span>` : '';
-    const encodedKey = encodeURIComponent(lib.key);
-    row.innerHTML = `<input type="checkbox" id="${id}" data-key="${encodedKey}" ${lib.enabled ? 'checked' : ''}><label for="${id}">${esc(lib.title)}${ownerTag}</label>`;
-    row.querySelector('input').addEventListener('change', async function() {
-      const path = this.checked ? `/admin/plex/libraries/${this.dataset.key}/enable` : `/admin/plex/libraries/${this.dataset.key}/disable`;
-      try { await api('POST', path); }
-      catch { showToast('Failed to update library'); this.checked = !this.checked; }
-    });
-    libraryList.appendChild(row);
+// One source-grouped list: each source is a row carrying a whole-source on/off
+// switch, priority arrows, (non-Plex) Remove, and — when it holds more than one
+// library — an "Edit libraries…" drill-in that reveals nested per-library
+// checkboxes. Source-off greys AND disables those checkboxes (source-off wins).
+// Grouping replaces the old "(Type — owner)" disambiguation tags (Libraries-panel).
+function renderSourcesList(sources, libs) {
+  _currentSources = sources.slice();
+  if (libs !== undefined) _currentLibs = libs;
+  if (!sources.length) {
+    sourcesList.innerHTML =
+      '<p style="color:#555;font-size:.85rem">No sources connected — use the buttons below to add one.</p>';
+    syncSurpriseSourceNote();
+    return;
+  }
+
+  // Group libraries under their owning source (explicit source_id, else key prefix).
+  const bySource = {};
+  (_currentLibs || []).forEach(l => {
+    const key = String(l.key || '');
+    const sid = (l.source_id !== undefined && l.source_id !== null && l.source_id !== '')
+      ? l.source_id : (key.includes(':') ? key.split(':', 1)[0] : '');
+    (bySource[sid] = bySource[sid] || []).push(l);
   });
+
+  // Inner helpers kept local so the per-page top-level surface (discipline
+  // allowlist) stays unchanged.
+  const cssSafe = (s) => 'x' + String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const arrowBtn = (dir, sid) => {
+    const b = document.createElement('button');
+    b.className = 'icbtn';
+    b.textContent = dir === 'up' ? '▲' : '▼';
+    b.title = dir === 'up' ? 'Higher priority' : 'Lower priority';
+    b.addEventListener('click', () => moveSourcePriority(sid, dir));
+    return b;
+  };
+  const showRowError = (block, msg) => {
+    let e = block.querySelector('.src-err');
+    if (!e) { e = document.createElement('div'); e.className = 'src-err'; block.appendChild(e); }
+    e.textContent = msg;
+  };
+  const clearRowError = (block) => { const e = block.querySelector('.src-err'); if (e) e.remove(); };
+
+  sourcesList.innerHTML = '';
+  sources.forEach((src, i) => {
+    const sid = src.source_id;
+    const srcLibs = bySource[sid] || [];
+    const multi = srcLibs.length > 1;
+    let on = src.enabled !== false;
+
+    const block = document.createElement('div');
+    block.className = 'src-block';
+    const row = document.createElement('div');
+    row.className = 'src-row';
+
+    const nameWrap = document.createElement('span');
+    nameWrap.className = 'src-name';
+    nameWrap.innerHTML =
+      `<span class="type-tag">${esc(SOURCE_TYPE_LABELS[src.type] || src.type || '')}</span>${esc(src.name)}`;
+
+    const meta = document.createElement('span');
+    meta.className = 'src-meta';
+    const setMeta = () => {
+      const n = srcLibs.filter(l => l.enabled).length;
+      meta.textContent = !srcLibs.length ? '' : (multi ? `${n} of ${srcLibs.length} on` : '1 library');
+    };
+
+    // Nested per-library checkboxes (source-off greys + disables them).
+    const children = document.createElement('div');
+    children.className = 'lib-children';
+    children.id = 'libs-' + cssSafe(sid);
+    children.hidden = !_openDrills.has(sid);
+    srcLibs.forEach(lib => {
+      const label = document.createElement('label');
+      label.className = 'lib-child' + (on ? '' : ' greyed');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !!lib.enabled;
+      cb.disabled = !on;
+      cb.addEventListener('change', async () => {
+        // Don't race the whole-source switch: if it's off or mid-flight, this
+        // per-library write has no catalog effect (source-off wins) — revert and bail.
+        if (!on || _togglingSources.has(sid)) { cb.checked = !cb.checked; return; }
+        const path = `/admin/plex/libraries/${encodeURIComponent(lib.key)}/`
+          + (cb.checked ? 'enable' : 'disable');
+        try { await api('POST', path); lib.enabled = cb.checked; setMeta(); }
+        catch { showToast('Failed to update library'); cb.checked = !cb.checked; }
+      });
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(' ' + (lib.title || '')));
+      children.appendChild(label);
+    });
+
+    // "Edit libraries…" drill-in — only when the source holds more than one library.
+    if (multi) {
+      const drill = document.createElement('button');
+      drill.type = 'button';
+      drill.className = 'drill';
+      drill.setAttribute('aria-controls', children.id);
+      const syncDrill = () => {
+        const open = _openDrills.has(sid);
+        drill.textContent = open ? 'Hide libraries' : 'Edit libraries…';
+        drill.setAttribute('aria-expanded', open ? 'true' : 'false');
+        children.hidden = !open;
+      };
+      drill.addEventListener('click', () => {
+        if (_openDrills.has(sid)) _openDrills.delete(sid); else _openDrills.add(sid);
+        syncDrill();
+      });
+      syncDrill();
+      nameWrap.appendChild(document.createTextNode(' '));
+      nameWrap.appendChild(drill);
+    }
+    nameWrap.appendChild(meta);
+    setMeta();
+
+    const controls = document.createElement('span');
+    controls.className = 'src-controls';
+    if (i > 0) controls.appendChild(arrowBtn('up', sid));
+    if (i < sources.length - 1) controls.appendChild(arrowBtn('down', sid));
+    // Plex disconnect stays in the Plex flow; only non-Plex sources are removable here.
+    if (src.type !== 'plex') {
+      const rm = document.createElement('button');
+      rm.className = 'icbtn rm';
+      rm.textContent = 'Remove';
+      rm.addEventListener('click', () => removeSource(src.type, sid));
+      controls.appendChild(rm);
+    }
+
+    // Whole-source on/off switch.
+    const sw = document.createElement('label');
+    sw.className = 'switch';
+    const swInput = document.createElement('input');
+    swInput.type = 'checkbox';
+    swInput.checked = on;
+    swInput.setAttribute('aria-label', 'Enable ' + (src.name || 'source'));
+    const slider = document.createElement('span');
+    slider.className = 'slider';
+    sw.appendChild(swInput);
+    sw.appendChild(slider);
+    const applyGrey = () => {
+      children.querySelectorAll('.lib-child').forEach(lc => {
+        lc.classList.toggle('greyed', !on);
+        const cb = lc.querySelector('input'); if (cb) cb.disabled = !on;
+      });
+    };
+    swInput.addEventListener('change', async () => {
+      if (_togglingSources.has(sid)) { swInput.checked = !swInput.checked; return; }  // no double-toggle
+      const want = swInput.checked;
+      _togglingSources.add(sid);
+      swInput.disabled = true;
+      try {
+        await api('POST', `/admin/sources/${encodeURIComponent(sid)}/` + (want ? 'enable' : 'disable'));
+        on = want; src.enabled = want; applyGrey(); clearRowError(block);
+      } catch {
+        swInput.checked = !want;   // revert
+        showRowError(block, `Could not ${want ? 'enable' : 'disable'} ${src.name} — try again.`);
+      } finally {
+        _togglingSources.delete(sid); swInput.disabled = false;
+      }
+    });
+
+    row.appendChild(nameWrap);
+    row.appendChild(controls);
+    row.appendChild(sw);
+    block.appendChild(row);
+    if (multi) block.appendChild(children);
+    sourcesList.appendChild(block);
+  });
+  syncSurpriseSourceNote();
 }
 
-async function loadLibraries() {
+// U13 capability-degradation note: when a non-Plex source is connected, Surprise
+// Me falls back to whole-library random (the Plex similarity options don't apply
+// to a mixed/Jellyfin/local library). Surface that in the Surprise Me settings.
+function syncSurpriseSourceNote() {
+  const note = document.getElementById('surprise-source-note');
+  if (!note) return;
+  const mixed = _currentSources.some(s => s.type && s.type !== 'plex');
+  note.style.display = mixed ? '' : 'none';
+}
+
+async function loadSources() {
+  const gen = ++_loadSourcesGen;   // stale-overwrite guard (5 callers x 3 serial fetches)
   try {
-    const libs = await api('GET', '/admin/plex/libraries');
-    renderLibraryList(libs);
-  } catch { libraryList.innerHTML = '<p style="color:#f87171;font-size:.85rem">Plex not connected.</p>'; }
-  // Browse-index plan U6: surface index freshness next to the Rescan button.
-  // Inlined (not a new top-level helper) to respect the per-page allowlist.
+    const data = await api('GET', '/admin/sources');
+    let sources = data.sources || [];
+    // Render in saved-priority order (highest first); unknown ids fall after.
+    try {
+      const pr = await api('GET', '/admin/sources/priority');
+      const order = pr.order || [];
+      if (order.length) {
+        sources = sources.slice().sort((a, b) => {
+          const ia = order.indexOf(a.source_id), ib = order.indexOf(b.source_id);
+          return (ia === -1 ? 1e9 : ia) - (ib === -1 ? 1e9 : ib);
+        });
+      }
+    } catch {}
+    let libs = [];
+    try { libs = await api('GET', '/admin/plex/libraries'); } catch {}
+    if (gen !== _loadSourcesGen) return;   // a newer loadSources() started — drop this stale result
+    renderSourcesList(sources, libs);
+  } catch {
+    sourcesList.innerHTML = '<p style="color:#f87171;font-size:.85rem">Could not load sources.</p>';
+  }
+  renderSourceScanStatus();
+  // Browse-index freshness line next to Rescan (moved here from the old loadLibraries;
+  // 503s on a non-Plex install, which is fine — the line just stays blank).
   try {
     const s = await api('GET', '/admin/plex/index-status');
     const el = document.getElementById('index-status');
@@ -947,21 +1224,179 @@ async function loadLibraries() {
   } catch {}
 }
 
-async function adminRescan() {
-  const btn = document.getElementById('btn-rescan-libs');
-  if (!btn) return;
-  btn.disabled = true;
-  btn.textContent = 'Rescanning…';
-  try {
-    const libs = await api('POST', '/admin/plex/rescan');
-    renderLibraryList(libs);
-    // Rescan just triggered a background browse-index rebuild (plan U6).
-    const el = document.getElementById('index-status');
-    if (el) el.textContent = 'Indexing…';
-    showToast('Libraries refreshed');
-  } catch { showToast('Rescan failed'); }
-  finally { btn.disabled = false; btn.textContent = 'Rescan Libraries'; }
+// U15 admin scan-status badge: surfaces the catalog scan state under the Sources
+// list — "Scanning…" while a crawl runs, and a distinct "no music found" when a
+// finished scan returned nothing (vs the zero-source "No sources connected"
+// which the sources list itself shows). Hidden when the library is populated.
+async function renderSourceScanStatus() {
+  const el = document.getElementById('sources-scan-status');
+  if (!el) return;
+  let s;
+  try { s = await api('GET', '/admin/scan-status'); } catch { el.style.display = 'none'; return; }
+  let msg = '';
+  if (s.scanning) {
+    msg = 'Scanning sources… the library will populate as it runs.';
+  } else if (s.sources > 0 && s.scanned && s.empty) {
+    msg = 'Scan complete, but no music was found — the connected sources returned nothing.';
+  }
+  el.textContent = msg;
+  el.style.display = msg ? '' : 'none';
 }
+
+async function connectJellyfin() {
+  const btn = document.getElementById('btn-connect-jellyfin');
+  const url = document.getElementById('jf-url').value.trim();
+  const user = document.getElementById('jf-user').value.trim();
+  const pass = document.getElementById('jf-pass').value;
+  const name = document.getElementById('jf-name').value.trim();
+  jfConnectError.style.display = 'none';
+  if (!url || !user) {
+    jfConnectError.textContent = 'Server URL and username are required.';
+    jfConnectError.style.display = '';
+    return;
+  }
+  btn.disabled = true; btn.textContent = 'Connecting…';
+  try {
+    const resp = await fetch('/admin/sources/jellyfin', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ server_url: url, username: user, password: pass, name }),
+    });
+    if (!resp.ok) {
+      let cat = 'unreachable', msg = '';
+      try { const e = await resp.json(); if (e.detail) { cat = e.detail.category || cat; msg = e.detail.message || ''; } } catch {}
+      jfConnectError.textContent = cat === 'auth_rejected'
+        ? 'Jellyfin rejected the username/password.'
+        : (cat === 'unreachable' ? 'Could not reach the Jellyfin server. Check the URL.'
+                                 : (msg || 'Could not connect.'));
+      jfConnectError.style.display = '';
+      return;
+    }
+    ['jf-url', 'jf-user', 'jf-pass', 'jf-name'].forEach(id => { document.getElementById(id).value = ''; });
+    document.getElementById('jf-connect-form').style.display = 'none';
+    showToast('Jellyfin connected — scanning…');
+    loadSources();
+  } catch {
+    jfConnectError.textContent = 'Could not reach the Jellyfin server. Check the URL.';
+    jfConnectError.style.display = '';
+  } finally { btn.disabled = false; btn.textContent = 'Connect'; }
+}
+
+async function connectLocal() {
+  // Mirrors connectJellyfin: a directory path (read-only, no credential). The
+  // error element is looked up inline (no module-level const) to keep the
+  // per-page top-level surface unchanged for the discipline allowlist.
+  const btn = document.getElementById('btn-connect-local');
+  const err = document.getElementById('local-connect-error');
+  const dir = document.getElementById('local-dir').value.trim();
+  const name = document.getElementById('local-name').value.trim();
+  err.style.display = 'none';
+  if (!dir) {
+    err.textContent = 'A folder path is required.';
+    err.style.display = '';
+    return;
+  }
+  btn.disabled = true; btn.textContent = 'Connecting…';
+  try {
+    const resp = await fetch('/admin/sources/local', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root_dir: dir, name }),
+    });
+    if (!resp.ok) {
+      let msg = 'Could not connect to that folder.';
+      try { const e = await resp.json(); if (e.detail && e.detail.message) msg = e.detail.message; } catch {}
+      err.textContent = msg;
+      err.style.display = '';
+      return;
+    }
+    ['local-dir', 'local-name'].forEach(id => { document.getElementById(id).value = ''; });
+    document.getElementById('local-connect-form').style.display = 'none';
+    showToast('Local folder connected — scanning…');
+    loadSources();
+  } catch {
+    err.textContent = 'Could not connect to that folder.';
+    err.style.display = '';
+  } finally { btn.disabled = false; btn.textContent = 'Connect'; }
+}
+
+async function removeSource(type, sourceId) {
+  if (!confirm('Remove this source? Its tracks leave the library.')) return;
+  try {
+    await api('DELETE', `/admin/sources/${type}/${encodeURIComponent(sourceId)}`);
+    showToast('Source removed');
+    loadSources();
+  } catch { showToast('Failed to remove source'); }
+}
+
+async function rescanSources() {
+  const btn = document.getElementById('btn-rescan-sources');
+  if (btn) { btn.disabled = true; btn.textContent = 'Rescanning…'; }
+  try { await api('POST', '/admin/sources/rescan'); showToast('Rescanning all sources…'); }
+  catch { showToast('Rescan failed'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = 'Rescan Sources'; } }
+}
+
+function moveSourcePriority(sourceId, dir) {
+  const byId = {};
+  _currentSources.forEach(s => { byId[s.source_id] = s; });
+  const ids = _currentSources.map(s => s.source_id);
+  const i = ids.indexOf(sourceId);
+  if (i === -1) return;
+  const j = dir === 'up' ? i - 1 : i + 1;
+  if (j < 0 || j >= ids.length) return;
+  ids.splice(j, 0, ids.splice(i, 1)[0]);
+  if (_togglingSources.size) {
+    // A source switch is mid-flight; an optimistic re-render would rebuild that row
+    // from a stale enabled value. Persist priority and reload once it settles.
+    api('POST', '/admin/sources/priority', { order: ids })
+      .then(() => loadSources())
+      .catch(() => { showToast('Failed to save priority'); loadSources(); });
+    return;
+  }
+  renderSourcesList(ids.map(id => byId[id]), _currentLibs);  // optimistic reorder
+  api('POST', '/admin/sources/priority', { order: ids })
+    .then(() => showToast('Priority updated'))
+    .catch(() => { showToast('Failed to save priority'); loadSources(); });
+}
+
+// "Connect Jellyfin" reveals the inline form (mirrors the Plex connect button);
+// Cancel hides it. Submit ("Connect") + Rescan wire to the module functions.
+document.getElementById('btn-connect-jellyfin-toggle').addEventListener('click', () => {
+  const form = document.getElementById('jf-connect-form');
+  const open = form.style.display !== 'none';
+  form.style.display = open ? 'none' : '';
+  jfConnectError.style.display = 'none';
+  if (!open) document.getElementById('jf-url').focus();
+});
+document.getElementById('btn-cancel-jellyfin').addEventListener('click', () => {
+  document.getElementById('jf-connect-form').style.display = 'none';
+  jfConnectError.style.display = 'none';
+});
+document.getElementById('btn-connect-jellyfin').addEventListener('click', connectJellyfin);
+document.getElementById('btn-rescan-sources').addEventListener('click', rescanSources);
+
+// "Connect Local Folder" reveals its inline form; Cancel hides it; Connect submits.
+document.getElementById('btn-connect-local-toggle').addEventListener('click', () => {
+  const form = document.getElementById('local-connect-form');
+  const open = form.style.display !== 'none';
+  form.style.display = open ? 'none' : '';
+  document.getElementById('local-connect-error').style.display = 'none';
+  if (!open) document.getElementById('local-dir').focus();
+});
+document.getElementById('btn-cancel-local').addEventListener('click', () => {
+  document.getElementById('local-connect-form').style.display = 'none';
+  document.getElementById('local-connect-error').style.display = 'none';
+});
+document.getElementById('btn-connect-local').addEventListener('click', connectLocal);
+
+// ── Libraries ──────────────────────────────────────────────────────────────
+
+// The flat "Plex libraries" checkbox list and its "(Type — owner)" disambiguation
+// tags are gone — libraries now render nested under their source (renderSourcesList
+// above), so the grouping carries source identity for free (Libraries-panel).
+
+// Compat alias: the unified loader fetches sources + libraries and renders the one
+// source-grouped list. Existing call sites (init) keep working.
+async function loadLibraries() { return loadSources(); }
 
 // ── Plex connect ───────────────────────────────────────────────────────────
 
@@ -1057,6 +1492,121 @@ function renderSurpriseRecent(data) {
   el.textContent = parts.length ? parts.join(' · ') : 'No suggestions yet';
 }
 
+// ── Recent Plays curation panel (2026-07-03 plan; Direction A) ───────────────
+// Admin-only Setup chrome to prune recent plays. Fed by the SAME history array
+// that drives the shared read-only strip — captured from refreshQueueState() and
+// the queue_changed WS event via setRecentPlaysData(). Pages 10-at-a-time client-
+// side over the ~50-entry live buffer the /admin/queue payload already carries;
+// removal reuses POST /admin/history/remove-play (the shipped inverse chokepoint).
+// Row rendering lives here (not the shared playback module) because this is a
+// distinct admin management surface, like renderSourcesList / renderSurpriseRecent.
+let _recentPlaysData = [];
+let _recentPlaysPage = 0;
+let _recentPlaysGen = 0;
+let _recentPlaysExpanded = false;
+
+function _playedAgo(iso) {
+  const t = Date.parse(iso);
+  if (!t) return '';
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 45) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return m + ' min ago';
+  const h = Math.round(m / 60);
+  if (h < 24) return h + (h === 1 ? ' hr ago' : ' hrs ago');
+  const d = Math.round(h / 24);
+  return d + (d === 1 ? ' day ago' : ' days ago');
+}
+
+// Store the latest history and refresh the panel. The count badge updates even
+// when collapsed (it sits on the always-visible header); rows render only when
+// expanded. Bumping the generation lets an in-flight removal detect a newer
+// snapshot and skip its optimistic paint.
+function setRecentPlaysData(history) {
+  _recentPlaysData = Array.isArray(history) ? history : [];
+  _recentPlaysGen++;
+  renderRecentPlays();
+}
+
+function renderRecentPlays() {
+  const badge = document.getElementById('recent-plays-count');
+  const list = document.getElementById('recent-plays-list');
+  const pager = document.getElementById('recent-plays-pager');
+  if (!badge || !list || !pager) return;
+  const n = _recentPlaysData.length;
+  badge.textContent = n + (n === 1 ? ' play' : ' plays');
+  if (!_recentPlaysExpanded) return;  // build rows only when the panel is open
+  if (n === 0) {
+    list.innerHTML = '<div class="rp-empty">No plays recorded yet.</div>';
+    pager.innerHTML = '';
+    return;
+  }
+  const perPage = 10;
+  const maxPage = Math.max(0, Math.ceil(n / perPage) - 1);
+  if (_recentPlaysPage > maxPage) _recentPlaysPage = maxPage;  // clamp after a shrink
+  const start = _recentPlaysPage * perPage;
+  const rows = _recentPlaysData.slice(start, start + perPage);
+  list.innerHTML = rows.map((it) =>
+    '<div class="rp-row">'
+    + artImg(it.thumb, 'rp-art')
+    + `<div class="rp-meta"><div class="rp-t">${esc(it.title)}</div>`
+    + `<div class="rp-s">${esc(it.artist)}</div></div>`
+    + `<div class="rp-when">${esc(_playedAgo(it.added_at))}</div>`
+    + '<button type="button" class="rp-x" title="Remove this play">✕</button>'
+    + '</div>').join('');
+  list.querySelectorAll('.rp-x').forEach((btn, i) => {
+    const it = rows[i];
+    btn.setAttribute('aria-label', 'Remove ' + (it.title || 'this play') + ' from history');
+    btn.addEventListener('click', () => removeRecentPlay(it.track_id || it.id, it.added_at));
+  });
+  pager.innerHTML =
+    `<button type="button" class="rp-nav" aria-label="Newer page"${_recentPlaysPage === 0 ? ' disabled' : ''}>‹ Newer</button>`
+    + `<span class="rp-lbl">Page ${_recentPlaysPage + 1} of ${maxPage + 1}</span>`
+    + `<button type="button" class="rp-nav" aria-label="Older page"${_recentPlaysPage >= maxPage ? ' disabled' : ''}>Older ›</button>`;
+  const [prev, next] = pager.querySelectorAll('.rp-nav');
+  if (prev) prev.addEventListener('click', () => { if (_recentPlaysPage > 0) { _recentPlaysPage--; _recentPlaysGen++; renderRecentPlays(); } });
+  if (next) next.addEventListener('click', () => { if (_recentPlaysPage < maxPage) { _recentPlaysPage++; _recentPlaysGen++; renderRecentPlays(); } });
+}
+
+function toggleRecentPlays() {
+  const sec = document.getElementById('recent-plays');
+  if (!sec) return;
+  _recentPlaysExpanded = sec.classList.toggle('rp-collapsed') === false;
+  const head = document.getElementById('recent-plays-head');
+  if (head) head.setAttribute('aria-expanded', String(_recentPlaysExpanded));
+  _recentPlaysGen++;
+  renderRecentPlays();
+}
+
+// Remove one play. Raw fetch (admin api() throws on non-2xx and can't surface a
+// 404): 2xx → optimistic filter + repaint (the queue_changed broadcast re-confirms;
+// per the realtime-ui learning, write-then-render beats waiting on the event);
+// 404 (already gone) → refetch the snapshot; any other status → toast. No confirm.
+async function removeRecentPlay(trackId, addedAt) {
+  const gen = _recentPlaysGen;
+  let resp;
+  try {
+    resp = await fetch('/admin/history/remove-play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ track_id: trackId, added_at: addedAt }),
+    });
+  } catch { showToast('Could not remove play'); return; }
+  if (resp.status === 404) { refreshQueueState(); return; }
+  if (!resp.ok) { showToast('Could not remove play'); return; }
+  if (gen !== _recentPlaysGen) return;  // a newer snapshot already superseded us
+  _recentPlaysData = _recentPlaysData.filter(
+    (x) => !((x.track_id || x.id) === trackId && x.added_at === addedAt));
+  renderRecentPlays();
+}
+
+// Wire the collapse toggle (the header is a <button> in the admin template, so
+// Enter/Space fire click natively; this script runs at end of body).
+(() => {
+  const head = document.getElementById('recent-plays-head');
+  if (head) head.addEventListener('click', toggleRecentPlays);
+})();
+
 async function loadSettings() {
   try {
     const s = await api('GET', '/admin/settings');
@@ -1126,6 +1676,14 @@ async function loadSettings() {
     if (ctMessage) ctMessage.value = s.closing_time_message || '';
     const qeLimit = document.getElementById('queue-end-length-limit');
     if (qeLimit) qeLimit.checked = !!s.queue_end_length_limit;
+    // Gapless playback toggle (2026-07-11 supervisor plan U5): default OFF —
+    // hydrate checked only on an explicit true (mirrors ratings-visible).
+    const gaplessEnabled = document.getElementById('gapless-enabled');
+    if (gaplessEnabled) gaplessEnabled.checked = s.gapless_enabled === true;
+    // Auto-resume window (plan U5): the GET resolves the default (60), so the
+    // box always shows the live value; the >= 1 floor is enforced server-side.
+    const resumeWindow = document.getElementById('resume-window-minutes');
+    if (resumeWindow) resumeWindow.value = s.resume_window_minutes || '';
     // International rail (2026-06-22 plan 004): alpha-mode radios + the two
     // first-character thresholds (empty box → default 2 via placeholder). The
     // threshold row is ALWAYS visible — dimmed + disabled when International isn't
@@ -1204,6 +1762,12 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
   if (ctMessageEl) body.closing_time_message = ctMessageEl.value;
   const qeLimitEl = document.getElementById('queue-end-length-limit');
   if (qeLimitEl) body.queue_end_length_limit = qeLimitEl.checked;
+  // Gapless toggle + auto-resume window (2026-07-11 supervisor plan U5).
+  // Window empty/0 → default 60 (mirrors most-played-display-limit's shape).
+  const gaplessEl = document.getElementById('gapless-enabled');
+  if (gaplessEl) body.gapless_enabled = gaplessEl.checked;
+  const resumeWindowEl = document.getElementById('resume-window-minutes');
+  if (resumeWindowEl) body.resume_window_minutes = parseInt(resumeWindowEl.value, 10) || 60;
   // International rail (plan 004): alpha-mode + the two thresholds (empty/0 →
   // default 2, mirroring the popular-threshold field).
   const alphaModeEl = document.querySelector('[name=rail-alpha-mode]:checked');
@@ -1430,7 +1994,7 @@ document.getElementById('logout-link').addEventListener('click', async (e) => {
   }
   await playbackHandle.resume();   // authoritative position + np refresh
   loadDevices();
-  loadLibraries();
+  loadSources();   // unified loader: sources + libraries -> one source-grouped list
   loadSettings();
   loadRuleEditors();
   loadVolume();

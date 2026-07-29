@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, call
 from uuid import UUID
 
+from app.output import hold  # the hold flag's home since the session decomposition
 from app.plex.models import Track
 
 
@@ -420,7 +421,7 @@ async def test_play_proxied_ogg_advertises_flac(cast_mock):
     track = Track(id="t", title="S", artist="A", album="B", duration_ms=1000,
                   stream_key="/library/parts/89497/1/file.ogg")
     await backend.play(
-        "http://192.168.0.70/api/stream?key=k%3A%2Flibrary%2Fparts%2F89497%2F1%2Ffile.ogg",
+        "http://192.168.1.50/api/stream?key=k%3A%2Flibrary%2Fparts%2F89497%2F1%2Ffile.ogg",
         track,
     )
     args = cc.media_controller.play_media.call_args
@@ -677,11 +678,142 @@ async def test_eos_listener_ignores_error_before_play(cast_mock):
     assert not advance_called
 
 
+# ── confirmed-start signal (2026-07-11 supervisor plan U1) ────────────────────
+
+async def test_first_playing_status_emits_confirmed_start(cast_mock, fresh_supervisor):
+    """play() captures the supervisor's per-dispatch token; the FIRST PLAYING
+    media status confirms it → record_play fires exactly once via the
+    chokepoint. LOAD acceptance alone (play() returning) must not count."""
+    from app.output.chromecast import ChromecastBackend, _AdvanceListener
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    token = sup.on_dispatched(make_track())    # state dispatches before backend.play
+    await backend.play("http://url", make_track())
+    assert backend._confirm_token == token
+    rec.assert_not_called()                    # command accepted ≠ audio
+
+    status = MagicMock()
+    status.player_state = "PLAYING"
+    status.idle_reason = None
+    status.current_time = 1.0
+    _AdvanceListener(backend).new_media_status(status)
+    await asyncio.sleep(0)                     # call_soon_threadsafe hop
+    rec.assert_called_once()
+    assert backend._confirm_token is None      # one-shot
+    backend._cancel_watchdog()
+
+
+async def test_repeat_playing_status_confirms_only_once(cast_mock, fresh_supervisor):
+    from app.output.chromecast import ChromecastBackend, _AdvanceListener
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._loop = asyncio.get_running_loop()
+    backend._confirm_token = sup.on_dispatched(make_track())
+    status = MagicMock()
+    status.player_state = "PLAYING"
+    status.idle_reason = None
+    status.current_time = 1.0
+    listener = _AdvanceListener(backend)
+    listener.new_media_status(status)
+    listener.new_media_status(status)
+    await asyncio.sleep(0)
+    rec.assert_called_once()
+
+
+async def test_buffering_status_does_not_confirm(cast_mock, fresh_supervisor):
+    """BUFFERING is pre-playback (R15's extension state), not confirmation."""
+    from app.output.chromecast import ChromecastBackend, _AdvanceListener
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._loop = asyncio.get_running_loop()
+    token = sup.on_dispatched(make_track())
+    backend._confirm_token = token
+    status = MagicMock()
+    status.player_state = "BUFFERING"
+    status.idle_reason = None
+    status.current_time = 0.0
+    _AdvanceListener(backend).new_media_status(status)
+    await asyncio.sleep(0)
+    rec.assert_not_called()
+    assert backend._confirm_token == token     # still awaiting confirmation
+
+
+async def test_stale_playing_status_confirms_nothing_after_supersede(cast_mock, fresh_supervisor):
+    """A late PLAYING for a superseded dispatch names a stale token — the
+    supervisor ignores it (skip-during-confirmation-window shape)."""
+    from app.output.chromecast import ChromecastBackend, _AdvanceListener
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._loop = asyncio.get_running_loop()
+    backend._confirm_token = sup.on_dispatched(make_track())
+    sup.on_dispatched(make_track())            # a newer dispatch supersedes
+    status = MagicMock()
+    status.player_state = "PLAYING"
+    status.idle_reason = None
+    status.current_time = 1.0
+    _AdvanceListener(backend).new_media_status(status)
+    await asyncio.sleep(0)
+    rec.assert_not_called()
+
+
 # ── duration watchdog (U2) ────────────────────────────────────────────────────
 
 async def test_watchdog_fires_advance_when_no_eos(cast_mock):
-    """A hung stream that never reports any terminal status still advances:
-    the watchdog fires after duration + grace."""
+    """A hung stream that never reports any terminal status still advances
+    WHEN THE DEVICE IS REACHABLE: the watchdog fires after duration + grace
+    and the U2 probe confirms the receiver is alive (today's behavior)."""
+    from unittest.mock import patch as _patch
+    from app.output.chromecast import ChromecastBackend
+    advance_called = []
+
+    async def advance():
+        advance_called.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._is_playing = True
+    backend._play_token = 7
+    backend._cast = _make_cc()                 # socket_client.is_connected truthy
+
+    with _patch("app.output.chromecast.asyncio.sleep", AsyncMock(return_value=None)):
+        await backend._watchdog(7, 1000)
+
+    assert advance_called
+
+
+async def test_watchdog_unreachable_device_reports_outage_not_advance(
+    cast_mock, fresh_supervisor
+):
+    """U2's R15/R16 fork: watchdog expiry with the device UNREACHABLE reports
+    outage-suspected to the supervisor — the queue holds, no advance, no
+    consumed item (the origin party incident's exact mechanism)."""
+    from unittest.mock import patch as _patch
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+    advance_called = []
+
+    async def advance():
+        advance_called.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._is_playing = True
+    backend._play_token = 7
+    backend._cast = None                       # probe → unreachable
+
+    with _patch("app.output.chromecast.asyncio.sleep", AsyncMock(return_value=None)):
+        await backend._watchdog(7, 1000)
+
+    assert not advance_called
+    assert outages == ["watchdog_unreachable"]
+    assert backend._is_playing is False
+
+
+async def test_watchdog_superseded_during_probe_is_noop(cast_mock):
+    """A play() that lands while the watchdog's probe is in flight bumps the
+    token — the stale watchdog must neither advance nor report."""
     from unittest.mock import patch as _patch
     from app.output.chromecast import ChromecastBackend
     advance_called = []
@@ -693,10 +825,16 @@ async def test_watchdog_fires_advance_when_no_eos(cast_mock):
     backend._is_playing = True
     backend._play_token = 7
 
+    async def probe_and_supersede():
+        backend._play_token = 8                # a newer play() superseded us
+        return (True, "PLAYING")
+
+    backend.probe_liveness = probe_and_supersede
     with _patch("app.output.chromecast.asyncio.sleep", AsyncMock(return_value=None)):
         await backend._watchdog(7, 1000)
 
-    assert advance_called
+    assert not advance_called
+    assert backend._is_playing is True         # the new play() owns the flag
 
 
 async def test_watchdog_token_guard_prevents_stale_advance(cast_mock):
@@ -1536,3 +1674,1571 @@ async def test_probe_device_returns_false_when_unavailable():
         from app.output.chromecast import ChromecastBackend
         backend = ChromecastBackend()
         assert await backend.probe_device("any-id") is False
+
+
+# ── connection LOST + reachability probe (2026-07-11 supervisor plan U2) ─────
+
+async def test_connection_lost_while_playing_reports_outage(cast_mock, fresh_supervisor):
+    """Cast socket LOST mid-track is device-level by definition: report
+    outage-suspected (R16 re-point), never advance — the classifier's hold
+    is what keeps the party queue intact through a 5-minute outage."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+    advance_called = []
+
+    async def advance():
+        advance_called.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    cc = _make_cc()
+    backend._cast = cc
+    backend._is_playing = True
+    backend._loop = _asyncio.get_running_loop()
+
+    status = MagicMock()
+    status.status = "LOST"
+    _ConnectionListener(backend, cc).new_connection_status(status)
+    await _asyncio.sleep(0)                    # call_soon_threadsafe hop
+
+    assert outages == ["connection_lost"]
+    assert not advance_called
+    assert backend._is_playing is False
+
+
+async def test_connection_lost_while_idle_is_noop(cast_mock, fresh_supervisor):
+    """A LOST while nothing is playing interrupts nothing — no outage report
+    (U3's reconnect loop owns idle losses)."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    backend._cast = cc
+    backend._is_playing = False
+    backend._loop = _asyncio.get_running_loop()
+
+    status = MagicMock()
+    status.status = "LOST"
+    _ConnectionListener(backend, cc).new_connection_status(status)
+    await _asyncio.sleep(0)
+    assert outages == []
+
+
+async def test_connection_lost_while_user_paused_reports_outage(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """F11: a Cast powered off while USER-PAUSED still interrupts a live
+    session — pause() flipped _is_playing False, but a current+paused queue
+    means the plan's Paused→OutagePaused edge must fire, not vanish behind
+    the playing gate."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    import app.state as st
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+
+    fake_qe = MagicMock()
+    fake_qe.state.current = object()             # a live (paused) track
+    fake_qe.state.is_paused = True
+    monkeypatch.setattr(st, "queue_engine", fake_qe)
+
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    backend._cast = cc
+    backend._is_playing = False                  # pause() already flipped it
+    backend._loop = _asyncio.get_running_loop()
+
+    status = MagicMock()
+    status.status = "LOST"
+    _ConnectionListener(backend, cc).new_connection_status(status)
+    await _asyncio.sleep(0)
+
+    assert outages == ["connection_lost"]
+
+
+async def test_connection_lost_no_current_track_is_noop(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """F11 guard: plain idle (no current track) stays a no-op — nothing is
+    being interrupted, whatever the paused flag says."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    import app.state as st
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+
+    fake_qe = MagicMock()
+    fake_qe.state.current = None
+    fake_qe.state.is_paused = True
+    monkeypatch.setattr(st, "queue_engine", fake_qe)
+
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    backend._is_playing = False
+    backend._loop = _asyncio.get_running_loop()
+
+    status = MagicMock()
+    status.status = "LOST"
+    _ConnectionListener(backend, backend._cast).new_connection_status(status)
+    await _asyncio.sleep(0)
+    assert outages == []
+
+
+async def test_connection_lost_after_own_stop_race_still_noop(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """F11 guard: a LOST racing our own stop/skip (current set, NOT paused,
+    _is_playing already False) reports nothing — the playing dispatch owns
+    its own signals."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    import app.state as st
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+
+    fake_qe = MagicMock()
+    fake_qe.state.current = object()
+    fake_qe.state.is_paused = False              # live skip, not user pause
+    monkeypatch.setattr(st, "queue_engine", fake_qe)
+
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    backend._is_playing = False
+    backend._loop = _asyncio.get_running_loop()
+
+    status = MagicMock()
+    status.status = "LOST"
+    _ConnectionListener(backend, backend._cast).new_connection_status(status)
+    await _asyncio.sleep(0)
+    assert outages == []
+
+
+async def test_resume_swallows_media_controller_error(cast_mock):
+    """F11 (adjacent hardening): resume() gets the same guard as
+    pause()/stop() — a gone media session must not raise into the endpoint."""
+    from app.output.chromecast import ChromecastBackend
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    cc.media_controller.play.side_effect = RuntimeError("no active session")
+    backend._cast = cc
+    await backend.resume()                       # must not raise
+    assert backend._is_playing is True
+
+
+async def test_connection_lost_from_stale_cast_ignored(cast_mock, fresh_supervisor):
+    """A listener surviving on a superseded cast object (set_device switched
+    devices) must not report an outage for the new device."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+
+    backend = ChromecastBackend()
+    old_cc = _make_cc("Old", "abc-001")
+    backend._cast = _make_cc("New", "abc-002")   # a different, current cast
+    backend._is_playing = True
+    backend._loop = _asyncio.get_running_loop()
+
+    status = MagicMock()
+    status.status = "LOST"
+    _ConnectionListener(backend, old_cc).new_connection_status(status)
+    await _asyncio.sleep(0)
+    assert outages == []
+    assert backend._is_playing is True
+
+
+async def test_connection_non_lost_statuses_ignored(cast_mock, fresh_supervisor):
+    """CONNECTING/CONNECTED/DISCONNECTED are not outage signals in U2 (U3
+    wires CONNECTED for re-attach)."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    backend._cast = cc
+    backend._is_playing = True
+    backend._loop = _asyncio.get_running_loop()
+
+    for st in ("CONNECTING", "CONNECTED", "DISCONNECTED", "FAILED"):
+        status = MagicMock()
+        status.status = st
+        _ConnectionListener(backend, cc).new_connection_status(status)
+    await _asyncio.sleep(0)
+    assert outages == []
+
+
+# ── connection CONNECTED → supervisor re-attach trigger (plan U3) ─────────────
+
+async def test_connection_restored_during_hold_triggers_reattach(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """CONNECTED while an outage hold is active is the socket client's own
+    re-attach signal (LOST→CONNECTED destroyed the media session): route it
+    to the supervisor's single-flight entry."""
+    from app.output import session
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    monkeypatch.setattr(hold, "_output_hold", True)
+    triggers = []
+    monkeypatch.setattr(session, "notify_reconnect_trigger",
+                        lambda t: triggers.append(t))
+
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    backend._cast = cc
+    backend._loop = _asyncio.get_running_loop()
+
+    status = MagicMock()
+    status.status = "CONNECTED"
+    _ConnectionListener(backend, cc).new_connection_status(status)
+    await _asyncio.sleep(0)
+    assert triggers == ["cast_connected"]
+
+
+async def test_connection_restored_without_hold_is_noop(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """CONNECTED with nothing held is the initial connect / a routine blip —
+    it must not reach the supervisor's re-attach entry."""
+    from app.output import session
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    monkeypatch.setattr(hold, "_output_hold", False)
+    triggers = []
+    monkeypatch.setattr(session, "notify_reconnect_trigger",
+                        lambda t: triggers.append(t))
+
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    backend._cast = cc
+    backend._loop = _asyncio.get_running_loop()
+
+    status = MagicMock()
+    status.status = "CONNECTED"
+    _ConnectionListener(backend, cc).new_connection_status(status)
+    await _asyncio.sleep(0)
+    assert triggers == []
+
+
+async def test_connection_restored_from_stale_cast_ignored(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """A CONNECTED from a superseded cast object (manual switch happened)
+    must not trigger a re-attach for the new device."""
+    from app.output import session
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    import asyncio as _asyncio
+    monkeypatch.setattr(hold, "_output_hold", True)
+    triggers = []
+    monkeypatch.setattr(session, "notify_reconnect_trigger",
+                        lambda t: triggers.append(t))
+
+    backend = ChromecastBackend()
+    old_cc = _make_cc("Old", "abc-001")
+    backend._cast = _make_cc("New", "abc-002")
+    backend._loop = _asyncio.get_running_loop()
+
+    status = MagicMock()
+    status.status = "CONNECTED"
+    _ConnectionListener(backend, old_cc).new_connection_status(status)
+    await _asyncio.sleep(0)
+    assert triggers == []
+
+
+async def test_set_device_registers_connection_listener(cast_mock):
+    """set_device wires the U2 connection listener on the freshly connected
+    cast so a later LOST reaches the supervisor."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    cc = _make_cc("Device", "abc-001")
+    info = _make_cast_info("Device", "00000000-0000-0000-0000-000000000001")
+    cast_mock["pcc"].get_chromecast_from_cast_info.return_value = cc
+
+    backend = ChromecastBackend()
+    backend._cast_infos["00000000-0000-0000-0000-000000000001"] = info
+    backend._browser = MagicMock()
+    backend._zconf = MagicMock()
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", AsyncMock()):
+        await backend.set_device("00000000-0000-0000-0000-000000000001")
+
+    cc.register_connection_listener.assert_called_once()
+    listener = cc.register_connection_listener.call_args.args[0]
+    assert isinstance(listener, _ConnectionListener)
+
+
+async def test_probe_liveness_reachable_with_connected_socket(cast_mock):
+    """Cast probe semantics (plan KTD): socket/status liveness — connected
+    socket_client → reachable, with the receiver's player_state."""
+    from app.output.chromecast import ChromecastBackend
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    cc.socket_client.is_connected = True
+    cc.media_controller.status.player_state = "BUFFERING"
+    backend._cast = cc
+    assert await backend.probe_liveness() == (True, "BUFFERING")
+
+
+async def test_probe_liveness_unreachable_when_socket_down(cast_mock):
+    from app.output.chromecast import ChromecastBackend
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    cc.socket_client.is_connected = False
+    backend._cast = cc
+    reachable, _state = await backend.probe_liveness()
+    assert reachable is False
+
+
+async def test_probe_liveness_no_cast_is_unreachable(cast_mock):
+    from app.output.chromecast import ChromecastBackend
+    backend = ChromecastBackend()
+    assert await backend.probe_liveness() == (False, None)
+
+
+# ── flow mode (2026-07-11 supervisor plan U10) ────────────────────────────────
+# Gapless-on Cast plays ONE server-stitched flow URL: boundaries are the
+# advance authority (queue/Now Playing follow the ENCODE clock), while play
+# counts key on DEVICE-reported current_time crossing the boundary offsets.
+# The FakeFlowSession below is the exact engine surface the backend consumes;
+# test_flow_three_tracks_* runs the REAL U9 engine end-to-end.
+
+import contextlib
+import inspect
+from types import SimpleNamespace
+
+from app.output.flow import FlowBoundary
+
+
+def _ftrack(tid: str) -> Track:
+    t = Track(id=tid, title=f"Song {tid}", artist="A", album="B",
+              duration_ms=180000, stream_key=f"/parts/{tid}/f.flac")
+    t.container = "flac"
+    return t
+
+
+def _pstatus(player_state, idle_reason=None, current_time=None):
+    s = MagicMock()
+    s.player_state = player_state
+    s.idle_reason = idle_reason
+    s.current_time = current_time
+    return s
+
+
+class FakeFlowSession:
+    """Duck-typed FlowSession: the exact surface ChromecastBackend consumes
+    (listeners, reposition, pause/resume/close, the stitch-timeline mapping),
+    with test-driven boundary emission. Offsets are plain milliseconds."""
+
+    def __init__(self, first, start_offset_ms=0, session_id="flowtest"):
+        self.first_track = first
+        self.start_offset_ms = start_offset_ms
+        self.session_id = session_id
+        self.closed = False
+        self.ended = False
+        self.paused = False
+        self.pause_calls = 0
+        self.resume_calls = 0
+        self.repositions = []
+        self.boundary_listeners = []
+        self.skip_listeners = []
+        self.gone_listeners = []
+        self.ended_listeners = []
+        self.position_ms = 10 ** 9          # encode clock far ahead
+        self.boundaries_ms = [(0, first)]   # (offset_ms, track), stitch order
+
+    @property
+    def url_path(self):
+        return f"/api/stream/flow/{self.session_id}"
+
+    @property
+    def content_type(self):
+        return "audio/flac"
+
+    def add_boundary_listener(self, cb):
+        self.boundary_listeners.append(cb)
+
+    def add_skip_listener(self, cb):
+        self.skip_listeners.append(cb)
+
+    def add_consumer_gone_listener(self, cb):
+        self.gone_listeners.append(cb)
+
+    def add_ended_listener(self, cb):
+        self.ended_listeners.append(cb)
+
+    def pause(self):
+        self.pause_calls += 1
+        self.paused = True
+
+    def resume(self):
+        self.resume_calls += 1
+        self.paused = False
+
+    async def close(self):
+        self.closed = True
+
+    async def reposition(self, track, offset_ms=0):
+        if self.closed or self.ended:
+            return False
+        self.repositions.append((track, offset_ms))
+        return True
+
+    # ── stitch-timeline mapping (the U10 surface) ──
+    def track_at(self, ms):
+        found = None
+        for off, t in self.boundaries_ms:
+            if off <= ms:
+                found = t
+        return found
+
+    def offset_of(self, track):
+        out = None
+        for off, t in self.boundaries_ms:
+            if getattr(t, "id", None) == getattr(track, "id", None):
+                out = off
+        return out
+
+    def held_offset_from_device_time(self, device_time_s):
+        if device_time_s is None:
+            return max(0, self.position_ms - 10_000)
+        return max(0, min(int(device_time_s * 1000), self.position_ms))
+
+    # ── test driver ──
+    async def emit_boundary(self, track, offset_ms, reposition=False):
+        self.boundaries_ms.append((offset_ms, track))
+        ev = FlowBoundary(track=track,
+                          offset_samples=offset_ms * 44100 // 1000,
+                          offset_ms=offset_ms, reposition=reposition)
+        for cb in list(self.boundary_listeners):
+            res = cb(ev)
+            if inspect.isawaitable(res):
+                await res
+
+
+@pytest.fixture
+def flow_env(cast_mock, monkeypatch):
+    """Cast flow-mode harness: gapless ON, a device-reachable stream base,
+    and flow.create_flow_session building FakeFlowSessions registered in the
+    module registry (so current_flow_session() agrees with the backend)."""
+    import app.state as st
+    from app.config import settings
+    from app.output import flow
+    monkeypatch.setattr(st, "_gapless_enabled", True)
+    monkeypatch.setattr(settings, "stream_base_url", "http://192.168.0.70")
+    created = []
+
+    def fake_create(first, *, start_offset_ms=0, **kw):
+        s = FakeFlowSession(first, start_offset_ms=start_offset_ms,
+                            session_id=f"fs{len(created) + 1}")
+        old = flow._current_session
+        flow._current_session = s
+        if old is not None and not old.closed:
+            old.closed = True  # the registry supersedes (sync for tests)
+        created.append(s)
+        return s
+
+    monkeypatch.setattr(flow, "create_flow_session", fake_create)
+    monkeypatch.setattr(flow, "_current_session", None)
+    yield SimpleNamespace(created=created)
+    flow._current_session = None
+
+
+# The canonical queue-wiring helper lives in tests/conftest.py (shared with
+# test_output_direct.py and test_output_dlna.py).
+from tests.conftest import wire_queue as _wire_flow_queue
+
+
+async def _flow_play(sup, backend, track, url="http://x/api/stream?key=k",
+                     play_recorded=False):
+    """Dispatch `track` the way dispatch_play does (token first, then play)."""
+    token = sup.on_dispatched(track, play_recorded=play_recorded)
+    await backend.play(url, track)
+    return token
+
+
+async def test_flow_load_once_stream_type_and_no_watchdog(flow_env, fresh_supervisor):
+    """Gapless on → ONE LOAD of the flow URL (base composed like per-track
+    dispatch), BUFFERED-without-duration stream type (the documented knob),
+    and NO per-track duration watchdog (flow liveness = stream consumption +
+    connection status)."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    t1 = _ftrack("t1")
+
+    await _flow_play(sup, backend, t1)
+
+    cc.media_controller.play_media.assert_called_once()
+    args = cc.media_controller.play_media.call_args
+    assert args[0][0] == "http://192.168.0.70/api/stream/flow/fs1"
+    assert args[0][1] == "audio/flac"
+    assert args[1]["stream_type"] == "BUFFERED"
+    assert backend._watchdog_task is None
+    assert backend._duration_ms == 0
+    assert backend.is_playing is True
+    assert backend._flow_session is flow_env.created[0]
+    assert flow_env.created[0].start_offset_ms == 0
+
+
+async def test_flow_first_playing_confirms_first_track(flow_env, fresh_supervisor):
+    """The FIRST PLAYING status confirms the flow's first track through the
+    normal U1 token — device time 0 IS the first track's boundary offset."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    t1 = _ftrack("t1")
+    await _flow_play(sup, backend, t1)
+    rec.assert_not_called()                    # dispatch is never proof of audio
+
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.4))
+    await _drain()
+    rec.assert_called_once()
+    assert rec.call_args.args[0].id == "t1"
+
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=1.4))
+    await _drain()
+    rec.assert_called_once()                   # one-shot
+
+
+async def test_flow_boundary_advances_now_counts_at_device_crossing(
+        flow_env, fresh_supervisor):
+    """The two-phase split (AE5 + counting): a natural boundary advances the
+    queue on the ENCODE clock with NO per-track LOAD (the gap source is
+    gone), but the play count fires only when DEVICE-reported current_time
+    crosses the boundary offset."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    with contextlib.ExitStack() as stack:
+        qe = _wire_flow_queue(stack)
+        await qe.append(t1)
+        await qe.append(t2)
+        item1 = await qe.advance()
+        await _flow_play(sup, backend, item1.track)
+        backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.5))
+        await _drain()
+        rec.assert_called_once()               # t1 confirmed
+
+        sess = flow_env.created[0]
+        await sess.emit_boundary(t2, 180_000)  # encode clock crosses into t2
+
+        assert qe.state.current.track_id == "t2"           # advance NOW
+        assert [i.track_id for i in qe.history] == ["t1"]
+        cc.media_controller.play_media.assert_called_once()  # AE5: no re-LOAD
+        assert rec.call_count == 1             # NOT counted at encode time
+
+        # Device still inside t1 → no count yet.
+        backend._listener.new_media_status(
+            _pstatus("PLAYING", current_time=170.0))
+        await _drain()
+        assert rec.call_count == 1
+        # Device crosses t2's offset → the count fires exactly once.
+        backend._listener.new_media_status(
+            _pstatus("PLAYING", current_time=180.3))
+        await _drain()
+        assert rec.call_count == 2
+        assert rec.call_args.args[0].id == "t2"
+        backend._listener.new_media_status(
+            _pstatus("PLAYING", current_time=181.0))
+        await _drain()
+        assert rec.call_count == 2             # one-shot
+
+
+async def test_flow_skip_repositions_media_session_unchanged(
+        flow_env, fresh_supervisor):
+    """Skip in flow mode = stitcher reposition: NO LOAD, the dispatch's
+    confirm deadline is deferred (the device-buffer lag would misfire it),
+    and the count keys on the device crossing the reposition boundary."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    await _flow_play(sup, backend, t1)
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.5))
+    await _drain()
+    rec.assert_called_once()
+    sess = flow_env.created[0]
+
+    token2 = await _flow_play(sup, backend, t2, url="http://x/2")
+
+    assert sess.repositions == [(t2, 0)]
+    cc.media_controller.play_media.assert_called_once()    # media session kept
+    assert len(flow_env.created) == 1                      # no second stitcher
+    assert timers.timers[-1].cancelled                     # deadline deferred
+    assert sup._current.deferred is True
+    assert backend._confirm_token is None    # a routine PLAYING can't confirm
+    assert sess.resume_calls == 0            # non-paused reposition: no resume
+    cc.media_controller.play.assert_not_called()
+
+    await sess.emit_boundary(t2, 42_000, reposition=True)
+    assert list(backend._flow_pending_counts) == [(42_000, token2, "t2")]
+
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=42.5))
+    await _drain()
+    assert rec.call_count == 2
+    assert rec.call_args.args[0].id == "t2"
+
+
+async def test_flow_skip_before_crossing_cancels_pending_count(
+        flow_env, fresh_supervisor):
+    """No play is EVER counted for audio the listener never heard: a skip
+    past an uncrossed boundary cancels its pending count — even though the
+    buffered residue still plays for a moment."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    t1, t2, t3 = _ftrack("t1"), _ftrack("t2"), _ftrack("t3")
+    with contextlib.ExitStack() as stack:
+        qe = _wire_flow_queue(stack)
+        await qe.append(t1)
+        await qe.append(t2)
+        item1 = await qe.advance()
+        await _flow_play(sup, backend, item1.track)
+        backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.5))
+        await _drain()
+        rec.assert_called_once()               # t1
+        sess = flow_env.created[0]
+
+        await sess.emit_boundary(t2, 100_000)  # t2 pending, uncrossed
+        assert rec.call_count == 1
+
+        # Skip to t3 BEFORE the device reaches t2's offset.
+        await _flow_play(sup, backend, t3, url="http://x/3")
+        assert list(backend._flow_pending_counts) == []    # t2 cancelled
+        await sess.emit_boundary(t3, 130_000, reposition=True)
+
+        # Device now crosses BOTH offsets: only t3 counts.
+        backend._listener.new_media_status(
+            _pstatus("PLAYING", current_time=140.0))
+        await _drain()
+        assert rec.call_count == 2
+        assert rec.call_args.args[0].id == "t3"
+
+
+async def test_flow_toggle_off_teardown_at_next_boundary(
+        flow_env, fresh_supervisor, monkeypatch):
+    """Toggle off mid-flow: the current track finishes IN flow mode (nothing
+    torn down mid-track, no stop()); at the NEXT boundary the session tears
+    down and the boundary's track goes to the per-track dispatch — single
+    owner (_do_advance) both advances and dispatches, so the advance
+    authority reverts atomically with no double-advance."""
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    advance_calls = []
+
+    async def advance():
+        advance_calls.append(True)
+
+    cc = _make_cc()
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._cast = cc
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    await _flow_play(sup, backend, t1)
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.5))
+    await _drain()
+    sess = flow_env.created[0]
+
+    monkeypatch.setattr(st, "_gapless_enabled", False)
+    # Mid-track: the flow keeps playing — nothing happens until the boundary.
+    assert backend._flow_session is sess and not sess.closed
+    cc.media_controller.stop.assert_not_called()
+    assert advance_calls == []
+
+    await sess.emit_boundary(t2, 180_000)      # the teardown boundary
+
+    assert backend._flow_session is None       # detached AT the boundary
+    await _drain()                             # decoupled advance + close land
+    assert advance_calls == [True]             # exactly one advance owner
+    assert sess.closed is True
+    cc.media_controller.stop.assert_not_called()  # no audible interruption
+    assert rec.call_count == 1                 # boundary listener counted nothing
+
+
+async def test_flow_toggle_off_advance_survives_pump_cancellation(
+        flow_env, fresh_supervisor, monkeypatch):
+    """The toggle-off handoff dispatch must not ride the pump task:
+    FlowSession.close() (spawned in the same branch) cancels the pump, and
+    an advance awaited FROM the pump would be cancelled mid-dispatch — the
+    per-track handoff would never fire. The advance runs on its OWN task."""
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    started, finished = [], []
+
+    async def advance():
+        started.append(True)
+        for _ in range(5):                     # a real dispatch suspends
+            await asyncio.sleep(0)
+        finished.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._cast = _make_cc()
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    await _flow_play(sup, backend, t1)
+    sess = flow_env.created[0]
+
+    pump_holder = {}
+
+    async def cancelling_close():              # the real close cancels the pump
+        sess.closed = True
+        t = pump_holder.get("task")
+        if t is not None and not t.done():
+            t.cancel()
+
+    sess.close = cancelling_close
+    monkeypatch.setattr(st, "_gapless_enabled", False)
+
+    async def pump():
+        await sess.emit_boundary(t2, 180_000)  # the toggle-off boundary
+
+    pump_holder["task"] = asyncio.get_running_loop().create_task(pump())
+    for _ in range(30):
+        await asyncio.sleep(0)
+
+    assert started == [True]
+    assert finished == [True]                  # completed despite the close
+    assert sess.closed is True
+    assert backend._flow_session is None
+
+
+async def test_flow_skip_while_paused_resumes_stitcher_and_receiver(
+        flow_env, fresh_supervisor):
+    """Skip while flow-paused: the reposition must auto-play like a
+    per-track skip does — unfreeze the stitcher's pacing clock AND issue
+    the receiver play; otherwise the device stays silent while the UI
+    reads playing."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    await _flow_play(sup, backend, t1)
+    sess = flow_env.created[0]
+
+    await backend.pause()
+    assert sess.paused is True
+    cc.media_controller.play.assert_not_called()
+
+    await _flow_play(sup, backend, t2, url="http://x/2")   # skip while paused
+
+    assert sess.repositions == [(t2, 0)]
+    assert sess.resume_calls == 1              # stitcher clock unfrozen
+    assert sess.paused is False
+    cc.media_controller.play.assert_called_once()          # receiver resumed
+    assert backend.is_playing is True
+
+
+async def test_flow_status_poll_nudges_receiver_and_stops_on_detach(
+        flow_env, fresh_supervisor):
+    """Counts must not starve on receiver silence: pychromecast 14 has no
+    built-in media-status polling and flow mode disarms the watchdog, so
+    while pending device-time counts exist a loop-side poll nudges
+    update_status; it stops with the session (detach cancels it)."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    calls = []
+    cc.media_controller.update_status = lambda: calls.append(True)
+    backend = ChromecastBackend()
+    backend._flow_poll_interval_s = 0          # injectable: no real sleeps
+    backend._cast = cc
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    with contextlib.ExitStack() as stack:
+        qe = _wire_flow_queue(stack)
+        await qe.append(t1)
+        await qe.append(t2)
+        item1 = await qe.advance()
+        await _flow_play(sup, backend, item1.track)
+        assert backend._flow_poll_timer is None     # ledger empty — no poll
+
+        sess = flow_env.created[0]
+        await sess.emit_boundary(t2, 180_000)       # uncrossed pending count
+        assert backend._flow_poll_timer is not None  # poll armed
+
+        async def _until(cond):
+            while not cond():
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_until(lambda: len(calls) >= 2), timeout=5)
+
+        backend._detach_flow()                      # teardown cancels the poll
+        assert backend._flow_poll_timer is None
+        await _drain()                              # settle any in-flight tick
+        n = len(calls)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(calls) == n                      # poll stopped with the session
+        assert backend._flow_poll_timer is None     # a stale tick can't re-arm
+
+
+async def test_flow_first_track_decode_fail_never_counts_it(
+        flow_env, fresh_supervisor):
+    """A fresh flow session whose FIRST track fails to decode must not count
+    it at the first PLAYING (the audio that starts is track 2): the pending
+    LOAD confirmation is withdrawn and the next boundary owns the audible
+    track's advance/count (unheard-audio invariant)."""
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    with contextlib.ExitStack() as stack:
+        qe = _wire_flow_queue(stack)
+        skipped = AsyncMock()
+        stack.enter_context(patch.object(st, "_emit_track_skipped", skipped))
+        await qe.append(t1)
+        await qe.append(t2)
+        item1 = await qe.advance()
+        await _flow_play(sup, backend, item1.track)
+        sess = flow_env.created[0]
+
+        for cb in sess.skip_listeners:              # t1 fails to decode
+            await cb(t1, "decode failed")
+        assert backend._confirm_token is None       # confirmation withdrawn
+        skipped.assert_awaited_once()
+
+        backend._listener.new_media_status(         # first PLAYING = t2's audio
+            _pstatus("PLAYING", current_time=0.1))
+        await _drain()
+        rec.assert_not_called()                     # t1 never counted
+
+        await sess.emit_boundary(t2, 0)             # t2 contributes from offset 0
+        assert qe.state.current.track_id == "t2"
+        backend._listener.new_media_status(
+            _pstatus("PLAYING", current_time=0.3))
+        await _drain()
+        rec.assert_called_once()                    # t2 counts exactly once
+        assert rec.call_args.args[0].id == "t2"
+
+
+async def test_flow_natural_end_stale_session_hop_noops(
+        flow_env, fresh_supervisor):
+    """A natural-end hop that lands AFTER a fresh session replaced the one
+    it was captured for must no-op — never fire the NEW session's ledger or
+    tear it down (the session identity guard)."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    advance_calls = []
+
+    async def advance():
+        advance_calls.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._cast = _make_cc()
+    t1 = _ftrack("t1")
+    await _flow_play(sup, backend, t1)
+    live = flow_env.created[0]
+    from app.output.chromecast import _PendingCount
+    with backend._flow_lock:
+        backend._flow_pending_counts.append(_PendingCount(1000, 41, "t1"))
+
+    stale = FakeFlowSession(t1, session_id="stale")
+    stale.ended = True
+    await backend._flow_natural_end(stale)     # hop landed after a fresh LOAD
+
+    assert backend._flow_session is live       # nothing torn down
+    assert list(backend._flow_pending_counts) == [(1000, 41, "t1")]  # ledger intact
+    assert advance_calls == []
+    rec.assert_not_called()
+
+
+async def test_flow_idle_error_with_ended_session_is_natural_end(
+        flow_env, fresh_supervisor):
+    """IDLE(ERROR) with the session ended IS the final EOS: strict receivers
+    can't distinguish a clean chunked-stream close from a drop, and the
+    session is over either way — the remaining crossings fire and the flow
+    converges through the advance path, never the outage route (which would
+    discard the final counts)."""
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+    advance_calls = []
+
+    async def advance():
+        advance_calls.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._cast = _make_cc()
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    with contextlib.ExitStack() as stack:
+        qe = _wire_flow_queue(stack)
+        await qe.append(t1)
+        await qe.append(t2)
+        item1 = await qe.advance()
+        await _flow_play(sup, backend, item1.track)
+        backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.5))
+        await _drain()
+        sess = flow_env.created[0]
+        await sess.emit_boundary(t2, 8_000)    # short final track, uncrossed
+        sess.ended = True                      # queue exhausted server-side
+
+        backend._listener.new_media_status(
+            _pstatus("IDLE", idle_reason="ERROR"))
+        await _drain()
+
+        assert outages == []                   # never routed as an outage
+        assert rec.call_count == 2             # the final crossing WAS heard
+        assert rec.call_args.args[0].id == "t2"
+        assert advance_calls == [True]         # converged via the advance path
+        assert backend._flow_session is None
+        assert sess.closed is True
+
+
+async def test_flow_seek_repositions_current_and_maps_track_position(
+        flow_env, fresh_supervisor, monkeypatch):
+    """Seek within the current track = reposition(current, offset): no
+    receiver seek, no snapshot re-anchor (device stream time is continuous);
+    the reposition boundary re-keys the decode start offset so get_position
+    maps stitch position → TRACK position."""
+    import time as _t
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    t1 = _ftrack("t1")
+    await _flow_play(sup, backend, t1)
+    sess = flow_env.created[0]
+    fake_qe = MagicMock()
+    fake_qe.state.current = SimpleNamespace(track=t1, play_recorded=False)
+    monkeypatch.setattr(st, "queue_engine", fake_qe)
+
+    await backend.seek(30_000)
+
+    assert sess.repositions == [(t1, 30_000)]
+    cc.media_controller.seek.assert_not_called()
+
+    await sess.emit_boundary(t1, 55_000, reposition=True)
+    assert backend._flow_track_starts == {55_000: 30_000}
+
+    backend._pos_snapshot_ms = 56_000          # device stream time 56s
+    backend._pos_snapshot_at = _t.monotonic()
+    backend._is_playing = False                # freeze the elapsed estimate
+    assert await backend.get_position() == 31_000   # 56s - 55s + 30s start
+
+
+async def test_flow_get_position_is_track_relative(flow_env, fresh_supervisor):
+    """Now Playing progress shows TRACK position, not stream position."""
+    import time as _t
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    await _flow_play(sup, backend, t1)
+    sess = flow_env.created[0]
+    sess.boundaries_ms.append((90_000, t2))
+    backend._is_playing = False
+
+    backend._pos_snapshot_ms = 95_000          # device inside t2
+    backend._pos_snapshot_at = _t.monotonic()
+    assert await backend.get_position() == 5_000
+
+    backend._pos_snapshot_ms = 85_000          # device still inside t1
+    backend._pos_snapshot_at = _t.monotonic()
+    assert await backend.get_position() == 85_000
+
+
+async def test_flow_pause_resume_freeze_encode_clock_with_receiver(
+        flow_env, fresh_supervisor):
+    """Native pause/resume stay in sync with the stitcher's pacing clock —
+    otherwise the encode side keeps leading through a pause and the resume
+    skips ahead by the buffered audio."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    await _flow_play(sup, backend, _ftrack("t1"))
+    sess = flow_env.created[0]
+
+    await backend.pause()
+    cc.media_controller.pause.assert_called_once()
+    assert sess.pause_calls == 1
+    assert backend.is_playing is False
+
+    await backend.resume()
+    cc.media_controller.play.assert_called_once()
+    assert sess.resume_calls == 1
+    assert backend.is_playing is True
+
+
+async def test_flow_connection_lost_captures_mapped_offset_and_tears_down(
+        flow_env, fresh_supervisor, monkeypatch):
+    """Connection LOST mid-flow: the held offset comes from DEVICE-reported
+    position mapped through the stitch timeline (track-relative), captured
+    BEFORE the session tears down; the outage routes as connection_lost."""
+    import time as _t
+    import asyncio as _asyncio
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    backend._loop = _asyncio.get_running_loop()
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    await _flow_play(sup, backend, t1)
+    sess = flow_env.created[0]
+    sess.boundaries_ms.append((90_000, t2))
+    fake_qe = MagicMock()
+    fake_qe.state.current = SimpleNamespace(track=t2, play_recorded=False)
+    monkeypatch.setattr(st, "queue_engine", fake_qe)
+    backend._pos_snapshot_ms = 95_000          # device 5s into t2
+    backend._pos_snapshot_at = _t.monotonic()
+
+    status = MagicMock()
+    status.status = "LOST"
+    _ConnectionListener(backend, cc).new_connection_status(status)
+    await _drain()
+
+    assert outages == ["connection_lost"]
+    assert backend._flow_session is None
+    assert sess.closed is True                 # never two stitchers
+    # The hold hook consumes the stash exactly once (track-relative 5s).
+    assert backend.capture_held_position_ms() == 5_000
+    assert backend.capture_held_position_ms() is None   # per-track fallthrough
+
+
+async def test_flow_capture_device_behind_boundary_clock_holds_at_zero(
+        flow_env, fresh_supervisor, monkeypatch):
+    """The boundary clock leads the audio: when the device is still inside a
+    track Now Playing already advanced past, the held front never audibly
+    started — hold it at 0:00 (its pending count was cancelled, so the
+    resume still counts it exactly once, R19)."""
+    import time as _t
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    await _flow_play(sup, backend, t1)
+    sess = flow_env.created[0]
+    sess.boundaries_ms.append((90_000, t2))
+    fake_qe = MagicMock()
+    fake_qe.state.current = SimpleNamespace(track=t2, play_recorded=False)
+    monkeypatch.setattr(st, "queue_engine", fake_qe)
+    backend._pos_snapshot_ms = 85_000          # device still inside t1
+    backend._pos_snapshot_at = _t.monotonic()
+
+    assert backend.capture_held_position_ms() == 0
+
+
+async def test_flow_resume_recreates_session_at_held_offset_no_recount(
+        flow_env, fresh_supervisor):
+    """Outage resume in flow mode: play() consumes the supervisor-primed held
+    offset into create_flow_session(start_offset_ms=…) + re-LOADs the flow
+    URL; resume_seek is a NO-OP (position-resume fully server-controlled);
+    the R19 mark keeps the play uncounted; position maps with the start
+    offset folded in."""
+    import time as _t
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    t2 = _ftrack("t2")
+
+    backend.prime_resume_offset(5_000)         # the supervisor's held position
+    await _flow_play(sup, backend, t2, play_recorded=True)
+
+    sess = flow_env.created[0]
+    assert sess.start_offset_ms == 5_000
+    cc.media_controller.play_media.assert_called_once()   # the re-LOAD
+    assert backend._flow_track_starts == {0: 5_000}
+
+    await backend.resume_seek(5_000)           # supervisor's seek → no-op
+    assert sess.repositions == []
+    cc.media_controller.seek.assert_not_called()
+
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.2))
+    await _drain()
+    rec.assert_not_called()                    # R19: never counted twice
+
+    backend._pos_snapshot_ms = 3_000
+    backend._pos_snapshot_at = _t.monotonic()
+    backend._is_playing = False
+    assert await backend.get_position() == 8_000   # 3s device + 5s start
+
+
+@pytest.mark.parametrize("idle_reason", ["FINISHED", "ERROR"])
+async def test_flow_receiver_idle_routes_outage_not_advance(
+        flow_env, fresh_supervisor, monkeypatch, idle_reason):
+    """Per-track terminal states are SUPPRESSED as advance authority in flow
+    mode (no track boundaries exist device-side): a terminal IDLE mid-flow is
+    a receiver hiccup → outage-suspected, never advance."""
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+    advance_calls = []
+
+    async def advance():
+        advance_calls.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._cast = _make_cc()
+    t1 = _ftrack("t1")
+    await _flow_play(sup, backend, t1)
+    sess = flow_env.created[0]
+    fake_qe = MagicMock()
+    fake_qe.state.current = SimpleNamespace(track=t1, play_recorded=False)
+    monkeypatch.setattr(st, "queue_engine", fake_qe)
+
+    backend._listener.new_media_status(_pstatus("IDLE", idle_reason=idle_reason))
+    await _drain()
+
+    assert outages == ["flow_receiver_idle"]
+    assert advance_calls == []
+    assert backend._flow_session is None
+    assert sess.closed is True
+    assert backend.is_playing is False
+
+
+async def test_flow_idle_cancelled_interrupted_still_ignored(
+        flow_env, fresh_supervisor):
+    """Self-induced idle reasons stay non-signals in flow mode too."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    await _flow_play(sup, backend, _ftrack("t1"))
+
+    for reason in ("CANCELLED", "INTERRUPTED"):
+        backend._listener.new_media_status(_pstatus("IDLE", idle_reason=reason))
+    await _drain()
+    assert outages == []
+    assert backend._flow_session is not None   # flow untouched
+
+
+async def test_flow_consumer_gone_reports_ambiguous_outage(
+        flow_env, fresh_supervisor, monkeypatch):
+    """Consumer-gone grace expiry → outage-SUSPECTED with a deliberately
+    ambiguous reason (the socket may still be CONNECTED — the classifier's
+    probe is the R15 tie-breaker); the dead session tears down so a resume
+    or skip LOADs fresh. A stale session's callback is ignored (= the
+    re-bind-within-grace case never fires the listener at all)."""
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    t1 = _ftrack("t1")
+    await _flow_play(sup, backend, t1)
+    sess = flow_env.created[0]
+    fake_qe = MagicMock()
+    fake_qe.state.current = SimpleNamespace(track=t1, play_recorded=False)
+    monkeypatch.setattr(st, "queue_engine", fake_qe)
+
+    stale = FakeFlowSession(t1, session_id="stale")
+    backend._flow_consumer_gone(stale)         # not the live session → no-op
+    await _drain()
+    assert outages == []
+
+    backend._flow_consumer_gone(sess)
+    await _drain()
+    assert outages == ["flow_consumer_gone"]
+    assert backend._flow_session is None
+    assert sess.closed is True
+
+
+async def test_flow_ended_waits_for_receiver_then_converges_idle(
+        flow_env, fresh_supervisor, monkeypatch):
+    """Natural exhaustion: the encode-side ended event tears nothing down
+    (the receiver is still draining the audible tail — an uncrossed final
+    boundary must still count); the receiver's IDLE(FINISHED) is the flow's
+    real final EOS — it fires the remaining crossings and converges through
+    the same advance path a final per-track EOS takes."""
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    advance_calls = []
+
+    async def advance():
+        advance_calls.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._cast = _make_cc()
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    with contextlib.ExitStack() as stack:
+        qe = _wire_flow_queue(stack)
+        await qe.append(t1)
+        await qe.append(t2)
+        item1 = await qe.advance()
+        await _flow_play(sup, backend, item1.track)
+        backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.5))
+        await _drain()
+        sess = flow_env.created[0]
+        await sess.emit_boundary(t2, 8_000)    # short final track, uncrossed
+
+        sess.ended = True                      # queue exhausted server-side
+        for cb in sess.ended_listeners:
+            await cb()
+        assert backend._flow_session is sess   # nothing torn down yet
+        assert sess.closed is False            # the tail keeps draining
+        assert advance_calls == []
+
+        # The receiver drains the stream to its end.
+        backend._listener.new_media_status(
+            _pstatus("IDLE", idle_reason="FINISHED"))
+        await _drain()
+
+        assert rec.call_count == 2             # the final crossing WAS heard
+        assert rec.call_args.args[0].id == "t2"
+        assert advance_calls == [True]         # converge via the advance path
+        assert backend._flow_session is None
+        assert backend.is_playing is False
+
+
+async def test_flow_stop_closes_session(flow_env, fresh_supervisor):
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    await _flow_play(sup, backend, _ftrack("t1"))
+    sess = flow_env.created[0]
+
+    await backend.stop()
+
+    assert sess.closed is True
+    assert backend._flow_session is None
+    cc.media_controller.stop.assert_called_once()
+    assert backend.is_playing is False
+
+
+async def test_flow_set_device_closes_session_immediately(flow_env, fresh_supervisor):
+    """Device switch = immediate flow teardown (the stitcher belongs to the
+    OLD device's media session) — the same-backend device change never calls
+    stop(), so set_device owns it."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    cc = _make_cc("Living Room", "abc-123")
+    info = _make_cast_info("Living Room", "00000000-0000-0000-0000-000000000001")
+    backend = ChromecastBackend()
+    backend._cast = cc
+    backend._cast_infos["00000000-0000-0000-0000-000000000001"] = info
+    backend._browser = MagicMock()
+    backend._zconf = MagicMock()
+    await _flow_play(sup, backend, _ftrack("t1"))
+    sess = flow_env.created[0]
+
+    import app.output.chromecast as cc_mod
+    with patch.object(cc_mod.pychromecast, "get_chromecast_from_cast_info",
+                      return_value=_make_cc("Living Room", "abc-999")), \
+         patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", AsyncMock()):
+        await backend.set_device("00000000-0000-0000-0000-000000000001")
+
+    assert sess.closed is True
+    assert backend._flow_session is None
+
+
+async def test_flow_skip_listener_pops_failed_front_and_emits_skip(
+        flow_env, fresh_supervisor):
+    """The engine awaits the skip listener BEFORE re-resolving the lookahead:
+    the failed queue front must be popped (or the spin guard ends the flow),
+    and the R22 TrackSkippedEvent fires."""
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    with contextlib.ExitStack() as stack:
+        qe = _wire_flow_queue(stack)
+        skipped = AsyncMock()
+        stack.enter_context(patch.object(st, "_emit_track_skipped", skipped))
+        await qe.append(t1)
+        await qe.append(t2)
+        item1 = await qe.advance()
+        await _flow_play(sup, backend, item1.track)
+        sess = flow_env.created[0]
+
+        for cb in sess.skip_listeners:
+            await cb(t2, "decode failed")
+
+        assert [i.track_id for i in qe.queue] == []   # front popped
+        skipped.assert_awaited_once()
+        assert skipped.await_args.args[0] is t2
+
+
+async def test_flow_degrades_to_per_track_without_stream_base(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """Gapless on but no STREAM_BASE_URL/BIND_HOST → no device-reachable flow
+    URL exists: degrade to per-track dispatch (today's behavior) instead of
+    dead air."""
+    import app.state as st
+    from app.config import settings
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(st, "_gapless_enabled", True)
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(settings, "bind_host", "0.0.0.0")
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    t1 = _ftrack("t1")
+
+    await _flow_play(sup, backend, t1, url="http://plex.local/file.flac")
+
+    assert backend._flow_session is None
+    args = cc.media_controller.play_media.call_args
+    assert args[0][0] == "http://plex.local/file.flac"   # per-track LOAD
+    assert "stream_type" not in args[1]
+    assert backend._watchdog_task is not None            # per-track watchdog
+
+
+async def test_backend_exposes_no_arm_next(cast_mock):
+    """The U6 arming orchestrator gates on hasattr(backend, "arm_next") —
+    Cast flow mode has no device-side arming (the stitcher's lookahead owns
+    the next track), so the orchestrator must naturally no-op for Cast."""
+    from app.output.chromecast import ChromecastBackend
+    backend = ChromecastBackend()
+    assert not hasattr(backend, "arm_next")
+    assert not hasattr(backend, "revoke_next")
+
+
+async def test_flow_three_tracks_real_engine_single_load_one_count_each(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """Integration on the REAL U9 engine (fixture PCM, unbounded run-ahead):
+    gapless on + Cast active → ONE flow LOAD; three queue tracks play with
+    boundary-driven advances on the ENCODE clock and exactly ONE play count
+    each, fired at DEVICE-time crossings; the receiver's IDLE(FINISHED) after
+    the finalized stream converges through the advance path."""
+    import app.state as st
+    from app.config import settings
+    from app.output import flow
+    from app.output.chromecast import ChromecastBackend
+    from tests.test_flow_stream import (FakePCMDecoder, PassthroughEncoder,
+                                        make_pcm)
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(st, "_gapless_enabled", True)
+    monkeypatch.setattr(settings, "stream_base_url", "http://192.168.0.70")
+    monkeypatch.setattr(flow, "_current_session", None)
+
+    pcm = {"t1": make_pcm(44100, 1), "t2": make_pcm(44100, 2),
+           "t3": make_pcm(22050, 3)}          # 1s + 1s + 0.5s of stitch audio
+    real_create = flow.create_flow_session
+
+    def fake_create(first, *, start_offset_ms=0, **kw):
+        async def resolver(track):
+            return (track.id, {})
+
+        async def next_fn(prev):
+            return st.effective_next_track()  # real lookahead, no DB reads
+
+        return real_create(
+            first, start_offset_ms=start_offset_ms,
+            decoder_factory=lambda src, hdrs, off: FakePCMDecoder(
+                pcm[src], offset_ms=off),
+            encoder_factory=lambda fmt, sr, ch: PassthroughEncoder(),
+            source_resolver=resolver, next_track_fn=next_fn,
+            run_ahead_s=1e9)
+
+    monkeypatch.setattr(flow, "create_flow_session", fake_create)
+    advance_calls = []
+
+    async def advance():
+        advance_calls.append(True)
+
+    cc = _make_cc()
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._cast = cc
+    t1, t2, t3 = _ftrack("t1"), _ftrack("t2"), _ftrack("t3")
+    with contextlib.ExitStack() as stack:
+        qe = _wire_flow_queue(stack)
+        await qe.append(t1)
+        await qe.append(t2)
+        await qe.append(t3)
+        item1 = await qe.advance()
+        await _flow_play(sup, backend, item1.track)
+        sess = flow.current_flow_session()
+        cc.media_controller.play_media.assert_called_once()
+
+        backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.1))
+        for _ in range(400):                   # let the pump stitch everything
+            await asyncio.sleep(0)
+            if sess.ended:
+                break
+        assert sess.ended
+        assert sess.offset_of(t2) == 1000
+        assert sess.offset_of(t3) == 2000
+        # Boundary-clock advances happened with exactly ONE LOAD (AE5: the
+        # album-track boundary emits no per-track LOAD — the gap source is gone).
+        assert qe.state.current.track_id == "t3"
+        assert [i.track_id for i in qe.history] == ["t2", "t1"]
+        cc.media_controller.play_media.assert_called_once()
+        await _drain()
+        rec.assert_called_once()               # only t1 confirmed so far
+        assert rec.call_args.args[0].id == "t1"
+
+        # Device-time crossings: t2 counts at 1.0s, t3 at 2.0s — never before.
+        backend._listener.new_media_status(_pstatus("PLAYING", current_time=0.9))
+        await _drain()
+        assert rec.call_count == 1
+        backend._listener.new_media_status(_pstatus("PLAYING", current_time=1.2))
+        await _drain()
+        assert rec.call_count == 2
+        assert rec.call_args.args[0].id == "t2"
+        backend._listener.new_media_status(_pstatus("PLAYING", current_time=2.1))
+        await _drain()
+        assert rec.call_count == 3
+        assert rec.call_args.args[0].id == "t3"
+
+        # The receiver drains the finalized stream → the flow's final EOS.
+        backend._listener.new_media_status(
+            _pstatus("IDLE", idle_reason="FINISHED"))
+        await _drain()
+        assert advance_calls == [True]
+        assert backend._flow_session is None
+        assert rec.call_count == 3             # one count each, nothing extra
+
+
+async def test_flow_toggle_off_real_engine_clean_teardown(
+        cast_mock, fresh_supervisor, monkeypatch, caplog):
+    """Toggle-off against the REAL engine: the boundary listener detaches
+    synchronously and closes out-of-band, so the pump winds down cleanly
+    (no 'encoder died' ERROR from tripping over its own teardown) and the
+    per-track dispatch fires exactly once, at the boundary."""
+    import logging as _logging
+    import app.state as st
+    from app.config import settings
+    from app.output import flow
+    from app.output.chromecast import ChromecastBackend
+    from tests.test_flow_stream import (FakePCMDecoder, PassthroughEncoder,
+                                        make_pcm)
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(st, "_gapless_enabled", True)
+    monkeypatch.setattr(settings, "stream_base_url", "http://192.168.0.70")
+    monkeypatch.setattr(flow, "_current_session", None)
+
+    pcm = {"t1": make_pcm(44100, 1), "t2": make_pcm(44100, 2)}
+    decs = {}
+    real_create = flow.create_flow_session
+
+    def fake_create(first, *, start_offset_ms=0, **kw):
+        def dec_factory(src, hdrs, off):
+            d = FakePCMDecoder(pcm[src], offset_ms=off,
+                               block_after=(88_200 if src == "t1" else None))
+            decs[src] = d
+            return d
+
+        async def resolver(track):
+            return (track.id, {})
+
+        async def next_fn(prev):
+            return st.effective_next_track()
+
+        return real_create(
+            first, start_offset_ms=start_offset_ms,
+            decoder_factory=dec_factory,
+            encoder_factory=lambda fmt, sr, ch: PassthroughEncoder(),
+            source_resolver=resolver, next_track_fn=next_fn,
+            run_ahead_s=1e9)
+
+    monkeypatch.setattr(flow, "create_flow_session", fake_create)
+    advance_calls = []
+
+    async def advance():
+        advance_calls.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._cast = _make_cc()
+    t1, t2 = _ftrack("t1"), _ftrack("t2")
+    with contextlib.ExitStack() as stack:
+        qe = _wire_flow_queue(stack)
+        await qe.append(t1)
+        await qe.append(t2)
+        item1 = await qe.advance()
+        await _flow_play(sup, backend, item1.track)
+        sess = flow.current_flow_session()
+        for _ in range(200):                   # pump stalls mid-t1 (blocked)
+            await asyncio.sleep(0)
+            if decs.get("t1") is not None and decs["t1"].blocked.is_set():
+                break
+        assert decs["t1"].blocked.is_set()
+
+        monkeypatch.setattr(st, "_gapless_enabled", False)  # mid-track flip
+        assert advance_calls == []             # nothing until the boundary
+        assert backend._flow_session is sess
+
+        with caplog.at_level(_logging.ERROR, logger="app.output.flow"):
+            decs["t1"].release()               # t1 finishes → t2 boundary
+            for _ in range(400):
+                await asyncio.sleep(0)
+                if advance_calls and sess.closed:
+                    break
+
+        assert advance_calls == [True]         # dispatch exactly at the boundary
+        assert backend._flow_session is None
+        assert sess.closed is True
+        assert [r for r in caplog.records if r.levelno >= _logging.ERROR] == []
+
+
+# ── FakeFlowSession ↔ FlowSession attribute parity (2026-07-12 review C10) ────
+
+def test_fake_flow_session_covers_backend_consumed_flow_surface():
+    """Every public method/property the BACKEND calls on a flow session must
+    exist on BOTH FakeFlowSession and the real FlowSession — an engine method
+    the backend starts consuming that is silently missing from the fake must
+    fail HERE at test time, never ship green against a stale fake. The
+    consumed surface is scraped from app/output/chromecast.py's source
+    (``sess.<attr>``, ``._flow_session.<attr>`` and ``getattr(sess, "<attr>",
+    …)`` usages), so a new call site extends the checked set automatically.
+
+    Documented finding: ``FlowSession.set_device_epoch_offset`` is NOT part
+    of this surface — the backend never calls it on the resume path (an
+    outage resume creates a FRESH session via
+    ``create_flow_session(start_offset_ms=…)``, whose stitch origin is the
+    device's new time zero, so no epoch rebase is needed); only
+    tests/test_flow_stream.py exercises it directly."""
+    import re
+    from app.output import chromecast as cc_mod
+    from app.output.flow import FlowSession
+
+    src = inspect.getsource(cc_mod)
+    consumed = set(re.findall(r"\bsess\.(\w+)", src))
+    consumed |= set(re.findall(r"\b_flow_session\.(\w+)", src))
+    consumed |= set(re.findall(r"getattr\(sess,\s*[\"'](\w+)[\"']", src))
+    assert consumed, "no flow-session usages found — the source scrape went stale"
+
+    fake = FakeFlowSession(_ftrack("t1"))
+    missing_on_fake = sorted(a for a in consumed if not hasattr(fake, a))
+    # FlowSession is checked at class level (methods + properties both live
+    # there); it is never instantiated here — its ctor builds a real encoder.
+    missing_on_real = sorted(a for a in consumed if not hasattr(FlowSession, a))
+    assert missing_on_fake == [], (
+        f"FakeFlowSession lacks backend-consumed attrs: {missing_on_fake}")
+    assert missing_on_real == [], (
+        f"FlowSession lacks backend-consumed attrs: {missing_on_real}")

@@ -581,17 +581,19 @@
   border: 1px solid var(--border);
   border-radius: 10px;
 }
-/* Sticky sub-bars inside the panel — guest's search bar and the drill-in
-   wayfinder — sit on the frosted .browse-surface, so they must NOT paint a
-   background of their own: a surface tint composites over the translucent panel
-   and reads darker (a "darker box"), and a backdrop blur paints its own frosted
-   RECTANGLE (a "second semitransparent box", visible on the gradient themes).
-   Transparent matches the panel exactly = no box, in parity with admin's search
-   field (which has no container box at all). The inner input / filter-tabs /
-   breadcrumb carry their own surface backgrounds for legibility. Shared rule
-   (both pages link rail.css); outranks the templates' inline #search-bar /
-   .wayfind-bar background. */
-.browse-surface #search-bar,
+/* The drill-in .wayfind-bar is NON-sticky (it scrolls away with the content, so
+   nothing ever passes behind it) and sits on the frosted .browse-surface — so it
+   must NOT paint a background of its own: a surface tint reads darker (a "darker
+   box") and a backdrop blur paints its own frosted rectangle (a "second
+   semitransparent box" on gradient themes). Transparent matches the panel exactly
+   = no box, in parity with admin. Shared rule (both pages link rail.css).
+   NOTE (2026-07-02 ce-debug): #search-bar is NOT in this transparent rule — it is
+   position:sticky, so scrolled results pass BEHIND it and a transparent backing
+   let them bleed through the docked bar (guest only, since only guest's
+   #browse-container carries .browse-surface — admin was already opaque via the
+   base #search-bar rule). A docked bar over scrolling content must be opaque, so
+   #search-bar backs with the opaque --elev-base (+ --surface tint) in its base
+   rule below. */
 .browse-surface .wayfind-bar {
   background: transparent;
 }
@@ -676,3 +678,38 @@
 .trk-tags .trk-tag-add { font-size: .72rem; color: var(--muted); background: none; border: 1px dashed var(--border); border-radius: 999px; padding: .08rem .5rem; cursor: pointer; }
 .trk-tags .trk-tag-add:hover { color: var(--accent-ui, var(--accent)); border-color: var(--accent-ui, var(--accent)); }
 .trk-tags .trk-tag-input { font-size: .72rem; background: var(--surface); color: var(--text); border: 1px solid var(--accent-ui, var(--accent)); border-radius: 999px; padding: .06rem .5rem; width: 110px; outline: none; }
+
+/* ── Search: docked filter-tab bar (2026-07-02 ce-debug) ──────────────────────
+   Single source for guest + admin (was forked in both templates with divergent
+   structure — guest wrapped input+tabs in a sticky #search-bar backed by
+   var(--bg); admin had NO wrapper and NO sticky). The bar docks to the top of
+   the search scroll area and follows scroll. It backs with the OPAQUE
+   --elev-base (not var(--bg)) so scrolled results never bleed through it on the
+   translucent / gradient schemes (Tubular Blue, Ladyland, Bloody Pink) — the
+   same opaque-base treatment the sort popover uses. Both templates mount the
+   identical #search-bar > (.search-field + #search-filter-tabs) markup. */
+#search-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  padding: .75rem .75rem .5rem;
+  /* Opaque base + surface tint so scrolled results never bleed through the
+     docked bar, and it still reads as the panel's surface tone on translucent /
+     gradient schemes (mirrors the sort popover's opaque-base treatment). This
+     OUTRANKS nothing by itself, so it must not be re-forced transparent by a
+     .browse-surface rule — see the .wayfind-bar note above. */
+  background-color: var(--elev-base, #16161b);
+  background-image: linear-gradient(var(--surface), var(--surface));
+  border-bottom: 1px solid var(--divider);
+}
+#search-filter-tabs { display: flex; gap: .4rem; padding: .5rem 0 0; flex-wrap: wrap; }
+.filter-tab {
+  padding: .28rem .75rem;
+  border: none;
+  border-radius: 999px;
+  background: var(--surface2);
+  color: var(--accent-ui, var(--accent));
+  font-size: .78rem;
+  cursor: pointer;
+}
+.filter-tab.active { background: var(--accent-grad, var(--accent)); color: var(--on-accent); }

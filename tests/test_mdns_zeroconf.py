@@ -75,8 +75,13 @@ class FakeBrowser:
         self.cancelled = True
 
     def fire(self, name, state_change):
+        # Invoke handlers exactly as python-zeroconf's AsyncServiceBrowser does —
+        # with service_type as a KEYWORD arg. A handler whose parameter is misnamed
+        # (e.g. service_type_) then raises TypeError here, which is the regression
+        # that flooded the event loop and shipped undetected (ce-code-review
+        # 2026-07-24). Positional firing would mask exactly that class of bug.
         for h in self.handlers:
-            h(self.zc, self.type_, name, state_change)
+            h(self.zc, service_type=self.type_, name=name, state_change=state_change)
 
 
 @pytest.fixture(autouse=True)

@@ -40,11 +40,21 @@ def _log_task_exc(task: asyncio.Task) -> None:
 
 
 def is_authorized_stream_key(key: str) -> bool:
-    """Return True only if key matches a track that Jukeplox loaded into the queue."""
+    """Return True only if key matches a track Jukeplox loaded into the queue.
+
+    Multi-source plan U9: a queued track may carry several holder keys (its holds
+    snapshot), and play-time fallback can stream from any of them — so every
+    holder key is authorized, not just the primary ``stream_key``."""
     items = list(queue_engine.queue) + list(queue_engine.history)
     if queue_engine.state.current:
         items.append(queue_engine.state.current)
-    return any(item.track.stream_key == key for item in items)
+    for item in items:
+        if item.track.stream_key == key:
+            return True
+        for h in (getattr(item.track, "holds", None) or []):
+            if h.get("key") == key:
+                return True
+    return False
 
 
 from app.output.router import OutputRouter
@@ -97,7 +107,15 @@ _plex_client_lock = asyncio.Lock()
 
 
 async def get_plex_client():
-    """Return a PlexClient (or MultiPlexClient) built from stored config, or None."""
+    """Return the SourceRegistry of connected media sources, or None when none.
+
+    Retained under the name ``get_plex_client`` for call-site and test-patch
+    continuity during the multi-source transition (U3); ``get_source_registry``
+    is the source-neutral alias new code should use. Plex servers register as
+    ``PlexSource`` providers; future Jellyfin/local sources register the same way.
+    Returns None when no source is configured (callers already degrade on None),
+    so a zero-source install starts and stays safe.
+    """
     global _plex_client
     if _plex_client is not None:
         return _plex_client
@@ -105,26 +123,62 @@ async def get_plex_client():
         if _plex_client is not None:
             return _plex_client
         from app import database
-        from app.plex.client import MultiPlexClient, PlexClient
+        from app.plex.client import PlexClient
+        from app.sources.plex import PlexSource
+        from app.sources.registry import SourceRegistry
+        sources = []
         servers = await database.get_plex_servers()
         if servers:
-            clients = [
-                PlexClient(
+            sources = [
+                PlexSource(PlexClient(
                     server_url=s["server_url"],
                     token=s["token"],
                     client_id=s["client_id"],
                     machine_id=s["machine_id"],
                     server_name=s.get("name", ""),
                     owner=s.get("owner", ""),
-                )
+                ))
                 for s in servers
             ]
-            _plex_client = MultiPlexClient(clients)
         else:
-            # Backward-compat: use legacy single-server config
+            # Backward-compat: legacy single-server config (machine_id "").
             cfg = await database.get_plex_config()
             if cfg:
-                _plex_client = PlexClient(cfg["server_url"], cfg["token"], cfg["client_id"])
+                sources = [PlexSource(
+                    PlexClient(cfg["server_url"], cfg["token"], cfg["client_id"]),
+                    source_id="",
+                )]
+        # Jellyfin sources (U10): additive — appended AFTER Plex so the native
+        # Plex pipeline stays primary (lower scan priority index). The loop is
+        # empty on a Plex-only install, so the registry is byte-identical there
+        # (AE6); a Jellyfin-only install still builds a registry. Connecting a
+        # non-Plex source is what flips the catalog floor on (guest._catalog_active
+        # keys on source_type, not source count).
+        jellyfin = await database.get_jellyfin_sources()
+        if jellyfin:
+            from app.sources.jellyfin import JellyfinSource
+            sources += [
+                JellyfinSource(
+                    server_url=j["server_url"], token=j["token"], user_id=j["user_id"],
+                    source_id=j["source_id"], server_name=j["name"], device_id=j["device_id"],
+                )
+                for j in jellyfin
+            ]
+        # Local-files sources (U11): same additive/gated posture as Jellyfin —
+        # appended after Plex/Jellyfin, empty loop on installs without one, so a
+        # Plex-only registry stays byte-identical (AE6). A connected local source
+        # is non-Plex, so it flips the catalog floor on (guest._catalog_active).
+        local = await database.get_local_sources()
+        if local:
+            from app.sources.local import LocalSource
+            sources += [
+                LocalSource(
+                    root_dir=l["root_dir"], source_id=l["source_id"], server_name=l["name"],
+                )
+                for l in local
+            ]
+        if sources:
+            _plex_client = SourceRegistry(sources)
         return _plex_client
 
 
@@ -133,11 +187,22 @@ def invalidate_plex_client() -> None:
     _plex_client = None
     from app.api import guest as _guest_api
     _guest_api._enabled_libs_cache = None
+    # Bump the refresh generation so an in-flight enabled-libraries refresh that
+    # started before this reconfiguration drops its now-stale result instead of
+    # writing it back over the cache we just cleared (2026-07-18 review).
+    _guest_api._enabled_libs_gen += 1
     # Selection inputs (server / library set) changed → drop any on-deck pick.
     # Sync best-effort clear + gen bump; an in-flight warm sees the bumped gen
     # under the lock and discards its result (2026-06-21 plan U4).
     _ondeck = None
     _ondeck_gen += 1
+
+
+# Source-neutral aliases (U3): new code should prefer these names. The legacy
+# ``get_plex_client`` / ``invalidate_plex_client`` names are retained above as the
+# call-site and test-patch surface during the multi-source transition.
+get_source_registry = get_plex_client
+invalidate_source_registry = invalidate_plex_client
 
 
 # ── playback advance ──────────────────────────────────────────────────────────
@@ -147,6 +212,21 @@ _advance_lock = asyncio.Lock()  # guards against concurrent EOS + skip advancing
 # Monotonic counter: incremented by skip so pending EOS _do_advance tasks bail when they
 # see the generation changed between their lock-check and lock-acquisition.
 _advance_gen: int = 0
+
+
+def advance_lock() -> asyncio.Lock:
+    """The advance serialization lock — the public read for out-of-module
+    consumers (the output-session supervisor's boundary/resume paths). Reads
+    the module attribute live, so tests that monkeypatch ``_advance_lock``
+    keep working unchanged."""
+    return _advance_lock
+
+
+def advance_gen() -> int:
+    """The current advance generation (see ``_advance_gen``) — the public
+    read for out-of-module consumers. Capture before taking the lock; a
+    mismatch after acquisition means a skip superseded the caller."""
+    return _advance_gen
 # Closing Time mode (2026-06-24 plan U2): True between a trigger-song freeze and
 # the admin's resume. In-memory only — a restart while frozen resets it (the
 # party is over anyway, and the next trigger play re-arms). Gates the idle
@@ -156,6 +236,49 @@ _closing_active: bool = False
 # snapshots can render the banner for a late-joining client without a DB read or
 # drifting from what was broadcast. Empty when not frozen.
 _closing_message: str = ""
+
+# ── gapless playback toggle (2026-07-11 supervisor plan U5) ───────────────────
+# Live-applied module flag following the queue_end_behavior triad: persisted
+# under "gapless_enabled" ("1"/"0", default OFF), restored in setup(), and
+# flipped by POST /admin/settings without a restart. NO playback path consults
+# it yet — U6+ (arming lifecycle, per-backend gapless) are the consumers; with
+# the toggle off, playback is byte-identical to today by construction.
+_gapless_enabled: bool = False
+# Arming-generation counter (U6 hook point): bumped on every effective toggle
+# flip so U6's device-side arming lifecycle can key revocation off it — an
+# armed next must never outlive the toggle state that armed it. Mirrors the
+# _ondeck_gen / _advance_gen stale-guard shape (capture at arm time, compare
+# later; mismatch = stale). U5 only guarantees the bump is observable; U6
+# builds the real arm/revoke lifecycle on top.
+_arming_gen: int = 0
+
+
+def gapless_enabled() -> bool:
+    """Live gapless toggle (plan U5). Decision-time read for U6+'s arming and
+    per-backend gapless paths — restored from settings at startup, updated by
+    the settings POST; never a DB read on the hot path."""
+    return _gapless_enabled
+
+
+def arming_gen() -> int:
+    """Current arming generation (U6 revocation hook). Consumers capture the
+    value at arm time; a later mismatch means the gapless toggle flipped and
+    the armed next is stale (must revoke)."""
+    return _arming_gen
+
+
+def set_gapless_enabled(value: bool) -> None:
+    """Live-apply the gapless toggle (settings POST + setup() restore). A real
+    flip bumps the arming generation so a device-side armed next (U6) is
+    invalidated; a same-value write is a no-op — no revoke churn. The flip
+    also fires the arming reconcile directly (U6): a mid-track OFF must
+    revoke NOW, not at the next queue event, and an ON flip arms the
+    already-warmed effective next."""
+    global _gapless_enabled, _arming_gen
+    if value != _gapless_enabled:
+        _gapless_enabled = value
+        _arming_gen += 1
+        trigger_arming_eval()
 
 # ── random auto-fill pre-buffer ("on-deck"; 2026-06-21 plan U1/U2) ────────────
 # One pre-selected next random track, warmed in the background while the current
@@ -209,6 +332,61 @@ async def _on_dacp_volume_change(session, value: float, absolute: bool) -> None:
         _log.warning("DACP: VolumeChangedEvent broadcast failed", exc_info=True)
 
 
+async def catalog_active() -> bool:
+    """True when a non-Plex source is connected, so source-neutral paths (random,
+    Surprise Me, genres) serve the merged catalog floor instead of Plex's native
+    pipeline (plan U8/U13).
+
+    Mirrors ``guest._catalog_active`` (which delegates here) — gated on source
+    TYPE, not count: an all-Plex registry stays native regardless of how many
+    servers it spans (AE6 parity), and the floor takes over the moment any
+    Jellyfin/local source joins. Defensive: only a real registry exposing a
+    ``sources`` list can activate it — any other client shape (mocks, a legacy
+    single client) reads as native."""
+    reg = await get_plex_client()
+    srcs = getattr(reg, "sources", None)
+    if not isinstance(srcs, list) or not srcs:
+        return False
+    return any(getattr(s, "source_type", "plex") != "plex" for s in srcs)
+
+
+def _row_within_band(row, min_ms, max_ms) -> bool:
+    """Inclusive [min_ms, max_ms] band test on a catalog track row's
+    ``duration_ms``, mirroring ``surprise._within_length``: a missing/zero
+    duration always passes (we never silently drop a track whose length we
+    can't read). Both bounds None → always True."""
+    dur = row.get("duration_ms") or 0
+    if not dur:
+        return True
+    if min_ms is not None and dur < min_ms:
+        return False
+    if max_ms is not None and dur > max_ms:
+        return False
+    return True
+
+
+async def _catalog_shuffle(min_ms, max_ms):
+    """Whole-library random off the unified catalog — the source-neutral floor
+    (plan U13).
+
+    The Plex artist→album→track traversal below can't reach Jellyfin/local
+    content, so once a non-Plex source is connected the random floor draws from
+    the catalog's track rows instead. Band handling mirrors ``_shuffle_provider``:
+    when a min/max is in effect, filter rows to the band and pick one at random;
+    if none qualify, fall back to an unfiltered pick so the floor never
+    dead-ends. Returns a fully-built ``Track`` (carrying its priority-ordered
+    holds for play-time fallback) or None when the catalog is empty."""
+    from app.catalog import store, views
+    rows = await store.get_all_tracks()
+    if not rows:
+        return None
+    if min_ms is not None or max_ms is not None:
+        in_band = [r for r in rows if _row_within_band(r, min_ms, max_ms)]
+        if in_band:
+            rows = in_band
+    return await views._track(random.choice(rows))
+
+
 async def _shuffle_provider(bounds=_UNSET):
     """Return a random track from enabled libraries (artist→album→track traversal).
 
@@ -236,13 +414,18 @@ async def _shuffle_provider(bounds=_UNSET):
     else:
         min_ms, max_ms = bounds
 
+    # Source-neutral floor (plan U13): with a non-Plex source connected, the Plex
+    # traversal below can't see Jellyfin/local tracks — draw from the catalog.
+    if await catalog_active():
+        return await _catalog_shuffle(min_ms, max_ms)
+
     # Band-invariant fetches are hoisted out of the retry loop — the client and
     # the enabled-library list don't change between attempts, so re-fetching them
     # per retry (up to _SHUFFLE_BAND_TRIES + 1 times) would be wasted work.
     client = await get_plex_client()
     if not client:
         return None
-    enabled_keys = {lib["section_key"] for lib in await database.get_enabled_libraries()}
+    enabled_keys = {lib["section_key"] for lib in await database.get_effective_enabled_libraries()}
     all_libs = await client.get_libraries()
     libs = [lib for lib in all_libs if lib.key in enabled_keys]
     if not libs:
@@ -375,6 +558,22 @@ async def _auto_fill_provider(behavior):
     return await _select_auto_fill_track(behavior)
 
 
+async def invalidate_ondeck_if_track(track_id) -> bool:
+    """Invalidate the on-deck slot iff it currently holds ``track_id`` —
+    the id-check and the invalidate run under ``_ondeck_lock`` as one atomic
+    step (a warm landing between a caller's own read and its invalidate
+    could otherwise drop a FRESH pick). Returns True when the slot was
+    cleared. The public entry for out-of-module consumers (the Cast flow
+    engine's server-side skip) — never reach into ``_ondeck`` directly."""
+    global _ondeck, _ondeck_gen
+    async with _ondeck_lock:
+        if _ondeck is None or getattr(_ondeck, "id", None) != track_id:
+            return False
+        _ondeck = None
+        _ondeck_gen += 1
+        return True
+
+
 async def invalidate_ondeck() -> None:
     """Discard any buffered on-deck track and bump the generation so an in-flight
     warm discards its now-stale result (2026-06-21 plan U2). Called on preemption
@@ -415,6 +614,7 @@ async def _warm_ondeck(behavior, gen: int) -> None:
     select discards the result. Best-effort — exceptions surface via the task's
     done-callback, never to a caller."""
     global _ondeck, _ondeck_warming
+    installed = False
     try:
         track = await _select_auto_fill_track(behavior)
         if track is None:
@@ -423,8 +623,13 @@ async def _warm_ondeck(behavior, gen: int) -> None:
             if gen == _ondeck_gen and _ondeck is None:
                 _ondeck = track
                 schedule_prefetch([track], n=1)
+                installed = True
     finally:
         _ondeck_warming = False
+    if installed:
+        # U6: with the queue empty in a random mode, the pick that just landed
+        # IS the effective next — let the arming orchestrator see it.
+        trigger_arming_eval()
 
 
 async def _ondeck_react(event: str) -> None:
@@ -443,6 +648,281 @@ async def _ondeck_react(event: str) -> None:
             trigger_ondeck_warm()
 
 
+# ── effective-next prefetch + device-side arming (2026-07-11 plan U6) ─────────
+# The generalization of the on-deck warm (R13/R14). While the current track
+# plays, the EFFECTIVE next track — queue[0], or the on-deck autofill pick when
+# the queue is empty in a random queue-end mode — has its transcode pre-warmed
+# through the stream proxy's single-flight cache (PREFETCH: runs regardless of
+# the gapless toggle, R13 — cache-warm only, dispatch behavior is untouched),
+# and, when the toggle is ON and the active backend is gapless-capable, it is
+# armed device-side. Arming is duck-typed, never a Protocol change: the call
+# site guards with ``hasattr(backend, "arm_next")`` (mirroring the watcher's
+# hasattr-guarded ``register_resolved`` chain); supporting backends (U7/U8)
+# implement ``async arm_next(stream_url, track)`` / ``async revoke_next()``
+# directly and ``AbstractOutputBackend`` is untouched.
+#
+# ARMING INPUTS = (gapless toggle via ``arming_gen()``, active backend/device,
+# effective next track, Closing Time config). ANY change revokes and re-arms:
+# the reconcile below recomputes the effective next and compares it BY OBJECT
+# IDENTITY against the armed one, so a tail append is a pure no-op (no revoke
+# churn, R14) while a change of queue[0] (remove / reorder / prepend / append
+# to an empty queue preempting an armed autofill pick) revokes and re-arms
+# (AE6). A device-visible armed next needs this EXPLICIT revoke — the
+# generation counter alone only discards in-flight warms (the on-deck doc's
+# warning); the counter shape is still reused for staleness after every await.
+#
+# This is a PARALLEL orchestrator that COMPOSES with the on-deck machinery (it
+# READS the slot as the effective next; it never consumes or invalidates it) —
+# extending ``_ondeck`` would have forced its existing consumers
+# (``_auto_fill_provider``, the invalidate paths) through compare-and-re-arm
+# semantics they don't have.
+_armed_next_track = None            # Track armed device-side (None = slot empty)
+_armed_next_url: str = ""           # the stream URL handed to arm_next
+_armed_next_backend = None          # the backend the arm was issued to
+_armed_next_agen: int = 0           # arming_gen() captured at arm time
+_next_warm_track = None             # last successfully warmed next (memo, by identity)
+_next_warm_url: str = ""
+_arming_evaluating: bool = False    # single-flight guard for the reconcile task
+_arming_dirty: bool = False         # a trigger landed mid-reconcile → run again
+
+
+def effective_next_track():
+    """The track the next boundary would play: ``queue[0]``, else the on-deck
+    autofill pick when the queue is empty and a random queue-end mode is
+    active (the pick may still be warming — ``_warm_ondeck`` re-triggers the
+    reconcile when it lands), else None (the boundary stops). Closing Time is
+    deliberately NOT folded in here: this is a sync read, and the send-off
+    suppression is the reconcile's async arm-time check (R21) — U9's flow
+    lookahead must apply the same ``_closing_trigger_message`` check."""
+    from app.queue.models import QueueEndBehavior
+    q = queue_engine.queue
+    if q:
+        return q[0].track
+    if queue_engine.end_behavior in (
+        QueueEndBehavior.POPULAR_RANDOM, QueueEndBehavior.FULL_RANDOM
+    ):
+        return _ondeck
+    return None
+
+
+def armed_next():
+    """The device-armed ``(track, stream_url)``, or None — the orchestrator-
+    side view (tests, U9's flow lookahead). U7's about-to-finish handler must
+    NOT come here: it runs on a GLib streaming thread with no asyncio access —
+    the backend stashes what it needs in its own thread-safe slot at
+    ``arm_next`` time and reads THAT at the boundary."""
+    if _armed_next_track is None:
+        return None
+    return (_armed_next_track, _armed_next_url)
+
+
+def trigger_arming_eval() -> None:
+    """Fire-and-forget: reconcile the armed next against the current arming
+    inputs. Single-flight with a dirty-flag re-loop — a trigger landing while
+    a reconcile runs marks it dirty and the loop runs once more, so no input
+    change is ever lost to coalescing. Sync + loop-guarded so sync call sites
+    (``set_gapless_enabled``, the router's ``set_backend``) can fire it; with
+    no running loop it no-ops — the next playback/queue event re-evaluates."""
+    global _arming_evaluating, _arming_dirty
+    if _arming_evaluating:
+        _arming_dirty = True
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no loop (sync caller in tests/shutdown) — nothing to arm for
+    _arming_evaluating = True
+    task = loop.create_task(_arming_eval_loop())
+    task.add_done_callback(_log_task_exc)
+
+
+async def _arming_eval_loop() -> None:
+    """Drain reconciles until no trigger landed mid-run. The final dirty-check
+    → return → finally sequence has no awaits, so on the single event loop a
+    trigger can never land in that gap unseen."""
+    global _arming_evaluating, _arming_dirty
+    try:
+        while True:
+            _arming_dirty = False
+            await _reconcile_armed_next()
+            if not _arming_dirty:
+                return
+    finally:
+        _arming_evaluating = False
+
+
+async def _reconcile_armed_next() -> None:
+    """Compare the DESIRED armed state against the CURRENT one; revoke and/or
+    warm+arm to converge. Every await is followed by a recheck of the inputs
+    it could have raced (the ``_ondeck_gen`` stale-guard shape), and the
+    dirty re-loop in ``_arming_eval_loop`` owns anything that shifted while
+    this pass ran. The R21 arm-time check lives here: when the CURRENT track
+    is the Closing Time trigger the boundary freezes instead of advancing, so
+    nothing is prefetched or armed past it."""
+    global _armed_next_track, _armed_next_url, _armed_next_backend
+    global _armed_next_agen, _next_warm_track, _next_warm_url
+    nxt = effective_next_track()
+    cur = queue_engine.state.current
+    want_next = (nxt is not None and cur is not None
+                 and queue_engine.state.is_playing)
+    # The R21 closing check exists to keep DEVICE-SIDE arming from crossing
+    # the send-off track; with gapless OFF and nothing armed there is nothing
+    # to arm or revoke, so skip the per-queue-event closing-config DB read
+    # entirely — the R13 prefetch below is cache-warm only and carries no
+    # dispatch behavior. Behavior is identical whenever gapless is on or a
+    # slot is armed (the read still gates want_next there).
+    if want_next and (gapless_enabled() or _armed_next_track is not None):
+        try:
+            closing = (await _closing_trigger_message(cur.track)) is not None
+        except Exception:
+            closing = False  # unreadable config is not a freeze (matches _do_advance's read-at-decision posture)
+        if closing:
+            want_next = False  # R21: never prepare past the send-off track
+        else:
+            # The settings read awaited — recompute the cheap inputs.
+            nxt = effective_next_track()
+            want_next = nxt is not None and queue_engine.state.is_playing
+    backend = output_router.active
+    arm_wanted = (want_next
+                  and gapless_enabled()
+                  and not output_router.has_pending
+                  and backend is not None
+                  and hasattr(backend, "arm_next"))
+    if _armed_next_track is not None and (
+            not arm_wanted
+            or _armed_next_track is not nxt
+            or _armed_next_agen != arming_gen()
+            or _armed_next_backend is not backend):
+        await _revoke_armed_next("arming inputs changed")
+    if not want_next:
+        return
+    # R13 prefetch: warm regardless of the toggle. The memo makes repeat
+    # reconciles for the SAME next (every tail append re-enters here) free; a
+    # FAILED warm is not memoized, so a recovered source warms on the next
+    # event instead of staying dead.
+    if _next_warm_track is not nxt:
+        url = await _warm_next_transcode(nxt)
+        if effective_next_track() is not nxt:
+            return  # the queue moved under the warm; the dirty re-loop owns it
+        if url is None:
+            # Warm failed (source down / no holders): arm nothing — the
+            # boundary falls back to today's non-gapless advance with its
+            # full holder fallback; never a dead end.
+            return
+        _next_warm_track, _next_warm_url = nxt, url
+    if not arm_wanted or _armed_next_track is nxt:
+        return
+    # Re-validate the arm inputs after the awaits above (toggle, router,
+    # backend, the next itself, and the empty slot) before going device-side.
+    backend = output_router.active
+    if (not gapless_enabled() or output_router.has_pending
+            or backend is None or not hasattr(backend, "arm_next")
+            or _armed_next_track is not None
+            or effective_next_track() is not nxt):
+        return
+    try:
+        await backend.arm_next(_next_warm_url, nxt)
+    except Exception:
+        _log.warning("Gapless: arm_next failed for %r — the boundary will "
+                     "fall back gapped", getattr(nxt, "title", "?"),
+                     exc_info=True)
+        return
+    _armed_next_track, _armed_next_url = nxt, _next_warm_url
+    _armed_next_backend, _armed_next_agen = backend, arming_gen()
+    _log.info("Gapless: armed next %r on the active backend",
+              getattr(nxt, "title", "?"))
+
+
+async def _revoke_armed_next(reason: str) -> None:
+    """Revoke the device-armed next (if any): clear the orchestrator slot
+    FIRST (so overlapping paths observe it empty — no double revoke), then
+    call the owning backend's ``revoke_next``. The slot clears even when the
+    device call fails — stale server-side arm state is worse than a device
+    that needs its boundary fallback (U8 owns per-protocol revoke-failure
+    handling). Idempotent no-op when nothing is armed. ``revoke_next`` may
+    also fire right after a boundary consumed the arm (post-advance churn) —
+    backends must implement it idempotently."""
+    global _armed_next_track, _armed_next_url, _armed_next_backend, _armed_next_agen
+    track, backend = _armed_next_track, _armed_next_backend
+    if track is None:
+        return
+    _armed_next_track, _armed_next_url = None, ""
+    _armed_next_backend, _armed_next_agen = None, 0
+    _log.info("Gapless: revoking armed next %r (%s)",
+              getattr(track, "title", "?"), reason)
+    revoke = getattr(backend, "revoke_next", None)
+    if callable(revoke):
+        try:
+            await revoke()
+        except Exception:
+            _log.warning("Gapless: revoke_next failed (%s) for %r — slot "
+                         "cleared server-side; the boundary falls back gapped",
+                         reason, getattr(track, "title", "?"), exc_info=True)
+
+
+async def notify_closing_config_changed() -> None:
+    """Closing Time config edited (admin settings POST → here). The closing
+    config is an ARMING INPUT (R21): the armed decision was made under the OLD
+    config, so any edit revokes the armed next outright, then re-evaluates —
+    the reconcile re-arms only when the new config still allows it (never past
+    the send-off track)."""
+    await _revoke_armed_next("closing config changed")
+    trigger_arming_eval()
+
+
+async def _warm_next_transcode(track) -> str | None:
+    """Prefetch the effective next (R13): resolve its primary holder to the
+    device-facing stream URL (exactly what dispatch would use) and pre-warm
+    the transcoded artifact through the stream proxy's single-flight cache —
+    the same cache the boundary's GET will hit, so an Ogg-family next serves
+    instantly instead of paying the full fetch+transcode at the transition.
+    Non-transcode sources need no server-side warm (passthrough / local file):
+    URL resolution alone suffices. Only the PRIMARY holder is warmed/armed —
+    a boundary fallback still walks the full holder list. Returns the stream
+    URL, or None on ANY failure (best-effort by contract): the caller then
+    arms nothing and the boundary falls back to today's advance."""
+    try:
+        client = await get_plex_client()
+        if client is None:
+            return None
+        keys = _holder_keys(track)
+        if not keys:
+            return None
+        key = keys[0]
+        url = _make_stream_url(key, client)
+        target = client.resolve_stream(key)
+        if getattr(target, "path", None):
+            return url  # local file — served range-aware from disk; nothing to warm
+        source_url = (getattr(target, "url", None) or "").strip()
+        if not source_url:
+            return None
+        from app.transcode import transcodes_to_flac
+        if transcodes_to_flac(source_url):
+            from app.api import stream as stream_api
+            await stream_api._get_or_transcode(
+                key, source_url, dict(getattr(target, "headers", None) or {}))
+        return url
+    except Exception:
+        _log.warning("Prefetch: next-track warm failed for %r — the boundary "
+                     "will fall back to the non-gapless advance",
+                     getattr(track, "title", "?"), exc_info=True)
+        return None
+
+
+def _stream_url_base() -> str:
+    """The device-reachable base URL for server-proxied streams: explicit
+    STREAM_BASE_URL, else a specific (non-0.0.0.0) BIND_HOST. "" when neither
+    is configured — the per-track dispatch then falls back to the source's
+    direct URL; the Cast flow stream (U10) has no such fallback and degrades
+    to per-track playback instead. Single-sourced here so the two URL
+    builders can never disagree about what "reachable base" means."""
+    from app.config import settings
+    base = settings.stream_base_url
+    if not base and settings.bind_host and settings.bind_host != "0.0.0.0":
+        base = f"http://{settings.bind_host}"
+    return base.rstrip("/") if base else ""
+
+
 def _make_stream_url(stream_key: str, client) -> str:
     """Return the playback URL for a track.
 
@@ -450,12 +930,9 @@ def _make_stream_url(stream_key: str, client) -> str:
     set explicitly, returns a /api/stream proxy URL so Cast/DLNA devices that
     can't reach Plex directly fetch the audio through Jukeplox instead.
     """
-    from app.config import settings
-    base = settings.stream_base_url
-    if not base and settings.bind_host and settings.bind_host != "0.0.0.0":
-        base = f"http://{settings.bind_host}"
+    base = _stream_url_base()
     if base:
-        return (base.rstrip("/")
+        return (base
                 + "/api/stream?key="
                 + urllib.parse.quote(stream_key, safe=""))
     return client.stream_url(stream_key)
@@ -467,10 +944,12 @@ def record_play(track) -> None:
     The single source of truth for "a track started playing": increments the
     track/album/artist play counts and upserts the display metadata that backs
     /api/most-played. Fire-and-forget so counting never blocks or fails the
-    playback path. EVERY play-start path (natural EOS advance, forward Skip,
-    Skip Back) must call this — centralising it is what stops a new play path
-    from silently forgetting to count (the bug that kept skipped-to tracks off
-    Most Played).
+    playback path. Since 2026-07-11 (supervisor plan U1) the ONLY playback
+    caller is the output-session supervisor's confirmed-start chokepoint
+    (app/output/session.py): every play-start path (natural EOS advance,
+    forward Skip, Skip Back) reports its dispatch via ``dispatch_play`` and
+    the count fires when the backend confirms playback actually started —
+    a dispatch to a dead device never counts.
     """
     from app import database
     # guest.py imports app.state at module level, so the shared serializer is
@@ -487,6 +966,74 @@ def record_play(track) -> None:
     if track.artist:
         _t3 = asyncio.create_task(database.increment_play_count("artist", track.artist))
         _t3.add_done_callback(_log_task_exc)
+
+
+# ── Play-data curation: inverse of record_play (2026-07-03 plan U2) ───────────
+# These are the inverse chokepoint for record_play. Unlike record_play (sync,
+# fire-and-forget so counting never blocks playback), these are async and are
+# AWAITED by the admin handler — the mutation must commit before the endpoint
+# responds. Both resolve the (possibly stale) incoming key to its live catalog
+# identity and act on the WHOLE re-mint sibling set, so the scan-time reconcile's
+# max-fold can't silently revert the mutation (ce-debug 2026-07-03; see
+# docs/solutions/architecture-patterns/reminted-catalog-identity-repair-keys-resolve-display-live.md).
+
+async def _track_play_keys(track_id: str) -> tuple[str, list[str]]:
+    """Return ``(identity, keys)``: the catalog identity ``track_id`` resolves to,
+    and every ``play_counts`` track key that resolves to the same identity (the
+    re-mint sibling set). ``store.find_identity`` is forward-only (key → identity)
+    and cannot enumerate keys resolving TO an identity, so — exactly as
+    ``catalog.migrate.migrate_metadata`` does — siblings are found by iterating all
+    track counts and forward-resolving each."""
+    from app import database
+    from app.catalog import identity as cat_identity
+    target = await cat_identity.identity_for_track_id(track_id) or track_id
+    keys: list[str] = []
+    for row in await database.get_all_play_counts("track"):
+        key = row["entity_id"]
+        resolved = await cat_identity.identity_for_track_id(key) or key
+        if resolved == target:
+            keys.append(key)
+    return target, keys
+
+
+async def unrecord_play(track_id: str, album: str | None, artist: str | None) -> None:
+    """Roll back ONE play — the inverse of ``record_play`` (plan U2, R2/R3).
+
+    Consolidate-then-decrement: fold the track's sibling counts onto its live
+    identity with ``max`` (they are copies of the same plays) and delete the
+    siblings, THEN decrement the single consolidated identity row by one. This
+    avoids both a revert (a higher sibling refolding via ``max`` on the next
+    Rescan) and an over-correction (deleting a sibling that held the real total
+    while the identity row was 0). Album/artist counts are name-keyed; decrement
+    them only when the name is truthy, mirroring ``record_play``'s guards."""
+    from app import database
+    target, keys = await _track_play_keys(track_id)
+    best = 0
+    for key in keys:
+        best = max(best, await database.get_play_count("track", key))
+    await database.set_play_count("track", target, best)
+    for key in keys:
+        if key != target:
+            await database.delete_play_count("track", key)
+            await database.delete_play_track_meta(key)
+    await database.decrement_play_count("track", target)
+    if album:
+        await database.decrement_play_count("album", album)
+    if artist:
+        await database.decrement_play_count("artist", artist)
+
+
+async def purge_play_track(track_id: str) -> None:
+    """Remove a track from Most Played (plan U2, R5/R6): delete the track's
+    ``play_counts`` row AND every re-mint sibling key's row plus their captured
+    ``play_track_meta``. An incomplete sibling sweep would leave a ``count>0`` row
+    that re-surfaces the "removed" track on the leaderboard. Track-scoped — never
+    touches the album/artist name-keyed aggregates."""
+    from app import database
+    _target, keys = await _track_play_keys(track_id)
+    for key in keys:
+        await database.delete_play_count("track", key)
+        await database.delete_play_track_meta(key)
 
 
 # ── Closing Time mode (2026-06-24 plan U2) ───────────────────────────────────
@@ -557,17 +1104,24 @@ async def clear_closing_and_continue() -> None:
 
 def _should_auto_start() -> bool:
     """Whether a queue_changed should kick off playback: something is queued,
-    nothing is playing, no advance already pending, and NOT frozen for Closing
-    Time — the freeze must not be undone by the idle auto-start."""
+    nothing is playing, no advance already pending, NOT frozen for Closing
+    Time, and NOT held by a device-level outage (supervisor plan U2) — the
+    hold re-front-inserts the interrupted item, and auto-start would
+    immediately re-dispatch it to the dead device."""
+    from app.output import session as output_session
     return (not queue_engine.state.is_playing
             and bool(queue_engine.queue)
             and not _auto_advance_pending
-            and not _closing_active)
+            and not _closing_active
+            and not output_session.output_hold_active())
 
 
 async def _do_advance() -> None:
     """Pop the next queued track and start playing it. Called by backend EOS callbacks."""
     from app.output.base import DeviceNotReadyError
+    from app.output import session as output_session
+    if output_session.output_hold_active():
+        return  # outage hold: the queue is frozen until resume (plan U2, R15)
     captured_gen = _advance_gen
     if _advance_lock.locked():
         return  # skip is in progress; let it own the advance
@@ -584,24 +1138,172 @@ async def _do_advance() -> None:
                 await _fire_closing(_msg)
                 return
         for _ in range(_MAX_CONSECUTIVE_FAILURES):
+            if output_session.output_hold_active():
+                return  # a hold landed while we were consuming failures (R15)
             next_item = await queue_engine.advance()
             if not next_item:
                 return
             client = await get_plex_client()
             if not client:
                 return
-            url = _make_stream_url(next_item.track.stream_key, client)
             try:
-                await output_router.play(url, next_item.track)
-                record_play(next_item.track)
+                if await _play_with_fallback(next_item, client):
+                    return
+            except DeviceNotReadyError as exc:
+                # Device-level failure (DeviceLostError included): pause and
+                # hold the interrupted item as next-up instead of stranding it
+                # as a phantom `current` or draining the queue past it
+                # (supervisor plan U2, R15/R18 — covers the idle-entry outage:
+                # a guest queuing against a dead device lands here too).
+                _log.warning(
+                    "_do_advance: device-level failure (%s: %s) — entering outage hold",
+                    type(exc).__name__, exc,
+                )
+                await output_session.enter_output_hold("dispatch_failed")
                 return
-            except DeviceNotReadyError:
-                _log.warning("_do_advance: output backend has no device connected; halting advance")
-                return
-            except Exception:
-                _log.exception("Playback failed for %r; advancing to next", next_item.track.title)
+            # Every holder for this item failed to stream (R13: 404/gone/auth, or
+            # a removed source that solely held it) — declare it unplayable and
+            # advance to the next queued item, flashing the R22 skip notification.
+            _log.warning("All holders failed for %r; skipping to next item",
+                         next_item.track.title)
+            await _emit_track_skipped(next_item.track)
         _log.error("_do_advance: gave up after %d consecutive playback failures",
                    _MAX_CONSECUTIVE_FAILURES)
+
+
+async def _emit_track_skipped(track) -> None:
+    """Broadcast the R22 skip notification when every holder failed (plan U16).
+
+    Admins get the source ids that were tried (from the U9 holds snapshot) as a
+    diagnostic; guests get title-only (``sources_tried`` omitted on their
+    broadcast). Best-effort — a broadcast failure never blocks the advance."""
+    from app.events.bus import manager
+    from app.events.types import TrackSkippedEvent
+    title = getattr(track, "title", "") or ""
+    tried = [h.get("source_id") for h in (getattr(track, "holds", None) or []) if h.get("source_id")]
+    try:
+        await manager.broadcast_to_admins(
+            TrackSkippedEvent(track_title=title, sources_tried=tried or None))
+        await manager.broadcast_to_guests(
+            TrackSkippedEvent(track_title=title, sources_tried=None))
+    except Exception:
+        _log.warning("track_skipped broadcast failed", exc_info=True)
+
+
+def _holder_keys(track) -> list[str]:
+    """Priority-ordered resolvable stream keys to try for a track: the
+    enqueue-time holds snapshot (multi-source plan U9), else the single
+    ``stream_key`` (single-holder track / pre-snapshot queue item)."""
+    keys = [h["key"] for h in (getattr(track, "holds", None) or []) if h.get("key")]
+    return keys or ([track.stream_key] if track.stream_key else [])
+
+
+def _backend_type_of(backend) -> str | None:
+    """Which module singleton ``backend`` is ("direct" / "chromecast" /
+    "dlna" / "airplay"), or None for a foreign instance. The output-session
+    supervisor's reconnect loop (plan U3) keys its per-backend attach
+    mechanics and cache seeding off this — identity comparison against the
+    singletons, so a test fake patched into the module resolves too."""
+    if backend is None:
+        return None
+    for name in ("direct", "chromecast", "dlna", "airplay"):
+        if backend is globals().get(f"{name}_backend"):
+            return name
+    return None
+
+
+def _output_probe():
+    """The active backend's reachability probe as the supervisor's ``ProbeFn``,
+    or None when the backend has none (supervisor plan U2).
+
+    hasattr-guarded like the watcher's ``register_resolved`` chain — backends
+    opt in by implementing ``probe_liveness()`` (async → ``(reachable,
+    transport_state | None)``). Consumed by three callers: ``dispatch_play``
+    (the U1 deadline-extension probe), ``_play_with_fallback``'s holder
+    tie-breaker, and the session classifier."""
+    backend = output_router.active
+    probe = getattr(backend, "probe_liveness", None) if backend is not None else None
+    return probe if callable(probe) else None
+
+
+async def dispatch_play(url: str, track, *, play_recorded: bool = False) -> None:
+    """Dispatch one track to the active output, reporting it to the output-
+    session supervisor (2026-07-11 supervisor plan U1).
+
+    The single dispatch chokepoint for every play-start entry point (natural
+    advance via ``_play_with_fallback``, admin Skip, admin Skip Back). The play
+    is NOT counted here: ``record_play`` fires only from the supervisor's
+    confirmed-start chokepoint once the backend reports actual playback —
+    "command accepted" is never proof of audio. ``play_recorded`` is the R19
+    mark: a resume path replaying an already-counted item sets it so the
+    chokepoint skips counting. The active backend's reachability probe rides
+    along (U2) so the confirmation deadline's R15 extension and the outage
+    classifier get real per-backend probes.
+
+    A dispatch that raises is withdrawn from the supervisor before the error
+    propagates, so a failed holder/entry point cannot age into a spurious
+    outage-suspected emission."""
+    from app.output import session
+    supervisor = session.get_supervisor()
+    token = supervisor.on_dispatched(track, play_recorded=play_recorded,
+                                     probe=_output_probe())
+    try:
+        await output_router.play(url, track)
+    except BaseException:
+        supervisor.on_dispatch_failed(token)
+        raise
+
+
+async def _play_with_fallback(item, client) -> bool:
+    """Try each holder in priority order; return True once one plays (R12/R13).
+
+    Re-raises ``DeviceNotReadyError`` (no output device → halt the advance, not a
+    holder problem). Returns False when no holder serves, so the caller can skip
+    the item. Each attempt is reported to the output-session supervisor via
+    ``dispatch_play``; the play is counted only at the supervisor's
+    confirmed-start chokepoint (plan U1), never here at dispatch.
+
+    U2 (R15 tie-breaker): a holder failure is ambiguous — bad media or dead
+    device. Probe the device before consuming another holder; unreachable
+    makes this a device-level failure (``DeviceLostError`` → the caller's
+    outage hold), never the track's fault. A probe that itself blows up (or a
+    backend without one) yields no evidence — keep today's holder-fallback
+    behavior so a broken probe can't freeze playback. The probe runs at most
+    ONCE per invocation (this all happens under ``_advance_lock`` — N failing
+    holders must not stack N slow probes); the first verdict is reused."""
+    from app.output.base import DeviceLostError, DeviceNotReadyError
+    play_recorded = bool(getattr(item, "play_recorded", False))
+    reachable: bool | None = None
+    for key in _holder_keys(item.track):
+        url = _make_stream_url(key, client)
+        try:
+            await dispatch_play(url, item.track, play_recorded=play_recorded)
+            # The R19 mark protected THIS pending play; consume it so a later
+            # organic replay (e.g. Skip Back after it finishes) counts again.
+            # Safe: any re-hold re-stamps the mark from the supervisor's
+            # dispatch state, which captured play_recorded before this clear.
+            item.play_recorded = False
+            return True
+        except DeviceNotReadyError:
+            raise
+        except Exception:
+            _log.warning("Holder %s failed for %r; trying next holder", key, item.track.title)
+            if reachable is None:
+                probe = _output_probe()
+                if probe is None:
+                    reachable = True  # no probe — no evidence, keep fallback
+                else:
+                    try:
+                        reachable, _transport = await probe()
+                    except Exception:
+                        _log.debug("holder tie-breaker probe failed", exc_info=True)
+                        reachable = True  # no evidence — don't hold on a broken probe
+            if not reachable:
+                raise DeviceLostError(
+                    f"output device unreachable after holder failure for "
+                    f"{item.track.title!r}"
+                )
+    return False
 
 
 async def _trigger_auto_advance() -> None:
@@ -653,10 +1355,18 @@ async def _refresh_genre_cache() -> None:
     global _genre_refresh_running
     from app import database
     try:
+        # Source-neutral genres (plan U13): in a catalog install, genre counts
+        # come from the merged catalog's track tags (Plex styles is a native
+        # specialization the floor doesn't reach). Recompute + restamp, done.
+        if await catalog_active():
+            from app.catalog import views
+            await database.set_genre_cache(await views.genres())
+            await stamp_cache("genre_cache_computed_at")
+            return
         client = await get_plex_client()
         if not client:
             return
-        libs = await database.get_enabled_libraries()
+        libs = await database.get_effective_enabled_libraries()
         if not libs:
             return
         results = await asyncio.gather(
@@ -708,7 +1418,7 @@ async def _refresh_credit_cache() -> None:
         client = await get_plex_client()
         if not client:
             return
-        libs = await database.get_enabled_libraries()
+        libs = await database.get_effective_enabled_libraries()
         if not libs:
             return
         results = await asyncio.gather(
@@ -826,8 +1536,17 @@ async def _refresh_browse_index() -> None:
         client = await get_plex_client()
         if not client:
             return
+        enabled_keys = {lib["section_key"] for lib in await database.get_effective_enabled_libraries()}
+        if not enabled_keys:
+            # Nothing effectively enabled (all libraries disabled or all sources vetoed):
+            # clear the index BEFORE hitting the network, so a whole-source OFF still hides
+            # its browse content even when Plex is transiently unreachable (Libraries-panel U2).
+            await database.set_browse_index([], [])
+            await stamp_cache("browse_index_computed_at")
+            _browse_index_gen += 1
+            await _rebuild_artist_grouping()
+            return
         all_libs = await client.get_libraries()
-        enabled_keys = {lib["section_key"] for lib in await database.get_enabled_libraries()}
         libs = [l for l in all_libs if l.key in enabled_keys]
         if not libs:
             return
@@ -892,6 +1611,85 @@ def browse_index_building() -> bool:
     """True while a browse-index crawl is in flight — for the admin status
     badge (plan U6). Accessor so callers don't reach into the module global."""
     return _browse_index_refresh_running
+
+
+# ── unified catalog background refresh (2026-06-27 multi-source plan U6) ──────
+# Runs ALONGSIDE the browse-index refresh during Phase B: the catalog is the
+# track-grained, multi-source store U8 switches browse/search onto, but until a
+# new source type validates the browse-index is retained for rollback (plan U7),
+# so both populate from their triggers. Mirrors the browse-index refresh shape
+# (single-flight + don't-wipe guard, the latter living in scan.scan_and_replace).
+
+_catalog_refresh_running = False
+
+
+async def _refresh_catalog() -> None:
+    global _catalog_refresh_running
+    from app import database
+    from app.catalog import scan
+    try:
+        registry = await get_plex_client()
+        if not registry:
+            return
+        # Effective enabled-library keys = enabled libraries minus any whose source
+        # is vetoed (disabled_sources), applied to EVERY source type uniformly so a
+        # whole-source OFF switch excludes it from the rebuilt catalog. An empty set
+        # (all disabled/vetoed) makes scan_and_replace clear the catalog, not bail.
+        # (Libraries-panel U2.)
+        enabled_keys = {lib["section_key"] for lib in await database.get_effective_enabled_libraries()}
+        replaced = await scan.scan_and_replace(registry, enabled_keys)
+        if replaced:
+            await stamp_cache("catalog_computed_at")
+    except Exception:
+        _log.exception("Catalog refresh failed")
+    finally:
+        _catalog_refresh_running = False
+
+
+def trigger_catalog_refresh() -> None:
+    """Fire-and-forget unified-catalog rebuild. Single-flighted (mirrors
+    trigger_browse_index_refresh) so concurrent triggers can't stack full
+    cross-source crawls."""
+    global _catalog_refresh_running
+    if _catalog_refresh_running:
+        return
+    _catalog_refresh_running = True
+    task = asyncio.create_task(_refresh_catalog())
+    task.add_done_callback(_log_task_exc)
+
+
+def catalog_building() -> bool:
+    """True while a catalog crawl is in flight — for the admin scan-status badge
+    (plan U15). Accessor so callers don't reach into the module global."""
+    return _catalog_refresh_running
+
+
+async def scan_status() -> dict:
+    """Snapshot of catalog/scan state for the onboarding + scan-status surfaces
+    (plan U15/R19/R20). Source-neutral and the single source of truth for both
+    the guest empty-state picker and the admin scan badge:
+
+      - ``sources``  number of connected sources (0 = nothing connected → R19
+        zero-source state)
+      - ``scanning`` a catalog crawl is in flight (first scan or a rescan)
+      - ``scanned``  at least one catalog scan has completed (the
+        ``catalog_computed_at`` stamp exists)
+      - ``empty``    the catalog has no tracks
+
+    ``empty``/``scanned`` describe the catalog floor; a native Plex-only install
+    never populates it, so the guest browse consults this only to choose an
+    empty-state message when a browse response itself came back empty (the
+    distinction the four R19/R20 states need)."""
+    from app import database
+    from app.catalog import store
+    reg = await get_plex_client()
+    sources = len(getattr(reg, "sources", []) or []) if reg else 0
+    return {
+        "sources": sources,
+        "scanning": _catalog_refresh_running,
+        "scanned": bool(await database.get_setting("catalog_computed_at")),
+        "empty": await store.is_empty(),
+    }
 
 
 # ── artist grouping map (rule-norm → base_keys; 2026-06-22 plan U1) ──────────
@@ -999,25 +1797,31 @@ async def _startup_reconnect(backend, device_id: str) -> None:
     """Reconnect to the last-used device. Fire-and-forget; never raises."""
     from app import database
 
-    # R3: Try cached host:port first — no mDNS, no D-Bus, no socket mount required.
+    # R3: Try cached address first — no mDNS, no D-Bus, no socket mount required.
     addr_raw = await database.get_setting(f"output_addr:{device_id}")
     if addr_raw:
         try:
             addr = json.loads(addr_raw)
-            host = addr["host"]
-            port = int(addr["port"])
-            name = addr.get("name", device_id)
             from app.output.chromecast import ChromecastBackend
             from app.output.airplay import AirPlayBackend
+            from app.output.dlna import DlnaBackend
             if isinstance(backend, ChromecastBackend):
-                backend._dbus_index[device_id] = (name, host, port)
+                name = addr.get("name", device_id)
+                backend._dbus_index[device_id] = (name, addr["host"],
+                                                  int(addr["port"]))
             elif isinstance(backend, AirPlayBackend):
                 # Empty TXT dict on cached-reconnect path: cliap2 will then
                 # likely fail HAP pair-verify and surface a re-pair event on
                 # stderr, which the watcher converts to an OutputChangedEvent.
                 # That signals the user to rescan rather than silently using
                 # a stale cached address.
-                backend._device_addr[device_id] = (name, host, port, {})
+                name = addr.get("name", device_id)
+                backend._device_addr[device_id] = (name, addr["host"],
+                                                   int(addr["port"]), {})
+            elif isinstance(backend, DlnaBackend):
+                # DLNA's address is its description LOCATION URL (persisted
+                # by DlnaBackend.set_device since supervisor plan U3).
+                backend._device_locations[device_id] = addr["location"]
             await backend.set_device(device_id)
             return  # R4: connected via cached address, no discovery needed
         except Exception:
@@ -1144,6 +1948,12 @@ async def setup() -> None:
         await database.get_setting("queue_end_behavior")
     )
 
+    # Restore the gapless toggle (2026-07-11 supervisor plan U5) — same
+    # startup-restore posture as queue_end_behavior above: without this the
+    # live flag would silently revert to OFF on every restart until the admin
+    # re-saved. Default off; the setter also seeds the arming generation.
+    set_gapless_enabled(await database.get_gapless_enabled())
+
     # Restore last active backend from DB
     backend_type = await database.get_setting("output_backend_type") or "direct"
     device_id = await database.get_setting("output_device_id") or "default"
@@ -1197,6 +2007,10 @@ async def setup() -> None:
             schedule_prefetch([i.track for i in queue_engine.queue])
             # On-deck pre-buffer reaction (2026-06-21 plan U3).
             await _ondeck_react("queue_changed")
+            # Effective-next prefetch + arming reconcile (2026-07-11 plan U6):
+            # a queue mutation may have changed the effective next — recompute
+            # and compare against the armed one (tail appends no-op there).
+            trigger_arming_eval()
             # Auto-start: if nothing is playing and the queue just got items, begin
             # playback — unless a Closing Time freeze is active (which must not be
             # undone by restarting the next track). See _should_auto_start.
@@ -1228,6 +2042,11 @@ async def setup() -> None:
             schedule_prefetch([i.track for i in queue_engine.queue])
             # On-deck pre-buffer reaction (2026-06-21 plan U3).
             await _ondeck_react("now_playing_changed")
+            # Effective-next prefetch + arming reconcile (2026-07-11 plan U6):
+            # a track started (or playback stopped) — warm the new effective
+            # next and arm it where gapless is on; the boundary that just
+            # consumed an armed next re-arms the one after it here.
+            trigger_arming_eval()
         elif event == "playback_state_changed":
             state = queue_engine.state
             await manager.broadcast_to_all(
@@ -1273,6 +2092,17 @@ async def activate_backend(
     global _auto_advance_pending
     from app import database
     from app.config import settings
+    from app.output import session as output_session
+    # R17 switch-as-resume, cancellation half (supervisor plan U3): bump the
+    # attach-epoch and retire the old device's retry loop BEFORE any await —
+    # an in-flight executor attach of the OLD device must find its epoch
+    # stale, and no backoff tick may re-attach it after this point. The hold
+    # itself clears only after the switch succeeds (below), so a failed
+    # switch leaves the queue protected. The retired outage context is
+    # snapshotted first: a FAILED switch hands it back to reopen_outage, or
+    # auto-reconnect would be dead for the rest of the hold.
+    prev_outage = output_session.get_supervisor().peek_outage()
+    output_session.notify_manual_switch()
     if backend_type in ("chromecast", "dlna") and not settings.stream_base_url:
         _log.warning(
             "SECURITY: STREAM_BASE_URL is not set — Plex auth tokens will be embedded "
@@ -1286,15 +2116,33 @@ async def activate_backend(
         output_router.set_backend(new_backend)
         if device_id != "default":
             try:
-                await new_backend.set_device(device_id)
+                # Under the supervisor's attach-serial lock: an in-flight
+                # re-attach of the OLD device either finishes before this
+                # set_device starts, or acquires after it and aborts on the
+                # bumped epoch — its executor connect can never finish last
+                # and overwrite the new device's backend internals.
+                async with output_session._attach_serial:
+                    await new_backend.set_device(device_id)
             except Exception:
                 output_router.set_backend(prev_backend)
+                if output_session.output_hold_active() and prev_outage is not None:
+                    # The switch failed while an outage held the queue:
+                    # notify_manual_switch retired the reconnect loop above,
+                    # so re-open it — the previous device is still the way
+                    # back (resume window keeps counting, R8).
+                    output_session.get_supervisor().reopen_outage(prev_outage)
                 raise
     await database.set_setting("output_backend_type", backend_type)
     await database.set_setting("output_device_id", device_id)
     if host:
         await database.set_setting("output_host", host)
         await database.set_setting(f"device_via:{host}", backend_type)
+    # A manual device/backend switch during an outage hold acts as a manual
+    # resume onto the new output (R17): the old retry loop was cancelled
+    # atomically up top (notify_manual_switch); clear the hold HERE, after
+    # the switch succeeded, so the auto-start below isn't gated and the held
+    # item (queue front, play_recorded marked) dispatches restart-from-top.
+    output_session.clear_output_hold()
     # If tracks are queued and nothing is playing, start now on the newly selected backend
     if (not queue_engine.state.is_playing
             and queue_engine.queue

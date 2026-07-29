@@ -6,6 +6,42 @@ import contextlib
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.output import hold  # the hold flag's home since the session decomposition
+
+
+async def test_registry_includes_local_source_when_configured():
+    """U11: a stored local source builds a LocalSource into the registry (the
+    additive wiring mirroring U10's Jellyfin path)."""
+    import app.state as st
+    import app.database as db
+    st.invalidate_plex_client()
+    with patch.object(db, "get_plex_servers", AsyncMock(return_value=[])), \
+         patch.object(db, "get_plex_config", AsyncMock(return_value=None)), \
+         patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_local_sources", AsyncMock(return_value=[
+             {"source_id": "local-1", "name": "Vinyl", "root_dir": "/music"}])):
+        reg = await st.get_plex_client()
+    st.invalidate_plex_client()
+    assert reg is not None
+    local = next(s for s in reg.sources if s.source_type == "local")
+    assert local.source_id == "local-1"
+    assert local.server_name == "Vinyl"
+
+
+async def test_registry_none_when_no_sources_at_all():
+    """AE6 additivity: the local loop is empty-safe — a zero-source install still
+    returns None (no registry), exactly as before U11."""
+    import app.state as st
+    import app.database as db
+    st.invalidate_plex_client()
+    with patch.object(db, "get_plex_servers", AsyncMock(return_value=[])), \
+         patch.object(db, "get_plex_config", AsyncMock(return_value=None)), \
+         patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_local_sources", AsyncMock(return_value=[])):
+        reg = await st.get_plex_client()
+    st.invalidate_plex_client()
+    assert reg is None
+
 
 async def test_startup_reconnect_calls_discover_then_set_device():
     """Without a cached address, falls through to discover_devices then set_device."""
@@ -103,6 +139,30 @@ async def test_startup_reconnect_cached_address_airplay_populates_device_addr():
     assert backend._device_addr["ap-host:7000"] == (
         "Bedroom Speaker", "192.168.1.20", 7000, {}
     )
+
+
+async def test_startup_reconnect_cached_location_dlna_populates_device_locations():
+    """Supervisor plan U3: DLNA joins the cached-address reconnect — the
+    persisted output_addr carries the description LOCATION URL, seeded into
+    _device_locations so set_device can attach with no discovery round."""
+    import json
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output.dlna import DlnaBackend
+
+    backend = DlnaBackend()
+    backend.set_device = AsyncMock()
+    backend.discover_devices = AsyncMock()
+
+    cached = json.dumps({"location": "http://192.168.1.60:49152/desc.xml"})
+    usn = "uuid:wiim-1::urn:schemas-upnp-org:device:MediaRenderer:1"
+    with patch.object(db, "get_setting", AsyncMock(return_value=cached)), \
+         patch("app.database.set_setting", AsyncMock()):
+        await _startup_reconnect(backend, usn)
+
+    assert backend._device_locations[usn] == "http://192.168.1.60:49152/desc.xml"
+    backend.set_device.assert_awaited_once_with(usn)
+    backend.discover_devices.assert_not_awaited()
 
 
 async def test_startup_reconnect_cached_address_fails_falls_through_to_discover():
@@ -1084,6 +1144,589 @@ async def test_ondeck_react_queue_empty_warms():
         inv.assert_not_awaited()
 
 
+# ── Gapless toggle live flag + arming generation (2026-07-11 plan U5) ─────────
+
+@contextlib.contextmanager
+def _gapless_reset():
+    """Save/restore the module-level gapless flag + arming generation around a
+    test (mirrors _ondeck_reset above)."""
+    import app.state as st
+    saved = (st._gapless_enabled, st._arming_gen)
+    st._gapless_enabled, st._arming_gen = False, 0
+    try:
+        yield st
+    finally:
+        st._gapless_enabled, st._arming_gen = saved
+
+
+def test_gapless_disabled_by_default():
+    """Plan U5 (R10): the live flag defaults OFF — with the toggle off no
+    playback path may behave differently, and the accessor is the only
+    surface U6+ consult."""
+    with _gapless_reset() as st:
+        assert st.gapless_enabled() is False
+
+
+def test_set_gapless_enabled_flips_flag_and_bumps_arming_gen():
+    """A real flip live-applies (accessor reflects it immediately, no restart)
+    AND bumps the arming generation — the U6 hook: an armed device-side next
+    keyed to the old generation reads as stale and must be revoked."""
+    with _gapless_reset() as st:
+        gen0 = st.arming_gen()
+        st.set_gapless_enabled(True)
+        assert st.gapless_enabled() is True
+        assert st.arming_gen() == gen0 + 1
+        st.set_gapless_enabled(False)
+        assert st.gapless_enabled() is False
+        assert st.arming_gen() == gen0 + 2
+
+
+def test_set_gapless_enabled_same_value_is_noop_for_arming_gen():
+    """A same-value write is not a flip: no generation bump, so U6 never
+    revokes/re-arms on a redundant settings save."""
+    with _gapless_reset() as st:
+        st.set_gapless_enabled(True)
+        gen = st.arming_gen()
+        st.set_gapless_enabled(True)
+        assert st.arming_gen() == gen
+        assert st.gapless_enabled() is True
+
+
+# ── Effective-next prefetch + device-side arming (2026-07-11 plan U6) ─────────
+
+def _arm_track(tid):
+    from app.models import Track
+    return Track(id=tid, title=f"T{tid}", artist="A", album="Al",
+                 duration_ms=200000, stream_key=f"sk-{tid}")
+
+
+class _FakeArmingBackend:
+    """Gapless-capable fake for the U6 harness (U7/U8 implement the real
+    ones): records the arm/revoke call sequence and mirrors the thread-safe-
+    slot contract — arm_next stashes a single plain attribute a streaming
+    thread could read without asyncio access."""
+
+    def __init__(self):
+        self.calls = []            # ("arm", url, track) / ("revoke",)
+        self.armed = None          # the thread-safe slot: (url, track) | None
+        self.is_playing = True
+
+    async def arm_next(self, stream_url, track):
+        self.calls.append(("arm", stream_url, track))
+        self.armed = (stream_url, track)
+
+    async def revoke_next(self):
+        self.calls.append(("revoke",))
+        self.armed = None
+
+    def arm_count(self):
+        return sum(1 for c in self.calls if c[0] == "arm")
+
+    def revoke_count(self):
+        return sum(1 for c in self.calls if c[0] == "revoke")
+
+
+def _arm_engine(*, queue_tracks=(), current=None, playing=True, behavior=None):
+    from types import SimpleNamespace
+    from app.queue.models import QueueEndBehavior
+    return SimpleNamespace(
+        end_behavior=behavior or QueueEndBehavior.STOP,
+        queue=[SimpleNamespace(track=t) for t in queue_tracks],
+        state=SimpleNamespace(
+            current=(SimpleNamespace(track=current)
+                     if current is not None else None),
+            is_playing=playing,
+        ),
+    )
+
+
+@contextlib.contextmanager
+def _arming_env(*, engine, backend=None, pending=False, gapless=True,
+                closing=None):
+    """The U6 test harness: reset the module arming/prefetch state, install a
+    fake engine/router, and stub the warm (``url:<track.id>``) + the closing
+    read. Yields ``(st, warm_mock)``; the router/closing stubs are reachable
+    as ``st.output_router`` / ``st._closing_trigger_message``."""
+    from types import SimpleNamespace
+    import app.state as st
+    saved = (st._armed_next_track, st._armed_next_url, st._armed_next_backend,
+             st._armed_next_agen, st._next_warm_track, st._next_warm_url,
+             st._arming_evaluating, st._arming_dirty,
+             st._gapless_enabled, st._arming_gen)
+    st._armed_next_track, st._armed_next_url = None, ""
+    st._armed_next_backend, st._armed_next_agen = None, 0
+    st._next_warm_track, st._next_warm_url = None, ""
+    st._arming_evaluating, st._arming_dirty = False, False
+    st._gapless_enabled, st._arming_gen = bool(gapless), 0
+    warm = AsyncMock(side_effect=lambda t: f"url:{t.id}")
+    router = SimpleNamespace(active=backend, has_pending=pending)
+    try:
+        with patch.object(st, "queue_engine", engine), \
+             patch.object(st, "output_router", router), \
+             patch.object(st, "_warm_next_transcode", warm), \
+             patch.object(st, "_closing_trigger_message",
+                          AsyncMock(return_value=closing)):
+            yield st, warm
+    finally:
+        (st._armed_next_track, st._armed_next_url, st._armed_next_backend,
+         st._armed_next_agen, st._next_warm_track, st._next_warm_url,
+         st._arming_evaluating, st._arming_dirty,
+         st._gapless_enabled, st._arming_gen) = saved
+
+
+async def test_track_start_warms_and_arms_once():
+    """A track starts → the effective next is warmed and (toggle on, capable
+    backend) armed exactly once: the advance's queue_changed +
+    now_playing_changed double event must not double-warm or double-arm."""
+    t_next = _arm_track("next")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t_next], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()   # queue_changed
+        await st._reconcile_armed_next()   # now_playing_changed
+        assert warm.await_count == 1
+        assert be.calls == [("arm", "url:next", t_next)]
+        assert st.armed_next() == (t_next, "url:next")
+        assert be.armed == ("url:next", t_next)   # the boundary-readable slot
+
+
+async def test_prefetch_warms_with_gapless_off_but_never_arms():
+    """R13: the prefetch runs regardless of the toggle — cache-warm only. With
+    gapless OFF nothing goes device-side (toggle-off playback stays
+    byte-identical; the warm is the one deliberate, transparent addition)."""
+    t_next = _arm_track("next")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t_next], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be, gapless=False) as (st, warm):
+        await st._reconcile_armed_next()
+        assert warm.await_count == 1
+        assert be.calls == []
+        assert st.armed_next() is None
+
+
+async def test_backend_without_arm_next_prefetches_but_never_arms():
+    """Duck-typed gate (hasattr, the register_resolved shape): an incapable
+    backend still gets the R13 prefetch; AbstractOutputBackend is untouched,
+    so nothing is ever armed on it."""
+    t_next = _arm_track("next")
+    be = MagicMock(spec=[])   # exposes NO arm_next
+    eng = _arm_engine(queue_tracks=[t_next], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        assert warm.await_count == 1
+        assert st.armed_next() is None
+
+
+async def test_removed_armed_next_revokes_and_rearms():
+    """AE6: a guest removes the armed next → revoke, then re-arm with the new
+    queue front — the boundary would play the correct track."""
+    t1, t2 = _arm_track("t1"), _arm_track("t2")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1, t2], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        assert be.calls == [("arm", "url:t1", t1)]
+        del eng.queue[0]                    # guest removes the armed next
+        await st._reconcile_armed_next()    # queue_changed
+        assert be.calls[1:] == [("revoke",), ("arm", "url:t2", t2)]
+        assert st.armed_next() == (t2, "url:t2")
+        assert be.armed == ("url:t2", t2)   # the device slot holds the right track
+
+
+async def test_tail_append_no_revoke_churn():
+    """A tail append leaves queue[0] unchanged → pure no-op: arm_next called
+    once ever, revoke_next never, and the memo spares even the re-warm."""
+    from types import SimpleNamespace
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        eng.queue.append(SimpleNamespace(track=_arm_track("t9")))
+        await st._reconcile_armed_next()    # queue_changed (tail append)
+        eng.queue.append(SimpleNamespace(track=_arm_track("t10")))
+        await st._reconcile_armed_next()
+        assert be.arm_count() == 1
+        assert be.revoke_count() == 0
+        assert warm.await_count == 1
+
+
+async def test_append_to_empty_queue_preempts_armed_autofill_pick():
+    """Empty queue + random mode: the on-deck pick is the armed effective
+    next; a guest append preempts it → revoke + re-arm with the guest's
+    track (the on-deck react drops the pick on the same event)."""
+    from types import SimpleNamespace
+    from app.queue.models import QueueEndBehavior
+    pick, guest = _arm_track("pick"), _arm_track("guest")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[], current=_arm_track("cur"),
+                      behavior=QueueEndBehavior.FULL_RANDOM)
+    with _ondeck_reset():
+        with _arming_env(engine=eng, backend=be) as (st, warm):
+            st._ondeck = pick
+            await st._reconcile_armed_next()
+            assert be.calls == [("arm", "url:pick", pick)]
+            # Guest append: the queue gains a front; _ondeck_react invalidates
+            # the pick on the same queue_changed — mirror both effects.
+            eng.queue.append(SimpleNamespace(track=guest))
+            st._ondeck = None
+            await st._reconcile_armed_next()
+            assert be.calls[1:] == [("revoke",), ("arm", "url:guest", guest)]
+            assert st.armed_next() == (guest, "url:guest")
+
+
+async def test_toggle_flip_mid_track_revokes():
+    """set_gapless_enabled(False) mid-track fires the reconcile itself (no
+    waiting for the next queue event): arming_gen mismatch → revoke."""
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        assert be.arm_count() == 1
+        st.set_gapless_enabled(False)   # bumps arming_gen + fires the trigger
+        for _ in range(10):
+            await asyncio.sleep(0)      # let the spawned eval loop drain
+        assert be.revoke_count() == 1
+        assert st.armed_next() is None
+
+
+async def test_output_switch_pending_revokes_and_holds_off():
+    """Flow Gap 9b: a pending backend switch revokes the armed next so the
+    boundary returns to server control (the router's swap_pending owns the
+    next track); nothing re-arms while the swap is pending."""
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        st.output_router.has_pending = True    # switch requested mid-track
+        await st._reconcile_armed_next()       # the router-fired reconcile
+        assert be.calls[-1] == ("revoke",)
+        assert st.armed_next() is None
+        await st._reconcile_armed_next()       # still pending → still nothing
+        assert be.arm_count() == 1
+
+
+async def test_backend_swap_revokes_on_owner_and_arms_on_new():
+    """An immediate backend switch (nothing playing at the router) changes the
+    active-backend arming input: the revoke goes to the backend that OWNS the
+    arm; the re-arm lands on the new active backend."""
+    t1 = _arm_track("t1")
+    old, new = _FakeArmingBackend(), _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=old) as (st, warm):
+        await st._reconcile_armed_next()
+        assert old.arm_count() == 1
+        st.output_router.active = new
+        await st._reconcile_armed_next()
+        assert old.calls[-1] == ("revoke",)
+        assert new.calls == [("arm", "url:t1", t1)]
+
+
+async def test_router_set_backend_fires_arming_eval():
+    """Both set_backend branches (immediate + deferred) call the state-level
+    hook — the reconcile then reads has_pending / active as stale."""
+    from app.output.router import OutputRouter
+    import app.state as st
+    r = OutputRouter()
+    a = MagicMock(is_playing=True)
+    b = MagicMock(is_playing=False)
+    with patch.object(st, "trigger_arming_eval", MagicMock()) as trig:
+        r.set_backend(a)     # immediate (no active yet)
+        r.set_backend(b)     # deferred (active is playing)
+    assert r.active is a and r.has_pending is True
+    assert trig.call_count == 2
+
+
+async def test_reconcile_gapless_off_nothing_armed_skips_closing_read():
+    """Toggle-off cost bound (2026-07-12 review C11): with gapless OFF and
+    nothing armed there is nothing to arm or revoke, so the reconcile skips
+    the per-queue-event closing-config DB read entirely — while the R13
+    prefetch warm still runs (cache-warm only, no dispatch behavior). With
+    gapless on or a slot armed the read still gates want_next (the R21
+    tests below pin that path)."""
+    t_next = _arm_track("next")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t_next], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be, gapless=False) as (st, warm):
+        await st._reconcile_armed_next()    # a queue event's reconcile
+        st._closing_trigger_message.assert_not_awaited()   # no config read
+        assert warm.await_count == 1        # the R13 warm still ran
+        assert be.calls == []
+        assert st.armed_next() is None
+
+
+async def test_closing_sendoff_playing_suppresses_arming():
+    """R21 arm-time check: the current track is the configured send-off — the
+    boundary freezes instead of advancing, so nothing is prefetched or armed
+    past it."""
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("sendoff"))
+    with _arming_env(engine=eng, backend=be, closing="last call!") as (st, warm):
+        await st._reconcile_armed_next()
+        assert be.calls == []
+        assert warm.await_count == 0
+        assert st.armed_next() is None
+
+
+async def test_closing_trigger_becoming_current_revokes_armed_next():
+    """A next armed while closing was quiet must not survive the current track
+    BECOMING the send-off (config edit mid-track): the reconcile revokes."""
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        assert be.arm_count() == 1
+        st._closing_trigger_message.return_value = "last call!"  # config edit
+        await st._reconcile_armed_next()
+        assert be.calls[-1] == ("revoke",)
+        assert st.armed_next() is None
+
+
+async def test_closing_config_edit_revokes_and_reevaluates():
+    """Closing config edited with a next armed → revoke NOW (the armed
+    decision was made under the old config), then a fresh evaluation is
+    triggered — the settings POST calls notify_closing_config_changed."""
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        with patch.object(st, "trigger_arming_eval", MagicMock()) as trig:
+            await st.notify_closing_config_changed()
+        assert be.revoke_count() == 1
+        assert st.armed_next() is None
+        trig.assert_called_once()
+
+
+async def test_warm_failure_no_arm_no_dead_end():
+    """The warm fails (source down) → no arm, no exception: the boundary falls
+    back to today's non-gapless advance. The failure is NOT memoized, so a
+    recovered source warms and arms on the next event."""
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        warm.side_effect = None
+        warm.return_value = None            # source down
+        await st._reconcile_armed_next()    # must not raise
+        assert be.calls == []
+        assert st.armed_next() is None
+        assert st._next_warm_track is None  # failure not memoized
+        warm.side_effect = lambda t: f"url:{t.id}"   # source recovers
+        await st._reconcile_armed_next()
+        assert be.calls == [("arm", "url:t1", t1)]
+
+
+async def test_stale_warm_discarded_when_queue_moves_mid_warm():
+    """Generation-guard contract (the _ondeck_gen shape): the queue changes
+    while the warm awaits — the finishing warm discards its result and arms
+    nothing; the re-triggered pass owns the new next."""
+    from types import SimpleNamespace
+    t1, t2 = _arm_track("t1"), _arm_track("t2")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        async def _warm_and_mutate(track):
+            eng.queue[0] = SimpleNamespace(track=t2)   # queue moved mid-warm
+            return f"url:{track.id}"
+        warm.side_effect = _warm_and_mutate
+        await st._reconcile_armed_next()
+        assert be.calls == []               # stale result discarded
+        assert st.armed_next() is None
+        warm.side_effect = lambda t: f"url:{t.id}"
+        await st._reconcile_armed_next()    # the dirty re-loop's pass
+        assert be.calls == [("arm", "url:t2", t2)]
+
+
+async def test_stop_playback_revokes_armed_next():
+    """Playback stopping (idle boundary) leaves nothing to arm past: the armed
+    next is revoked rather than left device-visible."""
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        eng.state.current = None            # stopped
+        eng.state.is_playing = False
+        await st._reconcile_armed_next()
+        assert be.calls[-1] == ("revoke",)
+        assert st.armed_next() is None
+
+
+async def test_arm_next_raising_leaves_slot_empty():
+    """A device that rejects the arm is a gapped boundary, not an error path:
+    the slot stays empty and no exception propagates."""
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+
+    async def _boom(url, track):
+        raise RuntimeError("device refused")
+
+    be.arm_next = _boom
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()    # must not raise
+        assert st.armed_next() is None
+
+
+async def test_trigger_arming_eval_coalesces_and_reruns():
+    """Single-flight with the dirty re-loop: a trigger landing mid-reconcile
+    runs exactly one more pass instead of stacking tasks."""
+    import app.state as st
+    calls = []
+
+    async def _rec():
+        calls.append(1)
+        if len(calls) == 1:
+            st.trigger_arming_eval()   # lands mid-run → dirty, no second task
+
+    saved = (st._arming_evaluating, st._arming_dirty)
+    st._arming_evaluating, st._arming_dirty = False, False
+    try:
+        with patch.object(st, "_reconcile_armed_next", _rec):
+            st.trigger_arming_eval()
+            for _ in range(10):
+                await asyncio.sleep(0)
+        assert calls == [1, 1]
+        assert st._arming_evaluating is False
+    finally:
+        st._arming_evaluating, st._arming_dirty = saved
+
+
+async def test_effective_next_prefers_queue_front_over_ondeck():
+    from app.queue.models import QueueEndBehavior
+    q0 = _arm_track("q0")
+    eng = _arm_engine(queue_tracks=[q0], playing=False,
+                      behavior=QueueEndBehavior.FULL_RANDOM)
+    with _ondeck_reset() as st:
+        st._ondeck = _arm_track("pick")
+        with patch.object(st, "queue_engine", eng):
+            assert st.effective_next_track() is q0
+
+
+async def test_effective_next_ondeck_only_in_random_modes():
+    """Empty queue: a random mode serves the on-deck pick; STOP means the
+    boundary stops — no effective next, nothing to warm or arm."""
+    from app.queue.models import QueueEndBehavior
+    pick = _arm_track("pick")
+    with _ondeck_reset() as st:
+        st._ondeck = pick
+        rand = _arm_engine(behavior=QueueEndBehavior.POPULAR_RANDOM)
+        stop = _arm_engine(behavior=QueueEndBehavior.STOP)
+        with patch.object(st, "queue_engine", rand):
+            assert st.effective_next_track() is pick
+        with patch.object(st, "queue_engine", stop):
+            assert st.effective_next_track() is None
+
+
+async def test_warm_ondeck_install_triggers_arming_eval():
+    """The on-deck pick landing IS a new effective next (empty queue, random
+    mode) — the install re-triggers the arming reconcile."""
+    from app.queue.models import QueueEndBehavior
+    picked = _shuf_track("warmed", 200000)
+    with _ondeck_reset() as st:
+        with patch.object(st, "_select_auto_fill_track",
+                          AsyncMock(return_value=picked)), \
+             patch.object(st, "schedule_prefetch", MagicMock()), \
+             patch.object(st, "trigger_arming_eval", MagicMock()) as trig:
+            await st._warm_ondeck(QueueEndBehavior.FULL_RANDOM, st._ondeck_gen)
+        assert st._ondeck is picked
+        trig.assert_called_once()
+
+
+async def test_warm_ondeck_stale_install_does_not_trigger_arming_eval():
+    """The on-deck generation guard keeps its contract: a stale warm neither
+    installs nor pokes the arming orchestrator."""
+    from app.queue.models import QueueEndBehavior
+    picked = _shuf_track("stale", 200000)
+    with _ondeck_reset() as st:
+        stale_gen = st._ondeck_gen
+        st._ondeck_gen = stale_gen + 1
+        with patch.object(st, "_select_auto_fill_track",
+                          AsyncMock(return_value=picked)), \
+             patch.object(st, "schedule_prefetch", MagicMock()), \
+             patch.object(st, "trigger_arming_eval", MagicMock()) as trig:
+            await st._warm_ondeck(QueueEndBehavior.FULL_RANDOM, stale_gen)
+        assert st._ondeck is None
+        trig.assert_not_called()
+
+
+# ── _warm_next_transcode: URL resolution + warm fetch (plan U6, R13) ──────────
+
+def _warm_client(target):
+    c = MagicMock()
+    c.stream_url = lambda k: f"plex:{k}"
+    c.resolve_stream = MagicMock(return_value=target)
+    return c
+
+
+async def test_warm_next_transcode_prewarms_ogg_through_stream_cache():
+    """An Ogg-family next is pre-warmed through the stream proxy's EXISTING
+    single-flight cache (never a parallel transcode path), keyed exactly as
+    the boundary's GET will be, with the provider's auth headers."""
+    import app.state as st
+    from app.api import stream as stream_api
+    from app.sources.base import StreamTarget
+    track = _arm_track("t1")   # primary holder key sk-t1
+    client = _warm_client(StreamTarget(url="http://src/f.ogg",
+                                       headers={"X-Auth": "y"}))
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=client)), \
+         patch.object(stream_api, "_get_or_transcode", AsyncMock()) as got:
+        url = await st._warm_next_transcode(track)
+    assert url == st._make_stream_url("sk-t1", client)
+    got.assert_awaited_once_with("sk-t1", "http://src/f.ogg", {"X-Auth": "y"})
+
+
+async def test_warm_next_transcode_local_and_passthrough_skip_transcode():
+    """Local files and non-Ogg URLs need no server-side warm: URL resolution
+    alone succeeds, and the transcode cache is never touched."""
+    import app.state as st
+    from app.api import stream as stream_api
+    from app.sources.base import StreamTarget
+    track = _arm_track("t1")
+    for target in (StreamTarget(path="/music/a.flac"),
+                   StreamTarget(url="http://src/f.flac")):
+        client = _warm_client(target)
+        with patch.object(st, "get_plex_client",
+                          AsyncMock(return_value=client)), \
+             patch.object(stream_api, "_get_or_transcode", AsyncMock()) as got:
+            url = await st._warm_next_transcode(track)
+        assert url == st._make_stream_url("sk-t1", client)
+        got.assert_not_awaited()
+
+
+async def test_warm_next_transcode_failure_paths_return_none():
+    """Every failure degrades to None (no arm, boundary falls back): no
+    client, no holders, empty resolution, and a transcode that raises."""
+    import app.state as st
+    from app.api import stream as stream_api
+    from app.sources.base import StreamTarget
+    track = _arm_track("t1")
+    # no client
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=None)):
+        assert await st._warm_next_transcode(track) is None
+    # no holders
+    bare = _arm_track("t2")
+    bare.stream_key = ""
+    client = _warm_client(StreamTarget(url="http://src/f.ogg"))
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=client)):
+        assert await st._warm_next_transcode(bare) is None
+    # empty resolution (neither path nor url)
+    client = _warm_client(StreamTarget(url=""))
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=client)):
+        assert await st._warm_next_transcode(track) is None
+    # transcode raises (source down) — swallowed, never propagates
+    client = _warm_client(StreamTarget(url="http://src/f.ogg"))
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=client)), \
+         patch.object(stream_api, "_get_or_transcode",
+                      AsyncMock(side_effect=RuntimeError("down"))):
+        assert await st._warm_next_transcode(track) is None
+
+
 # ── browse index refresh (2026-06-21 browse-index plan U2) ───────────────────
 
 def _mk_artist(id, title, **kw):
@@ -1264,7 +1907,11 @@ async def test_refresh_browse_index_partial_failure_indexes_good_sections():
     stamp.assert_awaited_once()
 
 
-async def test_refresh_browse_index_no_enabled_libs_noops():
+async def test_refresh_browse_index_no_enabled_libs_clears_index():
+    # All-off (nothing effectively enabled — all libraries disabled or all sources
+    # vetoed): CLEAR the browse index rather than keep a stale one, and never crawl.
+    # Previously this no-op'd and left the stale index serving vetoed content — the
+    # P0 the doc review caught (Libraries-panel U2).
     import app.state as st
     client = MagicMock()
     client.get_libraries = AsyncMock(return_value=[_mk_lib("A:1", "ServerA")])
@@ -1272,12 +1919,14 @@ async def test_refresh_browse_index_no_enabled_libs_noops():
     client.get_albums = AsyncMock()
     set_idx = AsyncMock()
     with patch("app.state.get_plex_client", AsyncMock(return_value=client)), \
-         patch("app.database.get_enabled_libraries", AsyncMock(return_value=[])), \
+         patch("app.database.get_effective_enabled_libraries", AsyncMock(return_value=[])), \
          patch("app.database.set_browse_index", set_idx), \
+         patch("app.state._rebuild_artist_grouping", AsyncMock()), \
          patch("app.state.stamp_cache", AsyncMock()):
         await st._refresh_browse_index()
-    set_idx.assert_not_awaited()
-    client.get_artists.assert_not_awaited()
+    set_idx.assert_awaited_once_with([], [])   # index cleared
+    client.get_libraries.assert_not_awaited()  # cleared before hitting the network
+    client.get_artists.assert_not_awaited()    # no crawl
 
 
 def test_trigger_browse_index_single_flight_noops_when_running():
@@ -1553,3 +2202,811 @@ async def test_clear_closing_noop_when_inactive(monkeypatch):
     with patch.object(_bus.manager, "broadcast_to_all", bc):
         await st.clear_closing()
     bc.assert_not_awaited()
+
+
+# ── U13: source-neutral random floor + catalog-active predicate ───────────────
+
+async def test_catalog_active_true_with_non_plex_source():
+    import app.state as st
+    reg = MagicMock()
+    reg.sources = [MagicMock(source_type="plex"), MagicMock(source_type="jellyfin")]
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+        assert await st.catalog_active() is True
+
+
+async def test_catalog_active_false_for_plex_only_multiserver():
+    # AE6: one PlexSource PER server, so an all-Plex install has >1 source but
+    # stays native — gated on TYPE, not count.
+    import app.state as st
+    reg = MagicMock()
+    reg.sources = [MagicMock(source_type="plex"), MagicMock(source_type="plex")]
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+        assert await st.catalog_active() is False
+
+
+async def test_catalog_active_false_for_none_or_nonregistry():
+    import app.state as st
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=None)):
+        assert await st.catalog_active() is False
+    # A bare MagicMock's .sources is a Mock, not a list → native.
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=MagicMock())):
+        assert await st.catalog_active() is False
+
+
+async def _seed_shuffle_catalog(tmp_path, monkeypatch, tracks):
+    import app.database as database
+    from app.catalog import store
+    from app.config import Settings
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    await database.init_db()
+    holds = [{"entity_type": "track", "identity": t["identity"], "source_id": "jelly",
+              "provider_local_key": f"jelly:{t['identity']}", "priority": 0,
+              "server_name": "Jelly"} for t in tracks]
+    await store.replace_catalog(artists=[], albums=[], tracks=tracks, holds=holds)
+
+
+async def test_shuffle_provider_routes_to_catalog_when_active(tmp_path, monkeypatch):
+    """The whole-library random floor draws from the catalog (carrying holds for
+    play-time fallback) once a non-Plex source is connected — the Plex traversal
+    can't see Jellyfin/local tracks (U13)."""
+    import app.state as st
+    import app.database as database
+    await _seed_shuffle_catalog(tmp_path, monkeypatch, [
+        {"identity": "t1", "title": "Only", "title_base": "only", "artist": "A",
+         "artist_base_key": "a", "album": "Al", "album_identity": None, "duration_ms": 180000}])
+    try:
+        with patch.object(st, "catalog_active", AsyncMock(return_value=True)):
+            track = await st._shuffle_provider()
+        assert track is not None
+        assert track.id == "t1"
+        assert track.stream_key == "jelly:t1"
+        # Carries the priority-ordered holds so _holder_keys / fallback works.
+        assert [h["key"] for h in track.holds] == ["jelly:t1"]
+    finally:
+        await database.close_db()
+
+
+async def test_catalog_shuffle_band_filters_then_never_dead_ends(tmp_path, monkeypatch):
+    import app.state as st
+    import app.database as database
+    await _seed_shuffle_catalog(tmp_path, monkeypatch, [
+        {"identity": "short", "title": "S", "title_base": "s", "artist": "A",
+         "artist_base_key": "a", "album": "Al", "album_identity": None, "duration_ms": 60000},
+        {"identity": "long", "title": "L", "title_base": "l", "artist": "A",
+         "artist_base_key": "a", "album": "Al", "album_identity": None, "duration_ms": 600000}])
+    try:
+        # In-band [0,120s] → only the short track qualifies (deterministic).
+        t = await st._catalog_shuffle(0, 120000)
+        assert t.id == "short"
+        # Nothing fits [700s, ∞) → never dead-end: an unfiltered pick still returns.
+        t2 = await st._catalog_shuffle(700000, None)
+        assert t2 is not None and t2.id in {"short", "long"}
+    finally:
+        await database.close_db()
+
+
+async def test_catalog_shuffle_empty_catalog_returns_none(tmp_path, monkeypatch):
+    import app.state as st
+    import app.database as database
+    await _seed_shuffle_catalog(tmp_path, monkeypatch, [])
+    try:
+        assert await st._catalog_shuffle(None, None) is None
+    finally:
+        await database.close_db()
+
+
+# ── U15: scan-status snapshot (onboarding + scan states) ──────────────────────
+
+async def _u15_status_db(tmp_path, monkeypatch, scanning):
+    import app.state as st
+    import app.database as database
+    from app.config import Settings
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    monkeypatch.setattr(st, "_catalog_refresh_running", scanning)
+    await database.init_db()
+    return st, database
+
+
+async def test_scan_status_zero_sources(tmp_path, monkeypatch):
+    st, database = await _u15_status_db(tmp_path, monkeypatch, scanning=False)
+    try:
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=None)):
+            status = await st.scan_status()
+        assert status == {"sources": 0, "scanning": False, "scanned": False, "empty": True}
+    finally:
+        await database.close_db()
+
+
+async def test_scan_status_first_scan_building(tmp_path, monkeypatch):
+    st, database = await _u15_status_db(tmp_path, monkeypatch, scanning=True)
+    try:
+        reg = MagicMock(); reg.sources = [MagicMock(source_type="jellyfin")]
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+            status = await st.scan_status()
+        # First scan: a source connected, crawl in flight, nothing stamped/stored.
+        assert status == {"sources": 1, "scanning": True, "scanned": False, "empty": True}
+    finally:
+        await database.close_db()
+
+
+async def test_scan_status_scanned_with_content(tmp_path, monkeypatch):
+    st, database = await _u15_status_db(tmp_path, monkeypatch, scanning=False)
+    from app.catalog import store
+    try:
+        await store.replace_catalog(
+            artists=[], albums=[],
+            tracks=[{"identity": "t1", "title": "X", "title_base": "x", "artist": "A",
+                     "artist_base_key": "a", "album": "Al", "album_identity": None,
+                     "duration_ms": 1000}],
+            holds=[])
+        await database.set_setting("catalog_computed_at", "2026-06-30T00:00:00+00:00")
+        reg = MagicMock(); reg.sources = [MagicMock(source_type="jellyfin")]
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+            status = await st.scan_status()
+        assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": False}
+    finally:
+        await database.close_db()
+
+
+async def test_scan_status_scanned_but_empty(tmp_path, monkeypatch):
+    st, database = await _u15_status_db(tmp_path, monkeypatch, scanning=False)
+    try:
+        await database.set_setting("catalog_computed_at", "2026-06-30T00:00:00+00:00")
+        reg = MagicMock(); reg.sources = [MagicMock(source_type="local")]
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+            status = await st.scan_status()
+        # Distinct from zero-source: a finished scan that found nothing.
+        assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": True}
+    finally:
+        await database.close_db()
+
+
+# ── Play-data curation: unrecord_play / purge_play_track (plan U2) ────────────
+
+async def _curation_db(tmp_path, monkeypatch):
+    import app.database as database
+    from app.config import Settings
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    await database.init_db()
+    return database
+
+
+async def test_unrecord_play_decrements_all_three_counts(tmp_path, monkeypatch):
+    """AE1: removing one play rolls back the track, album, and artist counts."""
+    import app.state as st
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        for _ in range(5):
+            await database.increment_play_count("track", "t1")
+        for _ in range(8):
+            await database.increment_play_count("album", "Broken")
+        for _ in range(12):
+            await database.increment_play_count("artist", "NIN")
+        await st.unrecord_play("t1", "Broken", "NIN")
+        assert await database.get_play_count("track", "t1") == 4
+        assert await database.get_play_count("album", "Broken") == 7
+        assert await database.get_play_count("artist", "NIN") == 11
+    finally:
+        await database.close_db()
+
+
+async def test_unrecord_play_floors_at_zero(tmp_path, monkeypatch):
+    """AE2: nothing seeded → no count goes negative, call still succeeds."""
+    import app.state as st
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await st.unrecord_play("t1", "Broken", "NIN")
+        assert await database.get_play_count("track", "t1") == 0
+        assert await database.get_play_count("album", "Broken") == 0
+        assert await database.get_play_count("artist", "NIN") == 0
+    finally:
+        await database.close_db()
+
+
+async def test_unrecord_play_skips_empty_album_artist(tmp_path, monkeypatch):
+    """A track with an empty album/artist never created an ("album","") row, so
+    the inverse must not touch one (mirrors record_play's truthiness guards)."""
+    import app.state as st
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await database.increment_play_count("track", "t1")
+        await st.unrecord_play("t1", "", None)
+        assert await database.get_play_count("track", "t1") == 0
+        assert await database.get_all_play_counts("album") == []
+        assert await database.get_all_play_counts("artist") == []
+    finally:
+        await database.close_db()
+
+
+async def test_unrecord_play_consolidates_before_decrement(tmp_path, monkeypatch):
+    """Identity row = 0 but a stale sibling holds the real 5 → consolidate to 5,
+    then decrement to 4 (not 0). Prevents the over-correction the naive
+    decrement-then-delete would cause."""
+    import app.state as st
+    from app.catalog import store
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await store.register_alias("track", "I", "I")   # identity self-alias
+        await store.register_alias("track", "S", "I")   # stale sibling → identity
+        await database.set_play_count("track", "S", 5)   # real total on the stale key
+        await st.unrecord_play("I", None, None)
+        assert await database.get_play_count("track", "I") == 4
+        assert await database.get_play_count("track", "S") == 0   # sibling swept
+    finally:
+        await database.close_db()
+
+
+async def test_purge_play_track_is_track_scoped(tmp_path, monkeypatch):
+    """AE4: removing a track from Most Played deletes its count + meta and leaves
+    the shared album/artist name-keyed counts untouched."""
+    import app.state as st
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await database.increment_play_count("track", "t1")
+        await database.set_play_track_meta("t1", {"title": "X", "artist": "A"})
+        await database.increment_play_count("album", "Broken")
+        await database.increment_play_count("artist", "NIN")
+        await st.purge_play_track("t1")
+        assert await database.get_play_count("track", "t1") == 0
+        assert await database.get_all_play_track_meta() == {}
+        assert await database.get_play_count("album", "Broken") == 1
+        assert await database.get_play_count("artist", "NIN") == 1
+    finally:
+        await database.close_db()
+
+
+async def test_purge_play_track_survives_rescan_reconcile(tmp_path, monkeypatch):
+    """AE3 durability: seed a live identity + a stale sibling (real durable state,
+    not a fresh DB), purge, then a follow-up reconcile does NOT restore the count
+    and the track is off the leaderboard."""
+    import app.state as st
+    from app.catalog import store, migrate
+    database = await _curation_db(tmp_path, monkeypatch)
+    try:
+        await store.replace_catalog(artists=[], albums=[], tracks=[
+            {"identity": "I", "title": "Wish", "title_base": "wish",
+             "artist": "NIN", "artist_base_key": "nin"}], holds=[])
+        await store.register_alias("track", "I", "I")
+        await store.register_alias("track", "S", "I")
+        await database.set_play_count("track", "I", 13)
+        await database.set_play_count("track", "S", 13)
+        await database.set_play_track_meta("I", {"title": "Wish"})
+        await database.set_play_track_meta("S", {"title": "Wish"})
+        await st.purge_play_track("I")
+        assert await database.get_play_count("track", "I") == 0
+        assert await database.get_play_count("track", "S") == 0
+        await migrate.migrate_metadata()   # a subsequent Rescan
+        assert await database.get_play_count("track", "I") == 0
+        assert [r for r in await database.get_top_played_tracks(None)
+                if r["track_id"] in ("I", "S")] == []
+    finally:
+        await database.close_db()
+
+
+# ── Dispatch reporting to the output-session supervisor (2026-07-11 U1) ───────
+# _play_with_fallback no longer counts at dispatch: it reports each dispatch to
+# the supervisor, and record_play fires only from the confirmed-start
+# chokepoint (tests/test_output_session.py owns the supervisor's own behavior).
+
+def _u1_track(tid="x"):
+    from app.models import Track
+    return Track(id=tid, title="Song", artist="Act", album="Rec",
+                 duration_ms=1000, stream_key="primary")
+
+
+def _u1_client():
+    c = MagicMock()
+    c.stream_url = lambda k: f"url:{k}"
+    return c
+
+
+async def test_play_with_fallback_counts_only_at_confirmed_start(fresh_supervisor):
+    """The natural-advance entry point: dispatch must NOT count; confirmation
+    counts exactly once with the dispatched track."""
+    import app.state as state
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track())
+    play = AsyncMock(return_value=None)
+    with patch.object(state, "output_router", MagicMock(play=play)):
+        ok = await state._play_with_fallback(item, _u1_client())
+    assert ok is True
+    rec.assert_not_called()                      # no count at dispatch
+    assert sup.current_token() is not None       # dispatch was reported
+    sup.on_playback_confirmed(sup.current_token())
+    rec.assert_called_once()
+    assert rec.call_args.args[0] is item.track
+
+
+async def test_play_with_fallback_failed_holder_withdraws_its_dispatch(fresh_supervisor):
+    """Holder 1 fails, holder 2 plays: the failed attempt's token is withdrawn
+    (its timer cancelled, a late deadline no-ops) and only the successful
+    attempt's confirmation counts."""
+    import app.state as state
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+    item = QueueItem(track=_u1_track())
+    item.track.holds = [{"source_id": "m1", "key": "k1"},
+                        {"source_id": "j", "key": "k2"}]
+    play = AsyncMock(side_effect=[Exception("404"), None])
+    with patch.object(state, "output_router", MagicMock(play=play)):
+        ok = await state._play_with_fallback(item, _u1_client())
+    assert ok is True
+    assert len(timers.timers) == 2               # one dispatch per holder attempt
+    assert timers.timers[0].cancelled            # failed attempt withdrawn
+    timers.timers[0].cb()                        # late deadline → staleness guard
+    await asyncio.sleep(0)
+    assert outages == []
+    sup.on_playback_confirmed(sup.current_token())
+    rec.assert_called_once()
+
+
+async def test_play_with_fallback_all_fail_leaves_no_pending_dispatch(fresh_supervisor):
+    """Every holder fails → the item is the caller's to skip (track-level);
+    no dispatch may linger to age into an outage emission."""
+    import app.state as state
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track())
+    play = AsyncMock(side_effect=Exception("gone"))
+    with patch.object(state, "output_router", MagicMock(play=play)):
+        ok = await state._play_with_fallback(item, _u1_client())
+    assert ok is False
+    assert sup.current_token() is None
+    rec.assert_not_called()
+
+
+async def test_play_with_fallback_device_not_ready_withdraws_dispatch(fresh_supervisor):
+    """DeviceNotReadyError re-raises (halt the advance) — and the dispatch is
+    withdrawn on the way out."""
+    import app.state as state
+    from app.output.base import DeviceNotReadyError
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track())
+    play = AsyncMock(side_effect=DeviceNotReadyError())
+    with patch.object(state, "output_router", MagicMock(play=play)):
+        with pytest.raises(DeviceNotReadyError):
+            await state._play_with_fallback(item, _u1_client())
+    assert sup.current_token() is None
+    rec.assert_not_called()
+
+
+async def test_play_with_fallback_forwards_play_recorded_mark(fresh_supervisor):
+    """R19 groundwork: an item carrying the play_recorded mark (a held item a
+    resume path replays) confirms WITHOUT counting."""
+    import app.state as state
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track())
+    item.play_recorded = True
+    play = AsyncMock(return_value=None)
+    with patch.object(state, "output_router", MagicMock(play=play)):
+        ok = await state._play_with_fallback(item, _u1_client())
+    assert ok is True
+    sup.on_playback_confirmed(sup.current_token())
+    rec.assert_not_called()
+
+
+# ── U2: device-level hold routing + holder tie-breaker (supervisor plan U2) ──
+
+def _u2_router(play, probe=None):
+    """An output_router stand-in: .play as given; .active carries
+    probe_liveness only when a probe is supplied (no MagicMock auto-attr —
+    _output_probe is hasattr-guarded)."""
+    router = MagicMock()
+    router.play = play
+    active = MagicMock(spec=[])            # no probe_liveness attribute
+    if probe is not None:
+        active = MagicMock(spec=["probe_liveness"])
+        active.probe_liveness = probe
+    router.active = active
+    return router
+
+
+def _u2_track(tid):
+    from app.models import Track
+    return Track(id=tid, title=f"Song {tid}", artist="Act", album="Rec",
+                 duration_ms=1000, stream_key=f"key-{tid}")
+
+
+async def test_play_with_fallback_holder_failure_unreachable_raises_device_lost(fresh_supervisor):
+    """R15 tie-breaker: first holder throws a transport error and the probe
+    says UNREACHABLE — DeviceLostError, and the second holder is never
+    consumed (the failure is the device's, not the track's)."""
+    import app.state as state
+    from app.output.base import DeviceLostError
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track())
+    item.track.holds = [{"source_id": "m1", "key": "k1"},
+                        {"source_id": "j", "key": "k2"}]
+    play = AsyncMock(side_effect=Exception("connection reset"))
+    probe = AsyncMock(return_value=(False, None))
+    with patch.object(state, "output_router", _u2_router(play, probe)):
+        with pytest.raises(DeviceLostError):
+            await state._play_with_fallback(item, _u1_client())
+    assert play.await_count == 1               # no second holder consumed
+    probe.assert_awaited_once()
+    rec.assert_not_called()
+
+
+async def test_play_with_fallback_holder_failure_reachable_tries_next_holder(fresh_supervisor):
+    """Probe says REACHABLE — the failure is the holder's; fallback continues
+    exactly as today."""
+    import app.state as state
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track())
+    item.track.holds = [{"source_id": "m1", "key": "k1"},
+                        {"source_id": "j", "key": "k2"}]
+    play = AsyncMock(side_effect=[Exception("404"), None])
+    probe = AsyncMock(return_value=(True, "PLAYING"))
+    with patch.object(state, "output_router", _u2_router(play, probe)):
+        ok = await state._play_with_fallback(item, _u1_client())
+    assert ok is True
+    assert play.await_count == 2
+
+
+async def test_play_with_fallback_no_probe_keeps_todays_fallback(fresh_supervisor):
+    """A backend without probe_liveness yields no tie-break evidence — all
+    holders are tried and the item is the caller's to skip (today's path)."""
+    import app.state as state
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track())
+    item.track.holds = [{"source_id": "m1", "key": "k1"},
+                        {"source_id": "j", "key": "k2"}]
+    play = AsyncMock(side_effect=Exception("404"))
+    with patch.object(state, "output_router", _u2_router(play)):
+        ok = await state._play_with_fallback(item, _u1_client())
+    assert ok is False
+    assert play.await_count == 2
+
+
+async def test_play_with_fallback_broken_probe_fails_open(fresh_supervisor):
+    """A probe that itself raises is no evidence — don't hold on it (liveness:
+    a broken probe must not freeze playback)."""
+    import app.state as state
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track())
+    item.track.holds = [{"source_id": "m1", "key": "k1"},
+                        {"source_id": "j", "key": "k2"}]
+    play = AsyncMock(side_effect=[Exception("404"), None])
+    probe = AsyncMock(side_effect=RuntimeError("probe blew up"))
+    with patch.object(state, "output_router", _u2_router(play, probe)):
+        ok = await state._play_with_fallback(item, _u1_client())
+    assert ok is True
+    assert play.await_count == 2
+
+
+async def test_play_with_fallback_probes_at_most_once_per_invocation(fresh_supervisor):
+    """F9: N failing holders must not stack N reachability probes (each can
+    block ~5s under _advance_lock — DLNA's SOAP timeout) — the first verdict
+    is cached and reused; the fallback still consumes every holder under it."""
+    import app.state as state
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track())
+    item.track.holds = [{"source_id": "m1", "key": "k1"},
+                        {"source_id": "j", "key": "k2"},
+                        {"source_id": "l", "key": "k3"}]
+    play = AsyncMock(side_effect=Exception("404"))
+    probe = AsyncMock(return_value=(True, "PLAYING"))
+    with patch.object(state, "output_router", _u2_router(play, probe)):
+        ok = await state._play_with_fallback(item, _u1_client())
+    assert ok is False
+    assert play.await_count == 3                 # every holder still tried
+    probe.assert_awaited_once()                  # ONE probe, verdict reused
+
+
+async def test_play_with_fallback_consumes_play_recorded_mark(fresh_supervisor):
+    """The R19 mark protects one pending play: a successful dispatch consumes
+    it (the supervisor's dispatch captured it first), so a later organic
+    replay counts again."""
+    import app.state as state
+    from app.queue.models import QueueItem
+    sup, timers, rec = fresh_supervisor
+    item = QueueItem(track=_u1_track(), play_recorded=True)
+    play = AsyncMock(return_value=None)
+    with patch.object(state, "output_router", _u2_router(play)):
+        ok = await state._play_with_fallback(item, _u1_client())
+    assert ok is True
+    assert item.play_recorded is False           # consumed
+    sup.on_playback_confirmed(sup.current_token())
+    rec.assert_not_called()                      # dispatch still carried the mark
+
+
+async def test_do_advance_device_failure_enters_hold_with_item_next_up(fresh_supervisor):
+    """Idle-entry outage (plan scenario): a guest queues against a dead device
+    — dispatch fails device-level — hold with that track next-up, ZERO items
+    consumed, no TrackSkippedEvent, queue paused. The stranded-`current` bug
+    path is gone."""
+    import app.state as state
+    from app.output import session
+    from app.output.base import DeviceNotReadyError
+    from app.queue.engine import QueueEngine
+    sup, timers, rec = fresh_supervisor
+    qe = QueueEngine()
+    play = AsyncMock(side_effect=DeviceNotReadyError("no device"))
+    skipped = AsyncMock()
+    with patch.object(state, "queue_engine", qe), \
+         patch("app.queue.engine.database.save_queue", AsyncMock()), \
+         patch("app.queue.engine.database.save_history", AsyncMock()), \
+         patch.object(state, "output_router", _u2_router(play)), \
+         patch.object(state, "get_plex_client", AsyncMock(return_value=_u1_client())), \
+         patch.object(state, "_emit_track_skipped", skipped), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()):
+        await qe.append(_u2_track("t1"))
+        await qe.append(_u2_track("t2"))
+        await state._do_advance()
+
+        assert session.output_hold_active() is True
+        assert session.output_hold_reason() == "dispatch_failed"
+        assert [i.track_id for i in qe.queue] == ["t1", "t2"]  # nothing consumed
+        assert qe.queue[0].play_recorded is False              # never counted
+        assert qe.state.current is None
+        assert qe.state.is_paused is True
+        skipped.assert_not_called()
+        rec.assert_not_called()
+
+
+async def test_do_advance_bails_while_hold_active(fresh_supervisor, monkeypatch):
+    """The hold flag gates _do_advance (R15): a stale EOS advance racing the
+    hold consumes nothing."""
+    import app.state as state
+    from app.output import session
+    monkeypatch.setattr(hold, "_output_hold", True)
+    advance = AsyncMock()
+    with patch.object(state.queue_engine, "advance", advance):
+        await state._do_advance()
+    advance.assert_not_called()
+
+
+async def test_do_advance_device_lost_from_tie_breaker_enters_hold(fresh_supervisor):
+    """DeviceLostError raised by the holder tie-breaker routes to the same
+    hold as DeviceNotReadyError (it subclasses it)."""
+    import app.state as state
+    from app.output import session
+    from app.queue.engine import QueueEngine
+    sup, timers, rec = fresh_supervisor
+    qe = QueueEngine()
+    play = AsyncMock(side_effect=Exception("transport error"))
+    probe = AsyncMock(return_value=(False, None))
+    skipped = AsyncMock()
+    with patch.object(state, "queue_engine", qe), \
+         patch("app.queue.engine.database.save_queue", AsyncMock()), \
+         patch("app.queue.engine.database.save_history", AsyncMock()), \
+         patch.object(state, "output_router", _u2_router(play, probe)), \
+         patch.object(state, "get_plex_client", AsyncMock(return_value=_u1_client())), \
+         patch.object(state, "_emit_track_skipped", skipped), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()):
+        await qe.append(_u2_track("t1"))
+        await qe.append(_u2_track("t2"))
+        await state._do_advance()
+
+        assert session.output_hold_active() is True
+        assert [i.track_id for i in qe.queue] == ["t1", "t2"]
+        skipped.assert_not_called()
+
+
+async def test_do_advance_all_dead_holders_reachable_device_skips_as_today(fresh_supervisor):
+    """Plan scenario: a track with all-dead holders on a REACHABLE device is
+    skipped exactly as today — TrackSkippedEvent, queue advances to the next
+    item, no hold."""
+    import app.state as state
+    from app.output import session
+    from app.queue.engine import QueueEngine
+    sup, timers, rec = fresh_supervisor
+    qe = QueueEngine()
+    # t1's holder 404s (device reachable); t2 then plays fine.
+    play = AsyncMock(side_effect=[Exception("404"), None])
+    probe = AsyncMock(return_value=(True, "PLAYING"))
+    skipped = AsyncMock()
+    with patch.object(state, "queue_engine", qe), \
+         patch("app.queue.engine.database.save_queue", AsyncMock()), \
+         patch("app.queue.engine.database.save_history", AsyncMock()), \
+         patch.object(state, "output_router", _u2_router(play, probe)), \
+         patch.object(state, "get_plex_client", AsyncMock(return_value=_u1_client())), \
+         patch.object(state, "_emit_track_skipped", skipped):
+        await qe.append(_u2_track("t1"))
+        await qe.append(_u2_track("t2"))
+        await state._do_advance()
+
+        assert session.output_hold_active() is False
+        skipped.assert_awaited_once()            # t1 announced as skipped
+        assert qe.state.current is not None
+        assert qe.state.current.track_id == "t2" # queue advanced past the dead track
+        assert qe.queue == []
+
+
+def test_should_auto_start_gated_by_output_hold(monkeypatch):
+    """queue_changed during a hold must not auto-start (it would re-dispatch
+    the held item straight into the dead device)."""
+    import app.state as st
+    from app.output import session
+    fake_qe = MagicMock()
+    fake_qe.state.is_playing = False
+    fake_qe.queue = [MagicMock()]
+    monkeypatch.setattr(st, "queue_engine", fake_qe)
+    monkeypatch.setattr(st, "_auto_advance_pending", False)
+    monkeypatch.setattr(st, "_closing_active", False)
+    monkeypatch.setattr(hold, "_output_hold", False)
+    assert st._should_auto_start() is True
+    monkeypatch.setattr(hold, "_output_hold", True)
+    assert st._should_auto_start() is False
+
+
+async def test_dispatch_play_wires_backend_probe_into_deadline(fresh_supervisor):
+    """The U1 deadline extension gets the real backend probe: deadline expiry
+    consults the active backend's probe_liveness, and a reachable
+    pre-playback device earns the single extension."""
+    import app.state as state
+    sup, timers, rec = fresh_supervisor
+    play = AsyncMock(return_value=None)
+    probe = AsyncMock(return_value=(True, "BUFFERING"))
+    with patch.object(state, "output_router", _u2_router(play, probe)):
+        await state.dispatch_play("http://url", _u1_track())
+    assert len(timers.timers) == 1
+    timers.timers[0].fire()                      # fire the deadline
+    for _ in range(8):
+        await asyncio.sleep(0)
+    probe.assert_awaited_once()                  # the backend probe was consulted
+    assert len(timers.timers) == 2               # extension armed
+
+
+async def test_output_probe_none_without_backend_or_method():
+    import app.state as state
+    router = MagicMock()
+    router.active = None
+    with patch.object(state, "output_router", router):
+        assert state._output_probe() is None
+    router.active = MagicMock(spec=[])           # backend without probe_liveness
+    with patch.object(state, "output_router", router):
+        assert state._output_probe() is None
+
+
+async def test_activate_backend_during_hold_clears_hold(fresh_supervisor, monkeypatch):
+    """R17's U2 slice: a manual device/backend switch during an outage hold
+    is a manual resume — the hold clears after a successful switch so the
+    auto-start can dispatch the held item onto the new device."""
+    import app.state as state
+    from app.output import session
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    monkeypatch.setattr(hold, "_output_hold_reason", "connection_lost")
+    monkeypatch.setattr(state, "_auto_advance_pending", False)
+    backend = MagicMock()
+    backend.set_device = AsyncMock()
+    fake_qe = MagicMock()
+    fake_qe.state.is_playing = False
+    fake_qe.queue = [MagicMock()]
+    trigger = AsyncMock()
+    with patch.object(state, "_get_backend", lambda t: backend), \
+         patch.object(state, "output_router", MagicMock()), \
+         patch.object(state, "queue_engine", fake_qe), \
+         patch.object(state, "_trigger_auto_advance", trigger), \
+         patch("app.database.set_setting", AsyncMock()):
+        await state.activate_backend("chromecast", "dev-1")
+        assert session.output_hold_active() is False
+        await asyncio.sleep(0)                    # drain the auto-start task
+        trigger.assert_awaited_once()
+
+
+async def test_activate_backend_failed_switch_keeps_hold(fresh_supervisor, monkeypatch):
+    """A switch whose set_device fails must NOT clear the hold — the outage
+    is still real and nothing new can play."""
+    import app.state as state
+    from app.output import session
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    monkeypatch.setattr(hold, "_output_hold_reason", "connection_lost")
+    backend = MagicMock()
+    backend.set_device = AsyncMock(side_effect=RuntimeError("unreachable"))
+    with patch.object(state, "_get_backend", lambda t: backend), \
+         patch.object(state, "output_router", MagicMock()), \
+         patch("app.database.set_setting", AsyncMock()):
+        with pytest.raises(RuntimeError):
+            await state.activate_backend("chromecast", "dev-1")
+        assert session.output_hold_active() is True
+
+
+# ── U3: switch-as-resume cancellation half ────────────────────────────────────
+
+async def test_activate_backend_bumps_epoch_and_retires_retry_loop(
+        fresh_supervisor, monkeypatch):
+    """R17 (U3): a manual switch cancels the old device's retry loop
+    ATOMICALLY before any await — epoch bumped, outage context retired, its
+    backoff timer dead — even while the hold stays until the switch lands."""
+    import app.state as state
+    from app.output import session
+    sup, timers, rec = fresh_supervisor
+    # Open a real outage context with a retry loop on a fake dlna device.
+    held_backend = MagicMock(spec=["_device_id", "set_device", "get_position"])
+    held_backend._device_id = "dev-old"
+    held_backend.get_position = AsyncMock(return_value=1000)
+    fake_qe = MagicMock()
+    fake_qe.state.is_paused = False
+    fake_qe.state.current = None
+    fake_qe.set_paused = AsyncMock()
+    router = MagicMock()
+    router.active = held_backend
+    with patch.object(state, "queue_engine", fake_qe), \
+         patch.object(state, "output_router", router), \
+         patch.object(state, "dlna_backend", held_backend), \
+         patch.object(state, "_auto_advance_pending", True), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()):
+        await session.enter_output_hold("connection_lost")
+        ot = sup._outage
+        assert ot is not None and ot.timer is not None
+        retry_timer = ot.timer
+        epoch_before = sup.attach_epoch
+
+        new_backend = MagicMock()
+        new_backend.set_device = AsyncMock()
+        with patch.object(state, "_get_backend", lambda t: new_backend), \
+             patch("app.database.set_setting", AsyncMock()):
+            await state.activate_backend("chromecast", "dev-new")
+
+        assert sup.attach_epoch == epoch_before + 1
+        assert sup._outage is None                    # retired atomically
+        assert any(t is retry_timer and t.cancelled
+                   for t in timers.timers)            # backoff timer dead
+        assert session.output_hold_active() is False  # cleared post-switch
+
+
+async def test_activate_backend_failed_switch_reopens_reconnect_loop(
+        fresh_supervisor, monkeypatch):
+    """F6: a FAILED device switch during a hold must not kill auto-reconnect
+    permanently — notify_manual_switch retired the outage context up front,
+    so the set_device-failure path re-opens it: fresh retry loop armed for
+    the ORIGINAL device, original entered_at preserved (the resume window
+    keeps counting from the original failure, R8), hold intact."""
+    import app.state as state
+    from app.output import session
+    from app.output.session import RETRY_BACKOFF_START_S
+    sup, timers, rec = fresh_supervisor
+    held_backend = MagicMock(spec=["_device_id", "set_device", "get_position"])
+    held_backend._device_id = "dev-old"
+    held_backend.get_position = AsyncMock(return_value=1000)
+    fake_qe = MagicMock()
+    fake_qe.state.is_paused = False
+    fake_qe.state.current = None
+    fake_qe.set_paused = AsyncMock()
+    router = MagicMock()
+    router.active = held_backend
+    with patch.object(state, "queue_engine", fake_qe), \
+         patch.object(state, "output_router", router), \
+         patch.object(state, "dlna_backend", held_backend), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()), \
+         patch("app.events.bus.manager.broadcast_to_guests", AsyncMock()):
+        await session.enter_output_hold("connection_lost")
+        entered = sup._outage.entered_at
+        held_position = sup._outage.held_position_ms
+
+        new_backend = MagicMock()
+        new_backend.set_device = AsyncMock(side_effect=RuntimeError("unreachable"))
+        with patch.object(state, "_get_backend", lambda t: new_backend), \
+             patch("app.database.set_setting", AsyncMock()):
+            with pytest.raises(RuntimeError):
+                await state.activate_backend("chromecast", "dev-new")
+
+        assert session.output_hold_active() is True   # hold survived
+        ot = sup._outage
+        assert ot is not None                         # context REOPENED
+        assert ot.device_id == "dev-old"              # the original device
+        assert ot.entered_at == entered               # same window (R8)
+        assert ot.held_position_ms == held_position
+        assert sup.session_state == session.STATE_OUTAGE_PAUSED
+        assert ot.timer is not None                   # retry loop re-armed
+        handle = timers.timers[-1]
+        assert handle is ot.timer and not handle.cancelled
+        assert handle.delay == RETRY_BACKOFF_START_S  # fresh backoff
+        for _ in range(4):
+            await asyncio.sleep(0)                    # settle _schedule_emit

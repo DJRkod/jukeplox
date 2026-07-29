@@ -89,17 +89,17 @@ def test_transcodes_to_flac_matches_needs_transcode_extension_arm():
 @pytest.mark.parametrize("stream_url,part_path,native,expected", [
     # Proxied OGG → /api/stream serves FLAC, so advertise audio/flac, NOT the
     # source audio/ogg (the 2026-06-17 Chromecast "~1s then stops" bug).
-    ("http://192.168.0.70/api/stream?key=k%2Ffile.ogg", "/library/parts/1/2/file.ogg", "audio/ogg", "audio/flac"),
+    ("http://192.168.1.50/api/stream?key=k%2Ffile.ogg", "/library/parts/1/2/file.ogg", "audio/ogg", "audio/flac"),
     # Proxied non-OGG → no transcode, native passes through unchanged.
-    ("http://192.168.0.70/api/stream?key=k%2Ffile.flac", "/library/parts/1/2/file.flac", "audio/flac", "audio/flac"),
-    ("http://192.168.0.70/api/stream?key=k%2Ffile.mp3", "/library/parts/1/2/file.mp3", "audio/mpeg", "audio/mpeg"),
+    ("http://192.168.1.50/api/stream?key=k%2Ffile.flac", "/library/parts/1/2/file.flac", "audio/flac", "audio/flac"),
+    ("http://192.168.1.50/api/stream?key=k%2Ffile.mp3", "/library/parts/1/2/file.mp3", "audio/mpeg", "audio/mpeg"),
     # Direct Plex URL (no proxy) → /api/stream isn't in the path, nothing is
     # transcoded, keep the native source type even for OGG.
     ("http://plex.local/library/parts/1/2/file.ogg?X-Plex-Token=t", "/library/parts/1/2/file.ogg", "audio/ogg", "audio/ogg"),
     # Code-review #11: proxied OGG that Plex serves WITHOUT an ogg extension but
     # WITH an audio/ogg native type → /api/stream still transcodes (content-type
     # arm of _needs_transcode), so advertise audio/flac, not audio/ogg.
-    ("http://192.168.0.70/api/stream?key=k%2Ffile.bin", "/library/parts/1/2/file.bin", "audio/ogg", "audio/flac"),
+    ("http://192.168.1.50/api/stream?key=k%2Ffile.bin", "/library/parts/1/2/file.bin", "audio/ogg", "audio/flac"),
 ])
 def test_device_stream_content_type(stream_url: str, part_path: str, native: str, expected: str):
     """The content-type a Cast/DLNA renderer is told must equal what /api/stream
@@ -150,7 +150,7 @@ async def test_serve_transcoded_flac_returns_range_capable_file_response(tmp_pat
     flac = tmp_path / "out.flac"
     flac.write_bytes(b"fLaC" + b"\0" * 4096)
 
-    async def _fake_get_or_transcode(key, plex_url):
+    async def _fake_get_or_transcode(key, plex_url, headers=None):
         return str(flac)
 
     monkeypatch.setattr(s, "_get_or_transcode", _fake_get_or_transcode)
@@ -169,7 +169,7 @@ async def test_get_or_transcode_caches_one_transcode_per_key(tmp_path, monkeypat
     s._TRANSCODE_CACHE.clear()
     calls = {"n": 0}
 
-    async def _fake_fetch(plex_url):
+    async def _fake_fetch(plex_url, headers=None):
         calls["n"] += 1
         p = tmp_path / f"f{calls['n']}.flac"
         p.write_bytes(b"fLaC")
@@ -199,7 +199,7 @@ async def test_get_or_transcode_coalesces_same_key_parallelizes_distinct(tmp_pat
     inflight = {"n": 0, "peak": 0}
     calls = {"n": 0}
 
-    async def _fake_fetch(plex_url):
+    async def _fake_fetch(plex_url, headers=None):
         calls["n"] += 1
         inflight["n"] += 1
         inflight["peak"] = max(inflight["peak"], inflight["n"])
@@ -235,7 +235,7 @@ async def test_get_or_transcode_evicts_and_unlinks_lru(tmp_path, monkeypatch):
     monkeypatch.setattr(s, "_TRANSCODE_CACHE_MAX", 2)
     seq = {"n": 0}
 
-    async def _fake_fetch(plex_url):
+    async def _fake_fetch(plex_url, headers=None):
         p = tmp_path / f"{seq['n']}.flac"
         seq["n"] += 1
         p.write_bytes(b"fLaC")
@@ -248,6 +248,79 @@ async def test_get_or_transcode_evicts_and_unlinks_lru(tmp_path, monkeypatch):
         await s._get_or_transcode("C", "u")  # over capacity → evicts A (LRU)
         assert not os.path.exists(a)          # A's temp file was unlinked
         assert os.path.exists(b)
+    finally:
+        for p in list(s._TRANSCODE_CACHE.values()):
+            if os.path.exists(p):
+                os.unlink(p)
+        s._TRANSCODE_CACHE.clear()
+
+
+# ── LRU sizing guard: never evict the currently-playing track (plan U6) ──────
+
+def _stream_fake_fetch(tmp_path):
+    seq = {"n": 0}
+
+    async def _fake_fetch(plex_url, headers=None):
+        p = tmp_path / f"{seq['n']}.flac"
+        seq["n"] += 1
+        p.write_bytes(b"fLaC")
+        return str(p)
+
+    return _fake_fetch
+
+
+def _stream_fake_current(*keys):
+    """A queue-engine stand-in whose current track holds the given stream keys
+    (first = primary stream_key, all = holder snapshot)."""
+    from types import SimpleNamespace
+    track = SimpleNamespace(stream_key=keys[0],
+                            holds=[{"key": k} for k in keys])
+    return SimpleNamespace(
+        state=SimpleNamespace(current=SimpleNamespace(track=track)))
+
+
+async def test_evict_skips_currently_playing_tracks_keys(tmp_path, monkeypatch):
+    """U6 sizing guard: warming the effective next must never evict the
+    CURRENTLY-PLAYING track's artifact — eviction skips its holder keys and
+    takes the next-oldest unpinned entry instead."""
+    from app.api import stream as s
+
+    s._TRANSCODE_CACHE.clear()
+    monkeypatch.setattr(s, "_TRANSCODE_CACHE_MAX", 2)
+    monkeypatch.setattr(s, "_fetch_and_transcode", _stream_fake_fetch(tmp_path))
+    monkeypatch.setattr(s.state, "queue_engine", _stream_fake_current("CUR"))
+    try:
+        cur = await s._get_or_transcode("CUR", "u")   # the playing track (LRU-oldest)
+        b = await s._get_or_transcode("B", "u")
+        await s._get_or_transcode("NEXT", "u")        # the next-track warm, over capacity
+        assert "CUR" in s._TRANSCODE_CACHE            # pinned — survived the warm
+        assert os.path.exists(cur)
+        assert "B" not in s._TRANSCODE_CACHE          # the unpinned LRU went instead
+        assert not os.path.exists(b)
+        assert "NEXT" in s._TRANSCODE_CACHE
+    finally:
+        for p in list(s._TRANSCODE_CACHE.values()):
+            if os.path.exists(p):
+                os.unlink(p)
+        s._TRANSCODE_CACHE.clear()
+
+
+async def test_evict_all_pinned_accepts_bounded_overshoot(tmp_path, monkeypatch):
+    """Every cached entry belongs to the current track (multi-holder) → no
+    eviction at all: a bounded overshoot beats unlinking an artifact the
+    device is actively range-reading."""
+    from app.api import stream as s
+
+    s._TRANSCODE_CACHE.clear()
+    monkeypatch.setattr(s, "_TRANSCODE_CACHE_MAX", 1)
+    monkeypatch.setattr(s, "_fetch_and_transcode", _stream_fake_fetch(tmp_path))
+    monkeypatch.setattr(s.state, "queue_engine",
+                        _stream_fake_current("CUR", "CUR2"))
+    try:
+        a = await s._get_or_transcode("CUR", "u")
+        b = await s._get_or_transcode("CUR2", "u")   # over capacity, both pinned
+        assert set(s._TRANSCODE_CACHE) == {"CUR", "CUR2"}
+        assert os.path.exists(a) and os.path.exists(b)
     finally:
         for p in list(s._TRANSCODE_CACHE.values()):
             if os.path.exists(p):
@@ -345,3 +418,69 @@ async def test_transcode_adds_seektable(tmp_path):
         assert "SEEKTABLE" in blocks, blocks
     finally:
         os.unlink(out_path)
+
+
+# ── U4: source-aware proxy resolution (resolve_stream branching) ──────────────
+
+
+def test_proxy_serves_local_path_target(tmp_path):
+    """A local-file source resolves to a StreamTarget(path=...); the proxy serves
+    it via FileResponse (range-aware from disk) rather than the httpx URL path."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.sources.base import StreamTarget
+
+    f = tmp_path / "song.flac"
+    f.write_bytes(b"fLaC-local-bytes")
+    reg = MagicMock()
+    reg.resolve_stream = MagicMock(return_value=StreamTarget(path=str(f)))
+
+    with patch("app.state.is_authorized_stream_key", return_value=True), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=reg)):
+        r = TestClient(app).get("/api/stream", params={"key": "local:song"})
+    assert r.status_code == 200
+    assert r.content == b"fLaC-local-bytes"
+
+
+def test_proxy_no_source_returns_source_neutral_503():
+    """With no source configured the proxy 503s with source-neutral text — no
+    'Plex' leaks to a Jellyfin/local-only operator (R14)."""
+    from unittest.mock import AsyncMock, patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with patch("app.state.is_authorized_stream_key", return_value=True), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=None)):
+        r = TestClient(app).get("/api/stream", params={"key": "x"})
+    assert r.status_code == 503
+    assert "Plex" not in r.text
+    assert r.json()["detail"] == "No media source configured"
+
+
+def test_proxy_rejects_unauthorized_key():
+    from unittest.mock import patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with patch("app.state.is_authorized_stream_key", return_value=False):
+        r = TestClient(app).get("/api/stream", params={"key": "nope"})
+    assert r.status_code == 403
+
+
+def test_proxy_rejects_uncontained_local_key_with_404():
+    """U12: a local key that fails realpath containment resolves to an empty
+    StreamTarget (no path, no url). The proxy rejects it (404) rather than falling
+    through to an empty-URL upstream fetch (which would 502 misleadingly)."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.sources.base import StreamTarget
+
+    reg = MagicMock()
+    reg.resolve_stream = MagicMock(return_value=StreamTarget())  # neither path nor url
+
+    with patch("app.state.is_authorized_stream_key", return_value=True), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=reg)):
+        r = TestClient(app).get("/api/stream", params={"key": "loc:../escape"})
+    assert r.status_code == 404

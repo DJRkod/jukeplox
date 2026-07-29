@@ -167,6 +167,16 @@ class DeviceWatcher:
         self._dbus_available_fn = dbus_available or self._default_dbus_available
 
         self.registry: dict[tuple[str, str], RegistryEntry] = {}
+        # Per-device arrival listeners (2026-07-11 supervisor plan U3): the
+        # output-session supervisor registers a callback keyed by
+        # (backend, device_id) while an outage holds that device; every live
+        # arrival for the key — mDNS resolve (after register_resolved fed the
+        # backend cache), DLNA sweep hit, SSDP alive — invokes it so the
+        # reconnect loop's backoff wait is short-circuited immediately.
+        # Mirrors the hasattr-guarded watcher→backend chain: the supervisor
+        # guards hasattr(watcher, "add_arrival_listener").
+        self._arrival_listeners: dict[tuple[str, str],
+                                      list[Callable[[], None]]] = {}
         # (backend, avahi_name) → registry key. ItemRemove carries only the
         # announced instance name; this index translates it back to the
         # (backend, device_id) registry key.
@@ -288,6 +298,9 @@ class DeviceWatcher:
         for handle in self._purge_timers.values():
             handle.cancel()
         self._purge_timers.clear()
+        # U3 (supervisor): registered arrival listeners die with the watcher
+        # — the supervisor's backoff loop keeps reconnecting without them.
+        self._arrival_listeners.clear()
         # Cancel in-flight broadcasts BEFORE unsubscribing so a snapshot
         # mid-build never observes half-torn-down state.
         tasks = list(self._tasks)
@@ -350,6 +363,30 @@ class DeviceWatcher:
         status["discovery"] = (
             "ok" if (self._handles or self._mdns_sweep_active) else "unavailable")
         return status
+
+    def add_arrival_listener(self, backend: str, device_id: str,
+                             cb: Callable[[], None]) -> None:
+        """Register *cb* to fire on every live arrival of (backend,
+        device_id) — the supervisor's discovery fast path (plan U3). Fired
+        AFTER the arrival fed the backend's address cache, so the callback
+        can immediately connect. Callbacks run on the loop and are invoked
+        fail-soft; multiple registrations for one key coexist."""
+        self._arrival_listeners.setdefault((backend, device_id), []).append(cb)
+
+    def remove_arrival_listener(self, backend: str, device_id: str,
+                                cb: Callable[[], None]) -> None:
+        """Deregister *cb*. Unknown key/callback no-ops (the supervisor may
+        retire an outage whose watcher restarted meanwhile)."""
+        key = (backend, device_id)
+        listeners = self._arrival_listeners.get(key)
+        if not listeners:
+            return
+        try:
+            listeners.remove(cb)
+        except ValueError:
+            return
+        if not listeners:
+            del self._arrival_listeners[key]
 
     def reconcile(self, found: dict[str, list[OutputDevice]]) -> bool:
         """Merge a forced Scan's one-shot results into the registry (U5).
@@ -497,6 +534,17 @@ class DeviceWatcher:
             except Exception:
                 _log.warning("device watcher: probe trigger failed for %s/%s",
                              key[0], key[1], exc_info=True)
+        # Supervisor arrival fast path (plan U3): fire on EVERY arrival, not
+        # just the offline→online edge — during an outage the device may
+        # return inside the grace window (no edge), and listeners exist only
+        # while an outage holds this exact device (the supervisor's
+        # single-flight re-attach absorbs bursts). Fail-soft.
+        for cb in list(self._arrival_listeners.get(key, ())):
+            try:
+                cb()
+            except Exception:
+                _log.warning("device watcher: arrival listener failed for "
+                             "%s/%s", key[0], key[1], exc_info=True)
 
     def _start_grace(self, key: tuple[str, str]) -> None:
         """Arm the offline grace timer for *key* (KTD3). No-ops for

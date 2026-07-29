@@ -8,6 +8,9 @@ services:
       # already owns UDP 5353 (e.g. TrueNAS) — the automatic fallback for
       # discovery. Harmless on hosts without avahi. One-time; survives reboots.
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      # Optional: a local music folder as a source. Mount it READ-ONLY, then in the app
+      # Connect Local Folder → the CONTAINER path (/music). Jellyfin needs no mount.
+      # - /srv/music:/music:ro
     # Attached-speaker audio. /dev/snd is the HEADLESS path (no host sound server).
     # On a Linux DESKTOP (PulseAudio/PipeWire owns the card) remove this and use the
     # pulse route instead — see INSTALL.md Step 4. Omit entirely if you only cast to
@@ -16,8 +19,15 @@ services:
       - /dev/snd             # headless ALSA passthrough (Linux only); desktop → use PULSE_SERVER
     # group_add:             # uncomment with /dev/snd so the container may open the card
     #   - audio
+    security_opt:
+      - systempaths=unconfined   # ALSA reads /proc/asound to enumerate cards, which
+                                 # Docker masks by default — without this, alsasink
+                                 # can't find the card even with /dev/snd mounted.
+    # If your host defines a custom `default` PCM in /etc/asound.conf (softvol / dmix /
+    # a fixed rate), the container does NOT inherit it — bind-mount it under `volumes:`
+    # above so `device=default` resolves the same inside:  - /etc/asound.conf:/etc/asound.conf:ro
     environment:
-      BIND_HOST: "0.0.0.0"   # set to your LAN IP (e.g. 192.168.0.70) so Cast/DLNA can reach the stream proxy
+      BIND_HOST: "0.0.0.0"   # set to your LAN IP (e.g. 192.168.1.50) so Cast/DLNA can reach the stream proxy
       # PORT: "70"           # HTTP listen port (default 80). Under host networking this is the host port
                              # directly — set a free one if 80 is taken (e.g. the TrueNAS web UI uses 80).
       # Desktop audio instead of /dev/snd (replace 1000 with `id -u`); also add the

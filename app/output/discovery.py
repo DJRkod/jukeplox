@@ -67,6 +67,24 @@ _NAME_PRIORITY = {
 # entry seeds the result; otherwise alphabetical for predictability.
 _BACKEND_ORDER = ("direct", "airplay", "chromecast", "dlna")
 
+# Per-protocol gapless capability (2026-07-11 supervisor plan U5, R10/R12).
+# Static per-backend verdicts: Direct chains via GStreamer about-to-finish
+# (U7) and Chromecast via the server-stitched flow stream (U9/U10) — both
+# "supported"; AirPlay stays per-track (plan scope) — "unsupported"; DLNA's
+# "unverified" is the DEFAULT for devices with no cached behavioral verdict:
+# U8's lazy verification (SetNextAVTransportURI is advertised-but-ignored on
+# some renderers) decides per device at the first armed boundary, and
+# build_devices_snapshot overrides this map with the persisted per-device
+# verdict. Serialized onto every protocol entry in build_devices_snapshot,
+# so the picker chip and GET /admin/output/devices carry the same value on
+# both the pull and push paths (KTD5).
+GAPLESS_CAPABILITY = {
+    "direct": "supported",
+    "chromecast": "supported",
+    "dlna": "unverified",
+    "airplay": "unsupported",
+}
+
 
 @dataclass
 class ProtocolEntry:
@@ -321,6 +339,22 @@ async def build_devices_snapshot(
                      exc_info=True)
         verdicts = {}
 
+    # Per-device DLNA gapless verdicts (plan U8): the static map's
+    # "unverified" is only the no-evidence default — a device whose first
+    # armed boundary decided a behavioral verdict carries that instead.
+    # Bulk-loaded from the settings store exactly like the probe cache above
+    # (this builder is already async and already does that per-snapshot DB
+    # read), which stays correct across restarts and for devices never
+    # selected in this process — an in-memory-only read couldn't. Fail-soft:
+    # on error the static default stands.
+    dlna_gapless: dict[str, str] = {}
+    try:
+        from app import database
+        dlna_gapless = await database.get_gapless_verdicts("dlna")
+    except Exception:
+        _log.warning("Gapless verdict bulk-load failed; DLNA entries read "
+                     "the static capability", exc_info=True)
+
     aggregated = aggregate_devices(
         per_backend,
         lambda d, b: host_for(d, b, backend_for),
@@ -342,6 +376,17 @@ async def build_devices_snapshot(
                     "device_id": p.device_id,
                     "verified": p.verified,
                     "checked_at": p.checked_at,
+                    # Gapless capability chip (plan U5) — per backend type; an
+                    # unknown future backend defaults to "unsupported" (honest
+                    # until it earns a verdict). DLNA is per DEVICE (plan U8):
+                    # the cached behavioral verdict overrides the static
+                    # "unverified" default.
+                    "gapless": (
+                        dlna_gapless.get(p.device_id,
+                                         GAPLESS_CAPABILITY["dlna"])
+                        if p.backend == "dlna"
+                        else GAPLESS_CAPABILITY.get(p.backend, "unsupported")
+                    ),
                 }
                 for p in dev.protocols
             ],

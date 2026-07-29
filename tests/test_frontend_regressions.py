@@ -782,6 +782,117 @@ def test_lyrics_body_resets_scroll_to_top_on_render():
     )
 
 
+# ── Search filter-tab scroll memory (2026-07-01 ce-debug) ────────────────────
+# Switching filter tabs within a search rebuilt #search-results in place but
+# never touched the scroller. On guest the scroller is the ANCESTOR (#content),
+# not #search-results itself, so clearing the child's innerHTML left the
+# ancestor's scrollTop untouched — an unvisited tab opened mid-list at the prior
+# tab's depth. Fix: per-filter scroll memory keyed by filter name — capture the
+# outgoing tab's depth before the rebuild, land the incoming tab at its
+# remembered depth or the top (|| 0) if it was never scrolled, and reset on each
+# new query. Same inherited-scroll family as the lyrics-body reset above; no JS
+# runtime in this suite, so these are static-source pins.
+
+
+def test_search_filter_tab_scroll_memory():
+    browse = BROWSE_JS.read_text(encoding="utf-8")
+    assert "_searchTabScroll" in browse, (
+        "static/browse/index.js must keep a per-filter scroll store "
+        "(_searchTabScroll) so search filter tabs don't share one scroll position."
+    )
+    # Isolate the filter-tab click wiring inside _wireSearch.
+    start = browse.index("function _wireSearch")
+    end = browse.index("async function doSearch", start)
+    region = browse[start:end]
+    # Capture the OUTGOING tab's depth before the in-place rebuild…
+    assert re.search(r"_searchTabScroll\[[^\]]+\]\s*=\s*[^\n]*scrollTop", region), (
+        "the filter-tab handler must capture the outgoing tab's scrollTop into "
+        "_searchTabScroll before re-rendering."
+    )
+    # …and land the INCOMING tab at its remembered depth or the top (|| 0) — an
+    # unvisited tab must start at the top, not inherit the prior tab's scroll.
+    assert re.search(r"scrollTop\s*=\s*_searchTabScroll\[[^\]]+\]\s*\|\|\s*0", region), (
+        "the filter-tab handler must restore _searchTabScroll[incoming] || 0 so "
+        "a never-scrolled tab opens at the top (not the prior tab's depth)."
+    )
+    # Resolve the scroller generically so the fix works on guest (ancestor
+    # #content) AND admin (#search-results is its own overflow:auto scroller).
+    assert "_scrollOwner(" in region, (
+        "the filter-tab handler must resolve the scroller via _scrollOwner so the "
+        "fix covers both guest (ancestor scroller) and admin (self scroller)."
+    )
+    # A new query resets the per-tab memory — tabs don't inherit a prior search.
+    ds_start = browse.index("async function doSearch")
+    ds_end = browse.index("\n  function ", ds_start)
+    ds_region = browse[ds_start:ds_end]
+    assert re.search(r"_searchTabScroll\s*=\s*\{\}", ds_region), (
+        "doSearch must reset _searchTabScroll = {} so a new query starts every "
+        "filter tab fresh at the top."
+    )
+
+
+# ── Search filter-tab bar: single-source, opaque, docked (2026-07-02 ce-debug) ─
+# The filter-tab bar was forked across both templates — guest wrapped input+tabs
+# in a sticky #search-bar backed by var(--bg) (bleeds on translucent/gradient
+# schemes); admin had NO wrapper and NO sticky, plus its own .admin-shell tab
+# rules. It now lives single-source in rail.css as an opaque (var(--elev-base)),
+# sticky, top-docked bar, with the identical #search-bar wrapper markup on both
+# pages (CLAUDE.md shared-UI standard).
+
+
+def test_search_filter_bar_single_source_and_docked():
+    rail = RAIL_CSS.read_text(encoding="utf-8")
+    guest = GUEST_TEMPLATE.read_text(encoding="utf-8")
+    admin = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+
+    # Shared rule: a sticky bar docked to the top with an OPAQUE backing.
+    m = re.search(r"#search-bar\s*\{([^}]*)\}", rail)
+    assert m, "#search-bar must be styled in the shared static/browse/rail.css."
+    body = m.group(1)
+    assert "position: sticky" in body and "top: 0" in body, (
+        "#search-bar must be a bar docked to the top (position: sticky; top: 0)."
+    )
+    assert "var(--elev-base" in body and "var(--bg)" not in body, (
+        "#search-bar must back with the opaque var(--elev-base), NOT var(--bg) — "
+        "var(--bg) is a gradient/translucent on some schemes and lets scrolled "
+        "results bleed through the docked bar (the 2026-07-02 overlay bug)."
+    )
+    # The sticky bar must NOT be forced transparent by a .browse-surface override
+    # (guest-only — only guest's #browse-container carries .browse-surface). That
+    # let scrolled results bleed through the docked bar on guest while admin looked
+    # fine (2026-07-02 ce-debug part 2). Only the NON-sticky .wayfind-bar may be
+    # transparent.
+    assert ".browse-surface #search-bar" not in rail, (
+        "rail.css must not force .browse-surface #search-bar transparent — #search-bar "
+        "is position:sticky, so a transparent backing lets scrolled results bleed "
+        "through the docked bar on guest. Keep it opaque; only .wayfind-bar (non-sticky) "
+        "stays transparent."
+    )
+    assert "#search-filter-tabs" in rail and ".filter-tab.active" in rail, (
+        "#search-filter-tabs and .filter-tab(.active) must be single-source in rail.css."
+    )
+    # Neither template re-forks the bar or the tab styling.
+    for name, src in (("guest", guest), ("admin", admin)):
+        assert "#search-bar {" not in src, (
+            f"{name} template must not re-style #search-bar — it lives in rail.css now."
+        )
+        assert "#search-filter-tabs {" not in src and ".filter-tab {" not in src, (
+            f"{name} template must not fork #search-filter-tabs/.filter-tab styling."
+        )
+    assert ".admin-shell .filter-tab" not in admin and ".admin-shell #search-filter-tabs" not in admin, (
+        "the admin template's forked .admin-shell filter-tab rules must be removed."
+    )
+    # Both pages mount the identical wrapper: #search-bar contains the tabs, above
+    # #search-results.
+    for name, src in (("guest", guest), ("admin", admin)):
+        bar = src.find('id="search-bar"')
+        assert bar != -1, f"{name} template must wrap search chrome in #search-bar."
+        wrapper = src[bar:src.index('id="search-results"', bar)]
+        assert 'id="search-filter-tabs"' in wrapper, (
+            f"{name}: #search-bar must wrap #search-filter-tabs (identical markup both pages)."
+        )
+
+
 def test_all_songs_popular_gated_when_unavailable():
     browse = BROWSE_JS.read_text(encoding="utf-8")
     assert "popular_available" in browse, "All Songs must read popular_available."
@@ -1035,18 +1146,18 @@ def test_overflow_sheet_caps_height_and_scrolls():
 
 def test_filter_tabs_accent_text_and_gradient_active():
     """2026-06-18 UI rework: unselected filter tabs use accent text (global, R4c);
-    the active tab fills with --accent-grad (R3). Both templates."""
-    for tmpl in (GUEST_TEMPLATE, ADMIN_TEMPLATE):
-        src = tmpl.read_text(encoding="utf-8")
-        base = re.search(r"\.filter-tab\s*\{([^}]*)\}", src)
-        assert base and "--accent-ui" in base.group(1) and "var(--muted)" not in base.group(1), (
-            f"Unselected .filter-tab in {tmpl.name} must use --accent-ui text (not --muted) "
-            f"so it's legible on the gradient schemes (R4c, global)."
-        )
-        active = re.search(r"\.filter-tab\.active\s*\{([^}]*)\}", src)
-        assert active and "--accent-grad" in active.group(1), (
-            f".filter-tab.active in {tmpl.name} must fill with --accent-grad (R3)."
-        )
+    the active tab fills with --accent-grad (R3). Single-source in rail.css since
+    the 2026-07-02 ce-debug docked-bar fix moved the forked template rules there."""
+    rail = RAIL_CSS.read_text(encoding="utf-8")
+    base = re.search(r"\.filter-tab\s*\{([^}]*)\}", rail)
+    assert base and "--accent-ui" in base.group(1) and "var(--muted)" not in base.group(1), (
+        "Unselected .filter-tab in rail.css must use --accent-ui text (not --muted) "
+        "so it's legible on the gradient schemes (R4c, global)."
+    )
+    active = re.search(r"\.filter-tab\.active\s*\{([^}]*)\}", rail)
+    assert active and "--accent-grad" in active.group(1), (
+        ".filter-tab.active in rail.css must fill with --accent-grad (R3)."
+    )
 
 
 def test_translucent_schemes_opaque_and_readable():
@@ -2029,3 +2140,156 @@ def test_browse_chunked_render_completes_and_aborts_node_vm():
     b = data["b"]
     assert b["built"] == [0, 1, 2], b["built"]          # stale guard stopped the build
     assert b["done"] == 0                               # and suppressed onComplete
+
+
+# ── U15: onboarding & scan empty states (shared module + admin badge) ─────────
+
+def test_browse_empty_state_picks_source_aware_message():
+    """The shared browse module must distinguish the three R19/R20 empty states
+    (zero-source, scan-in-progress, scanned-empty) off /api/scan-status, not a
+    single generic 'nothing here'. Lives in the shared module (discipline)."""
+    js = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    assert "_renderBrowseEmptyState" in js, "the shared empty-state helper must exist"
+    assert "/api/scan-status" in js, "empty state must consult the scan-status surface"
+    # The three distinct states are present.
+    assert "No music sources connected" in js
+    assert "being prepared" in js
+    assert "No music found." in js
+    # Wired into BOTH top-level browse lists (artists + albums).
+    assert js.count("_renderBrowseEmptyState(el,") >= 2
+
+
+def test_admin_scan_status_badge_wired():
+    """The admin Sources panel renders a scan-status badge (scanning /
+    scanned-empty) from /admin/scan-status — in static/admin/app.js (admin
+    chrome) with its target element in the dashboard template."""
+    js = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    assert "renderSourceScanStatus" in js
+    assert "/admin/scan-status" in js
+    assert "renderSourceScanStatus()" in js  # called from loadSources
+    html = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    assert 'id="sources-scan-status"' in html
+
+
+def test_skip_notification_lives_in_shared_playback_module():
+    """R22/U16: the skip toast is a single-source shared-playback feature — both
+    pages dispatch the track_skipped WS event to the shared module's showSkipped,
+    never a per-page renderer (shared-module discipline)."""
+    js = (ROOT / "static/playback/index.js").read_text(encoding="utf-8")
+    assert "function showSkipped" in js
+    assert "skip-note" in js                       # the overlay element/class
+    assert "showSkipped," in js                    # exported on the handle
+    # Both per-page WS handlers route track_skipped to the shared module.
+    for page in ("static/guest/app.js", "static/admin/app.js"):
+        src = (ROOT / page).read_text(encoding="utf-8")
+        assert "track_skipped" in src and "playbackHandle.showSkipped" in src, page
+    # The toast has CSS.
+    css = (ROOT / "static/playback/queue.css").read_text(encoding="utf-8")
+    assert ".skip-note-overlay" in css
+
+
+# ── Play-data curation UI (2026-07-03 plan U5/U6) ────────────────────────────
+
+BROWSE_JS = ROOT / "static/browse/index.js"
+PLAYBACK_JS = ROOT / "static/playback/index.js"
+
+
+def test_most_played_admin_remove_item_is_source_pinned():
+    """U5 (R4/R7/R8): an admin-only 'Remove from Most Played' kebab item, scoped
+    to the Most Played context, with an inline two-step confirm (never native
+    confirm) and a non-optimistic POST — all in the shared browse module."""
+    js = BROWSE_JS.read_text(encoding="utf-8")
+    assert "Remove from Most Played" in js
+    assert "ctx.mostPlayed" in js                 # scoped to the Most Played list only
+    assert "authMode === 'admin'" in js           # admin-gated on the client
+    assert "mostPlayed: true" in js               # loadMostPlayed threads the ctx
+    assert "/admin/most-played/remove" in js      # POSTs the admin endpoint
+    assert "Confirm: remove" in js                # inline two-step confirm
+    assert "window.confirm(" not in js            # never native confirm (blocks the loop)
+
+
+def test_history_admin_remove_play_is_source_pinned():
+    """Play-data curation relocation (2026-07-03 plan, R1/R5/R7): the admin
+    "remove this play" affordance moved OFF the shared history strip into the
+    Setup -> Recent Plays panel. The strip is now read-only for everyone; the
+    panel (admin Setup chrome) owns the POST /admin/history/remove-play call and
+    reads each play's added_at, and the strip-scoped chip CSS is gone."""
+    admin = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    css = (ROOT / "static/playback/queue.css").read_text(encoding="utf-8")
+    dashboard = (ROOT / "app/templates/admin/dashboard.html").read_text(encoding="utf-8")
+    # Strip is read-only: the admin mountPlayback history config carries only `el`,
+    # with no removePlan hook (the guest strip never passed one either).
+    assert "history: { el: '#history-strip' }" in admin
+    # The Recent Plays panel is admin-only Setup chrome that owns the removal.
+    assert 'id="recent-plays"' in dashboard
+    assert "renderRecentPlays" in admin
+    assert "/admin/history/remove-play" in admin
+    assert "added_at" in admin
+    # The strip-scoped chip CSS was removed (base .qi-remove stays for queue-remove).
+    assert ".qs-history .qi-remove" not in css
+
+
+# ── Broad search tier: observer root, abort, stale-chain bound (2026-07-17) ────
+# ce-debug of the guest/admin search bifurcation. Three load-bearing behaviors
+# in static/browse/index.js's Tier-2 machinery, each pinned against the exact
+# regression that caused (or hid) the "guest search is much slower" report:
+#   1. The sentinel observer roots on _scrollOwner(el) — the element that
+#      ACTUALLY scrolls #search-results (guest: ancestor #content; admin:
+#      #search-results' own overflow box, which _findScrollAncestor skips).
+#      With the wrong root the tier silently never fired on admin (fixed
+#      2026-07-02 in 20b7520, lost in the 546cd36 revert, re-applied here).
+#   2. _teardownBroadTier aborts the in-flight page and the fetch carries the
+#      signal, so per-keystroke re-queries stop consuming server capacity.
+#   3. The forced re-observe self-chain is bounded by _BROAD_STALE_CHAIN so
+#      all-duplicates pages (catalog installs: every broad row dedups against
+#      Tier 1) and failing sources cannot spin an unbounded serial cascade.
+
+
+def _broad_tier_source():
+    browse = BROWSE_JS.read_text(encoding="utf-8")
+    st = browse.index("function _teardownBroadTier")
+    en = browse.index("// ── Tab activation hooks", st)
+    return browse[st:en]
+
+
+def test_broad_observer_uses_scroll_owner_root():
+    src = _broad_tier_source()
+    assert "_scrollOwner(el)" in src, (
+        "_setupBroadTier's sentinel observer must root on _scrollOwner(el) so the "
+        "broad tier auto-loads on admin, where #search-results is its own scroller "
+        "(_findScrollAncestor starts at parentElement and skips it)."
+    )
+    assert "root: _findScrollAncestor(el)" not in src, (
+        "Rooting on _findScrollAncestor(el) leaves admin's sentinel clipped inside "
+        "its own scroll box — the tier never fires there (the 546cd36 regression)."
+    )
+
+
+def test_broad_teardown_aborts_inflight_page():
+    src = _broad_tier_source()
+    teardown = src[:src.index("function _setupBroadTier")]
+    assert "_broad.abort" in teardown and ".abort()" in teardown, (
+        "_teardownBroadTier must abort the in-flight broad fetch — a stale "
+        "keystroke's page otherwise keeps burning per-source semaphore slots."
+    )
+    assert "signal: b.abort.signal" in src, (
+        "The broad-page fetch must carry the tier's AbortController signal."
+    )
+    assert "AbortError" in src, (
+        "The page loader must swallow its own teardown abort (not count it as a "
+        "stale/failed page)."
+    )
+
+
+def test_broad_stale_chain_is_bounded():
+    src = _broad_tier_source()
+    assert "_BROAD_STALE_CHAIN" in src, (
+        "The forced re-observe self-chain must be bounded: all-duplicates pages "
+        "chained up to BROAD_MAX_PAGES serial live-source calls per query on "
+        "catalog installs (2026-07-17 ce-debug)."
+    )
+    assert "b.stale < _BROAD_STALE_CHAIN" in src, (
+        "The finally-block re-observe must gate on the stale counter."
+    )
+    # Failures count toward the chain so a dead source can't retry-loop forever.
+    assert "if (_broad === b) b.stale++;" in src

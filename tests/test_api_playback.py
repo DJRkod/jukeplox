@@ -100,26 +100,45 @@ async def test_playback_previous_bumps_advance_generation(client, mock_state):
     assert state_module._advance_gen == gen_before + 1
 
 
-async def test_playback_previous_increments_play_counts(client, mock_state):
-    """Replay counts as a real play — track/album/artist counts increment via
-    the _do_advance fire-and-forget pattern (playback_skip increments nothing)."""
-    import asyncio as _asyncio
+async def test_playback_previous_counts_via_confirmed_start_chokepoint(client, mock_state, fresh_supervisor):
+    """Replay counts as a real play — but only once the backend CONFIRMS
+    playback started (2026-07-11 supervisor plan U1). Skip Back reports the
+    dispatch to the output-session supervisor instead of calling record_play;
+    all three entry points share that chokepoint."""
+    sup, timers, rec = fresh_supervisor
     qe, or_ = mock_state
     await qe.set_playing(make_track("t1"))
     await qe.advance()
-    inc = AsyncMock()
     with patch("app.state.get_plex_client", AsyncMock(return_value=MagicMock())), \
-         patch("app.state._make_stream_url", return_value="http://stream/t1"), \
-         patch("app.database.increment_play_count", inc):
+         patch("app.state._make_stream_url", return_value="http://stream/t1"):
         resp = client.post("/admin/playback/previous")
         assert resp.status_code == 200
-        # Counts are fire-and-forget tasks on the app loop; poll briefly.
-        for _ in range(100):
-            if inc.await_count >= 3:
-                break
-            await _asyncio.sleep(0.01)
-    kinds = {call.args[0] for call in inc.await_args_list}
-    assert kinds == {"track", "album", "artist"}
+        rec.assert_not_called()                  # dispatch alone must not count
+        token = sup.current_token()
+        assert token is not None                 # dispatch was reported
+        sup.on_playback_confirmed(token)         # backend confirms playback
+    rec.assert_called_once()
+    assert rec.call_args.args[0].id == "t1"      # the dispatched track counted
+
+
+async def test_playback_previous_consumes_r19_mark(client, mock_state, fresh_supervisor):
+    """Supervisor plan U3 (R19): a history item carrying the play_recorded
+    mark (an outage-held replay) dispatches WITH the mark — confirming must
+    not re-count — and the mark is consumed on success so a later organic
+    replay counts again (unified with _play_with_fallback / Skip)."""
+    sup, timers, rec = fresh_supervisor
+    qe, or_ = mock_state
+    await qe.set_playing(make_track("t1"))
+    await qe.advance()                           # t1 → history
+    qe.history[0].play_recorded = True           # already counted pre-outage
+    with patch("app.state.get_plex_client", AsyncMock(return_value=MagicMock())), \
+         patch("app.state._make_stream_url", return_value="http://stream/t1"):
+        resp = client.post("/admin/playback/previous")
+    assert resp.status_code == 200
+    or_.play.assert_awaited_once()
+    assert qe.state.current.play_recorded is False   # mark consumed
+    sup.on_playback_confirmed(sup.current_token())   # carried into dispatch:
+    rec.assert_not_called()                          # no double count
 
 
 async def test_playback_previous_while_paused_results_in_playing(client, mock_state):
@@ -159,9 +178,13 @@ async def test_playback_previous_while_idle_plays_history_without_requeue(client
     assert qe.queue == []
 
 
-async def test_playback_previous_captures_track_meta(client, mock_state):
+async def test_playback_previous_captures_track_meta_after_confirm(client, mock_state, monkeypatch):
     """Most-played plan U1: a replay is a real play — the meta upsert fires
-    alongside the count increment with the track's display dict."""
+    with the track's display dict once the supervisor's confirmed-start
+    chokepoint runs the real record_play (never at dispatch)."""
+    from app.output import session
+    sup = session.OutputSessionSupervisor(timer_factory=lambda d, cb: MagicMock())
+    monkeypatch.setattr(session, "_supervisor", sup)
     qe, or_ = mock_state
     await qe.set_playing(make_track("t1"))
     await qe.advance()
@@ -171,7 +194,14 @@ async def test_playback_previous_captures_track_meta(client, mock_state):
          patch("app.database.increment_play_count", AsyncMock()), \
          patch("app.database.set_play_track_meta", AsyncMock()) as meta:
         resp = client.post("/admin/playback/previous")
-    assert resp.status_code == 200
+        assert resp.status_code == 200
+        assert meta.await_count == 0             # nothing captured at dispatch
+        sup.on_playback_confirmed(sup.current_token())
+        # record_play is fire-and-forget tasks on this loop; poll briefly.
+        for _ in range(100):
+            if meta.await_count >= 1:
+                break
+            await asyncio.sleep(0.01)
     meta.assert_awaited_once()
     tid, payload = meta.await_args.args
     assert tid == "t1"

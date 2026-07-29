@@ -1,4 +1,4 @@
-"""Plex stream proxy — serves media to Cast/DLNA devices that can't reach Plex directly.
+"""Source stream proxy — serves media to Cast/DLNA devices that can't reach the source directly.
 
 When the upstream content-type is ``audio/ogg`` (Ogg Vorbis or Ogg Opus),
 the stream is transcoded to FLAC via ffmpeg on the fly.  Originally added
@@ -19,7 +19,7 @@ from collections import OrderedDict
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from app import state
 
@@ -59,21 +59,38 @@ async def proxy_plex_stream(key: str, request: Request):
         raise HTTPException(status_code=403, detail="Stream key not authorized")
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
 
-    plex_url = client.stream_url(key)
+    # Source-aware resolution (U4): the owning provider returns a StreamTarget
+    # that is either a remote URL (proxied over HTTP, with any auth headers the
+    # provider needs injected server-side so no credential rides the URL to LAN
+    # devices) or a local filesystem path (served range-aware from disk).
+    target = client.resolve_stream(key)
+    if getattr(target, "path", None):
+        # Local-file source. The provider enforces path containment (U12); the
+        # key already passed is_authorized_stream_key above.
+        return FileResponse(target.path)
+
+    source_url = (getattr(target, "url", None) or "").strip()
+    if not source_url:
+        # Neither a path nor a URL: a local-file key that failed realpath
+        # containment (U12 — traversal/symlink escape) or a source with no
+        # resolvable target. Reject cleanly rather than fall through to an
+        # empty-URL upstream fetch (which 502s with a misleading message).
+        raise HTTPException(status_code=404, detail="Stream source unavailable")
+    extra_headers = dict(getattr(target, "headers", None) or {})
     _log.debug("stream proxy: key=%s", key)
 
     # OGG-family sources are transcoded to a cached, seekable FLAC and served
-    # range-aware from that one file. The part extension is authoritative (Plex
-    # parts always carry the true container ext — 2026-06-14 learning), so we
-    # decide here WITHOUT opening Plex and NEVER forward the client's
-    # FLAC-coordinate Range to the smaller Ogg upstream. (Forwarding it 416s
-    # against Plex, and re-transcoding per Range request made the Cast assemble
-    # its buffer from many independent transcodes — the 2026-06-17 416-spam /
-    # repeated-transcode / mid-playback ERROR.)
-    if transcodes_to_flac(plex_url):
-        return await _serve_transcoded_flac(key, plex_url)
+    # range-aware from that one file. The part extension is authoritative (parts
+    # carry the true container ext — 2026-06-14 learning), so we decide here
+    # WITHOUT opening the source and NEVER forward the client's FLAC-coordinate
+    # Range to the smaller Ogg upstream. (Forwarding it 416s, and re-transcoding
+    # per Range request made the Cast assemble its buffer from many independent
+    # transcodes — the 2026-06-17 416-spam / repeated-transcode / mid-playback
+    # ERROR.)
+    if transcodes_to_flac(source_url):
+        return await _serve_transcoded_flac(key, source_url, extra_headers)
 
     # Non-Ogg: open the upstream, forwarding Range for native byte-seeking.
     http_client = httpx.AsyncClient(
@@ -81,25 +98,25 @@ async def proxy_plex_stream(key: str, request: Request):
         follow_redirects=True,
     )
     range_header = request.headers.get("range")
+    req_headers = dict(extra_headers)
+    if range_header:
+        req_headers["Range"] = range_header
     try:
-        plex_req = http_client.build_request(
-            "GET", plex_url,
-            headers={"Range": range_header} if range_header else {},
-        )
-        plex_resp = await http_client.send(plex_req, stream=True)
+        upstream_req = http_client.build_request("GET", source_url, headers=req_headers)
+        upstream_resp = await http_client.send(upstream_req, stream=True)
     except Exception:
         await http_client.aclose()
-        raise HTTPException(status_code=502, detail="Plex stream unavailable")
+        raise HTTPException(status_code=502, detail="Stream source unavailable")
 
-    content_type = plex_resp.headers.get("content-type", "application/octet-stream")
-    # Rare: an Ogg part Plex serves without an .ogg-family extension — the
+    content_type = upstream_resp.headers.get("content-type", "application/octet-stream")
+    # Rare: an Ogg part served without an .ogg-family extension — the
     # content-type is the only signal. Transcode it too (cached, no Range).
     if content_type.lower().startswith("audio/ogg"):
-        await plex_resp.aclose()
+        await upstream_resp.aclose()
         await http_client.aclose()
-        return await _serve_transcoded_flac(key, plex_url)
+        return await _serve_transcoded_flac(key, source_url, extra_headers)
 
-    return _stream_passthrough(plex_resp, http_client)
+    return _stream_passthrough(upstream_resp, http_client)
 
 
 def _stream_passthrough(plex_resp, http_client: httpx.AsyncClient) -> StreamingResponse:
@@ -252,22 +269,46 @@ _cache_lock = asyncio.Lock()                            # guards the OrderedDict
 _transcode_inflight: "dict[str, asyncio.Future]" = {}  # key -> in-flight transcode task
 
 
-async def _fetch_and_transcode(plex_url: str) -> str:
+def _pinned_keys() -> set[str]:
+    """Stream keys the LRU must never evict: every holder key of the
+    CURRENTLY-PLAYING track (2026-07-11 supervisor plan U6 sizing guard).
+
+    The effective-next prefetch (``state._warm_next_transcode``) now inserts
+    entries while the current track's artifact is still being range-served —
+    without the pin, a warm plus a burst of probe GETs could push the current
+    track out of LRU order, unlink its file, and force a mid-playback
+    re-transcode on the next Range request (the 2026-06-17 failure class).
+    Pinning by key (rather than raising capacity) is the minimal mechanism:
+    LRU semantics stay intact for everything else, no new tunable, and the
+    worst-case overshoot is bounded by ONE track's holder count. Reads the
+    queue engine at eviction time so the pin follows playback with no
+    write-through bookkeeping to forget."""
+    cur = state.queue_engine.state.current
+    if cur is None:
+        return set()
+    keys = {h.get("key") for h in (getattr(cur.track, "holds", None) or [])}
+    keys.discard(None)
+    if cur.track.stream_key:
+        keys.add(cur.track.stream_key)
+    return keys
+
+
+async def _fetch_and_transcode(plex_url: str, headers: dict | None = None) -> str:
     """Fetch the FULL upstream Ogg (no Range) and transcode it to a seekable
     temp FLAC file. The client's Range is never forwarded — FLAC byte offsets
     don't map to Ogg offsets, and a FLAC-coordinate Range 416s against the
-    smaller Ogg source."""
+    smaller Ogg source. Any provider auth headers are injected server-side."""
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
         follow_redirects=True,
     )
     try:
         plex_resp = await http_client.send(
-            http_client.build_request("GET", plex_url), stream=True
+            http_client.build_request("GET", plex_url, headers=headers or {}), stream=True
         )
     except Exception:
         await http_client.aclose()
-        raise HTTPException(status_code=502, detail="Plex stream unavailable")
+        raise HTTPException(status_code=502, detail="Stream source unavailable")
     try:
         return await _transcode_to_flac_file(plex_resp)
     finally:
@@ -275,7 +316,7 @@ async def _fetch_and_transcode(plex_url: str) -> str:
         await http_client.aclose()
 
 
-async def _get_or_transcode(key: str, plex_url: str) -> str:
+async def _get_or_transcode(key: str, plex_url: str, headers: dict | None = None) -> str:
     """Return a cached transcoded FLAC path for *key*, transcoding once on miss.
 
     Concurrent requests for the SAME key coalesce onto one transcode (a per-key
@@ -294,7 +335,7 @@ async def _get_or_transcode(key: str, plex_url: str) -> str:
             _TRANSCODE_CACHE.pop(key, None)
         task = _transcode_inflight.get(key)
         if task is None:
-            task = asyncio.ensure_future(_fetch_and_transcode(plex_url))
+            task = asyncio.ensure_future(_fetch_and_transcode(plex_url, headers))
             _transcode_inflight[key] = task
             task.add_done_callback(lambda _t, k=key: _transcode_inflight.pop(k, None))
 
@@ -307,20 +348,28 @@ async def _get_or_transcode(key: str, plex_url: str) -> str:
         if key not in _TRANSCODE_CACHE:
             _TRANSCODE_CACHE[key] = new_path
             _TRANSCODE_CACHE.move_to_end(key)
+            # Evict LRU-first, skipping the currently-playing track's keys and
+            # the entry just made (U6 sizing guard — see _pinned_keys). All
+            # candidates pinned → stop: a bounded overshoot beats unlinking
+            # the artifact a device is actively range-reading.
+            pinned = _pinned_keys()
+            pinned.add(key)
             while len(_TRANSCODE_CACHE) > _TRANSCODE_CACHE_MAX:
-                _, evicted = _TRANSCODE_CACHE.popitem(last=False)
-                if evicted != new_path:  # never unlink the file we just made
-                    _unlink_quietly(evicted)
+                victim = next((k for k in _TRANSCODE_CACHE if k not in pinned),
+                              None)
+                if victim is None:
+                    break
+                _unlink_quietly(_TRANSCODE_CACHE.pop(victim))
             _log.info("stream proxy: transcoded → seekable FLAC (%d bytes); "
                       "cached as %s, serving range-aware", os.path.getsize(new_path), key)
     return new_path
 
 
-async def _serve_transcoded_flac(key: str, plex_url: str):
+async def _serve_transcoded_flac(key: str, plex_url: str, headers: dict | None = None):
     """Serve the cached, seekable FLAC for *key* via a range-aware FileResponse
     (Content-Length + Accept-Ranges + 206). Transcodes once on cache miss."""
     try:
-        path = await _get_or_transcode(key, plex_url)
+        path = await _get_or_transcode(key, plex_url, headers)
     except HTTPException:
         raise
     except FileNotFoundError:
@@ -330,3 +379,87 @@ async def _serve_transcoded_flac(key: str, plex_url: str):
         _log.warning("stream proxy: transcode failed for %s: %s", plex_url, exc)
         raise HTTPException(status_code=502, detail="Transcode failed")
     return FileResponse(path, media_type="audio/flac")
+
+
+# ── Cast flow-mode stream (2026-07-11 supervisor plan U9) ─────────────────────
+# The api→output import direction is the allowed one (app/transcode.py's
+# layering rule forbids only the reverse); the flow ENGINE lives in
+# app/output/flow.py and this route is its single HTTP consumer surface.
+from app.output import flow as output_flow  # noqa: E402
+
+
+async def _primed_flow_body(first: bytes, rest):
+    """The flow response body: the primed first chunk, then the bound
+    generator (``itertools.chain`` shape). The finally closes ``rest``
+    deterministically whenever this wrapper starts; if Starlette abandons
+    the wrapper UNSTARTED (instant disconnect), dropping it releases the
+    only reference to ``rest`` — which IS started (suspended at a yield),
+    so asyncio's async-generator finalization runs its binding-release
+    finally promptly."""
+    try:
+        yield first
+        async for chunk in rest:
+            yield chunk
+    finally:
+        await rest.aclose()
+
+
+@router.get("/api/stream/flow/{session_id}")
+async def stream_flow(session_id: str, request: Request):
+    """Serve the continuous flow-mode stream for the active flow session.
+
+    SINGLE-SESSION resource, entirely unlike the seekable per-track proxy
+    above: exactly one consumer may be bound. A consumer disconnect arms the
+    session's short grace timer, and a new GET within it RE-BINDS the same
+    session mid-stream (Cast receivers re-request the media URL after
+    transient hiccups — the stream resumes from the current encode position,
+    never from zero). A second concurrent GET while a consumer is bound is
+    rejected with 409 and never spawns a second stitcher.
+
+    Auth posture: capability URL — deliberately NO ``is_authorized_stream_key``
+    check on this route. ``session_id`` is an unguessable 128-bit token
+    (``secrets.token_urlsafe(16)``) minted per flow session, and the id
+    itself IS the credential: presenting it is the authorization, the same
+    no-cookie posture as the per-track route's queue-authorized ``?key=``
+    (renderers can't send cookies, so a bearer-style URL secret is the only
+    workable scheme). A wrong or stale id 404s below having done no work,
+    so unauthenticated probing costs one registry dict lookup — there is
+    nothing an extra key check would reject earlier or more cheaply.
+
+    Served chunked and Range-less (the Cast live-read pattern): any Range
+    header is ignored and the response advertises ``Accept-Ranges: none`` —
+    a flow stream has no byte-addressable past to seek into.
+
+    The binding is PRIMED here rather than handed to Starlette cold:
+    ``bind_consumer`` marks the single consumer bound synchronously, but
+    only the generator body's finally releases it — and a never-STARTED
+    async generator runs no body and no finally, so a client that dropped
+    before Starlette's first ``__anext__`` would strand the binding forever
+    (every receiver re-request 409s, with the recovery grace armed only in
+    that same finally). Awaiting the first chunk in the route guarantees the
+    generator is started, and a started generator's finally IS guaranteed —
+    cancellation mid-priming, ``aclose``, and GC finalization all run it.
+    No await separates the conflict check from the bind, so two rapid GETs
+    still resolve to exactly one 200 and one 409.
+    """
+    del request  # Range-less by design; the request carries nothing we honor
+    session = output_flow.get_flow_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="No active flow session")
+    headers = {"Accept-Ranges": "none", "Cache-Control": "no-store"}
+    try:
+        body = session.bind_consumer()
+    except output_flow.FlowConsumerConflict:
+        raise HTTPException(
+            status_code=409, detail="Flow stream already bound to a consumer")
+    try:
+        first = await body.__anext__()  # the priming read (see docstring)
+    except StopAsyncIteration:
+        # Ended-and-drained session: nothing left to stream. The priming ran
+        # the generator to completion, finally included — nothing to release.
+        return Response(b"", media_type=session.content_type, headers=headers)
+    return StreamingResponse(
+        _primed_flow_body(first, body),
+        media_type=session.content_type,
+        headers=headers,
+    )

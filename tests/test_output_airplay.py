@@ -647,7 +647,7 @@ async def test_play_spawns_cliraop_for_raop_only_receiver(airplay_module, monkey
     # The WiiM Pro shape from the TrueNAS logs — just am/et/md/cn,
     # no features and no pk. _use_ap2 returns False.
     backend._device_addr["wiim"] = (
-        "42FDF3255868@WiiM Pro-5868", "192.168.1.42", 7000,
+        "A1B2C3D4E5F6@WiiM Pro-E5F6", "192.168.1.42", 7000,
         {"am": "WiiM Pro", "et": "0,1", "md": "0,1,2", "cn": "0,1,2,3"},
     )
     await backend.set_device("wiim")
@@ -1601,14 +1601,14 @@ def test_ensure_deviceid_synthesizes_from_name_prefix(airplay_module):
     """cliap2 logs `airplay: AirPlay device 'X' is missing a device ID`
     when --txt doesn't carry `deviceid`. The avahi-advertised RAOP
     service name follows `<12-hex>@<friendly>` (e.g.
-    `42FDF3255868@WiiM Pro-5868`); extract the MAC and inject as a
+    `A1B2C3D4E5F6@WiiM Pro-E5F6`); extract the MAC and inject as a
     colon-separated `deviceid` so cliap2 has the id its RAOP code
     matches against."""
     out = airplay_module._ensure_deviceid(
-        "42FDF3255868@WiiM Pro-5868",
+        "A1B2C3D4E5F6@WiiM Pro-E5F6",
         {"am": "WiiM Pro", "cn": "0,1,2,3"},
     )
-    assert out["deviceid"] == "42:FD:F3:25:58:68"
+    assert out["deviceid"] == "A1:B2:C3:D4:E5:F6"
     # Other entries preserved.
     assert out["am"] == "WiiM Pro"
     assert out["cn"] == "0,1,2,3"
@@ -1619,7 +1619,7 @@ def test_ensure_deviceid_does_not_overwrite_existing(airplay_module):
     keeps the advertised value — never silently replace the speaker's
     own identity."""
     out = airplay_module._ensure_deviceid(
-        "42FDF3255868@WiiM Pro-5868",
+        "A1B2C3D4E5F6@WiiM Pro-E5F6",
         {"deviceid": "AA:BB:CC:DD:EE:FF", "am": "WiiM Pro"},
     )
     assert out["deviceid"] == "AA:BB:CC:DD:EE:FF"
@@ -1641,7 +1641,7 @@ def test_ensure_deviceid_returns_new_dict_not_mutation(airplay_module):
     """Caller's TXT dict must not be mutated — defensive against future
     callers who pass a shared/cached TXT dict from discovery state."""
     original = {"am": "WiiM Pro"}
-    out = airplay_module._ensure_deviceid("42FDF3255868@WiiM Pro-5868", original)
+    out = airplay_module._ensure_deviceid("A1B2C3D4E5F6@WiiM Pro-E5F6", original)
     assert out is not original
     assert "deviceid" not in original
 
@@ -1718,7 +1718,7 @@ def test_build_cliap2_args_normalises_raw_discovery_txt(airplay_module):
     the contract regardless of how many spawn call sites exist."""
     args = airplay_module._build_cliap2_args(
         binary="/usr/local/bin/cliap2",
-        name="42FDF3255868@WiiM Pro-5868",
+        name="A1B2C3D4E5F6@WiiM Pro-E5F6",
         host="192.168.0.117",
         port=7000,
         txt={"ft": "0x445D0A00,0x1C340", "am": "WiiM Pro", "cn": "0,1"},
@@ -1733,7 +1733,7 @@ def test_build_cliap2_args_normalises_raw_discovery_txt(airplay_module):
     txt_value = args[args.index("--txt") + 1]
     assert '"features=0x445D0A00,0x1C340"' in txt_value
     assert '"model=WiiM Pro"' in txt_value
-    assert '"deviceid=42:FD:F3:25:58:68"' in txt_value
+    assert '"deviceid=A1:B2:C3:D4:E5:F6"' in txt_value
 
 
 @pytest.mark.asyncio
@@ -1932,7 +1932,7 @@ async def test_discover_devices_returns_output_devices(
     async def fake_discover(service_type, aiozc=None):
         assert service_type == "_raop._tcp.local"
         return [
-            ("14EA63E0F446@JBL Charge 5 Wi-Fi SE", "192.168.1.20", 7000, None,
+            ("112233445566@JBL Charge 5 Wi-Fi SE", "192.168.1.20", 7000, None,
              {"am": "JBLChargeAlfa", "cn": "0,1,2,3"}),
             ("WiiM Pro", "192.168.1.21", 7000, None, {"am": "WiiM"}),
         ]
@@ -1998,7 +1998,7 @@ async def test_discover_devices_merges_cache_never_evicts_missed_devices(
     txt = {"am": "JBLChargeAlfa"}
 
     async def fake_discover(service_type, aiozc=None):
-        return [("14EA63E0F446@JBL", "192.168.1.20", 7000, None, txt)]
+        return [("112233445566@JBL", "192.168.1.20", 7000, None, txt)]
 
     monkeypatch.setattr(mdns_zeroconf, "discover", fake_discover)
     devices = await backend.discover_devices()
@@ -2010,7 +2010,7 @@ async def test_discover_devices_merges_cache_never_evicts_missed_devices(
     assert backend._device_addr["10.0.0.9:7000"] == (
         "AA@Retained", "10.0.0.9", 7000, {"am": "X"})
     assert backend._device_addr["192.168.1.20:7000"] == (
-        "14EA63E0F446@JBL", "192.168.1.20", 7000, txt)
+        "112233445566@JBL", "192.168.1.20", 7000, txt)
 
 
 @pytest.mark.asyncio
@@ -2047,7 +2047,7 @@ async def test_discover_falls_back_to_dbus(airplay_module, monkeypatch, tmp_path
 
     async def fake_dbus(service_type):
         assert service_type == "_raop._tcp.local"
-        return [("42FDF3255868@WiiM Pro-5868", "192.168.0.50", 7000, None, txt)]
+        return [("A1B2C3D4E5F6@WiiM Pro-E5F6", "192.168.0.50", 7000, None, txt)]
 
     monkeypatch.setattr(mdns_zeroconf, "discover", zc_none)
     monkeypatch.setattr(mdns_dbus, "discover", fake_dbus)
@@ -2055,9 +2055,9 @@ async def test_discover_falls_back_to_dbus(airplay_module, monkeypatch, tmp_path
     backend = airplay_module.AirPlayBackend()
     devices = await backend.discover_devices()
     assert [d.id for d in devices] == ["192.168.0.50:7000"]
-    assert devices[0].name == "WiiM Pro-5868"  # MAC prefix stripped for display
+    assert devices[0].name == "WiiM Pro-E5F6"  # MAC prefix stripped for display
     # Raw avahi name retained in the cache (cliap2 _ensure_deviceid needs it).
-    assert backend._device_addr["192.168.0.50:7000"][0] == "42FDF3255868@WiiM Pro-5868"
+    assert backend._device_addr["192.168.0.50:7000"][0] == "A1B2C3D4E5F6@WiiM Pro-E5F6"
 
 
 # ── U1: _strip_raop_mac_prefix helper + display-name integration ─────────────
@@ -2067,8 +2067,8 @@ def test_strip_raop_mac_prefix_strips_canonical_form(airplay_module):
     """Avahi RAOP service names follow `<12-hex-mac>@<friendly>`; the canonical
     shape strips to just the friendly part so the picker shows clean labels."""
     strip = airplay_module._strip_raop_mac_prefix
-    assert strip("42FDF3255868@WiiM Pro-5868") == "WiiM Pro-5868"
-    assert strip("14EA63E0F446@JBL Charge 5 Wi-Fi SE") == "JBL Charge 5 Wi-Fi SE"
+    assert strip("A1B2C3D4E5F6@WiiM Pro-E5F6") == "WiiM Pro-E5F6"
+    assert strip("112233445566@JBL Charge 5 Wi-Fi SE") == "JBL Charge 5 Wi-Fi SE"
 
 
 def test_strip_raop_mac_prefix_passes_through_no_prefix(airplay_module):
@@ -2093,12 +2093,12 @@ def test_strip_raop_mac_prefix_handles_empty(airplay_module):
 
 
 def test_strip_raop_mac_prefix_falls_back_when_strip_would_be_empty(airplay_module):
-    """If a name is JUST the prefix (`42FDF3255868@`), stripping would leave
+    """If a name is JUST the prefix (`A1B2C3D4E5F6@`), stripping would leave
     the display name empty — the picker would show a blank entry. Fall back
     to the raw form in that case so the operator can still identify the
     device by its hex id."""
     strip = airplay_module._strip_raop_mac_prefix
-    assert strip("42FDF3255868@") == "42FDF3255868@"
+    assert strip("A1B2C3D4E5F6@") == "A1B2C3D4E5F6@"
 
 
 @pytest.mark.asyncio
@@ -2112,7 +2112,7 @@ async def test_discover_devices_strips_mac_prefix_from_display_name(
 
     from app.output import mdns_zeroconf
 
-    raw_avahi_name = "42FDF3255868@WiiM Pro-5868"
+    raw_avahi_name = "A1B2C3D4E5F6@WiiM Pro-E5F6"
     txt = {"am": "WiiM", "ft": "0x445F8A00,0x1C340"}
 
     async def fake_discover(service_type, aiozc=None):
@@ -2124,7 +2124,7 @@ async def test_discover_devices_strips_mac_prefix_from_display_name(
     devices = await backend.discover_devices()
 
     assert len(devices) == 1
-    assert devices[0].name == "WiiM Pro-5868"
+    assert devices[0].name == "WiiM Pro-E5F6"
     # The raw name MUST survive in _device_addr so cliap2's deviceid
     # synthesis (extracts the 12-hex MAC from the prefix) keeps working.
     cached = backend._device_addr["192.168.1.50:7000"]
@@ -2400,12 +2400,18 @@ class _ExitingProc:
 
 
 @pytest.mark.asyncio
-async def test_watcher_fires_advance_on_unexpected_exit(
-    airplay_module, monkeypatch, tmp_path
+async def test_watcher_nonzero_exit_reports_outage_not_advance(
+    airplay_module, monkeypatch, tmp_path, fresh_supervisor
 ):
-    """cliap2 exits non-zero before stderr emitted EOS → advance and crash
-    broadcast. Matches AE5: queue keeps moving even if the speaker dies."""
+    """cliap2 exits non-zero before stderr emitted EOS → the crash path is
+    re-pointed to outage-suspected (supervisor plan U2, R16) instead of the
+    old broadcast+advance. The classifier probes reachability and either
+    holds (speaker dead — an outage must not consume queue items) or skips
+    (speaker up — today's behavior, with the skip toast)."""
     _stub_binaries(monkeypatch, tmp_path, present=True)
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
 
     advance_calls: list[int] = []
     async def _advance():
@@ -2430,11 +2436,38 @@ async def test_watcher_fires_advance_on_unexpected_exit(
     proc.signal_exit()
     await backend._process_watcher_body(proc)
 
-    assert len(advance_calls) == 1
-    assert len(broadcast_calls) == 1
-    # Broadcast carries the OutputChangedEvent backend_type=error shape.
-    event = broadcast_calls[0][0][0]
-    assert event.backend_type == "error"
+    assert advance_calls == []                 # never advances directly (R16)
+    assert broadcast_calls == []               # classifier owns visibility now
+    assert outages == ["process_crash"]
+
+
+@pytest.mark.asyncio
+async def test_watcher_clean_exit_still_advances(
+    airplay_module, monkeypatch, tmp_path, fresh_supervisor
+):
+    """returncode=0 (cliraop processed the whole stream) stays the natural
+    end-of-stream advance — U2's re-point touches only the crash path."""
+    _stub_binaries(monkeypatch, tmp_path, present=True)
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+
+    advance_calls: list[int] = []
+    async def _advance():
+        advance_calls.append(1)
+
+    backend = airplay_module.AirPlayBackend(advance_cb=_advance)
+    backend._is_playing = True
+    backend._exit_handled = False
+
+    proc = _ExitingProc(returncode=0)
+    backend._cliap2_proc = proc
+
+    proc.signal_exit()
+    await backend._process_watcher_body(proc)
+
+    assert advance_calls == [1]
+    assert outages == []
 
 
 @pytest.mark.asyncio
@@ -2709,3 +2742,139 @@ async def test_watcher_clears_own_task_ref_before_teardown(
         await fake_watcher
     except asyncio.CancelledError:
         pass
+
+
+# ── confirmed-start proxy (2026-07-11 supervisor plan U1) ─────────────────────
+# AirPlay has no data-plane "audio is rendering" signal (the pyatv-era
+# control-plane-success/data-plane-silent ceiling), so the backend reports a
+# PROXY: sender subprocess alive past the NTP startup delay + grace, with the
+# position anchor progressing. asyncio.sleep is patched — no real waits.
+
+async def test_confirm_proxy_fires_when_sender_alive_past_startup(airplay_module, fresh_supervisor):
+    from unittest.mock import AsyncMock, MagicMock, patch
+    sup, timers, rec = fresh_supervisor
+    backend = airplay_module.AirPlayBackend()
+    token = sup.on_dispatched(_DummyTrack())
+    proc = MagicMock()
+    proc.returncode = None                     # sender still running
+    backend._cliap2_proc = proc
+    backend._is_playing = True
+    backend._stop_requested = False
+    backend._playback_started_at = 123.0       # anchor set → position progressing
+    ntp_delay_s = 0
+    sleep_mock = AsyncMock(return_value=None)
+    with patch("app.output.airplay.asyncio.sleep", sleep_mock):
+        await backend._confirm_start_body(proc, ntp_delay_s, token)
+    rec.assert_called_once()
+    # Startup-delay guard: the proxy waits exactly NTP delay + grace before
+    # judging liveness — never confirms early.
+    sleep_mock.assert_awaited_once_with(
+        ntp_delay_s + airplay_module._AIRPLAY_CONFIRM_GRACE_S)
+
+
+async def test_confirm_proxy_declines_when_sender_died_during_startup(airplay_module, fresh_supervisor):
+    """A pre-startup crash never confirms — the process watcher owns that
+    exit and the supervisor's deadline classifies the dispatch."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    sup, timers, rec = fresh_supervisor
+    backend = airplay_module.AirPlayBackend()
+    token = sup.on_dispatched(_DummyTrack())
+    proc = MagicMock()
+    proc.returncode = 1                        # crashed
+    backend._cliap2_proc = proc
+    backend._is_playing = True
+    backend._stop_requested = False
+    backend._playback_started_at = 123.0
+    with patch("app.output.airplay.asyncio.sleep", AsyncMock(return_value=None)):
+        await backend._confirm_start_body(proc, 0, token)
+    rec.assert_not_called()
+
+
+async def test_confirm_proxy_declines_after_stop_or_supersede(airplay_module, fresh_supervisor):
+    from unittest.mock import AsyncMock, MagicMock, patch
+    sup, timers, rec = fresh_supervisor
+    backend = airplay_module.AirPlayBackend()
+    token = sup.on_dispatched(_DummyTrack())
+    proc = MagicMock()
+    proc.returncode = None
+    backend._is_playing = True
+    backend._stop_requested = False
+    backend._playback_started_at = 123.0
+    backend._cliap2_proc = MagicMock()         # a NEWER session's process
+    with patch("app.output.airplay.asyncio.sleep", AsyncMock(return_value=None)):
+        await backend._confirm_start_body(proc, 0, token)   # stale proc
+    rec.assert_not_called()
+
+    backend._cliap2_proc = proc
+    backend._stop_requested = True             # user stop before audio
+    with patch("app.output.airplay.asyncio.sleep", AsyncMock(return_value=None)):
+        await backend._confirm_start_body(proc, 0, token)
+    rec.assert_not_called()
+
+
+async def test_teardown_cancels_confirm_task(airplay_module):
+    """_teardown sweeps the confirm-proxy task with the reader/watcher tasks
+    so a stale proxy can't confirm after a new session starts."""
+    backend = airplay_module.AirPlayBackend()
+    task = asyncio.create_task(asyncio.sleep(60))
+    backend._confirm_task = task
+    await backend._teardown(send_stop=False, caller="test")
+    assert task.done()
+    assert backend._confirm_task is None
+
+
+# ── reachability probe (2026-07-11 supervisor plan U2) ────────────────────────
+# The plan's KTD defines probe semantics for Cast/DLNA/Direct; AirPlay's
+# equivalent is a TCP connect to the cached receiver address (cliap2 exposes
+# no transport state). Reachable → the classifier keeps today's skip; socket
+# dead → device-level hold.
+
+@pytest.mark.asyncio
+async def test_probe_liveness_tcp_connect_success_is_reachable(
+    airplay_module, monkeypatch, tmp_path
+):
+    from unittest.mock import AsyncMock, MagicMock
+    _stub_binaries(monkeypatch, tmp_path, present=True)
+    backend = airplay_module.AirPlayBackend()
+    backend._device_id = "dev1"
+    backend._device_addr["dev1"] = ("Speaker", "192.168.1.40", 7000, {})
+
+    writer = MagicMock()
+    writer.close = MagicMock()
+    writer.wait_closed = AsyncMock()
+    opened = []
+
+    async def _open_connection(host, port):
+        opened.append((host, port))
+        return (MagicMock(), writer)
+
+    monkeypatch.setattr(airplay_module.asyncio, "open_connection", _open_connection)
+    assert await backend.probe_liveness() == (True, None)
+    assert opened == [("192.168.1.40", 7000)]
+    writer.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_probe_liveness_refused_connection_is_unreachable(
+    airplay_module, monkeypatch, tmp_path
+):
+    _stub_binaries(monkeypatch, tmp_path, present=True)
+    backend = airplay_module.AirPlayBackend()
+    backend._device_id = "dev1"
+    backend._device_addr["dev1"] = ("Speaker", "192.168.1.40", 7000, {})
+
+    async def _open_connection(host, port):
+        raise ConnectionRefusedError("down")
+
+    monkeypatch.setattr(airplay_module.asyncio, "open_connection", _open_connection)
+    assert await backend.probe_liveness() == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_probe_liveness_no_cached_address_is_unreachable(
+    airplay_module, monkeypatch, tmp_path
+):
+    _stub_binaries(monkeypatch, tmp_path, present=True)
+    backend = airplay_module.AirPlayBackend()
+    backend._device_id = None
+    assert await backend.probe_liveness() == (False, None)

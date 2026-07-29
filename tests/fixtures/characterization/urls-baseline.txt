@@ -1,6 +1,8 @@
 /admin/artist-exclusions
 /admin/auth/logout
+/admin/history/remove-play
 /admin/login
+/admin/most-played/remove
 /admin/output/active
 /admin/output/airplay-protocols
 /admin/output/devices
@@ -25,7 +27,14 @@
 /admin/queue/lock
 /admin/queue/move
 /admin/queue/unlock
+/admin/scan-status
 /admin/settings
+/admin/sources
+/admin/sources/
+/admin/sources/jellyfin
+/admin/sources/local
+/admin/sources/priority
+/admin/sources/rescan
 /admin/surprise/recent
 /admin/track-rating
 /admin/track-tags
@@ -50,6 +59,7 @@
 /api/queue/surprise
 /api/queue/undo
 /api/recently-added
+/api/scan-status
 /api/search
 /api/search/broad
 /api/servers

@@ -119,18 +119,45 @@ ADMIN_ALLOWED = {
     # Shared playback module mount + transport chrome
     "playbackHandle", "btnPrev", "isPlaying", "_historyEmpty", "_syncPrevEnabled",
     "decorateQueueRow", "refreshQueueState",
+    # Output-session outage banner (2026-07-11 supervisor plan U4): admin-only
+    # rich detail (device / attempts / retry / Resume button) layered over the
+    # shared lean note, which lives in static/playback/index.js
+    # (applyOutputSession — a forbidden symbol below, so it can't fork here).
+    "renderOutputSessionBanner",
     # Libraries / Plex / Settings (admin chrome)
     # Pattern Matching / Artist Exclusion editors (2026-06-10 pattern-rules
     # plan U4) — admin-only Setup chrome per the project standard.
     "patternRules", "exclusionNames", "editorsDirty",
     "renderPatternRules", "renderExclusions", "syncInertHint", "loadRuleEditors",
-    "libraryList", "renderLibraryList", "loadLibraries", "adminRescan",
+    "loadLibraries",  # compat alias -> loadSources (source-grouped list rewrite)
     "btnConnectPlex", "plexConnectSpinner", "plexConnectError",
     "plexPollInterval", "plexPollTimeout",
+    # Multi-source Sources panel (plan U14): connect/remove/rescan/priority —
+    # admin-only Setup chrome (no shared-module overlap; distinct from queue drag).
+    "sourcesList", "jfConnectError", "SOURCE_TYPE_LABELS", "_currentSources",
+    "renderSourcesList", "loadSources", "connectJellyfin", "connectLocal", "removeSource",
+    "rescanSources", "moveSourcePriority",
+    # Source-grouped Libraries panel (Libraries-panel redesign): the last libraries
+    # payload + which drill-ins are open + which switches are mid-request (so a
+    # re-render preserves open state and blocks double-toggles). Rendering lives in
+    # renderSourcesList; per-library rows nest under their source, no shared overlap.
+    "_currentLibs", "_openDrills", "_togglingSources", "_loadSourcesGen",
+    # Surprise Me capability-degradation note — toggled by source mix (plan U13).
+    "syncSurpriseSourceNote",
+    # Admin Sources scan-status badge (plan U15): scanning / scanned-empty.
+    "renderSourceScanStatus",
     "loadSettings",
     # Surprise "Recent suggestions" readout — shared render path for the GET fetch
     # + the live surprise_recorded WS event (admin-only Setup chrome).
     "renderSurpriseRecent",
+    # Recent Plays curation panel (2026-07-03 plan): admin-only Setup chrome to prune
+    # recent plays. Fed by refreshQueueState + queue_changed history; renders its own
+    # compact rows (a distinct management surface, NOT a shared-module fork — like the
+    # Sources / Surprise-Recent panels), pages client-side over the ~50 live buffer,
+    # and reuses POST /admin/history/remove-play.
+    "_recentPlaysData", "_recentPlaysPage", "_recentPlaysGen", "_recentPlaysExpanded",
+    "_playedAgo", "setRecentPlaysData", "renderRecentPlays", "toggleRecentPlays",
+    "removeRecentPlay",
     # Default-scheme picker (glow-up U6 — Setup chrome over the shared
     # APPEARANCE_SCHEMES table; admin-only by design)
     "defaultScheme", "renderDefaultSchemePicker",
@@ -156,6 +183,13 @@ FORBIDDEN_SYMBOLS = {
     # playbackHandle.applyClosingTime (a method call, not a declaration — not
     # extracted), so forbidding these names only fires on a per-page fork.
     "applyClosingTime", "_ensureClosingEl",
+    # Output-session (outage) note (2026-07-11 supervisor plan U4): the shared
+    # lean "paused — output offline" render lives ONLY in
+    # static/playback/index.js. Per-page files dispatch the output_session
+    # event to playbackHandle.applyOutputSession (a method call, not a
+    # declaration); admin-only banner DETAIL is renderOutputSessionBanner
+    # (allowlisted above). Forbidding the shared name fires on a per-page fork.
+    "applyOutputSession",
     "gStartTick", "gStopTick", "gStartSync", "gStopSync",
     "startProgressTick", "stopProgressTick", "startProgressSync", "stopProgressSync",
     "gFmtMs", "fmtMs",
@@ -473,6 +507,31 @@ def test_closing_banner_is_single_source():
         assert "closing-time-overlay" not in src, (
             f"{page} must not render the banner itself — single-source in the "
             f"playback module (the discipline test forbids applyClosingTime there)."
+        )
+
+
+def test_output_session_note_is_single_source():
+    """Output-session (outage) state render lives ONLY in the shared playback
+    module (2026-07-11 supervisor plan U4): the lean paused/interrupted note is
+    single-source; per-page files dispatch the output_session event to
+    playbackHandle.applyOutputSession and must not render the note themselves.
+    (Admin-only banner DETAIL — renderOutputSessionBanner — is page chrome and
+    allowed; it renders into its own #output-outage-banner, never the shared
+    .np-output-note.) Mirrors test_closing_banner_is_single_source."""
+    shared = (ROOT / "static/playback/index.js").read_text(encoding="utf-8")
+    assert "function applyOutputSession" in shared and "np-output-note" in shared, (
+        "static/playback/index.js must define applyOutputSession AND the note DOM "
+        "(.np-output-note) — it's the single home for the shared outage note."
+    )
+    for page in ("static/guest/app.js", "static/admin/app.js"):
+        src = (ROOT / page).read_text(encoding="utf-8")
+        assert "playbackHandle.applyOutputSession" in src, (
+            f"{page} must dispatch the output_session event to the shared handle."
+        )
+        assert "np-output-note" not in src, (
+            f"{page} must not render the shared outage note itself — single-source "
+            f"in the playback module (the forbidden-symbol check bars "
+            f"applyOutputSession there)."
         )
 
 

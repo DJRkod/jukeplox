@@ -1335,3 +1335,145 @@ async def test_get_artist_popular_tracks_fails_safe_on_error(respx_mock):
         return_value=httpx.Response(500)
     )
     assert await make_client().get_artist_popular_tracks("10") == []
+
+
+# ── MultiPlexClient.get_libraries: parallel, bounded, LOUD (2026-07-17) ────────
+# ce-debug of the guest-search 17s bug: the old sequential loop awaited each
+# server in turn and swallowed failures with a bare `except: pass` — one
+# blackholed server made every enabled-libraries refresh block 15s (the full
+# httpx timeout), silently dropped that server's libraries, and left zero log
+# evidence. Four debugging rounds were spent finding it. These tests pin the
+# replacement contract: legs run CONCURRENTLY, a failed leg costs a WARNING
+# that names the server, and the healthy legs' results always come back.
+
+
+async def test_multi_get_libraries_runs_legs_concurrently():
+    import asyncio
+    from app.plex.client import MultiPlexClient
+
+    b_entered = asyncio.Event()
+
+    class _A:
+        machine_id = "a"
+        server_name = "Alpha"
+        async def get_libraries(self):
+            # If legs were sequential (A awaited before B starts), this wait
+            # would deadlock — the 2s bound turns that into a loud failure.
+            await asyncio.wait_for(b_entered.wait(), timeout=2)
+            return ["libA"]
+
+    class _B:
+        machine_id = "b"
+        server_name = "Beta"
+        async def get_libraries(self):
+            b_entered.set()
+            return ["libB"]
+
+    m = MultiPlexClient([_A(), _B()])
+    libs = await __import__("asyncio").wait_for(m.get_libraries(), timeout=5)
+    assert sorted(libs) == ["libA", "libB"]
+
+
+async def test_multi_get_libraries_failed_leg_logs_and_keeps_others(caplog):
+    import logging
+    from app.plex.client import MultiPlexClient
+
+    class _Good:
+        machine_id = "a"
+        server_name = "Alpha"
+        async def get_libraries(self):
+            return ["libA"]
+
+    class _Dead:
+        machine_id = "b"
+        server_name = "DeadServer"
+        async def get_libraries(self):
+            raise TimeoutError("connect timed out")
+
+    m = MultiPlexClient([_Good(), _Dead()])
+    with caplog.at_level(logging.WARNING, logger="app.plex.client"):
+        libs = await m.get_libraries()
+    assert libs == ["libA"]
+    assert any("DeadServer" in r.getMessage() for r in caplog.records), (
+        "a failed get_libraries leg must WARN with the server name — the old "
+        "silent swallow hid a dead server through four debugging rounds"
+    )
+
+
+def test_plex_client_splits_connect_timeout():
+    """A blackholed server must fail the CONNECT phase in ~5s, not burn the
+    full 15s read budget (the 15s-per-refresh stall of the 17s search bug)."""
+    from app.plex.client import PlexClient
+    c = PlexClient("http://192.0.2.1:32400", "tok", "cid", "mid", "Srv")
+    t = c._http.timeout
+    assert t.connect == 5.0, f"connect timeout must be 5.0, got {t.connect}"
+    assert t.read == 15.0, f"read timeout must stay 15.0, got {t.read}"
+
+
+# ── U3: whole-library decode+parse runs off the event loop ────────────────────
+
+async def test_whole_library_401_raises_plex_auth_error(respx_mock):
+    """The off-loop path (_get_raw) preserves _get's auth contract: a 401 on a
+    whole-library section-all fetch is a typed PlexAuthError, not a bare
+    HTTPStatusError that the auth re-prompt flow would miss."""
+    import httpx
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(
+        return_value=httpx.Response(401)
+    )
+    client = make_client()
+    with pytest.raises(PlexAuthError):
+        await client.get_tracks("1")
+
+
+async def test_whole_library_parse_runs_off_the_event_loop(respx_mock, monkeypatch):
+    """Structural (not wall-clock): the decode+parse executes on an executor
+    worker thread, not the event-loop thread — this is what keeps transport
+    controls responsive during a large crawl (fix U3, the reported freeze)."""
+    import threading
+    import httpx
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(
+        return_value=httpx.Response(200, json=_metadata_response(
+            {"ratingKey": "1", "title": "T", "grandparentTitle": "A",
+             "parentTitle": "Al", "duration": 1000},
+        ))
+    )
+    client = make_client()
+    loop_thread = threading.get_ident()
+    parse_thread: list[int] = []
+    real_parse = client._parse_tracks
+
+    def record(raw):
+        parse_thread.append(threading.get_ident())
+        return real_parse(raw)
+
+    monkeypatch.setattr(client, "_parse_tracks", record)
+    tracks = await client.get_tracks("1")
+    assert len(tracks) == 1
+    assert parse_thread and parse_thread[0] != loop_thread
+
+
+async def test_get_raw_concurrency_is_capped_per_client():
+    """_get_raw rides the same per-client semaphore as _get, so the off-loop
+    whole-library fetches stay bounded by one ceiling. Parses run AFTER the
+    semaphore releases, so the cap governs sockets, not thread-pool time."""
+    import asyncio
+    from unittest.mock import MagicMock
+    client = make_client(max_concurrency=4)
+    in_flight = 0
+    peak = 0
+
+    async def fake_get(*args, **kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.content = b'{"MediaContainer": {}}'
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    client._http.get = fake_get
+    await asyncio.gather(*[client._get_raw(f"/p{i}") for i in range(20)])
+    assert 0 < peak <= 4

@@ -1,7 +1,8 @@
 # Jukeplox on TrueNAS Scale
 
 Install via the **Apps** UI. You need a dataset for app data (e.g. `/mnt/<pool>/jukeplox`)
-and a Plex account. Playback goes to network speakers (Chromecast/AirPlay/DLNA).
+and at least one music source — a Plex account, a Jellyfin server, or a folder of audio
+files on the NAS. Playback goes to network speakers (Chromecast/AirPlay/DLNA).
 
 ## 1. Create a Custom App
 
@@ -16,7 +17,7 @@ Apps → **Discover Apps** → **Custom App**. Set:
 
 ## 2. Container
 
-- **Environment Variables** → add `BIND_HOST` = your TrueNAS LAN IP (e.g. `192.168.0.70`). Lets Chromecast/DLNA fetch audio through Jukeplox. *(Skip only if you use AirPlay exclusively.)*
+- **Environment Variables** → add `BIND_HOST` = your TrueNAS LAN IP (e.g. `192.168.1.50`). Lets Chromecast/DLNA fetch audio through Jukeplox. *(Skip only if you use AirPlay exclusively.)*
 - **Restart Policy** → **Unless Stopped** — so it recovers from a crash. The default ("No") leaves Jukeplox down until you restart it by hand.
 
 ## 3. Network
@@ -36,12 +37,18 @@ Under **Storage and Persistence**, add two **Host Path** mounts:
 TrueNAS runs its own `avahi-daemon` (which owns UDP 5353), so Jukeplox asks avahi over the
 system D-Bus socket instead — that's the second mount. No host reconfiguration needed.
 
+**Using a local music folder as a source?** Add a third **Host Path** mount — your music
+dataset (e.g. `/mnt/<pool>/music`) → `/music`, set **Read Only**. Then in the app, **Connect
+Local Folder** → `/music` (the path is checked inside the container, so it must be mounted,
+not typed as a host path). Jellyfin needs no mount — it's reached over the network.
+
 ## 5. Install and set up
 
 Click **Install** and wait for **Running** (~30s). Open `http://<your-truenas-ip>`, then:
 
 1. Set an admin password — **≥12 chars, no reset** (forgetting it means wiping app data).
-2. Connect Plex — enter the code it shows at plex.tv.
+2. Add a music source under **Setup → Libraries** — Plex (code at plex.tv), Jellyfin
+   (sign in), or a local folder (`/music` from step 4). Then **Rescan**.
 3. Pick a speaker under **Setup → Output**.
 
 Share `http://<your-truenas-ip>` with guests — no app or password needed. *(Optional: add a

@@ -513,3 +513,184 @@ async def test_close_out_with_empty_queue_leaves_queue_empty(engine):
     assert engine.state.current is None
     assert list(engine.queue) == []
     assert engine.history[0].track_id == "cur"
+
+
+# ── admin history removal (play-data curation plan U3) ───────────────────────
+
+def _hist_item(track_id, added_at, album="Album", artist="Artist"):
+    from app.queue.models import QueueItem
+    t = make_track(track_id)
+    t.album = album
+    t.artist = artist
+    return QueueItem(track=t, added_at=added_at)
+
+
+async def test_remove_history_entry_removes_match_and_returns_it(engine):
+    from collections import deque
+    engine._history = deque([
+        _hist_item("t2", "2026-07-03T00:00:02+00:00"),
+        _hist_item("t1", "2026-07-03T00:00:01+00:00", album="Broken", artist="NIN"),
+    ])
+    events = []
+
+    async def cb(event, payload):
+        events.append(event)
+
+    engine.add_callback(cb)
+    removed = await engine.remove_history_entry("t1", "2026-07-03T00:00:01+00:00")
+    assert removed is not None
+    assert removed.track.album == "Broken" and removed.track.artist == "NIN"
+    assert [h.track_id for h in engine.history] == ["t2"]
+    assert events.count("queue_changed") == 1
+
+
+async def test_remove_history_entry_not_found_returns_none(engine):
+    from collections import deque
+    engine._history = deque([_hist_item("t1", "A")])
+    events = []
+
+    async def cb(event, payload):
+        events.append(event)
+
+    engine.add_callback(cb)
+    removed = await engine.remove_history_entry("t1", "MISMATCH")
+    assert removed is None
+    assert [h.track_id for h in engine.history] == ["t1"]   # untouched
+    assert events.count("queue_changed") == 0               # no emit on no-op
+
+
+async def test_remove_history_entry_tie_break_removes_head_only(engine):
+    from collections import deque
+    # Two entries share BOTH track_id and added_at → remove exactly one (head-most).
+    engine._history = deque([
+        _hist_item("t1", "SAME", album="head"),
+        _hist_item("t1", "SAME", album="tail"),
+    ])
+    removed = await engine.remove_history_entry("t1", "SAME")
+    assert removed.track.album == "head"
+    assert len(engine.history) == 1
+    assert engine.history[0].track.album == "tail"
+
+
+# ── outage hold (2026-07-11 supervisor plan U2) ───────────────────────────────
+
+async def test_hold_current_front_inserts_marked_and_pauses(engine):
+    """Device-level failure mid-track: the interrupted current re-front-inserts
+    carrying the play_recorded mark, current clears, and the queue lands
+    PAUSED (guest UI coherence) — nothing consumed, nothing lost."""
+    await engine.append(make_track("t1"))
+    await engine.append(make_track("t2"))
+    await engine.advance()                       # t1 playing, t2 queued
+
+    held = await engine.hold_current(play_recorded=True)
+
+    assert held is not None and held.track_id == "t1"
+    assert held.play_recorded is True
+    assert [i.track_id for i in engine.queue] == ["t1", "t2"]
+    assert engine.state.current is None
+    assert engine.state.is_playing is False
+    assert engine.state.is_paused is True
+
+
+async def test_hold_current_noop_when_idle(engine):
+    """No current → nothing to hold; repeated holds cannot double-insert."""
+    await engine.append(make_track("t1"))
+    assert await engine.hold_current(play_recorded=True) is None
+    assert [i.track_id for i in engine.queue] == ["t1"]
+    # And after a real hold, a second call is a no-op (current is gone).
+    await engine.advance()
+    await engine.hold_current(play_recorded=False)
+    assert await engine.hold_current(play_recorded=False) is None
+    assert [i.track_id for i in engine.queue] == ["t1"]
+
+
+async def test_hold_current_bypasses_queue_depth_cap(engine, monkeypatch):
+    """The front-insert is an internal op — the guest-append cap must not
+    reject it (the skip_back mechanic)."""
+    import app.queue.engine as eng_module
+    monkeypatch.setattr(eng_module, "_MAX_QUEUE_DEPTH", 2)
+    await engine.append(make_track("t1"))
+    await engine.advance()                       # t1 playing, queue empty
+    await engine.append(make_track("t2"))
+    await engine.append(make_track("t3"))        # queue at cap
+    held = await engine.hold_current(play_recorded=True)
+    assert held is not None
+    assert [i.track_id for i in engine.queue] == ["t1", "t2", "t3"]
+
+
+async def test_hold_current_emits_queue_nowplaying_and_state(engine):
+    events = []
+
+    async def cb(event, payload=None):
+        events.append(event)
+
+    await engine.append(make_track("t1"))
+    await engine.advance()
+    engine.add_callback(cb)
+    await engine.hold_current(play_recorded=False)
+    assert events == ["queue_changed", "now_playing_changed", "playback_state_changed"]
+
+
+async def test_hold_current_persists_front_insert(engine):
+    """The held item reaches save_queue at the queue front WITH its mark in
+    the metadata blob — the R18 restart contract's write half."""
+    import json
+    import app.queue.engine as eng_module
+    await engine.append(make_track("t1"))
+    await engine.advance()
+    await engine.hold_current(play_recorded=True)
+    for _ in range(4):                            # _persist is fire-and-forget
+        await asyncio.sleep(0)
+    saved = eng_module.database.save_queue.call_args.args[0]
+    assert saved[0]["track_id"] == "t1"
+    assert json.loads(saved[0]["metadata_json"])["play_recorded"] is True
+
+
+def test_queue_item_play_recorded_survives_round_trip():
+    """R19: the mark must survive the persistence round-trip (to_dict →
+    from_dict), and default False for legacy rows without the key."""
+    import json
+    from app.queue.models import QueueItem
+    item = QueueItem(track=make_track("t1"), play_recorded=True)
+    restored = QueueItem.from_dict(item.to_dict())
+    assert restored.play_recorded is True
+    assert restored.track_id == "t1"
+    # Legacy row (pre-U2 metadata blob without the key) → False.
+    legacy = item.to_dict()
+    meta = json.loads(legacy["metadata_json"])
+    del meta["play_recorded"]
+    legacy["metadata_json"] = json.dumps(meta)
+    assert QueueItem.from_dict(legacy).play_recorded is False
+
+
+async def test_restart_after_hold_lands_idle_with_held_item_front(tmp_path, monkeypatch):
+    """Integration (R18): hold → real DB persist → fresh engine restart. The
+    held item survives as queue front with its play_recorded mark; the fresh
+    engine is idle (no current, not playing) — no auto-play at startup."""
+    import app.database as database
+    from app.config import Settings
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    await database.init_db()
+    try:
+        engine = QueueEngine()
+        await engine.append(make_track("t1"))
+        await engine.append(make_track("t2"))
+        await engine.advance()                   # t1 playing
+        await engine.hold_current(play_recorded=True)
+        # _persist is fire-and-forget and earlier writes (append/advance) race
+        # it — wait until the HOLD's snapshot (both items) is what's on disk.
+        for _ in range(200):
+            if len(await database.load_queue()) == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        fresh = QueueEngine()                    # the restart
+        await fresh.load_from_db()
+        assert [i.track_id for i in fresh.queue] == ["t1", "t2"]
+        assert fresh.queue[0].play_recorded is True
+        assert fresh.queue[1].play_recorded is False
+        assert fresh.state.current is None
+        assert fresh.state.is_playing is False
+    finally:
+        await database.close_db()

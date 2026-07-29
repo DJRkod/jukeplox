@@ -176,6 +176,61 @@ class ClosingTimeEvent:
 
 
 @dataclass
+class TrackSkippedEvent:
+    """A queued track was skipped because every holder failed to stream (R22,
+    plan U16). Broadcast so the shared playback module flashes a transient
+    "Skipped …" toast on guest + admin. ``sources_tried`` (the provider source
+    ids attempted) is populated on the ADMIN broadcast only — a diagnostic the
+    host can act on; the guest broadcast omits it (None) and shows just the
+    title."""
+    type: str = "track_skipped"
+    track_title: str = ""
+    sources_tried: list | None = None
+
+    def to_json(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class OutputSessionEvent:
+    """Output-session supervisor state changed (2026-07-11 supervisor plan U4,
+    R20): the queue was held by a device-level outage, a reconnect attempt
+    started/failed, the device re-attached without auto-playing (IdlePaused),
+    playback resumed, or the hold cleared.
+
+    Dual-broadcast with admin-rich / guest-lean payloads, exactly like
+    ``TrackSkippedEvent``: BOTH audiences get the same state truth (``state``
+    + ``held``); the admin broadcast additionally carries the outage detail
+    (reason, device, attempt/countdown, window remaining, was_paused) while
+    the guest broadcast leaves those fields ``None``. Late joiners / WS-gap
+    clients converge from the mirrored ``output_session`` snapshot field on
+    the now-playing GETs (the ClosingTime snapshot-hydration pattern) —
+    every one of these deltas is refetchable there."""
+    type: str = "output_session"
+    # Shared truth (both broadcasts): the supervisor session state
+    # (idle|playing|paused|outage_paused|reconnecting|idle_paused), whether
+    # an outage hold currently freezes the queue, and whether a Cast gapless
+    # flow session is live (U10).
+    state: str = "idle"
+    held: bool = False
+    gapless_flow_active: bool = False
+    # Admin-rich detail (None on the guest broadcast):
+    reason: str | None = None
+    backend_type: str | None = None
+    device_id: str | None = None
+    device_name: str | None = None
+    attempts: int | None = None
+    next_retry_s: float | None = None
+    window_remaining_s: int | None = None
+    was_paused: bool | None = None
+    flap_tripped: bool | None = None
+    idle_paused_reason: str | None = None
+
+    def to_json(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class AirPlayProtocolChangedEvent:
     """Per-device AirPlay protocol decision changed (cliap2 vs cliraop).
 

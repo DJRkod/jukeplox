@@ -27,6 +27,55 @@ def make_artist(arid="ar1") -> Artist:
     return Artist(id=arid, title="Artist A")
 
 
+class FakeTimer:
+    """Handle contract the output-session supervisor needs: .cancel(). fire()
+    runs the callback (asserting the supervisor didn't cancel it first); cb()
+    can be called directly to simulate a late callback racing a cancel."""
+
+    def __init__(self, delay, cb):
+        self.delay = delay
+        self.cb = cb
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        assert not self.cancelled, "fired a timer the supervisor cancelled"
+        self.cb()
+
+
+class FakeTimerFactory:
+    """The suite's single fake supervisor-timer shape (2026-07-11 review
+    consolidation): armed timers accumulate in ``.timers`` in append order,
+    and the FakeTimer object IS the handle the supervisor holds — so
+    handle-identity assertions (``timers.timers[-1] is ot.timer``) work."""
+
+    def __init__(self):
+        self.timers: list[FakeTimer] = []
+
+    def __call__(self, delay, cb):
+        t = FakeTimer(delay, cb)
+        self.timers.append(t)
+        return t
+
+
+def wire_queue(stack, probe=None):
+    """A real in-memory QueueEngine patched into app.state (persistence
+    mocked) — the boundary-integration shape shared by the output-backend
+    suites (U7 direct, U8 DLNA, U10 Cast flow). Enter it on a test's
+    ``contextlib.ExitStack``; returns the engine. ``probe`` becomes the
+    supervisor's ``_output_probe`` result (None = no probe)."""
+    import app.state as st
+    from app.queue.engine import QueueEngine
+    qe = QueueEngine()
+    stack.enter_context(patch.object(st, "queue_engine", qe))
+    stack.enter_context(patch("app.queue.engine.database.save_queue", AsyncMock()))
+    stack.enter_context(patch("app.queue.engine.database.save_history", AsyncMock()))
+    stack.enter_context(patch.object(st, "_output_probe", lambda: probe))
+    return qe
+
+
 def _authenticated_client(app):
     """Return a TestClient with a pre-set session cookie."""
     client = TestClient(app, raise_server_exceptions=True)
@@ -78,6 +127,7 @@ def mock_state(mock_session):
          patch("app.state.output_router", or_), \
          patch("app.state.get_plex_client", AsyncMock(return_value=None)), \
          patch("app.state.trigger_browse_index_refresh", MagicMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
          patch("app.state.trigger_artist_grouping_rebuild", MagicMock()), \
          patch("app.database.get_browse_album_by_id", AsyncMock(return_value=None)), \
          patch("app.database.get_browse_albums_by_identity", AsyncMock(return_value=[])), \
@@ -94,6 +144,33 @@ def mock_state(mock_session):
     # must not survive into tests that don't use this fixture.
     watcher_module._watcher = None
     probe_runner_module._probe_semaphore = None
+
+
+@pytest.fixture
+def fresh_supervisor(monkeypatch):
+    """Fresh output-session supervisor installed as the module singleton
+    (2026-07-11 supervisor plan U1). The timer factory is FAKE — no real
+    timers, per the repo's pytest-hang policy — and record_play is a
+    MagicMock so entry-point tests can assert the count side effect fires
+    only at confirmed start, never at dispatch.
+
+    Yields ``(supervisor, timers, record_play)``; ``timers`` is a
+    ``FakeTimerFactory`` — the FakeTimer objects armed so far accumulate in
+    ``timers.timers`` (append order). Fire a deadline with
+    ``timers.timers[i].fire()``, or call ``.cb()`` directly to simulate a
+    late callback racing its cancel."""
+    from app.output import hold, session
+
+    timers = FakeTimerFactory()
+    rec = MagicMock()
+    sup = session.OutputSessionSupervisor(record_play=rec, timer_factory=timers)
+    monkeypatch.setattr(session, "_supervisor", sup)
+    # U2: the output-hold flag is module-global state (owned by
+    # app.output.hold since the session decomposition) — start every
+    # supervisor-fixture test un-held and restore after (monkeypatch teardown).
+    monkeypatch.setattr(hold, "_output_hold", False)
+    monkeypatch.setattr(hold, "_output_hold_reason", "")
+    return sup, timers, rec
 
 
 @pytest.fixture

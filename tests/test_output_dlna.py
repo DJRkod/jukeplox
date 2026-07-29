@@ -74,12 +74,27 @@ def make_dmr():
     dmr._seek_action.async_call = AsyncMock()
     dmr._stop_action = MagicMock()
     dmr._stop_action.async_call = AsyncMock()
+    # Plan U8 per-action mocks: SetNextAVTransportURI (arm + empty-URI
+    # revoke) and GetPositionInfo (the CurrentTrackURI boundary watch) also
+    # ride the direct _action path. The guarded library helper
+    # async_set_next_transport_uri gates on the same stale
+    # CurrentTransportActions cache as async_stop/async_seek_rel_time and
+    # must NEVER be awaited — tests pin await_count == 0.
+    dmr.async_set_next_transport_uri = AsyncMock()
+    dmr._setnext_action = MagicMock()
+    dmr._setnext_action.async_call = AsyncMock()
+    dmr._position_action = MagicMock()
+    dmr._position_action.async_call = AsyncMock(return_value={})
 
     def _action_side_effect(service, name):
         if service == "AVT" and name == "Seek":
             return dmr._seek_action
         if service == "AVT" and name == "Stop":
             return dmr._stop_action
+        if service == "AVT" and name == "SetNextAVTransportURI":
+            return dmr._setnext_action
+        if service == "AVT" and name == "GetPositionInfo":
+            return dmr._position_action
         return MagicMock()
 
     dmr._action = MagicMock(side_effect=_action_side_effect)
@@ -178,7 +193,7 @@ def test_mime_type_proxied_ogg_advertises_flac():
     the old mismatch by sniffing, but Chromecast does not (2026-06-17) and the
     correct type is required regardless. Route on the part path (stream_key)."""
     from app.output.dlna import _mime_type
-    url = "http://192.168.0.70/api/stream?key=k%2Ffile.ogg"
+    url = "http://192.168.1.50/api/stream?key=k%2Ffile.ogg"
     assert _mime_type(None, url, "/library/parts/1/2/file.ogg") == "audio/flac"
 
 
@@ -1064,6 +1079,35 @@ async def test_poll_eos_triggers_advance_on_two_consecutive_stopped(dlna_mock):
     assert backend.is_playing is False
 
 
+async def test_poll_eos_natural_advance_resets_play_start(dlna_mock):
+    """F7: the natural-EOS advance (2x STOPPED) must drop the _play_start
+    wall-clock anchor — otherwise a later position capture (outage entry for
+    a track that never started) reads the FINISHED track's elapsed time as
+    the new track's position."""
+    import time as _time
+    from app.output.dlna import DlnaBackend, TransportState
+
+    async def advance():
+        pass
+
+    dmr = make_dmr()
+
+    async def _update(do_ping: bool = True) -> None:
+        dmr.transport_state = TransportState.STOPPED
+
+    dmr.async_update = AsyncMock(side_effect=_update)
+
+    backend = DlnaBackend(advance_cb=advance)
+    backend._dmr = dmr
+    backend._is_playing = True
+    backend._play_start = _time.monotonic() - 200  # 200s into the track
+
+    with patch("asyncio.sleep", AsyncMock()):
+        await backend._poll_eos()
+
+    assert backend._play_start == 0.0
+
+
 async def test_poll_eos_ignores_transient_stopped(dlna_mock):
     """Regression: WiiM Pro / JBL DLNA renderers transiently report
     CurrentTransportState=STOPPED while still streaming audio. A single
@@ -1315,12 +1359,19 @@ async def test_poll_eos_parse_error_still_detects_eos(dlna_mock):
     assert backend.is_playing is False
 
 
-async def test_poll_eos_connectivity_error_still_counts_toward_strike(dlna_mock):
-    """U1: the narrow ParseError catch must NOT swallow real connectivity
-    failures. A generic exception (timeout / connection reset) from
-    async_update still counts toward the 3-strike budget and fires
-    advance_cb after the third consecutive error, exactly as before."""
+async def test_poll_eos_three_connectivity_errors_report_outage_not_advance(
+    dlna_mock, fresh_supervisor
+):
+    """U1 kept the narrow ParseError catch from swallowing real connectivity
+    failures — those still count toward the 3-strike budget. Supervisor plan
+    U2 (R16) re-points what the third strike DOES: three consecutive failed
+    transport polls are the reachability probe failing, so the poll reports
+    outage-suspected ("poll_errors", device-level → hold) instead of the old
+    force-advance that consumed queue items during an outage."""
     from app.output.dlna import DlnaBackend
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
     advance_called = []
 
     async def advance():
@@ -1340,9 +1391,11 @@ async def test_poll_eos_connectivity_error_still_counts_toward_strike(dlna_mock)
     with patch("asyncio.sleep", AsyncMock()):
         await backend._poll_eos()
 
-    assert advance_called == [True]
-    assert dmr.async_update.await_count == 3
+    assert advance_called == []                # was: force-advance
+    assert outages == ["poll_errors"]          # now: outage-suspected → hold
+    assert dmr.async_update.await_count == 3   # the 3-strike budget unchanged
     assert backend.is_playing is False
+    assert backend._poll_task is None          # loop exited cleanly
 
 
 async def test_poll_eos_steady_polls_log_at_debug_not_info(dlna_mock, caplog):
@@ -1612,6 +1665,67 @@ async def test_set_device_tears_down_previous_notify_server(dlna_mock):
     # on_event was wired so GENA NOTIFYs reach _on_dlna_event. Bound methods
     # compare equal but not identical (new instance each access), so use ==.
     assert dmr.on_event == backend._on_dlna_event
+
+
+async def test_set_device_persists_location_as_output_addr(dlna_mock):
+    """Supervisor plan U3: a successful set_device persists the renderer's
+    LOCATION under output_addr:{device_id} so the startup reconnect and the
+    outage retry loop can re-attach with no discovery round (extends the
+    Cast/AirPlay cached-address mechanic to DLNA)."""
+    import json as _json
+    from app.output.dlna import DlnaBackend
+    backend = DlnaBackend()
+    location = "http://192.168.1.50:8000/desc.xml"
+    backend._device_locations["dev-1"] = location
+
+    notify = MagicMock()
+    notify.async_start_server = AsyncMock()
+    notify.async_stop_server = AsyncMock()
+    notify.event_handler = MagicMock()
+    dmr = make_dmr()
+    fake_upnp_factory = MagicMock()
+    fake_upnp_factory.async_create_device = AsyncMock(return_value=MagicMock())
+    set_setting = AsyncMock()
+
+    with patch("app.output.dlna.AiohttpSessionRequester", MagicMock(), create=True), \
+         patch("app.output.dlna.UpnpFactory", MagicMock(return_value=fake_upnp_factory), create=True), \
+         patch("app.output.dlna.AiohttpNotifyServer", MagicMock(return_value=notify), create=True), \
+         patch("app.output.dlna.DmrDevice", MagicMock(return_value=dmr), create=True), \
+         patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", set_setting):
+        await backend.set_device("dev-1")
+
+    set_setting.assert_awaited_once_with(
+        "output_addr:dev-1", _json.dumps({"location": location}))
+
+
+async def test_set_device_subscribe_failure_persists_no_output_addr(dlna_mock):
+    """A failed set_device must NOT persist an address — the renderer never
+    attached, so the cached-address reconnect would seed a dead LOCATION."""
+    from app.output.dlna import DlnaBackend
+    backend = DlnaBackend()
+    backend._device_locations["dev-1"] = "http://192.168.1.50:8000/desc.xml"
+
+    notify = MagicMock()
+    notify.async_start_server = AsyncMock()
+    notify.async_stop_server = AsyncMock()
+    notify.event_handler = MagicMock()
+    dmr = MagicMock()
+    dmr.async_subscribe_services = AsyncMock(side_effect=RuntimeError("boom"))
+    fake_upnp_factory = MagicMock()
+    fake_upnp_factory.async_create_device = AsyncMock(return_value=MagicMock())
+    set_setting = AsyncMock()
+
+    with patch("app.output.dlna.AiohttpSessionRequester", MagicMock(), create=True), \
+         patch("app.output.dlna.UpnpFactory", MagicMock(return_value=fake_upnp_factory), create=True), \
+         patch("app.output.dlna.AiohttpNotifyServer", MagicMock(return_value=notify), create=True), \
+         patch("app.output.dlna.DmrDevice", MagicMock(return_value=dmr), create=True), \
+         patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", set_setting):
+        with pytest.raises(RuntimeError, match="boom"):
+            await backend.set_device("dev-1")
+
+    set_setting.assert_not_awaited()
 
 
 async def test_set_device_cleans_up_notify_server_on_subscribe_failure(dlna_mock):
@@ -1959,3 +2073,850 @@ async def test_probe_device_returns_false_when_unavailable():
         backend = DlnaBackend()
         backend._device_locations["dev-1"] = "http://192.168.1.50:8000/desc.xml"
         assert await backend.probe_device("dev-1") is False
+
+
+# ── confirmed-start signal (2026-07-11 supervisor plan U1) ────────────────────
+
+async def test_play_captures_confirm_token(dlna_mock, fresh_supervisor):
+    """play() captures the supervisor's per-dispatch token; accepted SOAP calls
+    alone (SetAVTransportURI/Play returning) must not count the play."""
+    from app.output.dlna import DlnaBackend
+    sup, timers, rec = fresh_supervisor
+    dmr = make_dmr()
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    token = sup.on_dispatched(make_track())    # state dispatches before backend.play
+    await backend.play("http://url", make_track())
+    assert backend._confirm_token == token
+    rec.assert_not_called()                    # command accepted ≠ audio
+    backend._cancel_poll()
+
+
+async def test_first_non_stopped_poll_emits_confirmed_start(dlna_mock, fresh_supervisor):
+    """The first poll reading the transport OUT of STOPPED confirms the
+    dispatch — once. The run ends with two consecutive STOPPED (EOS) so the
+    poll terminates; the count stays at exactly one."""
+    from app.output.dlna import DlnaBackend, TransportState
+    sup, timers, rec = fresh_supervisor
+    states = iter([
+        TransportState.STOPPED,        # renderer not started yet — no confirm
+        TransportState.TRANSITIONING,  # first non-STOPPED → confirmed-start
+        TransportState.PLAYING,        # already confirmed — no re-emit
+        TransportState.STOPPED,        # EOS begins
+        TransportState.STOPPED,        # confirmed EOS — poll exits
+    ])
+    dmr = make_dmr()
+
+    async def _update(do_ping: bool = True) -> None:
+        dmr.transport_state = next(states)
+
+    dmr.async_update = AsyncMock(side_effect=_update)
+    backend = DlnaBackend(advance_cb=AsyncMock())
+    backend._dmr = dmr
+    backend._is_playing = True
+    backend._confirm_token = sup.on_dispatched(make_track())
+
+    with patch("asyncio.sleep", AsyncMock()):
+        await backend._poll_eos()
+
+    rec.assert_called_once()
+    assert backend._confirm_token is None      # one-shot
+
+
+async def test_stopped_polls_never_confirm(dlna_mock, fresh_supervisor):
+    """A renderer that never leaves STOPPED (the silent SetAVTransportURI
+    rejection) must NOT confirm — this is exactly the phantom play the
+    chokepoint exists to stop counting."""
+    from app.output.dlna import DlnaBackend, TransportState
+    sup, timers, rec = fresh_supervisor
+    dmr = make_dmr()
+
+    async def _update(do_ping: bool = True) -> None:
+        dmr.transport_state = TransportState.STOPPED
+
+    dmr.async_update = AsyncMock(side_effect=_update)
+    backend = DlnaBackend(advance_cb=AsyncMock())
+    backend._dmr = dmr
+    backend._is_playing = True
+    token = sup.on_dispatched(make_track())
+    backend._confirm_token = token
+
+    with patch("asyncio.sleep", AsyncMock()):
+        await backend._poll_eos()              # exits via 2×STOPPED EOS
+
+    rec.assert_not_called()
+    assert backend._confirm_token == token     # still unconfirmed
+
+
+async def test_none_transport_state_does_not_confirm(dlna_mock, fresh_supervisor):
+    """A None transport read is 'unknown', not evidence of playback."""
+    from app.output.dlna import DlnaBackend, TransportState
+    sup, timers, rec = fresh_supervisor
+    states = iter([
+        None,                          # unknown — must not confirm
+        TransportState.STOPPED,
+        TransportState.STOPPED,        # EOS — poll exits
+    ])
+    dmr = make_dmr()
+
+    async def _update(do_ping: bool = True) -> None:
+        dmr.transport_state = next(states)
+
+    dmr.async_update = AsyncMock(side_effect=_update)
+    backend = DlnaBackend(advance_cb=AsyncMock())
+    backend._dmr = dmr
+    backend._is_playing = True
+    token = sup.on_dispatched(make_track())
+    backend._confirm_token = token
+
+    with patch("asyncio.sleep", AsyncMock()):
+        await backend._poll_eos()
+
+    rec.assert_not_called()
+
+
+# ── device-level typing + reachability probe (2026-07-11 supervisor plan U2) ──
+
+async def test_play_no_device_raises_device_not_ready(dlna_mock):
+    """The plain-RuntimeError asymmetry is closed (U2): "no device selected"
+    is a typed device-level error so the holder-fallback loop can never drain
+    the queue over it. Still a RuntimeError subclass, so every existing
+    `except RuntimeError` call site keeps working."""
+    from app.output.base import DeviceNotReadyError
+    from app.output.dlna import DlnaBackend
+    backend = DlnaBackend()
+    with pytest.raises(DeviceNotReadyError):
+        await backend.play("http://url", make_track())
+
+
+async def test_probe_liveness_queries_transport_info_via_direct_action(dlna_mock):
+    """DLNA probe semantics (plan KTD): one GetTransportInfo SOAP roundtrip
+    via the direct _action path (never a guarded library helper — the
+    Linkplay stale-action-cache convention)."""
+    from app.output.dlna import DlnaBackend
+    dmr = make_dmr()
+    gti_action = MagicMock()
+    gti_action.async_call = AsyncMock(
+        return_value={"CurrentTransportState": "PLAYING"})
+
+    def _action(service, name):
+        if service == "AVT" and name == "GetTransportInfo":
+            return gti_action
+        return MagicMock()
+
+    dmr._action = MagicMock(side_effect=_action)
+    backend = DlnaBackend()
+    backend._dmr = dmr
+
+    assert await backend.probe_liveness() == (True, "PLAYING")
+    gti_action.async_call.assert_awaited_once_with(InstanceID=0)
+
+
+async def test_probe_liveness_soap_failure_reads_unreachable(dlna_mock):
+    from app.output.dlna import DlnaBackend
+    dmr = make_dmr()
+    gti_action = MagicMock()
+    gti_action.async_call = AsyncMock(side_effect=ConnectionResetError("gone"))
+    dmr._action = MagicMock(return_value=gti_action)
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    assert await backend.probe_liveness() == (False, None)
+
+
+async def test_probe_liveness_no_device_reads_unreachable(dlna_mock):
+    from app.output.dlna import DlnaBackend
+    backend = DlnaBackend()
+    assert await backend.probe_liveness() == (False, None)
+
+
+async def test_probe_liveness_missing_action_reads_unreachable(dlna_mock):
+    from app.output.dlna import DlnaBackend
+    dmr = make_dmr()
+    dmr._action = MagicMock(return_value=None)
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    assert await backend.probe_liveness() == (False, None)
+
+
+# ── gapless SetNext arming + boundary (2026-07-11 supervisor plan U8) ─────────
+# The DLNA gapless advance-authority row: CurrentTrackURI change to the
+# EXPECTED armed next while PLAYING advances (no dispatch); STOPPED-anyway =
+# the gapped fallback (the existing 2xSTOPPED EOS advance, exactly once);
+# poll errors → the existing notify_outage path, unchanged. Every U8 SOAP
+# rides the direct _action path — the guarded library helper
+# async_set_next_transport_uri is pinned never-awaited (stale-action-cache
+# convention, same as async_stop/async_seek_rel_time).
+
+import contextlib
+import time as _time_mod
+
+
+def _track(tid: str) -> Track:
+    t = Track(id=tid, title=f"Song {tid}", artist="A", album="B",
+              duration_ms=180000, stream_key=f"/parts/{tid}/f.flac")
+    t.container = "flac"
+    return t
+
+
+class _StopPoll(Exception):
+    """Bounded exit for _poll_eos runs that would otherwise loop forever."""
+
+
+def _tick_limit(n: int):
+    """asyncio.sleep replacement that raises _StopPoll after n poll ticks —
+    the existing parse-error test's bounded-loop pattern."""
+    count = {"n": 0}
+
+    async def _sleep(*_a, **_k):
+        count["n"] += 1
+        if count["n"] > n:
+            raise _StopPoll
+
+    return AsyncMock(side_effect=_sleep)
+
+
+# The canonical queue-wiring helper lives in tests/conftest.py (shared with
+# test_output_direct.py and test_output_chromecast.py).
+from tests.conftest import wire_queue as _wire_queue
+
+
+def _playing_backend(dmr, advance_cb=None, current_uri="http://url1"):
+    """A DlnaBackend mid-playback on device dev-1 with the arm-timing gate
+    already satisfied (first PLAYING poll seen) — the state every boundary
+    scenario starts from."""
+    from app.output.dlna import DlnaBackend
+    backend = DlnaBackend(advance_cb=advance_cb)
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    backend._is_playing = True
+    backend._playing_confirmed = True
+    backend._current_uri = current_uri
+    backend._current_duration_ms = 180_000
+    backend._play_start = _time_mod.monotonic()
+    return backend
+
+
+async def test_arm_next_defers_setnext_until_first_playing_poll(dlna_mock):
+    """Arm-timing (capability map: Linkplay refuses SetNext near track end —
+    deliver right after PLAYING): an arm stashed before the renderer's first
+    PLAYING poll sends NOTHING; the first PLAYING read delivers it with the
+    same DIDL shape play() builds. The guarded helper is never awaited."""
+    from app.output.dlna import DlnaBackend, TransportState
+    dmr = make_dmr()
+    states = iter([
+        TransportState.TRANSITIONING,  # pre-playback — no SetNext yet
+        TransportState.PLAYING,        # first PLAYING → deliver the arm
+        TransportState.PLAYING,
+    ])
+
+    async def _update(do_ping: bool = True) -> None:
+        dmr.transport_state = next(states)
+
+    dmr.async_update = AsyncMock(side_effect=_update)
+    backend = DlnaBackend(advance_cb=AsyncMock())
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    backend._is_playing = True
+    backend._current_uri = "http://url1"
+    backend._current_duration_ms = 180_000
+    backend._play_start = _time_mod.monotonic()
+    t2 = _track("t2")
+
+    await backend.arm_next("http://url2", t2)
+    dmr._setnext_action.async_call.assert_not_awaited()      # stashed only
+    assert backend._armed_next == ("http://url2", t2)
+
+    with patch("asyncio.sleep", _tick_limit(3)):
+        with pytest.raises(_StopPoll):
+            await backend._poll_eos()
+
+    dmr._setnext_action.async_call.assert_awaited_once()
+    kwargs = dmr._setnext_action.async_call.await_args.kwargs
+    assert kwargs["InstanceID"] == 0
+    assert kwargs["NextURI"] == "http://url2"
+    assert "DIDL-Lite" in kwargs["NextURIMetaData"]          # play()'s DIDL shape
+    assert "Song t2" in kwargs["NextURIMetaData"]
+    assert backend._setnext_sent is True
+    assert dmr.async_set_next_transport_uri.await_count == 0
+
+
+async def test_gapless_boundary_uri_change_advances_counts_and_rearms(
+    dlna_mock, fresh_supervisor
+):
+    """U8 happy path (the advance-authority row): arm after PLAYING →
+    SetNext delivered via direct _action; CurrentTrackURI flips to the
+    expected next while PLAYING → notify_gapless_boundary advances the queue
+    WITHOUT any SetAVTransportURI reload and counts the new track exactly
+    once; the verdict flips supported (from unverified) and persists; the
+    slot is consumed so the next arm re-primes immediately (one-shot NextURI
+    per the capability map)."""
+    from app.output.dlna import TransportState
+    sup, timers, rec = fresh_supervisor
+    dmr = make_dmr()
+    dmr.transport_state = TransportState.PLAYING
+    uris = iter(["http://url1", "http://url2"])
+    dmr._position_action.async_call = AsyncMock(
+        side_effect=lambda **kw: {"TrackURI": next(uris)})
+    t1, t2 = _track("t1"), _track("t2")
+
+    with contextlib.ExitStack() as stack:
+        qe = _wire_queue(stack)
+        set_setting = stack.enter_context(
+            patch("app.database.set_setting", AsyncMock()))
+        await qe.append(t1)
+        item1 = await qe.advance()                 # t1 is the playing current
+        token = sup.on_dispatched(item1.track)
+        backend = _playing_backend(dmr, advance_cb=AsyncMock())
+        sup.on_playback_confirmed(token)           # t1's own confirmed start
+        rec.assert_called_once()
+        await qe.append(t2)
+
+        await backend.arm_next("http://url2", t2)  # already PLAYING → sent now
+        dmr._setnext_action.async_call.assert_awaited_once()
+
+        with patch("asyncio.sleep", _tick_limit(2)):
+            with pytest.raises(_StopPoll):
+                await backend._poll_eos()
+
+        assert qe.state.current.track_id == "t2"   # advanced — no dispatch
+        assert [i.track_id for i in qe.history] == ["t1"]
+        assert rec.call_count == 2                 # t2 counted exactly once
+        assert rec.call_args.args[0].id == "t2"
+        dmr.async_set_transport_uri.assert_not_awaited()  # no reload
+        backend._advance_cb.assert_not_awaited()   # boundary ≠ EOS advance
+        assert backend._gapless_verdicts["dev-1"] == "supported"
+        set_setting.assert_awaited_once_with(
+            "gapless_verdict:dlna:dev-1", "supported")
+        # Slot consumed → re-arm capability: the next arm delivers at once.
+        assert backend._armed_next is None and backend._setnext_sent is False
+        await backend.arm_next("http://url3", _track("t3"))
+        assert dmr._setnext_action.async_call.await_count == 2
+        assert dmr.async_set_next_transport_uri.await_count == 0
+
+
+async def test_stopped_anyway_despite_setnext_gapped_fallback_once_unsupported(
+    dlna_mock, fresh_supervisor
+):
+    """Renderer goes STOPPED despite an ACCEPTED SetNext: exactly ONE gapped
+    advance fires — the existing 2xSTOPPED EOS path re-plays the expected
+    next via the normal dispatch (the queue never advanced for the un-fired
+    boundary) — never a phantom boundary on top; the armed slot is discarded
+    and (the stop landing near the expected track end — a failed armed
+    boundary, not an external stop) the unverified device verdicts
+    unsupported."""
+    from app.output.dlna import TransportState
+    sup, timers, rec = fresh_supervisor
+    advance_called = []
+
+    async def advance():
+        advance_called.append(True)
+
+    dmr = make_dmr()
+
+    async def _update(do_ping: bool = True) -> None:
+        dmr.transport_state = TransportState.STOPPED
+
+    dmr.async_update = AsyncMock(side_effect=_update)
+    backend = _playing_backend(dmr, advance_cb=advance)
+    # 170s into the 180s track: inside the end margin — this STOPPED is a
+    # boundary-shaped stop, so it IS behavioral evidence (verdict written).
+    backend._play_start = _time_mod.monotonic() - 170
+    t2 = _track("t2")
+    backend._armed_next = ("http://url2", t2)
+    backend._setnext_sent = True
+    backend._sent_next_url = "http://url2"
+
+    notify = AsyncMock()
+    set_setting = AsyncMock()
+    with patch("app.output.session.notify_gapless_boundary", notify), \
+         patch("app.database.set_setting", set_setting), \
+         patch("asyncio.sleep", AsyncMock()):
+        await backend._poll_eos()
+
+    assert advance_called == [True]        # one advance — not zero, not two
+    notify.assert_not_awaited()            # no phantom boundary advance
+    assert backend._gapless_verdicts["dev-1"] == "unsupported"
+    set_setting.assert_awaited_once_with(
+        "gapless_verdict:dlna:dev-1", "unsupported")
+    assert backend._armed_next is None and backend._setnext_sent is False
+    assert backend.is_playing is False
+
+
+async def test_stopped_mid_track_while_armed_advances_without_verdict(
+    dlna_mock, fresh_supervisor
+):
+    """External-stop guard (review C3): 2xSTOPPED with an ACCEPTED SetNext
+    but far from the expected track end is an EXTERNAL stop (the user
+    stopped the renderer from its own app), not behavioral evidence — the
+    gapped fallback advance still fires exactly once, but NO verdict is
+    written: the device stays unverified and a real armed boundary can
+    still decide it later."""
+    from app.output.dlna import TransportState
+    sup, timers, rec = fresh_supervisor
+    advance_called = []
+
+    async def advance():
+        advance_called.append(True)
+
+    dmr = make_dmr()
+
+    async def _update(do_ping: bool = True) -> None:
+        dmr.transport_state = TransportState.STOPPED
+
+    dmr.async_update = AsyncMock(side_effect=_update)
+    # _playing_backend anchors _play_start at NOW → 0s into a 180s track,
+    # well outside the end margin.
+    backend = _playing_backend(dmr, advance_cb=advance)
+    t2 = _track("t2")
+    backend._armed_next = ("http://url2", t2)
+    backend._setnext_sent = True
+    backend._sent_next_url = "http://url2"
+
+    notify = AsyncMock()
+    set_setting = AsyncMock()
+    with patch("app.output.session.notify_gapless_boundary", notify), \
+         patch("app.database.set_setting", set_setting), \
+         patch("asyncio.sleep", AsyncMock()):
+        await backend._poll_eos()
+
+    assert advance_called == [True]        # the gapped advance is ungated
+    notify.assert_not_awaited()            # no phantom boundary advance
+    assert backend._gapless_verdicts.get("dev-1") is None   # verdict untouched
+    set_setting.assert_not_awaited()
+    assert backend._armed_next is None and backend._setnext_sent is False
+    assert backend.is_playing is False
+
+
+async def test_arm_same_uri_as_current_never_sends_no_verdict_normal_eos(
+    dlna_mock, fresh_supervisor
+):
+    """Duplicate-track arm, immediate-send path (review C1): the same track
+    queued twice makes the armed NextURI equal the CURRENT URI, so the
+    boundary's URI-flip detection could never fire — arming device-side
+    would only buy the late window expiry plus a false permanent
+    'unsupported'. The arm is discarded with NO SetNext SOAP and NO verdict
+    (same-URI transitions are inherently undetectable), and the track's own
+    EOS advances normally (per-track fallback)."""
+    from app.output.dlna import TransportState
+    sup, timers, rec = fresh_supervisor
+    advance_called = []
+
+    async def advance():
+        advance_called.append(True)
+
+    dmr = make_dmr()
+
+    async def _update(do_ping: bool = True) -> None:
+        dmr.transport_state = TransportState.STOPPED
+
+    dmr.async_update = AsyncMock(side_effect=_update)
+    backend = _playing_backend(dmr, advance_cb=advance,
+                               current_uri="http://url1")
+    set_setting = AsyncMock()
+    with patch("app.database.set_setting", set_setting):
+        await backend.arm_next("http://url1", _track("t1"))  # duplicate track
+
+    dmr._setnext_action.async_call.assert_not_awaited()   # no SetNext SOAP
+    assert backend._armed_next is None and backend._setnext_sent is False
+    assert backend._gapless_verdicts.get("dev-1") is None  # no verdict write
+    set_setting.assert_not_awaited()
+
+    with patch("asyncio.sleep", AsyncMock()):
+        await backend._poll_eos()
+    assert advance_called == [True]                        # normal EOS advance
+
+
+async def test_arm_same_uri_deferred_send_discards_at_first_playing(dlna_mock):
+    """Duplicate-track arm, deferred-send path (review C1): an arm stashed
+    BEFORE the renderer's first PLAYING poll is discarded — never sent — at
+    delivery time when its URI equals the current track's; no verdict, and
+    the boundary watch never starts (no GetPositionInfo reads)."""
+    from app.output.dlna import DlnaBackend, TransportState
+    dmr = make_dmr()
+    states = iter([
+        TransportState.TRANSITIONING,  # pre-playback — arm stays stashed
+        TransportState.PLAYING,        # first PLAYING → delivery time
+        TransportState.PLAYING,
+    ])
+
+    async def _update(do_ping: bool = True) -> None:
+        dmr.transport_state = next(states)
+
+    dmr.async_update = AsyncMock(side_effect=_update)
+    backend = DlnaBackend(advance_cb=AsyncMock())
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    backend._is_playing = True
+    backend._current_uri = "http://url1"
+    backend._current_duration_ms = 180_000
+    backend._play_start = _time_mod.monotonic()
+    t1_again = _track("t1")
+
+    set_setting = AsyncMock()
+    with patch("app.database.set_setting", set_setting):
+        await backend.arm_next("http://url1", t1_again)
+        assert backend._armed_next == ("http://url1", t1_again)  # stashed
+
+        with patch("asyncio.sleep", _tick_limit(3)):
+            with pytest.raises(_StopPoll):
+                await backend._poll_eos()
+
+    dmr._setnext_action.async_call.assert_not_awaited()   # discarded, not sent
+    dmr._position_action.async_call.assert_not_awaited()  # no boundary watch
+    assert backend._armed_next is None and backend._setnext_sent is False
+    assert backend._gapless_verdicts.get("dev-1") is None
+    set_setting.assert_not_awaited()
+
+
+async def test_setnext_failure_keeps_stale_watch_and_corrects_chained_next(
+    dlna_mock,
+):
+    """SetNext failure ≠ SetNext not applied (review C2): a SOAP
+    failure/timeout may still have been APPLIED by the renderer (a response
+    lost on the wire is indistinguishable from a refusal). The failed URL
+    goes on the stale watch instead of vanishing — so when the renderer
+    chains into it anyway, the existing wrong-URI correction fires
+    (corrective Stop + exactly one replay advance) instead of the delivered
+    next playing completely unwatched (frozen Now Playing + double play)."""
+    from app.output.dlna import TransportState
+    advance_called = []
+
+    async def advance():
+        advance_called.append(True)
+
+    dmr = make_dmr()
+    dmr._setnext_action.async_call = AsyncMock(
+        side_effect=Exception("timeout: response lost on the wire"))
+    backend = _playing_backend(dmr, advance_cb=advance)
+    set_setting = AsyncMock()
+    with patch("app.database.set_setting", set_setting):
+        await backend.arm_next("http://url2", _track("t2"))  # SOAP raises
+
+    assert backend._stale_next_uri == "http://url2"          # watched anyway
+    assert backend._armed_next is None and backend._setnext_sent is False
+    set_setting.assert_not_awaited()                         # no verdict
+
+    # The renderer applied the SetNext after all: CurrentTrackURI flips to
+    # the failed URL while PLAYING → the existing correction machinery.
+    dmr.transport_state = TransportState.PLAYING
+    dmr._position_action.async_call = AsyncMock(
+        return_value={"TrackURI": "http://url2"})
+    notify = AsyncMock()
+    with patch("app.output.session.notify_gapless_boundary", notify), \
+         patch("asyncio.sleep", AsyncMock()):
+        await backend._poll_eos()
+
+    dmr._stop_action.async_call.assert_awaited_once_with(InstanceID=0)
+    assert advance_called == [True]        # stop-and-replay, exactly once
+    notify.assert_not_awaited()            # never counted as a boundary
+    assert backend._stale_next_uri is None
+    assert backend.is_playing is False
+
+
+async def test_stale_uri_window_expiry_late_boundary_and_unsupported(
+    dlna_mock, fresh_supervisor
+):
+    """Audibly-gapless-but-URI-never-updates (the WiiM stale-metadata mode):
+    the bounded window past the expected track end expires with the
+    transport still PLAYING and CurrentTrackURI unchanged → treated as a
+    LATE boundary — counted once, queue advanced, so Now Playing never
+    freezes on the old track — and the verdict is unsupported (DETECTABILITY
+    criterion: audio quality alone is not support). Arming is disabled for
+    the device thereafter (per-track path)."""
+    from app.output.dlna import TransportState
+    sup, timers, rec = fresh_supervisor
+    dmr = make_dmr()
+    dmr.transport_state = TransportState.PLAYING
+    dmr._position_action.async_call = AsyncMock(
+        return_value={"TrackURI": "http://url1"})   # never flips
+    t1, t2 = _track("t1"), _track("t2")
+
+    with contextlib.ExitStack() as stack:
+        qe = _wire_queue(stack)
+        set_setting = stack.enter_context(
+            patch("app.database.set_setting", AsyncMock()))
+        await qe.append(t1)
+        item1 = await qe.advance()
+        sup.on_playback_confirmed(sup.on_dispatched(item1.track))
+        await qe.append(t2)
+        backend = _playing_backend(dmr, advance_cb=AsyncMock())
+        backend._play_start = _time_mod.monotonic() - 500  # 180s track long over
+        backend._armed_next = ("http://url2", t2)
+        backend._setnext_sent = True
+        backend._sent_next_url = "http://url2"
+
+        with patch("asyncio.sleep", _tick_limit(2)):
+            with pytest.raises(_StopPoll):
+                await backend._poll_eos()
+
+        assert qe.state.current.track_id == "t2"   # late boundary — no freeze
+        assert rec.call_count == 2                 # counted exactly once
+        backend._advance_cb.assert_not_awaited()   # one advance, via boundary
+        assert backend._gapless_verdicts["dev-1"] == "unsupported"
+        set_setting.assert_awaited_once_with(
+            "gapless_verdict:dlna:dev-1", "unsupported")
+        # Subsequent boundaries are per-track: arming is disabled now.
+        await backend.arm_next("http://url3", _track("t3"))
+        assert backend._armed_next is None
+        assert dmr._setnext_action.async_call.await_count == 0
+
+
+async def test_scpd_without_setnext_never_arms_and_caches_unsupported(dlna_mock):
+    """SCPD lacks SetNextAVTransportURI → never armed, per-track path, and
+    the capability is cached unsupported IMMEDIATELY (a static gate needs no
+    behavioral probe — the renderer cannot chain, full stop)."""
+    from app.output.dlna import DlnaBackend
+    dmr = make_dmr()
+    orig = dmr._action.side_effect
+
+    def _action(service, name):
+        if service == "AVT" and name == "SetNextAVTransportURI":
+            return None                            # action absent from SCPD
+        return orig(service, name)
+
+    dmr._action = MagicMock(side_effect=_action)
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    backend._playing_confirmed = True
+    set_setting = AsyncMock()
+    with patch("app.database.set_setting", set_setting):
+        await backend.arm_next("http://url2", _track("t2"))
+    assert backend._armed_next is None
+    dmr._setnext_action.async_call.assert_not_awaited()
+    assert backend._gapless_verdicts["dev-1"] == "unsupported"
+    set_setting.assert_awaited_once_with(
+        "gapless_verdict:dlna:dev-1", "unsupported")
+
+
+async def test_setnext_refusal_discards_arm_without_verdict_change(dlna_mock):
+    """Linkplay refuses SetNext sent near track end and on <40s tracks: the
+    refusal discards the arm — the boundary is per-track EOS naturally, no
+    armed state ever formed — with NO verdict change: a refusal is not
+    evidence of missing support; only a FAILED ARMED BOUNDARY decides."""
+    from app.output.dlna import DlnaBackend
+    dmr = make_dmr()
+    dmr._setnext_action.async_call = AsyncMock(
+        side_effect=Exception("712: refused near track end"))
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    backend._playing_confirmed = True
+    set_setting = AsyncMock()
+    with patch("app.database.set_setting", set_setting):
+        await backend.arm_next("http://url2", _track("t2"))  # must not raise
+    assert backend._armed_next is None and backend._setnext_sent is False
+    set_setting.assert_not_awaited()
+    assert backend._gapless_verdicts.get("dev-1") is None    # still unverified
+
+
+async def test_arm_next_noop_when_cached_verdict_unsupported(dlna_mock):
+    """"unsupported" disables arming: the verdict is per DEVICE while
+    hasattr(backend, "arm_next") is per class, so the backend itself
+    enforces the gate — no stash, no SOAP, per-track path."""
+    from app.output.dlna import DlnaBackend
+    dmr = make_dmr()
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    backend._playing_confirmed = True
+    backend._gapless_verdicts["dev-1"] = "unsupported"
+    await backend.arm_next("http://url2", _track("t2"))
+    assert backend._armed_next is None
+    dmr._setnext_action.async_call.assert_not_awaited()
+
+
+async def test_revoke_sends_empty_next_uri_and_keeps_stale_watch(dlna_mock):
+    """revoke_next on a DELIVERED arm issues the empty-NextURI revoke via
+    direct _action — and keeps the delivered URI on the stale watch either
+    way, because Linkplay firmware variously errors OR silently ignores the
+    empty-URI revoke and a SOAP success cannot tell honored from ignored.
+    Idempotent: a second revoke is a pure no-op."""
+    from app.output.dlna import DlnaBackend
+    dmr = make_dmr()
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    backend._playing_confirmed = True
+    await backend.arm_next("http://url2", _track("t2"))      # delivered
+    dmr._setnext_action.async_call.assert_awaited_once()
+
+    await backend.revoke_next()
+    assert dmr._setnext_action.async_call.await_count == 2
+    kwargs = dmr._setnext_action.async_call.await_args.kwargs
+    assert kwargs["NextURI"] == "" and kwargs["NextURIMetaData"] == ""
+    assert backend._armed_next is None and backend._setnext_sent is False
+    assert backend._stale_next_uri == "http://url2"          # watched
+
+    await backend.revoke_next()                              # idempotent
+    assert dmr._setnext_action.async_call.await_count == 2
+    assert dmr.async_set_next_transport_uri.await_count == 0
+
+
+async def test_revoke_error_keeps_stale_watch_without_raising(dlna_mock):
+    """The renderer ERRORS on the empty-URI revoke (firmware varies): the
+    slot still clears server-side, nothing raises, and the delivered URI
+    stays on the stale watch for the correction path."""
+    from app.output.dlna import DlnaBackend
+    dmr = make_dmr()
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    backend._playing_confirmed = True
+    await backend.arm_next("http://url2", _track("t2"))
+    dmr._setnext_action.async_call = AsyncMock(
+        side_effect=Exception("718: invalid instance / revoke unsupported"))
+    await backend.revoke_next()                              # must not raise
+    assert backend._stale_next_uri == "http://url2"
+    assert backend._armed_next is None and backend._setnext_sent is False
+
+
+async def test_stale_next_boundary_stop_and_replays_correct_front(dlna_mock):
+    """The DEFINED revoke-failure fallback: the renderer chained into the
+    REVOKED next anyway. The boundary watch sees the WRONG CurrentTrackURI
+    change → corrective Stop + exactly one normal advance (the replay of the
+    correct queue front via the normal dispatch path) — never a silent wrong
+    track, and never a boundary count for the wrong track."""
+    from app.output.dlna import TransportState
+    advance_called = []
+
+    async def advance():
+        advance_called.append(True)
+
+    dmr = make_dmr()
+    dmr.transport_state = TransportState.PLAYING
+    dmr._position_action.async_call = AsyncMock(
+        return_value={"TrackURI": "http://revoked"})
+    backend = _playing_backend(dmr, advance_cb=advance)
+    backend._stale_next_uri = "http://revoked"   # a failed/ignored revoke
+    notify = AsyncMock()
+    with patch("app.output.session.notify_gapless_boundary", notify), \
+         patch("asyncio.sleep", AsyncMock()):
+        await backend._poll_eos()
+
+    dmr._stop_action.async_call.assert_awaited_once_with(InstanceID=0)
+    assert advance_called == [True]        # the replay — exactly one advance
+    notify.assert_not_awaited()            # the wrong track is never counted
+    assert backend._stale_next_uri is None
+    assert backend.is_playing is False
+
+
+async def test_gapless_soap_bypasses_guarded_helpers_with_stale_action_cache(dlna_mock):
+    """Regression pin (stale-CurrentTransportActions doc): with the cache
+    stuck at {"play"} — the Linkplay bug condition — every U8 SOAP (SetNext
+    arm, boundary GetPositionInfo read, empty-URI revoke) still fires via
+    direct _action, and the guarded async_set_next_transport_uri helper is
+    never awaited."""
+    from app.output.dlna import TransportState
+    dmr = make_dmr()
+    dmr._current_transport_actions = {"play"}    # the stale-cache condition
+    dmr.transport_state = TransportState.PLAYING
+    dmr._position_action.async_call = AsyncMock(
+        return_value={"TrackURI": "http://url1"})
+    backend = _playing_backend(dmr, advance_cb=AsyncMock())
+
+    await backend.arm_next("http://url2", _track("t2"))
+    dmr._setnext_action.async_call.assert_awaited_once()
+
+    with patch("asyncio.sleep", _tick_limit(1)):
+        with pytest.raises(_StopPoll):
+            await backend._poll_eos()
+    dmr._position_action.async_call.assert_awaited_once_with(InstanceID=0)
+
+    await backend.revoke_next()
+    assert dmr._setnext_action.async_call.await_count == 2
+
+    assert dmr.async_set_next_transport_uri.await_count == 0
+
+
+async def test_play_clears_armed_state_and_arm_timing_gate(dlna_mock, fresh_supervisor):
+    """U6 contract: play() clears the slot — a fresh dispatch owns the
+    boundary. The arm-timing gate resets too, so the NEW track's arm waits
+    for ITS first PLAYING poll, and the boundary baseline re-anchors."""
+    from app.output.dlna import DlnaBackend
+    dmr = make_dmr()
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    backend._playing_confirmed = True
+    await backend.arm_next("http://url2", _track("t2"))
+    backend._stale_next_uri = "http://old"
+    await backend.play("http://url3", _track("t3"))
+    backend._cancel_poll()
+    assert backend._armed_next is None
+    assert backend._setnext_sent is False
+    assert backend._stale_next_uri is None
+    assert backend._playing_confirmed is False
+    assert backend._current_uri == "http://url3"
+
+
+async def test_verdict_first_boundary_decides_and_sticks(dlna_mock):
+    """First-armed-boundary-decides: an already-decided device keeps its
+    verdict — later outcomes never overwrite (re-verification = clearing the
+    persisted gapless_verdict:dlna:{device_id} setting)."""
+    from app.output.dlna import DlnaBackend
+    backend = DlnaBackend()
+    backend._device_id = "dev-1"
+    set_setting = AsyncMock()
+    with patch("app.database.set_setting", set_setting):
+        await backend._decide_gapless_verdict("supported")
+        await backend._decide_gapless_verdict("unsupported")
+    assert backend._gapless_verdicts["dev-1"] == "supported"
+    set_setting.assert_awaited_once_with(
+        "gapless_verdict:dlna:dev-1", "supported")
+
+
+async def test_verdict_flip_schedules_devices_changed_broadcast(dlna_mock, monkeypatch):
+    """A decided verdict refreshes the picker chip by reusing the watcher's
+    debounced devices_changed broadcast (the snapshot builder bulk-reads the
+    persisted verdicts, so the scheduled frame carries the flip)."""
+    import app.output.watcher as watcher_module
+    from app.output.dlna import DlnaBackend
+    fake_watcher = MagicMock()
+    monkeypatch.setattr(watcher_module, "_watcher", fake_watcher)
+    dmr = make_dmr()
+
+    def _action(service, name):
+        if service == "AVT" and name == "SetNextAVTransportURI":
+            return None                            # static gate → verdict
+        return MagicMock()
+
+    dmr._action = MagicMock(side_effect=_action)
+    backend = DlnaBackend()
+    backend._dmr = dmr
+    backend._device_id = "dev-1"
+    with patch("app.database.set_setting", AsyncMock()):
+        await backend.arm_next("http://url2", _track("t2"))
+    fake_watcher._schedule_broadcast.assert_called_once()
+
+
+async def test_set_device_hydrates_gapless_verdict(dlna_mock):
+    """set_device hydrates the per-device verdict cache from the persisted
+    gapless_verdict:dlna:{device_id} setting so the arming gate reads
+    memory, never the DB, on the playback path (plan U8)."""
+    from app.output.dlna import DlnaBackend
+    backend = DlnaBackend()
+    backend._device_locations["dev-1"] = "http://192.168.1.50:8000/desc.xml"
+
+    notify = MagicMock()
+    notify.async_start_server = AsyncMock()
+    notify.async_stop_server = AsyncMock()
+    notify.event_handler = MagicMock()
+    dmr = make_dmr()
+    fake_upnp_factory = MagicMock()
+    fake_upnp_factory.async_create_device = AsyncMock(return_value=MagicMock())
+
+    async def _get_setting(key, default=None):
+        if key == "gapless_verdict:dlna:dev-1":
+            return "unsupported"
+        return None
+
+    with patch("app.output.dlna.AiohttpSessionRequester", MagicMock(), create=True), \
+         patch("app.output.dlna.UpnpFactory", MagicMock(return_value=fake_upnp_factory), create=True), \
+         patch("app.output.dlna.AiohttpNotifyServer", MagicMock(return_value=notify), create=True), \
+         patch("app.output.dlna.DmrDevice", MagicMock(return_value=dmr), create=True), \
+         patch("app.database.get_setting", AsyncMock(side_effect=_get_setting)), \
+         patch("app.database.set_setting", AsyncMock()):
+        await backend.set_device("dev-1")
+
+    assert backend._gapless_verdicts["dev-1"] == "unsupported"

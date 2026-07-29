@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 
-from app.plex.models import Track
+from app.models import Track
 
 
 class QueueEndBehavior(str, Enum):
@@ -37,6 +37,12 @@ def coerce_queue_end_behavior(stored: str | None) -> QueueEndBehavior:
 class QueueItem:
     track: Track
     added_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    # Output-session supervisor plan U2 (R19): True when this item's play was
+    # already counted before an outage hold re-front-inserted it — the resume
+    # dispatch bypasses the play-count chokepoint so the play never counts
+    # twice. Persisted inside metadata_json (no schema change) so the mark
+    # survives a restart with the held item at the queue front (R18).
+    play_recorded: bool = False
 
     @property
     def track_id(self) -> str:
@@ -56,6 +62,12 @@ class QueueItem:
                 "thumb": self.track.thumb,
                 "stream_key": self.track.stream_key,
                 "server_name": self.track.server_name,
+                # Multi-source plan U9: persist the holds snapshot so play-time
+                # fallback survives a restart/restore.
+                "holds": self.track.holds,
+                # Supervisor plan U2 (R19): item-level held-play mark; rides
+                # the metadata blob to avoid a queue_state schema migration.
+                "play_recorded": self.play_recorded,
             }),
             "added_at": self.added_at,
         }
@@ -74,8 +86,10 @@ class QueueItem:
             thumb=meta.get("thumb"),
             stream_key=meta.get("stream_key", ""),
             server_name=meta.get("server_name", ""),
+            holds=meta.get("holds", []) or [],
         )
-        return cls(track=track, added_at=data["added_at"])
+        return cls(track=track, added_at=data["added_at"],
+                   play_recorded=bool(meta.get("play_recorded", False)))
 
 
 @dataclass
