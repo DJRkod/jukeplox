@@ -1435,3 +1435,55 @@ async def test_stop_closes_ssdp_transport_and_drops_late_packets():
     await asyncio.sleep(0)
     assert h.watcher.registry == {}
     assert h.timers.active == []
+
+
+# ── supervisor arrival listeners (2026-07-11 supervisor plan U3) ──────────────
+
+async def test_arrival_listener_fires_on_every_arrival_for_its_key():
+    """The supervisor's per-device callback fires after the arrival fed the
+    backend cache — on EVERY arrival (a device returning inside the grace
+    window has no offline→online edge), and only for its own key."""
+    h = await Harness().start()
+    calls = []
+    h.watcher.add_arrival_listener("chromecast", CAST_UUID,
+                                   lambda: calls.append("cast"))
+    h.emit(CAST, "new", cast_new())
+    assert calls == ["cast"]
+    # cache was fed BEFORE the callback (register_resolved ran in _on_new)
+    assert CAST_UUID in h.cast_backend._dbus_index
+    # a different device's arrival does not fire it
+    h.emit(RAOP, "new", air_new())
+    assert calls == ["cast"]
+    # a repeat announcement fires again (single-flight lives supervisor-side)
+    h.emit(CAST, "new", cast_new())
+    assert calls == ["cast", "cast"]
+
+
+async def test_arrival_listener_remove_and_raising_listener_fail_soft():
+    """remove_arrival_listener deregisters exactly the given callback, and a
+    listener that raises never breaks event handling."""
+    h = await Harness().start()
+    calls = []
+
+    def boom():
+        raise RuntimeError("listener bug")
+
+    h.watcher.add_arrival_listener("chromecast", CAST_UUID, boom)
+    h.watcher.add_arrival_listener("chromecast", CAST_UUID,
+                                   lambda: calls.append(1))
+    h.emit(CAST, "new", cast_new())          # boom absorbed, second still runs
+    assert calls == [1]
+    h.watcher.remove_arrival_listener("chromecast", CAST_UUID, boom)
+    # removing an unknown callback is a quiet no-op
+    h.watcher.remove_arrival_listener("dlna", "nope", boom)
+    h.emit(CAST, "new", cast_new())
+    assert calls == [1, 1]
+
+
+async def test_stop_clears_arrival_listeners():
+    h = await Harness().start()
+    calls = []
+    h.watcher.add_arrival_listener("chromecast", CAST_UUID,
+                                   lambda: calls.append(1))
+    await h.watcher.stop()
+    assert h.watcher._arrival_listeners == {}

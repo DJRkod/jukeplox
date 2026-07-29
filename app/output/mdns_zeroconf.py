@@ -217,7 +217,7 @@ async def discover(service_type: str, aiozc, *, timeout: float = 3.0):
         except Exception:
             _log.debug("mdns_zeroconf.discover: resolve failed for %r", name, exc_info=True)
 
-    def _on_change(zeroconf, service_type_, name, state_change) -> None:
+    def _on_change(zeroconf, service_type, name, state_change) -> None:
         if state_change is ServiceStateChange.Removed:
             return
         if name in pending or name in results:

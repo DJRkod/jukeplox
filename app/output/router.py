@@ -6,7 +6,7 @@ is swapped in.
 """
 
 from app.output.base import AbstractOutputBackend, OutputDevice
-from app.plex.models import Track
+from app.models import Track
 
 
 class OutputRouter:
@@ -21,6 +21,15 @@ class OutputRouter:
             self._pending = None
         else:
             self._pending = backend
+        # Arming lifecycle (2026-07-11 supervisor plan U6, flow Gap 9b): a
+        # switch request makes any device-armed next stale — on the deferred
+        # path the boundary must return to server control so swap_pending()
+        # owns the next track, and on the immediate path the arm belongs to
+        # the OLD backend. The state-level reconcile revokes it (has_pending /
+        # backend-changed both read as stale there); cheap no-op when nothing
+        # is armed. Late import: app.state imports this module at load time.
+        from app import state
+        state.trigger_arming_eval()
 
     async def swap_pending(self) -> None:
         """Called by advance() to activate a pending backend switch.

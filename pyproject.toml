@@ -20,6 +20,8 @@ dependencies = [
     "pychromecast>=14.0",
     "zeroconf>=0.130",
     "async-upnp-client>=0.40",
+    "mutagen>=1.47",
+    "cryptography>=43",
 ]
 
 [project.optional-dependencies]

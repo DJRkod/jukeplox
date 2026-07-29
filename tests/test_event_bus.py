@@ -223,10 +223,10 @@ def test_airplay_protocol_changed_event_to_json_happy_path():
     """Wire shape: type/device_id/protocol. The admin UI keys protocol
     labels by device_id and reads protocol to render 'AirPlay 2'/'AirPlay 1'."""
     assert AirPlayProtocolChangedEvent(
-        device_id="42FDF3255868@WiiM Pro-5868", protocol="ap1"
+        device_id="A1B2C3D4E5F6@WiiM Pro-E5F6", protocol="ap1"
     ).to_json() == {
         "type": "airplay_protocol_changed",
-        "device_id": "42FDF3255868@WiiM Pro-5868",
+        "device_id": "A1B2C3D4E5F6@WiiM Pro-E5F6",
         "protocol": "ap1",
     }
 

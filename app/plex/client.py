@@ -15,6 +15,7 @@ splitting on the first ":".
 """
 
 import asyncio
+import json
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -124,8 +125,12 @@ class PlexClient:
             from app.config import settings
             max_concurrency = settings.plex_max_concurrency
         self._sem = asyncio.Semaphore(max_concurrency)
+        # connect=5 split (2026-07-17 ce-debug): a blackholed server (SYN
+        # never answered — dead box, moved IP, filtered port) must fail the
+        # CONNECT phase in seconds, not burn the full 15s read budget. The
+        # read budget stays 15s for slow-but-alive PMS responses.
         self._http = httpx.AsyncClient(
-            timeout=15,
+            timeout=httpx.Timeout(15, connect=5),
             http2=False,
             limits=httpx.Limits(
                 max_connections=max_concurrency,
@@ -145,16 +150,36 @@ class PlexClient:
     def _url(self, path: str) -> str:
         return f"{self.server_url}{path}"
 
+    @staticmethod
+    def _check_status(resp) -> None:
+        """Shared status contract for _get and _get_raw so the two paths can't
+        drift: a 401 becomes a typed PlexAuthError (drives the auth re-prompt),
+        any other 4xx/5xx raises via raise_for_status."""
+        if resp.status_code == 401:
+            from app.plex.auth import PlexAuthError
+            raise PlexAuthError("Plex token rejected (401)")
+        resp.raise_for_status()
+
     async def _get(self, path: str, params: dict | None = None) -> dict:
         async with self._sem:
             resp = await self._http.get(
                 self._url(path), headers=self._headers(), params=params or {}
             )
-        if resp.status_code == 401:
-            from app.plex.auth import PlexAuthError
-            raise PlexAuthError("Plex token rejected (401)")
-        resp.raise_for_status()
+        self._check_status(resp)
         return resp.json()
+
+    async def _get_raw(self, path: str, params: dict | None = None) -> bytes:
+        """Fetch a response body as raw bytes, same status contract as _get but
+        WITHOUT decoding JSON on the event loop (fix U3). Whole-library callers
+        hand the bytes to run_in_executor so the (large) json.loads + object
+        build runs off-loop. The semaphore wraps only the I/O; the executor parse
+        happens after it releases, so the cap governs sockets, not thread time."""
+        async with self._sem:
+            resp = await self._http.get(
+                self._url(path), headers=self._headers(), params=params or {}
+            )
+        self._check_status(resp)
+        return resp.content
 
     def _cached(self, key: str) -> Any | None:
         entry = self._cache.get(key)
@@ -226,18 +251,12 @@ class PlexClient:
         cached = self._cached(cache_key)
         if cached is not None:
             return cached
-        data = await self._get(
+        raw = await self._get_raw(
             f"/library/sections/{bare_key}/all", params={"type": TYPE_ARTIST}
         )
-        artists = [
-            Artist(
-                id=self._make_id(item["ratingKey"]),
-                title=item["title"],
-                thumb=self._prefix(item.get("thumb")),
-                release_count=_parse_child_count(item.get("childCount")),
-            )
-            for item in data.get("MediaContainer", {}).get("Metadata", [])
-        ]
+        artists = await asyncio.get_running_loop().run_in_executor(
+            None, self._parse_artists, raw
+        )
         self._store(cache_key, artists)
         return artists
 
@@ -307,20 +326,10 @@ class PlexClient:
         cached = self._cached(cache_key)
         if cached is not None:
             return cached
-        data = await self._get(f"/library/sections/{bare_key}/all", params=params)
-        albums = [
-            Album(
-                id=self._make_id(item["ratingKey"]),
-                title=item["title"],
-                artist=item.get("parentTitle", ""),
-                year=item.get("year"),
-                thumb=self._prefix(item.get("thumb")),
-                subtype=item.get("subtype"),
-                added_at=item.get("addedAt"),
-                track_count=_parse_child_count(item.get("leafCount") or item.get("childCount")),
-            )
-            for item in data.get("MediaContainer", {}).get("Metadata", [])
-        ]
+        raw = await self._get_raw(f"/library/sections/{bare_key}/all", params=params)
+        albums = await asyncio.get_running_loop().run_in_executor(
+            None, self._parse_albums, raw
+        )
         self._store(cache_key, albums)
         return albums
 
@@ -355,6 +364,48 @@ class PlexClient:
             disc_number=item.get("parentIndex") or 1,
             track_number=item.get("index"),
         )
+
+    # ── off-loop whole-library parsers (2026-07-29 fix U3) ────────────────────
+    # Run on a run_in_executor worker thread: json.loads of a whole-library
+    # payload plus building thousands of dataclasses is CPU-bound work that would
+    # otherwise freeze the event loop (starving transport controls / position
+    # polls) for tens of seconds on a weak host. These mirror the previous inline
+    # comprehensions exactly — pure relocation of where the CPU runs.
+
+    def _parse_tracks(self, raw: bytes) -> list[Track]:
+        data = json.loads(raw)
+        return [
+            self._parse_track(item)
+            for item in data.get("MediaContainer", {}).get("Metadata", [])
+        ]
+
+    def _parse_artists(self, raw: bytes) -> list[Artist]:
+        data = json.loads(raw)
+        return [
+            Artist(
+                id=self._make_id(item["ratingKey"]),
+                title=item["title"],
+                thumb=self._prefix(item.get("thumb")),
+                release_count=_parse_child_count(item.get("childCount")),
+            )
+            for item in data.get("MediaContainer", {}).get("Metadata", [])
+        ]
+
+    def _parse_albums(self, raw: bytes) -> list[Album]:
+        data = json.loads(raw)
+        return [
+            Album(
+                id=self._make_id(item["ratingKey"]),
+                title=item["title"],
+                artist=item.get("parentTitle", ""),
+                year=item.get("year"),
+                thumb=self._prefix(item.get("thumb")),
+                subtype=item.get("subtype"),
+                added_at=item.get("addedAt"),
+                track_count=_parse_child_count(item.get("leafCount") or item.get("childCount")),
+            )
+            for item in data.get("MediaContainer", {}).get("Metadata", [])
+        ]
 
     async def get_tracks(
         self,
@@ -396,11 +447,10 @@ class PlexClient:
         cached = self._cached(cache_key)
         if cached is not None:
             return cached
-        data = await self._get(f"/library/sections/{bare_key}/all", params=params)
-        tracks = [
-            self._parse_track(item)
-            for item in data.get("MediaContainer", {}).get("Metadata", [])
-        ]
+        raw = await self._get_raw(f"/library/sections/{bare_key}/all", params=params)
+        tracks = await asyncio.get_running_loop().run_in_executor(
+            None, self._parse_tracks, raw
+        )
         self._store(cache_key, tracks)
         return tracks
 
@@ -774,13 +824,30 @@ class MultiPlexClient:
         return client.stream_url(stream_key)
 
     async def get_libraries(self) -> list[Library]:
-        result: list[Library] = []
-        for c in self._clients:
+        """Union of every server's libraries — CONCURRENT and LOUD.
+
+        2026-07-17 ce-debug: the previous sequential loop with a silent
+        `except: pass` let one blackholed server tax every caller the full
+        per-request timeout AND silently drop that server's libraries — the
+        root of the "guest search always takes 17s" bug, invisible through
+        four debugging rounds precisely because nothing logged. Legs now run
+        in parallel (cost = slowest leg, not the sum) and a failed leg WARNs
+        with the server name and elapsed time; healthy legs always land."""
+        import logging
+
+        async def _one(c) -> list[Library]:
+            t0 = time.monotonic()
             try:
-                result.extend(await c.get_libraries())
-            except Exception:
-                pass
-        return result
+                return await c.get_libraries()
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "get_libraries failed for server %r after %.1fs: %s",
+                    getattr(c, "server_name", "?") or "?",
+                    time.monotonic() - t0, exc,
+                )
+                return []
+        per_server = await asyncio.gather(*[_one(c) for c in self._clients])
+        return [lib for libs in per_server for lib in libs]
 
     async def get_artists(self, section_key: str) -> list[Artist]:
         _, client = self._route(section_key)

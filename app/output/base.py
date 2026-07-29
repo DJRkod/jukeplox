@@ -7,7 +7,7 @@ from typing import Any, Protocol, runtime_checkable
 
 AdvanceCallback = Callable[[], Coroutine[Any, Any, Any]]
 
-from app.plex.models import Track
+from app.models import Track
 
 
 # Shared echo-guard window used by every backend that emits volume_changed
@@ -31,6 +31,18 @@ class DeviceNotReadyError(RuntimeError):
 
     Unlike a normal playback failure, this signals that the queue should not be
     drained — the device is temporarily unavailable, not the content.
+    """
+
+
+class DeviceLostError(DeviceNotReadyError):
+    """Device-level playback failure (2026-07-11 supervisor plan U2, R15).
+
+    The device that was (or should be) rendering is unreachable: connection
+    lost, transport dead, sink gone. Subclasses ``DeviceNotReadyError`` so it
+    inherits the "don't drain the queue" semantics every existing handler
+    already applies; the output-session supervisor additionally routes it to
+    an outage hold (pause + re-front-insert the interrupted track) instead of
+    the skip/holder-fallback path a track-level failure takes.
     """
 
 

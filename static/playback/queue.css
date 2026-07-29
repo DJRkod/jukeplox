@@ -253,3 +253,53 @@
   font-weight: 600; font-size: .85rem;
 }
 .closing-time-resume:hover { filter: brightness(1.08); }
+
+/* ── Skip notification (plan U16 / R22) ─────────────────────────────────────
+ * Single-source transient toast shown on guest AND admin when a queued track is
+ * skipped because every holder failed to stream. Non-blocking, bottom-pinned,
+ * auto-dismissed by the shared playback module; rapid skips replace in place. */
+.skip-note-overlay {
+  position: fixed; inset: auto 0 calc(env(safe-area-inset-bottom, 0px) + 4.5rem) 0;
+  z-index: 9998; display: flex; justify-content: center;
+  padding: 0 1rem; pointer-events: none;
+}
+.skip-note-overlay[hidden] { display: none; }
+.skip-note-card {
+  display: flex; align-items: center; gap: .55rem;
+  max-width: min(92vw, 34rem);
+  background: var(--surface, #15171c);
+  border: 1px solid var(--border, #333);
+  border-left: 3px solid var(--accent, #c8a24a);
+  border-radius: 8px; padding: .6rem .9rem;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
+  color: var(--text, #f0e9d6); font-size: .9rem;
+  opacity: 0; transform: translateY(8px); transition: opacity .25s ease, transform .25s ease;
+}
+.skip-note-overlay.is-shown .skip-note-card { opacity: 1; transform: none; }
+.skip-note-icon { flex-shrink: 0; opacity: .85; }
+@media (prefers-reduced-motion: reduce) {
+  .skip-note-card { transition: none; }
+}
+
+/* The admin history-strip remove chip (former play-data curation plan U6) was
+   removed 2026-07-03: the "remove this play" affordance moved to the Setup →
+   Recent Plays panel (static/admin/app.js renderRecentPlays), so the strip is
+   read-only and needs no .qs-history-scoped chip rules. The base .qi-remove /
+   .qi-actions rules above stay — they still serve the queue-remove ✕. */
+
+/* Output-session outage note (2026-07-11 supervisor plan U4, R20). The shared
+ * lean "Paused — output offline" line the playback module renders into the
+ * Now Playing panel while a device-level outage holds the queue — identical
+ * on guest + admin (admin layers its rich banner separately, page chrome).
+ * Deliberately minimal pending the interaction-state mockups pass. */
+.np-output-note {
+  margin-top: .5rem;
+  padding: .35rem .6rem;
+  border-radius: 6px;
+  border: 1px solid var(--border, #333);
+  border-left: 3px solid var(--danger, #f87171);
+  background: var(--danger-dim);
+  color: var(--text, #f0e9d6);
+  font-size: .82rem;
+}
+.np-output-note[hidden] { display: none; }

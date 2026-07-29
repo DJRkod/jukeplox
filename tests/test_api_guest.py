@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
+from app.output import hold  # the hold flag's home since the session decomposition
 from app.plex.models import Track, Album, Artist, Library, SearchResults
 from app.queue.engine import QueueLockError
 
@@ -53,6 +54,37 @@ def make_plex_client(
     # All Songs (plan 007): per-artist online popularity; default none.
     client.get_artist_popular_tracks = AsyncMock(return_value=[])
     return client
+
+
+# ── _track_dict per-source picker guard (parity U2) ──────────────────────────
+
+def test_track_dict_no_sources_for_native_track():
+    # A native track has no catalog holds → no `sources` field → byte-identical
+    # to before this change (R8).
+    from app.api.guest import _track_dict
+    assert "sources" not in _track_dict(make_track())
+
+
+def test_track_dict_no_sources_for_playback_holds():
+    # Enqueue-time playback holds carry only {source_id, key} (no server_name),
+    # so a queued/history row serialized via _track_dict emits no picker — the
+    # picker is browse-only; queued-item source visibility is deferred.
+    from app.api.guest import _track_dict
+    t = make_track()
+    t.holds = [{"source_id": "m1", "key": "m1:p1"}, {"source_id": "jelly", "key": "jelly:p1"}]
+    assert "sources" not in _track_dict(t)
+
+
+def test_track_dict_emits_sources_from_browse_holds():
+    # Browse-shape holds (server_name + source_type) on a multi-holder track →
+    # a type-qualified per-source list for the picker.
+    from app.api.guest import _track_dict
+    t = make_track()
+    t.holds = [{"source_id": "m1", "key": "m1:p1", "server_name": "Home", "source_type": "plex"},
+               {"source_id": "jf", "key": "jf:p1", "server_name": "Den", "source_type": "jellyfin"}]
+    assert _track_dict(t)["sources"] == [
+        {"server_name": "Home", "source_type": "plex"},
+        {"server_name": "Den", "source_type": "jellyfin"}]
 
 
 @pytest.fixture
@@ -381,6 +413,85 @@ def test_highest_rated_shown_to_guest_when_visible(mock_deps):
     assert body[0]["rating"] == 5 and body[0]["title"] == "Song" and body[0]["play_count"] == 3
 
 
+# ── Leaderboard album-drill refresh (ce-debug 2026-07-03) ────────────────────
+# 'Go to Album' targets are snapshotted into play_track_meta at play time, but
+# album identities are re-clustered every scan, so old snapshots dangle (greyed
+# or blank release). The endpoint re-resolves the drill from the current catalog
+# by the stable track identity.
+
+def _mp_rows(album_id):
+    return [{"track_id": "ident-1", "count": 7,
+             "metadata": {"track_id": "ident-1", "title": "Wish",
+                          "artist": "Nine Inch Nails", "album": "Old Name",
+                          "album_id": album_id, "thumb": "/old.jpg"}}]
+
+
+def test_most_played_refreshes_stale_album_drill_from_catalog(mock_deps):
+    rows = _mp_rows("stale-album")            # snapshot points at a re-minted id
+    ct = {"identity": "ident-1", "album_identity": "current-album",
+          "album": "Broken", "thumb": "/new.jpg"}
+    with patch("app.database.get_most_played_display_limit", AsyncMock(return_value=100)), \
+         patch("app.database.get_top_played_tracks", AsyncMock(return_value=rows)), \
+         patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.catalog.store.get_track", AsyncMock(return_value=ct)):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/most-played").json()
+    assert body[0]["album_id"] == "current-album"   # re-pointed to the live identity
+    assert body[0]["album"] == "Broken" and body[0]["thumb"] == "/new.jpg"
+
+
+def test_most_played_ungreys_missing_album_id_when_catalogued(mock_deps):
+    rows = _mp_rows(None)                     # older snapshot: no album_id → greyed
+    ct = {"identity": "ident-1", "album_identity": "current-album",
+          "album": "Broken", "thumb": None}
+    with patch("app.database.get_most_played_display_limit", AsyncMock(return_value=100)), \
+         patch("app.database.get_top_played_tracks", AsyncMock(return_value=rows)), \
+         patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.catalog.store.get_track", AsyncMock(return_value=ct)):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/most-played").json()
+    assert body[0]["album_id"] == "current-album"   # now populated → no longer greyed
+
+
+def test_most_played_keeps_snapshot_when_track_not_catalogued(mock_deps):
+    rows = _mp_rows("snap-album")             # source gone → not in the catalog
+    with patch("app.database.get_most_played_display_limit", AsyncMock(return_value=100)), \
+         patch("app.database.get_top_played_tracks", AsyncMock(return_value=rows)), \
+         patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.catalog.store.get_track", AsyncMock(return_value=None)):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/most-played").json()
+    assert body[0]["album_id"] == "snap-album"      # best-effort snapshot preserved
+
+
+def test_most_played_leaves_snapshot_when_catalog_inactive(mock_deps):
+    rows = _mp_rows("plex-album")             # Plex-only: stable rating-key ids
+    with patch("app.database.get_most_played_display_limit", AsyncMock(return_value=100)), \
+         patch("app.database.get_top_played_tracks", AsyncMock(return_value=rows)), \
+         patch("app.api.guest._catalog_active", AsyncMock(return_value=False)), \
+         patch("app.catalog.store.get_track", AsyncMock()) as gt:
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/most-played").json()
+    assert body[0]["album_id"] == "plex-album"      # untouched
+    gt.assert_not_called()                          # catalog never consulted
+
+
+def test_highest_rated_refreshes_stale_album_drill_from_catalog(mock_deps):
+    rows = [{"track_id": "ident-1", "stars": 5, "play_count": 2,
+             "metadata": {"track_id": "ident-1", "title": "Wish", "artist": "NIN",
+                          "album": "Old", "album_id": "stale-album"}}]
+    ct = {"identity": "ident-1", "album_identity": "current-album",
+          "album": "Broken", "thumb": None}
+    with patch("app.database.get_ratings_visible_to_guests", AsyncMock(return_value=True)), \
+         patch("app.database.get_most_played_display_limit", AsyncMock(return_value=100)), \
+         patch("app.database.get_top_rated_tracks", AsyncMock(return_value=rows)), \
+         patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.catalog.store.get_track", AsyncMock(return_value=ct)):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/highest-rated").json()
+    assert body[0]["album_id"] == "current-album" and body[0]["rating"] == 5
+
+
 # ── Surprise Me endpoint (2026-06-17 plan U4) ────────────────────────────────
 
 
@@ -576,6 +687,25 @@ def test_scheme_ids_lockstep_with_frontend_table():
 
 
 # ── Broad search (Tier 2) ──────────────────────────────────────────────────────
+
+
+def test_search_broad_catalog_active_returns_empty_without_live_calls(mock_deps):
+    """Catalog mode short-circuits the broad tier (2026-07-17 ce-debug): the
+    catalog Tier-1 search is already a full substring scan, so Tier 2 has
+    nothing broader to serve — the endpoint must return an empty page (the
+    client's done signal) WITHOUT touching the live source. The prior live
+    fan-out here is what made guest search crawl (a serial page cascade of
+    per-(library x variant) source searches that deduped to nothing)."""
+    qe, plex = mock_deps
+    plex.search_titles = AsyncMock(return_value=SearchResults(
+        tracks=[make_track()], albums=[], artists=[]))
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/search/broad", params={"q": "Cicada", "types": "track"})
+    assert resp.status_code == 200
+    assert resp.json() == {"tracks": [], "albums": []}
+    plex.search_titles.assert_not_awaited()
 
 
 def test_search_broad_returns_title_results(mock_deps):
@@ -2484,6 +2614,149 @@ async def test_append_album_get_album_keyerror_returns_404(mock_deps):
     assert resp.status_code == 404
 
 
+# ── Catalog-aware enqueue (parity U4) ────────────────────────────────────────
+# When a non-Plex source is connected the catalog floor is active, so an enqueue
+# carries a catalog IDENTITY (not a provider rating key). append_to_queue must
+# resolve the identity → holds → the chosen (or highest-priority) holder's
+# provider copy, BEFORE building the queue item — never feed the identity to the
+# native Plex rating-key path (which silently returns nothing). A manual pick is
+# a preference: the chosen holder is promoted to primary, the rest stay as
+# fallback (U9 play-time fallback). (R1, R3, R7; AE1, AE2, AE8)
+
+
+@pytest.fixture
+async def catalog_env(tmp_path, monkeypatch):
+    """Real seeded catalog + real QueueEngine, with the catalog gate forced on.
+
+    Seeds: album 'al' held by Plex(m1, prio0) + Jellyfin(jelly, prio1) with two
+    tracks (t1 two-source, t2 Plex-only); a Jellyfin-ONLY album 'jonly' (its
+    identity is not a Plex key) with one track 'tjo'.
+    """
+    import contextlib
+    from app import database, state  # noqa: F811
+    from app.catalog import store
+    from app.config import Settings
+    from app.queue.engine import QueueEngine
+
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    await database.init_db()
+    await store.replace_catalog(
+        artists=[{"identity": "ar", "title": "Act", "base_key": "act"}],
+        albums=[
+            {"identity": "al", "title": "Rec", "title_base": "rec", "artist": "Act",
+             "artist_base_key": "act", "year": 2020, "track_count": 2},
+            {"identity": "jonly", "title": "JOnly", "title_base": "jonly", "artist": "Act",
+             "artist_base_key": "act", "year": 2021, "track_count": 1},
+        ],
+        tracks=[
+            {"identity": "t1", "title": "Song One", "title_base": "song one", "artist": "Act",
+             "artist_base_key": "act", "album": "Rec", "album_identity": "al",
+             "duration_ms": 180000, "disc_number": 1, "track_number": 1},
+            {"identity": "t2", "title": "Song Two", "title_base": "song two", "artist": "Act",
+             "artist_base_key": "act", "album": "Rec", "album_identity": "al",
+             "duration_ms": 200000, "disc_number": 1, "track_number": 2},
+            {"identity": "tjo", "title": "J Song", "title_base": "j song", "artist": "Act",
+             "artist_base_key": "act", "album": "JOnly", "album_identity": "jonly",
+             "duration_ms": 150000, "disc_number": 1, "track_number": 1},
+        ],
+        holds=[
+            {"entity_type": "album", "identity": "al", "source_id": "m1", "provider_local_key": "m1:al", "priority": 0, "server_name": "Plex"},
+            {"entity_type": "album", "identity": "al", "source_id": "jelly", "provider_local_key": "jelly:al", "priority": 1, "server_name": "Jelly"},
+            {"entity_type": "album", "identity": "jonly", "source_id": "jelly", "provider_local_key": "jelly:jonly", "priority": 1, "server_name": "Jelly"},
+            {"entity_type": "track", "identity": "t1", "source_id": "m1", "provider_local_key": "m1:p1", "priority": 0, "server_name": "Plex"},
+            {"entity_type": "track", "identity": "t1", "source_id": "jelly", "provider_local_key": "jelly:p1", "priority": 1, "server_name": "Jelly"},
+            {"entity_type": "track", "identity": "t2", "source_id": "m1", "provider_local_key": "m1:p2", "priority": 0, "server_name": "Plex"},
+            {"entity_type": "track", "identity": "tjo", "source_id": "jelly", "provider_local_key": "jelly:pjo", "priority": 1, "server_name": "Jelly"},
+        ],
+    )
+    qe = QueueEngine()
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("app.state.queue_engine", qe))
+        stack.enter_context(patch("app.state.get_plex_client", AsyncMock(return_value=MagicMock())))
+        stack.enter_context(patch("app.api.guest._catalog_active", AsyncMock(return_value=True)))
+        stack.enter_context(patch("app.database.save_queue", AsyncMock()))
+        stack.enter_context(patch("app.database.save_history", AsyncMock()))
+        try:
+            yield qe
+        finally:
+            await database.close_db()
+
+
+def _hold_sources(item):
+    return [h["source_id"] for h in item.track.holds]
+
+
+async def test_catalog_track_default_uses_highest_priority(catalog_env):
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    res = await append_to_queue(QueueAppendRequest(track_id="t1"))
+    qe = catalog_env
+    assert res["ok"] is True and res["tracks_added"] == 1
+    # Chokepoint: the undo receipt (entry) is returned, same shape as native.
+    assert res["entry"]["track_id"] == "t1"
+    assert len(qe.queue) == 1
+    # No pick → holds in priority order (Plex prio 0 first), Jellyfin as fallback.
+    assert _hold_sources(qe.queue[0]) == ["m1", "jelly"]
+
+
+async def test_catalog_track_play_from_jellyfin_promotes_holder(catalog_env):
+    # AE1 (track): pick Jellyfin → it becomes primary, Plex retained as fallback
+    # (preference, not pin — R3). stream_key follows the promoted primary.
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    await append_to_queue(QueueAppendRequest(track_id="t1", source_server_name="Jelly"))
+    qe = catalog_env
+    assert _hold_sources(qe.queue[0]) == ["jelly", "m1"]
+    assert qe.queue[0].track.stream_key == "jelly:p1"
+
+
+async def test_catalog_album_play_from_jellyfin(catalog_env):
+    # AE1 (album): pick Jellyfin on a Plex+Jellyfin album → both tracks queue
+    # with the Jellyfin copy primary; the batch receipt (entries) is returned.
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    res = await append_to_queue(QueueAppendRequest(album_id="al", source_server_name="Jelly"))
+    qe = catalog_env
+    assert res["tracks_added"] == 2
+    assert len(res["entries"]) == 2
+    assert {it.track_id for it in qe.queue} == {"t1", "t2"}
+    # t1 is held by both → Jellyfin promoted; t2 is Plex-only → unchanged.
+    by_id = {it.track_id: it for it in qe.queue}
+    assert _hold_sources(by_id["t1"]) == ["jelly", "m1"]
+    assert _hold_sources(by_id["t2"]) == ["m1"]
+
+
+async def test_catalog_jellyfin_only_album_resolves_via_holds(catalog_env):
+    # AE8: a Jellyfin-only album (catalog identity ≠ Plex rating key) resolves
+    # via holds and queues its track — not a native name-resolution miss.
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    res = await append_to_queue(QueueAppendRequest(album_id="jonly"))
+    qe = catalog_env
+    assert res["tracks_added"] == 1
+    assert qe.queue[0].track_id == "tjo"
+    assert _hold_sources(qe.queue[0]) == ["jelly"]
+
+
+async def test_catalog_track_not_in_catalog_warns_and_404(catalog_env, caplog):
+    import logging
+    from fastapi import HTTPException
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(HTTPException) as ei:
+            await append_to_queue(QueueAppendRequest(track_id="ghost"))
+    assert ei.value.status_code == 404
+    assert any("ghost" in r.message or "ghost" in r.getMessage() for r in caplog.records)
+
+
+async def test_catalog_album_no_tracks_warns_and_404(catalog_env, caplog):
+    import logging
+    from fastapi import HTTPException
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(HTTPException) as ei:
+            await append_to_queue(QueueAppendRequest(album_id="ghostalbum"))
+    assert ei.value.status_code == 404
+    assert catalog_env.queue == []
+
+
 # ── Plex not configured ───────────────────────────────────────────────────────
 
 def test_browse_artists_no_plex(mock_deps):
@@ -3269,6 +3542,37 @@ async def test_undo_empty_body_is_rejected(client, mock_deps):
     assert len(qe.queue) == 1  # nothing removed
 
 
+async def test_undo_while_held_bumps_gen(client, mock_deps, monkeypatch):
+    """F5 (guest half): a receipt-removal during an outage hold can drop the
+    HELD front — the gen bump (the admin queue_clear mechanic) re-targets any
+    in-flight resume at the new front from 0:00 instead of seeking the
+    removed track's held position into it."""
+    import app.state as st
+    from app.output import session
+    qe, _ = mock_deps
+    entry = client.post("/api/queue", json={"track_id": "t1"}).json()["entry"]
+    monkeypatch.setattr(hold, "_output_hold", True)
+    gen = st._advance_gen
+    resp = client.post("/api/queue/undo", json=entry)
+    assert resp.status_code == 200
+    assert resp.json()["removed"] == 1
+    assert st._advance_gen == gen + 1
+
+
+async def test_undo_not_held_does_not_bump_gen(client, mock_deps, monkeypatch):
+    """Guard: the gen bump is held-path only — a normal undo keeps today's
+    behavior (no pending-advance invalidation side effect)."""
+    import app.state as st
+    from app.output import session
+    qe, _ = mock_deps
+    entry = client.post("/api/queue", json={"track_id": "t1"}).json()["entry"]
+    monkeypatch.setattr(hold, "_output_hold", False)
+    gen = st._advance_gen
+    resp = client.post("/api/queue/undo", json=entry)
+    assert resp.status_code == 200
+    assert st._advance_gen == gen
+
+
 async def test_remove_entries_emits_single_queue_changed(mock_deps):
     """U3 (engine integration): a batch removal emits exactly one queue_changed
     for the whole batch, not one per entry."""
@@ -3708,3 +4012,340 @@ def test_recently_added_serves_index_deduped_and_dated(client):
     kid = next(d for d in data if d["title"] == "Kid A")
     assert kid["added_at"] == 2000  # earliest, serialized to the client
     assert {s["server_name"] for s in kid["sources"]} == {"A", "B"}
+
+
+# ── U13: source-neutral genres, Surprise policy, Popular fold-in ──────────────
+
+
+async def _u13_db(tmp_path, monkeypatch):
+    from app import database
+    from app.config import Settings
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    await database.init_db()
+    return database
+
+
+async def test_browse_genres_catalog_computes_from_tracks(tmp_path, monkeypatch):
+    """Cold cache + catalog active -> genres come from the merged catalog's track
+    tags (not Plex styles), highest count first (U13/R16)."""
+    from app.api import guest
+    from app.catalog import store
+    database = await _u13_db(tmp_path, monkeypatch)
+    try:
+        await store.replace_catalog(
+            artists=[], albums=[],
+            tracks=[
+                {"identity": "t1", "title": "A", "title_base": "a", "artist": "X",
+                 "artist_base_key": "x", "album": "Al", "album_identity": None,
+                 "genre": "Rock", "duration_ms": 1000},
+                {"identity": "t2", "title": "B", "title_base": "b", "artist": "X",
+                 "artist_base_key": "x", "album": "Al", "album_identity": None,
+                 "genre": "Rock", "duration_ms": 1000},
+                {"identity": "t3", "title": "C", "title_base": "c", "artist": "X",
+                 "artist_base_key": "x", "album": "Al", "album_identity": None,
+                 "genre": "Jazz", "duration_ms": 1000},
+            ],
+            holds=[],
+        )
+        with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)):
+            out = await guest.browse_genres()
+        assert out == [{"name": "Rock", "count": 2}, {"name": "Jazz", "count": 1}]
+    finally:
+        await database.close_db()
+
+
+async def test_browse_genre_albums_catalog_branch(tmp_path, monkeypatch):
+    """Genre drill-in serves catalog albums (Album objects) whose tracks carry
+    the genre, when the catalog floor is active (U13)."""
+    from app.api import guest
+    from app.catalog import store
+    database = await _u13_db(tmp_path, monkeypatch)
+    try:
+        await store.replace_catalog(
+            artists=[],
+            albums=[{"identity": "al", "title": "Rec", "title_base": "rec", "artist": "X",
+                     "artist_base_key": "x", "year": 2020, "track_count": 1}],
+            tracks=[{"identity": "t1", "title": "A", "title_base": "a", "artist": "X",
+                     "artist_base_key": "x", "album": "Rec", "album_identity": "al",
+                     "genre": "Rock", "duration_ms": 1000}],
+            holds=[{"entity_type": "album", "identity": "al", "source_id": "jelly",
+                    "provider_local_key": "jelly:al", "priority": 0, "server_name": "Jelly"}],
+        )
+        with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+             patch("app.state.get_plex_client", AsyncMock(return_value=MagicMock(sources=[]))):
+            albums = await guest.browse_genre_albums("rock")
+        assert [a.id for a in albums] == ["al"]
+    finally:
+        await database.close_db()
+
+
+async def _seed_one_artist_two_tracks(store, artist_source_id, artist_source_type):
+    """One Plex/Jellyfin/local-backed artist with two tracks; the artist hold's
+    source decides whether the Popular fold-in applies."""
+    await store.replace_catalog(
+        artists=[{"identity": "ar", "title": "Act", "base_key": "act"}],
+        albums=[{"identity": "al", "title": "Rec", "title_base": "rec", "artist": "Act",
+                 "artist_base_key": "act", "year": 2020, "track_count": 2}],
+        tracks=[
+            {"identity": "t1", "title": "Hit Song", "title_base": "hit song", "artist": "Act",
+             "artist_base_key": "act", "album": "Rec", "album_identity": "al",
+             "duration_ms": 180000, "disc_number": 1, "track_number": 1},
+            {"identity": "t2", "title": "Deep Cut", "title_base": "deep cut", "artist": "Act",
+             "artist_base_key": "act", "album": "Rec", "album_identity": "al",
+             "duration_ms": 200000, "disc_number": 1, "track_number": 2},
+        ],
+        holds=[
+            {"entity_type": "artist", "identity": "ar", "source_id": artist_source_id,
+             "provider_local_key": artist_source_id + ":art", "priority": 0, "server_name": "S"},
+            {"entity_type": "track", "identity": "t1", "source_id": artist_source_id,
+             "provider_local_key": artist_source_id + ":p1", "priority": 0, "server_name": "S"},
+            {"entity_type": "track", "identity": "t2", "source_id": artist_source_id,
+             "provider_local_key": artist_source_id + ":p2", "priority": 0, "server_name": "S"},
+        ],
+    )
+
+
+async def test_artist_songs_popular_folds_in_plex_backed(tmp_path, monkeypatch):
+    """Fold-in (U13): a Plex-backed artist in a MIXED install gets Plex
+    popularity ranks decorated onto the catalog tracks, so popular_available is
+    True and the matched track carries a pop_rank."""
+    from app.api import guest
+    from app.catalog import store
+    database = await _u13_db(tmp_path, monkeypatch)
+    try:
+        await _seed_one_artist_two_tracks(store, "m1", "plex")
+        reg = MagicMock()
+        reg.sources = [MagicMock(source_id="m1", source_type="plex"),
+                       MagicMock(source_id="jelly", source_type="jellyfin")]
+        reg.get_artist_popular_tracks = AsyncMock(return_value=[{"title": "Hit Song"}])
+        with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+             patch("app.state.get_plex_client", AsyncMock(return_value=reg)):
+            out = await guest.browse_artist_songs("ar")
+        assert out["popular_available"] is True
+        by_title = {t["title"]: t for t in out["tracks"]}
+        assert by_title["Hit Song"]["pop_rank"] == 0
+        assert by_title["Deep Cut"]["pop_rank"] is None
+        # Routed through the registry on the artist's Plex hold key.
+        reg.get_artist_popular_tracks.assert_awaited_once_with("m1:art")
+    finally:
+        await database.close_db()
+
+
+async def test_artist_songs_popular_unavailable_for_local_only_artist(tmp_path, monkeypatch):
+    """A non-Plex-backed artist has no popularity signal: popular_available is
+    False, pop_rank stays None, and Plex is never queried (correct degradation)."""
+    from app.api import guest
+    from app.catalog import store
+    database = await _u13_db(tmp_path, monkeypatch)
+    try:
+        await _seed_one_artist_two_tracks(store, "jelly", "jellyfin")
+        reg = MagicMock()
+        reg.sources = [MagicMock(source_id="jelly", source_type="jellyfin")]
+        reg.get_artist_popular_tracks = AsyncMock(return_value=[{"title": "Hit Song"}])
+        with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+             patch("app.state.get_plex_client", AsyncMock(return_value=reg)):
+            out = await guest.browse_artist_songs("ar")
+        assert out["popular_available"] is False
+        assert all(t["pop_rank"] is None for t in out["tracks"])
+        reg.get_artist_popular_tracks.assert_not_awaited()
+    finally:
+        await database.close_db()
+
+
+async def test_surprise_me_forces_random_floor_when_catalog_active(monkeypatch):
+    """Capability degradation (U13): with a non-Plex source connected, Surprise
+    Me resolves through the random floor regardless of the stored source mode."""
+    from app.api import guest
+    captured = {}
+
+    async def fake_resolve(seed, mode, **kw):
+        captured["mode"] = mode
+        return None, None  # short-circuits the handler to {"ok": False}
+
+    qe = MagicMock()
+    qe.is_locked = False
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=MagicMock())), \
+         patch("app.state.queue_engine", qe), \
+         patch("app.database.get_setting", AsyncMock(return_value="plex")), \
+         patch("app.database.get_random_length_bounds", AsyncMock(return_value=(None, None))), \
+         patch("app.queue.surprise.resolve_surprise", fake_resolve):
+        res = await guest.surprise_me(guest.SurpriseRequest())
+    assert res == {"ok": False}
+    assert captured["mode"] == "random"  # overridden off the stored "plex" mode
+
+
+async def test_scan_status_endpoint_delegates_to_state(monkeypatch):
+    """/api/scan-status is a thin public delegate to state.scan_status (the one
+    source of truth shared with the admin badge) — plan U15."""
+    from app.api import guest
+    snap = {"sources": 2, "scanning": True, "scanned": False, "empty": True}
+    with patch("app.state.scan_status", AsyncMock(return_value=snap)):
+        out = await guest.scan_status()
+    assert out == snap
+
+
+# ── Output-session lean snapshot (2026-07-11 supervisor plan U4, R20) ─────────
+
+
+async def test_now_playing_includes_lean_output_session(
+        client, mock_deps, fresh_supervisor, monkeypatch):
+    """A guest loading mid-outage learns the held state from the GET snapshot
+    (the hold clears `current`, so this rides the no-current branch — the
+    ClosingTime late-joiner pattern). The guest shape is LEAN: exactly
+    {state, held, gapless_flow_active}, the same state truth as the admin's
+    rich snapshot but none of the outage detail (reason/device/retry stay
+    admin-only)."""
+    from app.output import session
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    sup.session_state = session.STATE_OUTAGE_PAUSED
+
+    data = client.get("/api/now-playing").json()
+
+    assert data["output_session"] == {"state": "outage_paused", "held": True,
+                                      "gapless_flow_active": False}
+
+
+async def test_now_playing_output_session_default_unheld(
+        client, mock_deps, fresh_supervisor):
+    """No outage: the field is still present (clients hide the note from it)
+    and reads idle/unheld."""
+    data = client.get("/api/now-playing").json()
+    assert data["output_session"] == {"state": "idle", "held": False,
+                                      "gapless_flow_active": False}
+
+
+# ── enabled_libraries: stale-while-revalidate (2026-07-17 ce-debug) ───────────
+# The 17s guest-search bug: _ENABLED_LIBS_TTL=30 expired between human-paced
+# searches, and the refresh BLOCKED the request path on MultiPlexClient
+# get_libraries — 15s per refresh with one dead server. The contract now:
+# an EXPIRED cache is served immediately and refreshed by a single-flight
+# background task; only the very first call (no cache at all) may block.
+
+
+import asyncio as _aio
+import time as _time_mod
+
+
+def _libs_fixture(name):
+    return [Library(key=f"{name}-1", title=name, type="artist")]
+
+
+async def _swr_env(monkeypatch, refresh_gate, result_name="fresh"):
+    import app.api.guest as g
+    calls = {"n": 0}
+
+    class _Client:
+        async def get_libraries(self):
+            calls["n"] += 1
+            await refresh_gate.wait()
+            return _libs_fixture(result_name)
+
+    monkeypatch.setattr(g.state, "get_plex_client", AsyncMock(return_value=_Client()))
+    monkeypatch.setattr("app.database.get_enabled_libraries",
+                        AsyncMock(return_value=[{"section_key": f"{result_name}-1"}]))
+    return g, calls
+
+
+async def test_enabled_libraries_serves_stale_immediately_and_refreshes(monkeypatch):
+    gate = _aio.Event()
+    g, calls = await _swr_env(monkeypatch, gate)
+    monkeypatch.setattr(g, "_enabled_libs_cache", _libs_fixture("stale"))
+    monkeypatch.setattr(g, "_enabled_libs_cache_at", _time_mod.monotonic() - 999)
+    monkeypatch.setattr(g, "_enabled_libs_refresh_task", None)
+
+    t0 = _time_mod.monotonic()
+    libs = await _aio.wait_for(g.enabled_libraries(), timeout=2)
+    assert _time_mod.monotonic() - t0 < 1.0, "expired cache must be served without blocking"
+    assert libs and libs[0].title == "stale", "must serve the STALE list immediately"
+
+    gate.set()
+    for _ in range(20):
+        await _aio.sleep(0)
+    libs2 = await g.enabled_libraries()
+    assert libs2 and libs2[0].title == "fresh", "background refresh must land"
+    assert calls["n"] == 1
+
+
+async def test_enabled_libraries_refresh_is_single_flight(monkeypatch):
+    gate = _aio.Event()
+    g, calls = await _swr_env(monkeypatch, gate)
+    monkeypatch.setattr(g, "_enabled_libs_cache", _libs_fixture("stale"))
+    monkeypatch.setattr(g, "_enabled_libs_cache_at", _time_mod.monotonic() - 999)
+    monkeypatch.setattr(g, "_enabled_libs_refresh_task", None)
+
+    await g.enabled_libraries()
+    await g.enabled_libraries()
+    await g.enabled_libraries()
+    gate.set()
+    for _ in range(20):
+        await _aio.sleep(0)
+    assert calls["n"] == 1, "concurrent expiries must share ONE refresh task"
+
+
+async def test_enabled_libraries_failed_refresh_keeps_stale(monkeypatch, caplog):
+    import logging
+    import app.api.guest as g
+
+    class _Dying:
+        async def get_libraries(self):
+            raise TimeoutError("dead server")
+
+    monkeypatch.setattr(g.state, "get_plex_client", AsyncMock(return_value=_Dying()))
+    monkeypatch.setattr("app.database.get_enabled_libraries",
+                        AsyncMock(return_value=[{"section_key": "s-1"}]))
+    monkeypatch.setattr(g, "_enabled_libs_cache", _libs_fixture("stale"))
+    monkeypatch.setattr(g, "_enabled_libs_cache_at", _time_mod.monotonic() - 999)
+    monkeypatch.setattr(g, "_enabled_libs_refresh_task", None)
+
+    with caplog.at_level(logging.WARNING, logger="app.api.guest"):
+        libs = await g.enabled_libraries()
+        for _ in range(20):
+            await _aio.sleep(0)
+    assert libs and libs[0].title == "stale"
+    libs2 = await g.enabled_libraries()          # still serving stale, not raising
+    assert libs2 and libs2[0].title == "stale"
+    assert any("enabled-libraries refresh failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_enabled_libraries_first_call_blocks_once(monkeypatch):
+    gate = _aio.Event()
+    gate.set()                                    # refresh resolves immediately
+    g, calls = await _swr_env(monkeypatch, gate)
+    monkeypatch.setattr(g, "_enabled_libs_cache", None)
+    monkeypatch.setattr(g, "_enabled_libs_cache_at", 0.0)
+    monkeypatch.setattr(g, "_enabled_libs_refresh_task", None)
+
+    libs = await g.enabled_libraries()
+    assert libs and libs[0].title == "fresh", "no cache yet -> must block for the real list"
+    assert calls["n"] == 1
+
+
+async def test_enabled_libraries_stale_refresh_dropped_on_invalidation(monkeypatch):
+    """Cache-resurrection race (2026-07-18 review): a background refresh that
+    started BEFORE a source reconfiguration must not write its now-stale (old-
+    source) result back over the cache invalidate_plex_client() just cleared.
+    The generation guard drops the stale write; the cache stays cleared so the
+    next call re-fetches the new source set."""
+    import app.state as st
+    gate = _aio.Event()
+    g, calls = await _swr_env(monkeypatch, gate, result_name="oldsrv")
+    monkeypatch.setattr(g, "_enabled_libs_cache", _libs_fixture("stale"))
+    monkeypatch.setattr(g, "_enabled_libs_cache_at", _time_mod.monotonic() - 999)
+    monkeypatch.setattr(g, "_enabled_libs_refresh_task", None)
+    monkeypatch.setattr(g, "_enabled_libs_gen", 0)
+    monkeypatch.setattr(st, "_plex_client", None, raising=False)
+
+    await g.enabled_libraries()          # serves stale, schedules the bg refresh
+    for _ in range(5):                   # let it start and park at get_libraries
+        await _aio.sleep(0)              # (captures gen=0 before the invalidation)
+    st.invalidate_plex_client()          # clears cache + bumps _enabled_libs_gen
+    assert g._enabled_libs_cache is None
+    gate.set()                           # let the pre-invalidation refresh finish
+    for _ in range(20):
+        await _aio.sleep(0)
+    assert g._enabled_libs_cache is None, (
+        "a refresh that started before invalidation must not resurrect the cache")
+    assert calls["n"] == 1

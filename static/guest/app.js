@@ -282,6 +282,10 @@ function connectWS() {
     wsBackoff = 1000;
     // Events broadcast while the socket was down are gone — re-pull the
     // queue snapshot so strips/lists don't stay stale until the next event.
+    // resume() refetches now-playing (whose output_session field carries the
+    // outage note), mirroring the visibilitychange handler above — a guest
+    // reconnecting mid-outage converges instead of waiting for a delta.
+    playbackHandle.resume();
     refreshQueueState();
     // Glow-up U5: appearance defaults may also have changed while down.
     if (appearanceHandle) appearanceHandle.onReconnect();
@@ -291,6 +295,8 @@ function connectWS() {
     if (msg.type === 'now_playing_changed') playbackHandle.applyNowPlaying(msg);
     else if (msg.type === 'playback_state_changed') playbackHandle.applyPlaybackState(msg);
     else if (msg.type === 'closing_time') playbackHandle.applyClosingTime(msg);
+    else if (msg.type === 'output_session') playbackHandle.applyOutputSession(msg);
+    else if (msg.type === 'track_skipped') playbackHandle.showSkipped(msg);
     else if (msg.type === 'queue_changed') {
       queueReceipts.prune(msg.queue);
       playbackHandle.applyQueue(msg.queue, msg.history);

@@ -15,7 +15,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from app import database
-from app.plex.models import Track
+from app.models import Track
 from app.queue.models import PlaybackState, QueueEndBehavior, QueueItem
 
 
@@ -215,6 +215,30 @@ class QueueEngine:
             await self._persist()
         await self._emit("queue_changed")
 
+    async def remove_history_entry(self, track_id: str, added_at: str) -> QueueItem | None:
+        """Admin play-data curation (plan U3): remove ONE history entry matching
+        BOTH ``(track_id, added_at)`` — the first match from the head (most-recent)
+        — and return it, or ``None`` when nothing matches. ``added_at`` is not
+        guaranteed unique across a batch-append/restore, so the head-first
+        tie-break removes exactly one entry (the endpoint un-counts once). The
+        returned item lets the caller read ``item.track.album`` /
+        ``item.track.artist`` for the count roll-back. Persists and emits
+        ``queue_changed`` so every screen's history strip repaints."""
+        removed: QueueItem | None = None
+        async with self._lock:
+            remaining: list[QueueItem] = []
+            for item in self._history:  # deque iterates head (newest) → tail (oldest)
+                if removed is None and item.track_id == track_id and item.added_at == added_at:
+                    removed = item
+                    continue
+                remaining.append(item)
+            if removed is None:
+                return None
+            self._history = deque(remaining, maxlen=self._history_max)
+            await self._persist_history()
+        await self._emit("queue_changed")
+        return removed
+
     async def move(self, from_pos: int, to_pos: int) -> None:
         async with self._lock:
             n = len(self._queue)
@@ -309,6 +333,75 @@ class QueueEngine:
             result = self._current
         await self._emit("queue_changed")
         await self._emit("now_playing_changed")
+        return result
+
+    async def hold_current(self, *, play_recorded: bool = False) -> QueueItem | None:
+        """Outage hold (2026-07-11 supervisor plan U2): a device-level failure
+        interrupted the current track — re-front-insert it so it plays next at
+        resume, marked ``play_recorded`` so an already-counted play is never
+        counted twice (R19), and land the queue PAUSED so the guest UI reads
+        coherently. The front-insert deliberately bypasses ``_MAX_QUEUE_DEPTH``
+        (the cap guards guest appends, not internal ops — the ``skip_back``
+        mechanic). Persisted, so a restart lands idle with the held item at
+        the queue front and its mark intact (R18). No-op when nothing is
+        current — repeated holds cannot double-insert."""
+        async with self._lock:
+            if self._current is None:
+                return None
+            item = self._current
+            item.play_recorded = play_recorded
+            self._queue.insert(0, item)
+            self._current = None
+            self._is_playing = False
+            self._is_paused = True
+            await self._persist()
+            result = item
+        await self._emit("queue_changed")
+        await self._emit("now_playing_changed")
+        await self._emit("playback_state_changed")
+        return result
+
+    async def skip_held_front(self) -> QueueItem | None:
+        """Skip while outage-held (2026-07-11 supervisor plan U4, R17): the
+        held item IS the queue front (``hold_current`` re-front-inserted it),
+        so Skip retires it to history — exactly where ``advance()`` lands a
+        playing track — and the next queued item becomes the new held front.
+        A pure pointer move: nothing dispatches, ``current`` stays None
+        (nothing is playing), the queue stays paused. The retired item keeps
+        its ``play_recorded`` mark (it WAS counted if it played, and a
+        skip-back must not re-mint that); the new front's own mark governs
+        the eventual resume (an unplayed queued item is False → it counts
+        when it finally plays). No-op returning None on an empty queue."""
+        async with self._lock:
+            if not self._queue:
+                return None
+            item = self._queue.pop(0)
+            self._history.appendleft(item)
+            await self._persist()
+            await self._persist_history()
+            result = item
+        await self._emit("queue_changed")
+        return result
+
+    async def skip_back_held_front(self) -> QueueItem | None:
+        """Skip Back while outage-held (U4, R17): front-insert the most
+        recent history item so IT becomes the held front that plays at
+        resume — the mirror of ``skip_held_front``, and the ``skip_back``
+        front-insert mechanic (deliberately bypasses ``_MAX_QUEUE_DEPTH``;
+        the cap guards guest appends, not internal ops). The item's
+        ``play_recorded`` mark rides along: a held item skipped away and
+        pulled back keeps its already-counted mark, while an organically
+        played history item (mark False) re-counts at resume — matching
+        live Skip Back semantics. No-op returning None on empty history."""
+        async with self._lock:
+            if not self._history:
+                return None
+            item = self._history.popleft()
+            self._queue.insert(0, item)
+            await self._persist()
+            await self._persist_history()
+            result = item
+        await self._emit("queue_changed")
         return result
 
     async def set_playing(self, track: Track) -> None:

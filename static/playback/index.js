@@ -91,6 +91,7 @@ window.mountPlayback = function mountPlayback(config) {
           <div class="np-artist">Nothing playing</div>
         </div>
       </div>
+      <div class="np-output-note" hidden></div>
       <div class="np-lyrics" hidden>
         <div class="np-lyrics-slot">
           <button type="button" class="np-lyrics-pill" aria-expanded="false" hidden>♪ Lyrics</button>
@@ -135,6 +136,7 @@ window.mountPlayback = function mountPlayback(config) {
     title: npRoot.querySelector('.np-title'),
     artist: npRoot.querySelector('.np-artist'),
     nudge: npRoot.querySelector('.np-nudge'),
+    outputNote: npRoot.querySelector('.np-output-note'),
   } : null;
 
   // ── lyrics panel (2026-06-17 plan 008 U3/U4) ──────────────────────────
@@ -649,6 +651,17 @@ window.mountPlayback = function mountPlayback(config) {
             + `<div class="qs-title">${_esc(item.title)}</div>`;
           historyRoot.appendChild(div);
         });
+        // Admin curation (plan U6): the page supplies removePlan(items) → per-entry
+        // remove(); the module renders the shared ✕ chip (always-visible via CSS).
+        // Guest passes no removePlan → no ✕, so the affordance is admin-only.
+        if (h.removePlan) {
+          const plan = h.removePlan(items) || [];
+          const rows = Array.from(historyRoot.children);
+          plan.forEach(({ idx, remove }) => {
+            const row = rows[idx];
+            if (row && remove) _ensureActions(row).appendChild(_removeChip('Remove this play', remove));
+          });
+        }
       }
     }
   }
@@ -675,6 +688,11 @@ window.mountPlayback = function mountPlayback(config) {
       // it through this shared resume()). Runs in both the playing and idle
       // branches because the freeze clears `current`.
       applyClosingTime(data);
+      // Output-session state (supervisor plan U4): render the outage note from
+      // the snapshot so a client that missed the output_session delta (locked
+      // phone, WS gap) converges on refetch — the WS/GET resync contract. Runs
+      // in both branches because the hold clears `current`.
+      if (data && data.output_session) applyOutputSession(data.output_session);
       if (data && data.title) {
         applyNowPlaying(data);
         const p = await fetch('/api/playback/position');
@@ -818,10 +836,80 @@ window.mountPlayback = function mountPlayback(config) {
     }
   }
 
+  // ── Output-session (outage) state (2026-07-11 supervisor plan U4) ─────
+  // Single-source lean presentation for guest + admin: while a device-level
+  // outage holds the queue, a quiet "Paused — output offline" note shows in
+  // the Now Playing panel (the hold clears `current`, so the panel itself
+  // reads idle). Driven by the `output_session` WS event and by the mirrored
+  // `output_session` snapshot field on the now-playing GET (resume() below),
+  // so a client that missed the delta converges on refetch — the same
+  // event + snapshot-hydration pattern as the Closing Time banner. Accepts
+  // ONE shape for both paths: {state, held, ...}. Admin-only banner DETAIL
+  // (device/retry/resume button) is page chrome layered via cfg.onOutputSession.
+  // Deliberately minimal pending the interaction-state mockups pass (the plan
+  // defers that UX): a state note, no elaborate treatment.
+  function applyOutputSession(data) {
+    if (!data) return;
+    const held = !!data.held;
+    if (_npEls && _npEls.outputNote) {
+      if (held) {
+        _npEls.outputNote.textContent = data.state === 'reconnecting'
+          ? 'Paused — reconnecting to the speaker…'
+          : 'Paused — output offline';
+        _npEls.outputNote.hidden = false;
+      } else {
+        _npEls.outputNote.hidden = true;
+      }
+    }
+    if (cfg.onOutputSession) cfg.onOutputSession(data);
+  }
+
+  // ── Skip notification (plan U16 / R22) ───────────────────────────────
+  // Single-source so it appears identically on guest + admin: a transient,
+  // auto-dismissing toast shown when a queued track is skipped because every
+  // holder failed to stream. Rapid successive skips REPLACE rather than stack
+  // (one element, restarted timer) so a cascade of dead holders can't pile up.
+  const _SKIP_NOTE_MS = 4500;
+  let _skipEl = null;
+  let _skipTimer = null;
+  function _ensureSkipEl() {
+    if (_skipEl) return _skipEl;
+    const el = document.createElement('div');
+    el.className = 'skip-note-overlay';
+    el.hidden = true;
+    el.innerHTML =
+      '<div class="skip-note-card" role="status" aria-live="polite">' +
+      '<span class="skip-note-icon" aria-hidden="true">⏭</span>' +
+      '<span class="skip-note-msg"></span></div>';
+    document.body.appendChild(el);
+    _skipEl = el;
+    return el;
+  }
+  function showSkipped(data) {
+    const title = (data && data.track_title) || '';
+    // Admins additionally see which sources were tried (diagnostic). The guest
+    // broadcast omits sources_tried (null), so this degrades to title-only.
+    const tried = data && Array.isArray(data.sources_tried) ? data.sources_tried : null;
+    let msg = title ? ('Skipped “' + title + '” — unavailable') : 'Skipped an unavailable track';
+    if (tried && tried.length) msg += ' (tried: ' + tried.join(', ') + ')';
+    const el = _ensureSkipEl();
+    el.querySelector('.skip-note-msg').textContent = msg;   // R6: inert text, never innerHTML
+    el.hidden = false;
+    // Reflow so the enter transition runs even when replacing a visible toast.
+    void el.offsetWidth;
+    el.classList.add('is-shown');
+    if (_skipTimer) clearTimeout(_skipTimer);
+    _skipTimer = setTimeout(() => {
+      el.classList.remove('is-shown');
+      el.hidden = true;
+      _skipTimer = null;
+    }, _SKIP_NOTE_MS);
+  }
+
   // Initial paint: idle until the first payload arrives (the "Now" tab dot
   // and micro-bar must not claim playback before state is known).
   _setIdle();
 
   return { applyNowPlaying, applyPlaybackState, applyQueue, applyClosingTime,
-           setIdle: _setIdle, suspend, resume };
+           applyOutputSession, showSkipped, setIdle: _setIdle, suspend, resume };
 };

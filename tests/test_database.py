@@ -33,6 +33,20 @@ async def test_init_db_idempotent(db):
     await database.init_db()  # second call should not raise
 
 
+async def test_init_db_creates_catalog_tables(db):
+    # U5: the unified catalog ships additively alongside the browse-index, which
+    # is retained for the U7 rollback window — both must exist after init.
+    import aiosqlite
+    async with aiosqlite.connect(db.db_path) as conn:
+        async with conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ) as cur:
+            names = {row[0] async for row in cur}
+    assert {"catalog_artist", "catalog_album", "catalog_track",
+            "catalog_holds", "catalog_identity_alias"} <= names
+    assert {"browse_artist_index", "browse_album_index"} <= names  # coexistence
+
+
 # ── settings ─────────────────────────────────────────────────────────────────
 
 async def test_settings_round_trip(db):
@@ -92,6 +106,78 @@ async def test_plex_config_upsert(db):
     assert cfg["server_url"] == "http://new:32400"
 
 
+# ── jellyfin sources (U10) ────────────────────────────────────────────────────
+
+async def test_jellyfin_sources_empty_by_default(db):
+    assert await database.get_jellyfin_sources() == []
+
+
+async def test_jellyfin_source_round_trip_and_upsert(db):
+    await database.save_jellyfin_source(
+        "jelly1", "http://jf.local:8096", "Living Room", "tok", "uid", "dev1")
+    rows = await database.get_jellyfin_sources()
+    assert len(rows) == 1
+    assert rows[0]["server_url"] == "http://jf.local:8096"
+    assert rows[0]["token"] == "tok" and rows[0]["user_id"] == "uid"
+    # upsert on the same source_id replaces, not duplicates
+    await database.save_jellyfin_source(
+        "jelly1", "http://jf.local:8096", "Den", "tok2", "uid", "dev1")
+    rows = await database.get_jellyfin_sources()
+    assert len(rows) == 1 and rows[0]["name"] == "Den" and rows[0]["token"] == "tok2"
+
+
+async def test_jellyfin_source_stores_token_only_no_password_column(db):
+    # Plan R24: the account password is never persisted — there is no column for it.
+    import aiosqlite
+    async with aiosqlite.connect(db.db_path) as conn:
+        async with conn.execute("PRAGMA table_info(jellyfin_sources)") as cur:
+            cols = {row[1] async for row in cur}
+    assert "token" in cols and "user_id" in cols
+    assert not ({"password", "pw", "pass"} & cols)
+
+
+async def test_jellyfin_source_delete(db):
+    await database.save_jellyfin_source(
+        "jelly1", "http://jf.local:8096", "X", "tok", "uid", "dev1")
+    await database.delete_jellyfin_source("jelly1")
+    assert await database.get_jellyfin_sources() == []
+
+
+# ── local file sources (U11) ──────────────────────────────────────────────────
+
+async def test_local_sources_empty_by_default(db):
+    assert await database.get_local_sources() == []
+
+
+async def test_local_source_round_trip_and_upsert(db):
+    await database.save_local_source("local-1", "Vinyl Rips", "/music/flac")
+    rows = await database.get_local_sources()
+    assert len(rows) == 1
+    assert rows[0]["source_id"] == "local-1"
+    assert rows[0]["name"] == "Vinyl Rips"
+    assert rows[0]["root_dir"] == "/music/flac"
+    # upsert on the same source_id replaces, not duplicates
+    await database.save_local_source("local-1", "Archive", "/mnt/archive")
+    rows = await database.get_local_sources()
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Archive" and rows[0]["root_dir"] == "/mnt/archive"
+
+
+async def test_local_source_stores_no_credential_column(db):
+    # Plan R6/R24: a local source is read-only and credential-free.
+    import aiosqlite
+    async with aiosqlite.connect(db.db_path) as conn:
+        async with conn.execute("PRAGMA table_info(local_sources)") as cur:
+            cols = {row[1] async for row in cur}
+    assert cols == {"source_id", "name", "root_dir"}
+
+
+async def test_local_source_delete(db):
+    await database.save_local_source("local-1", "X", "/music")
+    await database.delete_local_source("local-1")
+    assert await database.get_local_sources() == []
+
+
 # ── enabled libraries ─────────────────────────────────────────────────────────
 
 async def test_toggle_library_enable(db):
@@ -109,6 +195,73 @@ async def test_toggle_library_disable(db):
 
 async def test_enabled_libraries_empty_by_default(db):
     assert await database.get_enabled_libraries() == []
+
+
+# ── disabled sources (per-source veto, Libraries-panel U1) ────────────────────
+
+async def test_disabled_sources_empty_by_default(db):
+    assert await database.get_disabled_sources() == []
+
+
+async def test_disabled_sources_round_trip(db):
+    await database.set_disabled_sources(["jf-abc", "local-123"])
+    assert await database.get_disabled_sources() == ["jf-abc", "local-123"]
+
+
+async def test_disabled_sources_overwrite_and_clear(db):
+    await database.set_disabled_sources(["jf-abc"])
+    await database.set_disabled_sources(["local-123"])
+    assert await database.get_disabled_sources() == ["local-123"]
+    await database.set_disabled_sources([])
+    assert await database.get_disabled_sources() == []
+
+
+async def test_disabled_sources_legacy_empty_source_id_round_trips(db):
+    # The legacy single Plex server has machine_id == "" -> source_id "".
+    await database.set_disabled_sources([""])
+    assert await database.get_disabled_sources() == [""]
+
+
+def test_source_id_from_section_key():
+    assert database.source_id_from_section_key("mach:5") == "mach"
+    assert database.source_id_from_section_key("jf-abc:12") == "jf-abc"
+    assert database.source_id_from_section_key("local-deadbeef:lib") == "local-deadbeef"
+    assert database.source_id_from_section_key("5") == ""       # legacy no-colon Plex key
+    assert database.source_id_from_section_key("") == ""
+
+
+async def test_effective_enabled_libraries_no_veto_returns_all(db):
+    await database.toggle_library("plexM:1", "Music", enabled=True)
+    await database.toggle_library("jf-a:2", "JF Music", enabled=True)
+    eff = await database.get_effective_enabled_libraries()
+    assert {r["section_key"] for r in eff} == {"plexM:1", "jf-a:2"}
+
+
+async def test_effective_enabled_libraries_excludes_vetoed_source(db):
+    await database.toggle_library("plexM:1", "Music", enabled=True)
+    await database.toggle_library("jf-a:2", "JF Music", enabled=True)
+    await database.set_disabled_sources(["jf-a"])
+    eff = await database.get_effective_enabled_libraries()
+    assert {r["section_key"] for r in eff} == {"plexM:1"}
+    # Raw enabled rows are untouched — the per-library selection is remembered.
+    assert {r["section_key"] for r in await database.get_enabled_libraries()} == {"plexM:1", "jf-a:2"}
+
+
+async def test_effective_enabled_libraries_legacy_empty_source_vetoed(db):
+    await database.toggle_library("5", "Legacy", enabled=True)   # no colon -> source_id ""
+    await database.set_disabled_sources([""])
+    assert await database.get_effective_enabled_libraries() == []
+
+
+async def test_effective_enabled_libraries_fails_open_when_veto_unreadable(db, monkeypatch):
+    await database.toggle_library("plexM:1", "Music", enabled=True)
+
+    async def boom():
+        raise RuntimeError("settings read failed")
+
+    monkeypatch.setattr(database, "get_disabled_sources", boom)
+    eff = await database.get_effective_enabled_libraries()
+    assert {r["section_key"] for r in eff} == {"plexM:1"}
 
 
 # ── sessions ──────────────────────────────────────────────────────────────────
@@ -326,6 +479,26 @@ async def test_top_played_ignores_album_artist_counts(db):
     await database.increment_play_count("album", "Some Album")
     await database.increment_play_count("artist", "Some Artist")
     assert await database.get_top_played_tracks() == []
+
+
+async def test_decrement_play_count_floors_at_zero_and_noops(db):
+    await database.increment_play_count("track", "t1")
+    await database.increment_play_count("track", "t1")          # count = 2
+    await database.decrement_play_count("track", "t1")
+    assert await database.get_play_count("track", "t1") == 1
+    await database.decrement_play_count("track", "t1")
+    await database.decrement_play_count("track", "t1")          # already 0 → floor
+    assert await database.get_play_count("track", "t1") == 0
+    await database.decrement_play_count("track", "absent")      # no row → no-op
+    assert await database.get_play_count("track", "absent") == 0
+
+
+async def test_decrement_play_count_is_name_keyed_and_independent(db):
+    await database.increment_play_count("album", "Broken")
+    await database.increment_play_count("track", "t1")
+    await database.decrement_play_count("album", "Broken")      # name-keyed album row
+    assert await database.get_play_count("album", "Broken") == 0
+    assert await database.get_play_count("track", "t1") == 1    # track row untouched
 
 
 async def test_top_played_unbounded_returns_all_with_none_limit(db):
@@ -690,3 +863,80 @@ async def test_browse_facets_default_on(db):
     assert all(facets.values())                             # all on by default
     await database.set_setting("facet_years", "0")
     assert (await database.get_browse_facets())["years"] is False
+
+
+# ── U17: credential at-rest hardening (R24) ──────────────────────────────────
+
+async def test_plex_servers_token_round_trips_and_sealed_at_rest(db):
+    from pathlib import Path
+    import aiosqlite
+    from app.sources import secrets
+    await database.save_plex_servers([{
+        "machine_id": "m1", "server_url": "http://x", "name": "Home", "owner": "me",
+        "token": "PLEX-SECRET-XYZ", "client_id": "c1", "owned": 1}])
+    # get_* opens the token back to plaintext for provider use.
+    got = await database.get_plex_servers()
+    assert got[0]["token"] == "PLEX-SECRET-XYZ"
+    # The raw DB bytes never contain the plaintext token (sealed at rest, R24).
+    assert b"PLEX-SECRET-XYZ" not in Path(db.db_path).read_bytes()
+    # And the stored column is in sealed form.
+    async with aiosqlite.connect(db.db_path) as conn:
+        async with conn.execute("SELECT token FROM plex_servers WHERE machine_id='m1'") as cur:
+            stored = (await cur.fetchone())[0]
+    assert secrets.is_sealed(stored)
+
+
+async def test_plex_config_token_round_trips_and_sealed(db):
+    import aiosqlite
+    from app.sources import secrets
+    await database.set_plex_config("http://x", "CONFIG-TOKEN-9", "client-9")
+    cfg = await database.get_plex_config()
+    assert cfg["token"] == "CONFIG-TOKEN-9"
+    async with aiosqlite.connect(db.db_path) as conn:
+        async with conn.execute("SELECT token FROM plex_config WHERE id=1") as cur:
+            stored = (await cur.fetchone())[0]
+    assert secrets.is_sealed(stored) and "CONFIG-TOKEN-9" not in stored
+
+
+async def test_jellyfin_token_round_trips_and_sealed(db):
+    import aiosqlite
+    from app.sources import secrets
+    await database.save_jellyfin_source("jf-1", "http://jf", "Den", "JF-TOKEN-77", "u1", "dev1")
+    got = await database.get_jellyfin_sources()
+    assert got[0]["token"] == "JF-TOKEN-77"
+    async with aiosqlite.connect(db.db_path) as conn:
+        async with conn.execute("SELECT token FROM jellyfin_sources WHERE source_id='jf-1'") as cur:
+            stored = (await cur.fetchone())[0]
+    assert secrets.is_sealed(stored) and "JF-TOKEN-77" not in stored
+
+
+async def test_plaintext_tokens_migrated_to_sealed_on_upgrade(db):
+    from app.sources import secrets
+    conn = database._conn()
+    # Simulate a pre-U17 row: a plaintext token written directly (bypassing seal).
+    await conn.execute(
+        "INSERT INTO plex_servers (machine_id, server_url, name, owner, token, client_id, owned) "
+        "VALUES ('m9','http://x','Home','me','LEGACY-PLAINTEXT','c1',1)")
+    await conn.commit()
+    await database._migrate_seal_credentials()
+    await conn.commit()
+    async with conn.execute("SELECT token FROM plex_servers WHERE machine_id='m9'") as cur:
+        stored = (await cur.fetchone())[0]
+    assert secrets.is_sealed(stored)  # re-sealed on upgrade
+    got = {s["machine_id"]: s for s in await database.get_plex_servers()}
+    assert got["m9"]["token"] == "LEGACY-PLAINTEXT"  # still authenticates (opens back)
+
+
+async def test_seal_migration_is_idempotent(db):
+    await database.save_plex_servers([{
+        "machine_id": "m1", "server_url": "http://x", "name": "Home", "owner": "me",
+        "token": "TOK", "client_id": "c1", "owned": 1}])
+    conn = database._conn()
+    async with conn.execute("SELECT token FROM plex_servers WHERE machine_id='m1'") as cur:
+        first = (await cur.fetchone())[0]
+    await database._migrate_seal_credentials()  # already sealed → must not double-seal
+    await conn.commit()
+    async with conn.execute("SELECT token FROM plex_servers WHERE machine_id='m1'") as cur:
+        second = (await cur.fetchone())[0]
+    assert first == second  # unchanged
+    assert (await database.get_plex_servers())[0]["token"] == "TOK"

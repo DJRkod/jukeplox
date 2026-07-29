@@ -38,7 +38,12 @@ page_router = APIRouter(tags=["admin-pages"])
 async def admin_login_page(request: Request):
     from app import database
     setup_required = not bool(await database.get_setting("setup_complete"))
-    return _templates.TemplateResponse(request, "admin/login.html", {"setup_required": setup_required})
+    # Cache-Control: no-cache on every HTML page (2026-07-17 ce-debug): the
+    # ?v=<sha> asset buster only fires if the HTML referencing it is fresh —
+    # header-less pages let browsers pin a stale JS bundle across deploys.
+    return _templates.TemplateResponse(
+        request, "admin/login.html", {"setup_required": setup_required},
+        headers={"Cache-Control": "no-cache"})
 
 
 @page_router.get("/admin", response_class=HTMLResponse, include_in_schema=False)
@@ -47,7 +52,9 @@ async def admin_dashboard_page(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if not token or not await session_mgr.validate_session(token):
         return RedirectResponse(url="/admin/login")
-    return _templates.TemplateResponse(request, "admin/dashboard.html")
+    # no-cache: same stale-bundle guard as the login page / guest index.
+    return _templates.TemplateResponse(request, "admin/dashboard.html",
+                                       headers={"Cache-Control": "no-cache"})
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -61,10 +68,20 @@ def _serialize_libraries(libraries: list, enabled_keys: set) -> list:
     return [
         {
             "key": lib.key,
+            # The owning source_id (key prefix) so the frontend groups libraries
+            # under their source without re-deriving it in JS (Libraries-panel U3).
+            "source_id": database.source_id_from_section_key(lib.key),
             "title": lib.title,
             "type": lib.type,
             "enabled": lib.key in enabled_keys,
             "owner": lib.owner,
+            # Per-source-type indicator for the Libraries list (ce-debug
+            # 2026-06-29): the frontend renders "(Plex — <name>)" / "(Jellyfin —
+            # <name>)" so same-named libraries across source types are
+            # distinguishable. server_name is the Jellyfin disambiguator (it
+            # carries no owner).
+            "source_type": getattr(lib, "source_type", "") or "",
+            "server_name": getattr(lib, "server_name", "") or "",
         }
         for lib in libraries
     ]
@@ -74,7 +91,7 @@ def _serialize_libraries(libraries: list, enabled_keys: set) -> list:
 async def list_libraries():
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libraries = await client.get_libraries()
     enabled_keys = {lib["section_key"] for lib in await database.get_enabled_libraries()}
     return _serialize_libraries(libraries, enabled_keys)
@@ -84,7 +101,7 @@ async def list_libraries():
 async def enable_library(key: str):
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     libraries = await client.get_libraries()
     lib = next((l for l in libraries if l.key == key), None)
     if not lib:
@@ -93,6 +110,7 @@ async def enable_library(key: str):
     client.invalidate_cache()
     await state.invalidate_ondeck()  # enabled-library set changed (plan U4)
     state.trigger_browse_index_refresh()  # browse-index plan U6/R9
+    state.trigger_catalog_refresh()  # multi-source catalog (plan U6)
     return {"ok": True}
 
 
@@ -104,6 +122,7 @@ async def disable_library(key: str):
         client.invalidate_cache()
     await state.invalidate_ondeck()  # enabled-library set changed (plan U4)
     state.trigger_browse_index_refresh()  # browse-index plan U6/R9
+    state.trigger_catalog_refresh()  # multi-source catalog (plan U6)
     return {"ok": True}
 
 
@@ -112,14 +131,284 @@ async def plex_rescan():
     """Invalidate in-memory Plex caches and return the refreshed library list."""
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     client.invalidate_cache()
     state.trigger_genre_refresh()
     state.trigger_credit_refresh()
     state.trigger_browse_index_refresh()  # browse-index plan U6/R7
+    state.trigger_catalog_refresh()  # multi-source catalog (plan U6)
     libraries = await client.get_libraries()
     enabled_keys = {lib["section_key"] for lib in await database.get_enabled_libraries()}
     return _serialize_libraries(libraries, enabled_keys)
+
+
+class SourcePriorityRequest(BaseModel):
+    order: list[str] = Field(default_factory=list, max_length=64)
+
+
+@router.get("/sources/priority")
+async def get_source_priority():
+    """The global source-priority order (highest first) — multi-source plan U9/R12."""
+    return {"order": await database.get_source_priority()}
+
+
+@router.post("/sources/priority")
+async def set_source_priority(body: SourcePriorityRequest):
+    """Persist the global source-priority order. Effective at the NEXT enqueue's
+    holds snapshot and stream resolution — no rescan needed (R12). Admin-gated by
+    the router-level require_admin (R26). The drag-reorder UI is U14."""
+    await database.set_source_priority(body.order)
+    return {"ok": True, "order": body.order}
+
+
+# ── Multi-source Sources panel (plan U14) ─────────────────────────────────────
+
+class JellyfinConnectRequest(BaseModel):
+    server_url: str = Field(min_length=1, max_length=512)
+    username: str = Field(min_length=1, max_length=256)
+    password: str = Field(default="", max_length=512)
+    name: str = Field(default="", max_length=128)
+
+
+class LocalConnectRequest(BaseModel):
+    root_dir: str = Field(min_length=1, max_length=4096)
+    name: str = Field(default="", max_length=128)
+
+
+def _hostname(url: str) -> str:
+    from urllib.parse import urlparse
+    try:
+        return urlparse(url if "://" in url else f"http://{url}").hostname or ""
+    except Exception:
+        return ""
+
+
+def _source_error(category: str, message: str) -> HTTPException:
+    # R21: a categorized, legible failure; the source is NOT saved. The frontend
+    # surfaces ``category`` (unreachable / auth_rejected) inline.
+    return HTTPException(status_code=400, detail={"category": category, "message": message})
+
+
+@router.get("/sources")
+async def list_sources():
+    """Connected media sources for the Sources panel + the priority list (U14).
+
+    Each entry is ``{source_id, type, name, enabled}``. ``enabled`` is the
+    whole-source on/off switch (False when the source is in the disabled_sources
+    veto set, Libraries-panel U3). Plex servers come from ``plex_servers`` (or the
+    legacy single-server config); Jellyfin from ``jellyfin_sources``; local-files
+    directories from ``local_sources`` (U11)."""
+    try:
+        disabled = set(await database.get_disabled_sources())
+    except Exception:
+        disabled = set()   # veto read fails open (show enabled); source-list reads below surface errors normally
+
+    def _entry(source_id: str, type_: str, name: str) -> dict:
+        return {"source_id": source_id, "type": type_, "name": name,
+                "enabled": source_id not in disabled}
+
+    out: list[dict] = []
+    for s in await database.get_plex_servers():
+        out.append(_entry(s["machine_id"], "plex", s.get("name") or "Plex"))
+    if not out:
+        cfg = await database.get_plex_config()
+        if cfg:
+            out.append(_entry("", "plex", "Plex"))
+    for j in await database.get_jellyfin_sources():
+        out.append(_entry(j["source_id"], "jellyfin", j.get("name") or "Jellyfin"))
+    for l in await database.get_local_sources():
+        out.append(_entry(l["source_id"], "local", l.get("name") or "Local"))
+    return {"sources": out}
+
+
+@router.get("/scan-status")
+async def scan_status():
+    """Catalog scan state for the admin Sources scan badge (plan U15/R20):
+    ``{sources, scanning, scanned, empty}`` — same snapshot the guest onboarding
+    states read, so admin and guest agree on one source of truth. Admin-gated by
+    the router-level require_admin (R26)."""
+    return await state.scan_status()
+
+
+async def _enable_new_source_libraries(source_id: str) -> None:
+    """Enable a freshly-connected non-Plex source's libraries by default.
+
+    Plex libraries are toggled manually in the dashboard (``/plex/libraries/{key}/
+    enable``), so a Plex server's checkboxes gate its import. Local-folder and
+    Jellyfin sources have NO per-library enable UI, yet the catalog scan filters
+    EVERY source's libraries by the enabled-library set (uniform gating, ce-debug
+    2026-06-29). Without seeding that set on connect, a local/Jellyfin library is
+    never enabled → the scan drops it → an empty catalog for any local-folder or
+    Jellyfin install (ce-debug 2026-07-24). Enable the new source's libraries here
+    so they crawl by default; a future per-library disable UI can still remove them.
+    """
+    # Best-effort, mirroring scan.py's _safe posture. By the time this runs the
+    # source is already saved and invalidate_plex_client() has cleared the cache,
+    # so a failure here must NOT 500 the connect nor skip the caller's
+    # trigger_catalog_refresh(). For Jellyfin, get_libraries() is a live HTTP call
+    # that can raise post-auth (transient 5xx, token race, missing 'Id'); for local
+    # it can't. The WARNING is load-bearing — it is the only signal that the source
+    # connected but its libraries weren't seeded (empty catalog until a reconnect).
+    try:
+        registry = await state.get_plex_client()
+        src = next((s for s in getattr(registry, "sources", []) or []
+                    if getattr(s, "source_id", None) == source_id), None)
+        if src is None:
+            _log.warning("enable-libraries: source %s absent from the rebuilt registry — "
+                         "libraries not seeded; reconnect the source to retry", source_id)
+            return
+        for lib in await src.get_libraries():
+            await database.toggle_library(lib.key, getattr(lib, "title", "") or "", enabled=True)
+    except Exception:
+        _log.warning("enable-libraries failed for %s — libraries not seeded; "
+                     "reconnect the source to retry", source_id, exc_info=True)
+
+
+@router.post("/sources/jellyfin")
+async def connect_jellyfin(body: JellyfinConnectRequest):
+    """Connect a Jellyfin source by account sign-in (R5). Validated by signing in;
+    on success the credential is saved TOKEN-ONLY (R24) and a catalog scan kicks
+    off. A bad URL/credentials surfaces an inline-categorized error and the source
+    is NOT saved (R21). Admin-gated by the router-level require_admin (R26)."""
+    from app.sources import jellyfin as jf
+    device_id = jf.new_device_id()
+    try:
+        creds = await jf.authenticate(
+            body.server_url, body.username, body.password, device_id=device_id)
+    except jf.JellyfinAuthError as e:
+        raise _source_error("auth_rejected", str(e) or "Jellyfin rejected the credentials")
+    except Exception:
+        raise _source_error("unreachable", "Could not reach the Jellyfin server")
+    # Stable id across reconnects: prefer the server's id, else the device id.
+    source_id = f"jf-{creds.get('server_id') or device_id}"
+    name = body.name.strip() or _hostname(body.server_url) or "Jellyfin"
+    await database.save_jellyfin_source(
+        source_id=source_id, server_url=body.server_url.rstrip("/"), name=name,
+        token=creds["token"], user_id=creds["user_id"], device_id=device_id)
+    await _clear_source_veto(source_id)   # reconnect must not inherit a stale veto (U3)
+    state.invalidate_plex_client()   # rebuild the registry with the new source
+    await _enable_new_source_libraries(source_id)  # non-Plex libs have no UI → enable by default
+    state.trigger_catalog_refresh()  # crawl it into the unified catalog
+    return {"ok": True, "source_id": source_id, "name": name, "type": "jellyfin"}
+
+
+@router.delete("/sources/jellyfin/{source_id}")
+async def remove_jellyfin(source_id: str):
+    """Remove a Jellyfin source and re-resolve the registry/catalog (U14/R7)."""
+    await database.delete_jellyfin_source(source_id)
+    await _clear_source_veto(source_id)   # don't leave an orphan veto entry (U3)
+    state.invalidate_plex_client()
+    state.trigger_catalog_refresh()
+    return {"ok": True}
+
+
+@router.post("/sources/local")
+async def connect_local(body: LocalConnectRequest):
+    """Connect a local-files source by directory path (R6). Validated by checking
+    the directory exists and is readable; on success it is saved and a catalog
+    scan kicks off. A missing/unreadable directory surfaces an inline-categorized
+    error and the source is NOT saved (R21). Admin-gated by require_admin (R26).
+
+    The realpath is stored (canonical root for LocalSource's containment) and a
+    stable source_id is derived from it, so reconnecting the same directory
+    updates the existing source rather than duplicating it."""
+    import hashlib
+    import os
+    real = os.path.realpath(body.root_dir.strip())
+    if not os.path.isdir(real):
+        raise _source_error("dir_not_found", "That folder does not exist")
+    if not os.access(real, os.R_OK):
+        raise _source_error("unreadable", "That folder is not readable")
+    source_id = f"local-{hashlib.sha1(real.encode('utf-8')).hexdigest()[:12]}"
+    name = body.name.strip() or os.path.basename(real.rstrip("/\\")) or "Local Music"
+    await database.save_local_source(source_id=source_id, name=name, root_dir=real)
+    await _clear_source_veto(source_id)   # reconnect must not inherit a stale veto (U3)
+    state.invalidate_plex_client()   # rebuild the registry with the new source
+    await _enable_new_source_libraries(source_id)  # non-Plex libs have no UI → enable by default
+    state.trigger_catalog_refresh()  # crawl it into the unified catalog
+    return {"ok": True, "source_id": source_id, "name": name, "type": "local"}
+
+
+@router.delete("/sources/local/{source_id}")
+async def remove_local(source_id: str):
+    """Remove a local-files source and re-resolve the registry/catalog (R7)."""
+    await database.delete_local_source(source_id)
+    await _clear_source_veto(source_id)   # don't leave an orphan veto entry (U3)
+    state.invalidate_plex_client()
+    state.trigger_catalog_refresh()
+    return {"ok": True}
+
+
+async def _clear_source_veto(source_id: str) -> None:
+    """Remove a source from the disabled_sources veto set (Libraries-panel U3).
+    Called on connect/reconnect so a freshly-seeded source honors its default-ON
+    switch instead of inheriting a stale veto ("connected but invisible"), and on
+    removal so the veto set doesn't accumulate orphan ids. No-op when absent.
+
+    Best-effort: this cleanup rides along with a connect/remove, so a veto-store
+    hiccup must not fail that primary op. Worst case a stale veto lingers until the
+    next explicit toggle."""
+    try:
+        disabled = await database.get_disabled_sources()
+        if source_id in disabled:
+            await database.set_disabled_sources([s for s in disabled if s != source_id])
+    except Exception:
+        _log.warning("clear-source-veto failed for %s", source_id, exc_info=True)
+
+
+async def _set_source_disabled(source_id: str, *, disabled: bool) -> None:
+    """The whole-source on/off switch (Libraries-panel U3): add/remove source_id in
+    the disabled_sources veto set, then reconcile caches. The veto write is the
+    must-succeed record; the cache invalidate + catalog/index refresh are wrapped
+    best-effort so a refresh failure can't 500 the toggle or skip the persisted veto
+    (control-plane-success / best-effort-after-commit)."""
+    current = await database.get_disabled_sources()
+    if disabled and source_id not in current:
+        await database.set_disabled_sources(current + [source_id])
+    elif not disabled and source_id in current:
+        await database.set_disabled_sources([s for s in current if s != source_id])
+    # Bump the SWR generation immediately (sync + infallible) so the native-path cache
+    # can't resurrect the pre-toggle set even if the best-effort reconcile below fails.
+    state.invalidate_plex_client()
+    try:
+        # Reconcile the rest best-effort: on-deck slot + the table-backed catalog and
+        # browse index (multi-source path). A failure here must not undo the veto write.
+        await state.invalidate_ondeck()
+        state.trigger_browse_index_refresh()
+        state.trigger_catalog_refresh()
+    except Exception:
+        _log.warning("source-toggle reconcile failed for %s (disabled=%s) — veto saved; "
+                     "reconciles on next scan", source_id, disabled, exc_info=True)
+
+
+@router.post("/sources/{source_id}/enable")
+async def enable_source(source_id: str):
+    """Turn a whole source ON (remove its veto); its remembered per-library selection
+    re-applies (Libraries-panel U3)."""
+    await _set_source_disabled(source_id, disabled=False)
+    return {"ok": True}
+
+
+@router.post("/sources/{source_id}/disable")
+async def disable_source(source_id: str):
+    """Turn a whole source OFF (veto it): its content is excluded from guest-visible
+    catalog/browse/random, but its enabled_libraries rows are kept so ON restores the
+    exact selection (Libraries-panel U3)."""
+    await _set_source_disabled(source_id, disabled=True)
+    return {"ok": True}
+
+
+@router.post("/sources/rescan")
+async def rescan_sources():
+    """Re-crawl every connected source into the catalog (U14/R7). Invalidates
+    in-memory caches and triggers the catalog (+ Plex browse-index) refresh;
+    effective without a restart."""
+    client = await state.get_plex_client()
+    if client:
+        client.invalidate_cache()
+    state.trigger_browse_index_refresh()
+    state.trigger_catalog_refresh()
+    return {"ok": True}
 
 
 @router.get("/plex/index-status")
@@ -142,7 +431,28 @@ async def plex_connect_pin():
 
 @router.get("/plex/connect/poll/{pin_id}")
 async def plex_connect_poll(pin_id: int, client_id: str):
+    # Snapshot connected Plex machine_ids BEFORE the flow so we clear the veto ONLY for
+    # a server this connect NEWLY added — never silently re-enable an already-connected,
+    # deliberately-disabled co-owned Plex server on a re-auth (ce-code-review 2026-07-28).
+    try:
+        before = {s["machine_id"] for s in await database.get_plex_servers()}
+    except Exception:
+        before = set()
     resolved = await plex_oauth.complete_flow(pin_id, client_id)
+    if resolved:
+        # A NEWLY (re)connected Plex server honors its default-ON switch: clear its veto
+        # so it can't come back invisible (U3). Plex has no panel Remove, so there is no
+        # Plex-disconnect veto path. Best-effort — a veto-store hiccup must not fail connect.
+        try:
+            after = {s["machine_id"] for s in await database.get_plex_servers()}
+            new_ids = after - before
+            disabled = await database.get_disabled_sources()
+            remaining = [d for d in disabled if d not in new_ids]
+            if len(remaining) != len(disabled):
+                await database.set_disabled_sources(remaining)
+                state.invalidate_plex_client()  # veto set changed -> bump the SWR generation
+        except Exception:
+            _log.warning("plex-connect veto clear failed", exc_info=True)
     return {"resolved": resolved}
 
 
@@ -434,7 +744,7 @@ async def admin_append_to_queue(body: AdminQueueAppendRequest):
         validate_plex_id(body.album_id)
     client = await state.get_plex_client()
     if not client:
-        raise HTTPException(status_code=503, detail="Plex not configured")
+        raise HTTPException(status_code=503, detail="No media source configured")
     q = state.queue_engine
     if body.track_id:
         track = await client.get_track(body.track_id)
@@ -464,6 +774,7 @@ async def admin_append_to_queue(body: AdminQueueAppendRequest):
 
 @router.get("/queue")
 async def get_queue():
+    from app.output import session as output_session
     q = state.queue_engine
     return {
         "queue": [{**_queue_item_dict(i), "position": idx} for idx, i in enumerate(q.queue)],
@@ -475,17 +786,29 @@ async def get_queue():
         # Closing Time (2026-06-24 plan U3): admin hydrates the banner from here.
         "closing_active": state._closing_active,
         "closing_message": state._closing_message,
+        # Output-session state (supervisor plan U4, R20): the admin-rich
+        # snapshot — the SAME shape the OutputSessionEvent broadcasts carry —
+        # so the page's refreshQueueState resync (load / WS reconnect / tab
+        # refocus) hydrates the outage banner through one render path.
+        "output_session": await output_session.session_snapshot_admin(),
     }
 
 
 @router.get("/playback/now-playing")
 async def admin_now_playing():
+    from app.output import session as output_session
     s = state.queue_engine.state
+    # Output-session state (supervisor plan U4, R20): the admin-rich snapshot
+    # mirror of the OutputSessionEvent broadcasts — present in BOTH branches
+    # because an outage hold clears `current` (the held item re-front-inserts),
+    # so the no-current branch is exactly the one late joiners hit mid-outage.
+    output_snap = await output_session.session_snapshot_admin()
     if not s.current:
         return {
             "is_playing": False, "is_paused": False,
             "closing_active": state._closing_active,
             "closing_message": state._closing_message,
+            "output_session": output_snap,
         }
     t = s.current.track
     return {
@@ -500,6 +823,7 @@ async def admin_now_playing():
         "is_paused": s.is_paused,
         "closing_active": state._closing_active,
         "closing_message": state._closing_message,
+        "output_session": output_snap,
     }
 
 
@@ -530,6 +854,13 @@ class MoveRequest(BaseModel):
 
 @router.post("/queue/move")
 async def queue_move(body: MoveRequest):
+    from app.output import session as output_session
+    if output_session.output_hold_active():
+        # R17 (the queue_clear mechanic): moving during an outage can change
+        # the HELD front — the gen bump makes any in-flight resume treat the
+        # new front as fresh at 0:00 instead of seeking the displaced
+        # track's held position into it.
+        state._advance_gen += 1
     try:
         await state.queue_engine.move(body.from_position, body.to_position)
     except IndexError:
@@ -545,12 +876,28 @@ class ClearRequest(BaseModel):
 async def queue_clear(body: ClearRequest):
     if not body.confirmed:
         raise HTTPException(status_code=400, detail="Must confirm queue clear")
+    from app.output import session as output_session
+    if output_session.output_hold_active():
+        # R17 (supervisor plan U4): clearing during an outage drops the HELD
+        # item too — it sits at the queue front, so clear() removes it with
+        # the rest. The hold itself stays (the device is still gone; U3's
+        # resume path lands IDLE on an empty queue at re-attach, so no orphan
+        # resume fires later). The gen bump makes any in-flight resume treat
+        # whatever the queue holds NEXT (a later append) as a fresh front at
+        # 0:00 instead of seeking the dropped track's held position into it.
+        state._advance_gen += 1
     await state.queue_engine.clear()
     return {"ok": True}
 
 
 @router.delete("/queue/{position}")
 async def queue_remove(position: int):
+    from app.output import session as output_session
+    if output_session.output_hold_active():
+        # R17 (the queue_clear mechanic): removing during an outage can drop
+        # the HELD front — the gen bump re-targets any in-flight resume at
+        # whatever is in front next, at 0:00.
+        state._advance_gen += 1
     try:
         await state.queue_engine.remove(position)
     except IndexError:
@@ -560,6 +907,12 @@ async def queue_remove(position: int):
 
 @router.post("/queue/{position}/play-next")
 async def queue_play_next(position: int):
+    from app.output import session as output_session
+    if output_session.output_hold_active():
+        # R17 (the queue_clear mechanic): promoting during an outage replaces
+        # the HELD front — the gen bump re-targets any in-flight resume at
+        # the promoted track from 0:00.
+        state._advance_gen += 1
     try:
         await state.queue_engine.promote(position)
     except IndexError:
@@ -583,6 +936,14 @@ async def queue_unlock():
 
 @router.post("/playback/pause")
 async def playback_pause():
+    from app.output import session as output_session
+    if output_session.output_hold_active():
+        # Pause during an outage hold (R17): the output is GONE — a live
+        # pause write would raise against the dead device (DLNA's
+        # async_pause has no guard → 500). Record the intent so re-attach
+        # lands PAUSED; the queue is already paused (the hold did that).
+        output_session.get_supervisor().set_held_paused_intent()
+        return {"ok": True}
     await state.output_router.pause()
     await state.queue_engine.set_paused(True)
     return {"ok": True}
@@ -590,6 +951,48 @@ async def playback_pause():
 
 @router.post("/playback/resume")
 async def playback_resume():
+    # Manual resume from an output-outage hold (supervisor plan U3, R17):
+    # works in OutagePaused (attach now, then play), Paused-after-reattach
+    # and IdlePaused (window expired / flap guard), playing from the held
+    # position. Checked BEFORE the Closing Time branch — while the queue is
+    # held there is no playback to "continue" until the device is back, and
+    # the admin pressing Play is the manual override the gates defer to.
+    from app.output import session as output_session
+    if output_session.output_hold_active():
+        sup = output_session.get_supervisor()
+        ok = await sup.manual_resume()
+        if not ok:
+            # Honest, machine-readable failure: tell a single-flight loss
+            # (another attempt already running) apart from a device that is
+            # genuinely still unreachable.
+            ot = sup.peek_outage()
+            if ot is not None and ot.attempt_inflight:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "attempt_in_progress",
+                        "message": "a reconnect attempt is already running "
+                                   "— try again shortly",
+                    },
+                )
+            device = None
+            if ot is not None:
+                device = (getattr(ot.backend, "_resolved_name", None)
+                          or ot.device_id)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "device_unreachable",
+                    "message": (f"Output device {device!r} is unreachable — "
+                                f"still retrying" if device else
+                                "Output device is unreachable — still retrying"),
+                },
+            )
+        # The resume restarted (or resolved) playback — an active Closing
+        # Time freeze is over, same as the live-resume path below.
+        if state._closing_active:
+            await state.clear_closing()
+        return {"ok": True}
     # Closing Time (2026-06-24 plan U2): after a trigger-song freeze there is no
     # paused output to resume — clear the banner and continue with the next
     # queued track instead. Otherwise this is a normal mid-track resume.
@@ -714,7 +1117,7 @@ async def playback_no_audio():
         await state.output_router.stop()
         client = await state.get_plex_client()
         if client is None:
-            raise HTTPException(status_code=502, detail="No Plex client configured")
+            raise HTTPException(status_code=502, detail="No media source configured")
         url = state._make_stream_url(current.track.stream_key, client)
         try:
             await state.output_router.play(url, current.track)
@@ -743,25 +1146,52 @@ async def playback_skip():
     to play() without a prior stop(); this endpoint now matches that
     pattern. Each backend's play() handles the renderer-side transition
     from the currently-playing media to the next.
+
+    While an outage holds the queue (supervisor plan U4, R17), Skip moves
+    the HELD POINTER only — no dispatch, no set_stopped, no 502.
     """
+    from app.output import session as output_session
     state._advance_gen += 1  # invalidate any pending EOS _do_advance task
     async with state._advance_lock:
+        # The held check lives INSIDE the lock: an in-flight resume holds it
+        # and may clear the hold before we run — deciding early would
+        # pointer-pop the then-LIVE queue front into history undispatched.
+        if output_session.output_hold_active():
+            # R17: the old path dispatched to the dead device → 502, and its
+            # set_stopped error handling destroyed the popped held item.
+            # Instead: retire the held front to history (its play_recorded
+            # mark intact) and let the next queued item become the held
+            # front, position 0:00. The gen bump re-targets any in-flight
+            # auto-resume at the new front from 0:00 (U3 pins that
+            # contract). The hold — and its retry loop — survive untouched.
+            # Closing Time is NOT cleared here: a pointer move restarts
+            # nothing.
+            await state.queue_engine.skip_held_front()
+            return {"ok": True}
         next_item = await state.queue_engine.advance()
         if next_item:
             client = await state.get_plex_client()
             if client:
                 url = state._make_stream_url(next_item.track.stream_key, client)
                 try:
-                    await state.output_router.play(url, next_item.track)
+                    # A track you skip forward to and listen to is a real play,
+                    # so it counts — via the output-session supervisor's
+                    # confirmed-start chokepoint (2026-07-11 plan U1), shared
+                    # with state._do_advance and playback_previous. Dispatching
+                    # reports the play; record_play fires only when the backend
+                    # confirms playback actually started.
+                    await state.dispatch_play(
+                        url, next_item.track,
+                        play_recorded=bool(getattr(next_item, "play_recorded", False)),
+                    )
+                    # The R19 mark protected THIS pending play; consume it so
+                    # a later organic replay counts again (supervisor plan U3
+                    # unified this with _play_with_fallback's consumption).
+                    next_item.play_recorded = False
                 except Exception:
                     _log.exception("playback_skip: play() failed for %r", next_item.track.title)
                     await state.queue_engine.set_stopped()
                     raise HTTPException(status_code=502, detail="Playback failed")
-                # A track you skip forward to and listen to is a real play, so
-                # it counts — mirrors state._do_advance and playback_previous via
-                # the shared record_play. (Skip historically counted nothing,
-                # which kept skipped-to tracks off Most Played.)
-                state.record_play(next_item.track)
         else:
             # Queue is empty after advance — stop playback fully.
             await state.output_router.stop()
@@ -788,25 +1218,54 @@ async def playback_previous():
     409 covers both "no history" (the button is disabled client-side;
     this is the race-condition safety net for history emptying between
     the last queue_changed event and the press) and "no Plex client".
+
+    While an outage holds the queue (supervisor plan U4, R17), Skip Back
+    moves the HELD POINTER only — a pointer move dispatches nothing and
+    needs no media source, so the client gate belongs to the live branch.
     """
-    client = await state.get_plex_client()
-    if not client:
-        raise HTTPException(status_code=409, detail="No Plex client available")
+    from app.output import session as output_session
     state._advance_gen += 1  # invalidate any pending EOS _do_advance task
     async with state._advance_lock:
+        # The held check lives INSIDE the lock: an in-flight resume holds it
+        # and may clear the hold before we run — deciding early would
+        # pointer-move a LIVE session's queue without dispatching.
+        if output_session.output_hold_active():
+            # R17: front-insert the previous history item as the new held
+            # front (no dispatch, no set_stopped, no 502; hold + retry loop
+            # survive). Its play_recorded mark rides along: a skipped-away
+            # held item keeps its counted mark; an organically played
+            # history item re-counts at resume, matching live Skip Back. The
+            # gen bump re-targets any in-flight auto-resume at the new front
+            # from 0:00 (U3 contract).
+            prev_item = await state.queue_engine.skip_back_held_front()
+            if prev_item is None:
+                raise HTTPException(status_code=409,
+                                    detail="No history to skip back to")
+            return {"ok": True}
+        client = await state.get_plex_client()
+        if not client:
+            raise HTTPException(status_code=409, detail="No media source available")
         prev_item = await state.queue_engine.skip_back()
         if prev_item is None:
             raise HTTPException(status_code=409, detail="No history to skip back to")
         url = state._make_stream_url(prev_item.track.stream_key, client)
         try:
-            await state.output_router.play(url, prev_item.track)
+            # A replay is a real play, so it counts — via the supervisor's
+            # confirmed-start chokepoint (2026-07-11 plan U1), shared with
+            # _do_advance and playback_skip: dispatch reports the play,
+            # record_play fires only on the backend's confirmed start.
+            await state.dispatch_play(
+                url, prev_item.track,
+                play_recorded=bool(getattr(prev_item, "play_recorded", False)),
+            )
+            # The R19 mark protected THIS pending play; consume it so a later
+            # organic replay counts again (supervisor plan U3 unified this
+            # with _play_with_fallback's consumption).
+            prev_item.play_recorded = False
         except Exception:
             _log.exception("playback_previous: play() failed for %r", prev_item.track.title)
             await state.queue_engine.set_stopped()
             raise HTTPException(status_code=502, detail="Playback failed")
-        # A replay is a real play, so it counts — shared with _do_advance and
-        # playback_skip via state.record_play (one canonical play-record path).
-        state.record_play(prev_item.track)
     # Skip Back restarted playback — clear any active Closing Time freeze too.
     await state.clear_closing()
     return {"ok": True}
@@ -827,6 +1286,13 @@ async def get_playback_volume():
 
 @router.post("/playback/volume")
 async def playback_volume(body: VolumeRequest):
+    # Volume during an outage hold (supervisor plan U3, R17): accepted +
+    # persisted + applied at re-attach before audio — a live device write
+    # would raise against the dead output and 500 this endpoint.
+    from app.output import session as output_session
+    if output_session.output_hold_active():
+        await output_session.set_held_volume(body.level)
+        return {"ok": True, "level": body.level}
     await state.output_router.set_volume(body.level)
     return {"ok": True, "level": body.level}
 
@@ -911,6 +1377,13 @@ async def get_settings():
         "rail_alpha_mode": await database.get_rail_alpha_mode(),
         "rail_artist_threshold": await database.get_rail_artist_threshold(),
         "rail_album_threshold": await database.get_rail_album_threshold(),
+        # Gapless playback (2026-07-11 supervisor plan U5, R10): default-off
+        # master toggle; per-protocol capability shows in the output picker.
+        "gapless_enabled": await database.get_gapless_enabled(),
+        # Auto-resume window (supervisor plan U3/U5, R8): minutes after an
+        # output outage within which the supervisor may still auto-resume. The
+        # getter resolves the default (60), so the box shows the live value.
+        "resume_window_minutes": await database.get_resume_window_minutes(),
     }
 
 
@@ -983,15 +1456,80 @@ class SettingsRequest(BaseModel):
     rail_alpha_mode: Literal['english', 'international'] | None = None
     rail_artist_threshold: int | None = None
     rail_album_threshold: int | None = None
+    # Output-session supervisor + gapless (2026-07-11 plan U5).
+    # gapless_enabled: default-off master toggle (R10), persisted "1"/"0" and
+    # live-applied via state.set_gapless_enabled (no restart; a flip bumps the
+    # arming generation for U6's revoke lifecycle). resume_window_minutes: the
+    # auto-resume window (R8; >= 1, default 60) consumed at decision time by
+    # U3's supervisor — the >= 1 floor is enforced in update_settings (mirrors
+    # most_played_display_limit).
+    gapless_enabled: bool | None = None
+    resume_window_minutes: int | None = None
 
 
 @router.post("/settings")
 async def update_settings(body: SettingsRequest):
+    # ── validation, ALL of it, before ANY persist/live-apply ─────────────────
+    # A mixed request must be atomic on the invalid path: every field check
+    # runs up front so a 4xx applies NOTHING (previously gapless_enabled was
+    # persisted+live-applied before resume_window_minutes' floor check raised,
+    # partially applying the request). Valid requests are untouched — the
+    # apply blocks below run in their original order.
+    eb: QueueEndBehavior | None = None
     if body.queue_end_behavior is not None:
         try:
             eb = QueueEndBehavior(body.queue_end_behavior)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid queue_end_behavior")
+
+    # Random-pick length band (2026-06-20 plan U1): validate the EFFECTIVE pair
+    # (incoming value wins; fall back to the stored value for an omitted side).
+    # 0 = bound off; a band is only contradictory when BOTH ends are active and
+    # min >= max.
+    if body.random_min_seconds is not None or body.random_max_seconds is not None:
+        def _stored_secs(raw: str | None) -> int:
+            return int(raw) if raw and raw.lstrip("-").isdigit() else 0
+
+        eff_min = (body.random_min_seconds if body.random_min_seconds is not None
+                   else _stored_secs(await database.get_setting("random_min_seconds")))
+        eff_max = (body.random_max_seconds if body.random_max_seconds is not None
+                   else _stored_secs(await database.get_setting("random_max_seconds")))
+        if eff_min < 0 or eff_max < 0:
+            raise HTTPException(status_code=422, detail="length bounds must be non-negative")
+        if eff_min > 0 and eff_max > 0 and eff_min >= eff_max:
+            raise HTTPException(
+                status_code=422,
+                detail="random_min_seconds must be less than random_max_seconds",
+            )
+
+    if body.popular_random_threshold is not None and body.popular_random_threshold < 1:
+        raise HTTPException(
+            status_code=422, detail="popular_random_threshold must be >= 1"
+        )
+
+    if body.most_played_display_limit is not None and body.most_played_display_limit < 1:
+        raise HTTPException(
+            status_code=422, detail="most_played_display_limit must be >= 1"
+        )
+
+    # International rail thresholds: >= 1 floor (same shape as
+    # popular_random_threshold); the mode is Literal-validated by Pydantic.
+    for _field, _key in (
+        (body.rail_artist_threshold, "rail_artist_threshold"),
+        (body.rail_album_threshold, "rail_album_threshold"),
+    ):
+        if _field is not None and _field < 1:
+            raise HTTPException(status_code=422, detail=f"{_key} must be >= 1")
+
+    # Auto-resume window (supervisor plan U5): >= 1 floor, same validation
+    # shape as most_played_display_limit.
+    if body.resume_window_minutes is not None and body.resume_window_minutes < 1:
+        raise HTTPException(
+            status_code=422, detail="resume_window_minutes must be >= 1"
+        )
+
+    # ── apply (validated above; original order preserved) ────────────────────
+    if eb is not None:
         await database.set_setting("queue_end_behavior", eb.value)
         state.queue_engine.end_behavior = eb
 
@@ -1039,37 +1577,16 @@ async def update_settings(body: SettingsRequest):
     if body.surprise_me_diversity is not None:
         await database.set_setting("surprise_me_diversity", body.surprise_me_diversity)
 
-    # Random-pick length band (2026-06-20 plan U1). Validate the EFFECTIVE pair
-    # (incoming value wins; fall back to the stored value for an omitted side)
-    # before persisting either, so a rejected request writes nothing. 0 = bound
-    # off; a band is only contradictory when BOTH ends are active and min >= max.
-    if body.random_min_seconds is not None or body.random_max_seconds is not None:
-        def _stored_secs(raw: str | None) -> int:
-            return int(raw) if raw and raw.lstrip("-").isdigit() else 0
-
-        eff_min = (body.random_min_seconds if body.random_min_seconds is not None
-                   else _stored_secs(await database.get_setting("random_min_seconds")))
-        eff_max = (body.random_max_seconds if body.random_max_seconds is not None
-                   else _stored_secs(await database.get_setting("random_max_seconds")))
-        if eff_min < 0 or eff_max < 0:
-            raise HTTPException(status_code=422, detail="length bounds must be non-negative")
-        if eff_min > 0 and eff_max > 0 and eff_min >= eff_max:
-            raise HTTPException(
-                status_code=422,
-                detail="random_min_seconds must be less than random_max_seconds",
-            )
-        if body.random_min_seconds is not None:
-            await database.set_setting("random_min_seconds", str(body.random_min_seconds))
-        if body.random_max_seconds is not None:
-            await database.set_setting("random_max_seconds", str(body.random_max_seconds))
+    # Random-pick length band (2026-06-20 plan U1); the effective-pair
+    # validation ran up top, so a rejected request wrote nothing.
+    if body.random_min_seconds is not None:
+        await database.set_setting("random_min_seconds", str(body.random_min_seconds))
+    if body.random_max_seconds is not None:
+        await database.set_setting("random_max_seconds", str(body.random_max_seconds))
 
     # Queue-end rework (2026-06-21 plan U2): Popular Random threshold + the opt-in
     # length-limit gate for the queue-end random modes.
     if body.popular_random_threshold is not None:
-        if body.popular_random_threshold < 1:
-            raise HTTPException(
-                status_code=422, detail="popular_random_threshold must be >= 1"
-            )
         await database.set_setting(
             "popular_random_threshold", str(body.popular_random_threshold)
         )
@@ -1079,13 +1596,9 @@ async def update_settings(body: SettingsRequest):
             "queue_end_length_limit", "1" if body.queue_end_length_limit else "0"
         )
 
-    # Most Played leaderboard size (2026-06-23): display-only floor of 1, same
-    # validation shape as popular_random_threshold.
+    # Most Played leaderboard size (2026-06-23): display-only floor of 1
+    # (validated up top).
     if body.most_played_display_limit is not None:
-        if body.most_played_display_limit < 1:
-            raise HTTPException(
-                status_code=422, detail="most_played_display_limit must be >= 1"
-            )
         await database.set_setting(
             "most_played_display_limit", str(body.most_played_display_limit)
         )
@@ -1105,9 +1618,19 @@ async def update_settings(body: SettingsRequest):
         if _val is not None:
             await database.set_setting(_key, _val.strip())
 
+    # Arming lifecycle (2026-07-11 supervisor plan U6, R21): the Closing Time
+    # config is an arming input — any edit revokes a device-armed next
+    # outright (the armed decision was made under the OLD config) and
+    # re-evaluates, so a next armed past a freshly-configured send-off track
+    # can never survive the edit. No-op when nothing is armed.
+    if any(v is not None for v in (
+        body.closing_time_enabled, body.closing_time_title,
+        body.closing_time_artist, body.closing_time_message,
+    )):
+        await state.notify_closing_config_changed()
+
     # International rail (2026-06-22 plan 004): alpha-rail mode + per-rail first-char
-    # thresholds. Mode is Literal-validated by Pydantic; thresholds enforce the >= 1
-    # floor here (same shape as popular_random_threshold).
+    # thresholds (the >= 1 floor validated up top).
     if body.rail_alpha_mode is not None:
         await database.set_setting("rail_alpha_mode", body.rail_alpha_mode)
 
@@ -1116,9 +1639,26 @@ async def update_settings(body: SettingsRequest):
         (body.rail_album_threshold, "rail_album_threshold"),
     ):
         if _field is not None:
-            if _field < 1:
-                raise HTTPException(status_code=422, detail=f"{_key} must be >= 1")
             await database.set_setting(_key, str(_field))
+
+    # Gapless toggle (2026-07-11 supervisor plan U5): persist + live-apply,
+    # queue_end_behavior-style. The state setter bumps the arming generation
+    # on a real flip so U6's device-side armed next is revoked; no playback
+    # path consults the flag yet, so toggle-off stays byte-identical.
+    if body.gapless_enabled is not None:
+        await database.set_setting(
+            "gapless_enabled", "1" if body.gapless_enabled else "0"
+        )
+        state.set_gapless_enabled(body.gapless_enabled)
+
+    # Auto-resume window (supervisor plan U5): >= 1 floor validated up top.
+    # Decision-time read (U3's supervisor calls
+    # database.get_resume_window_minutes at resume time) — no live-apply
+    # machinery needed.
+    if body.resume_window_minutes is not None:
+        await database.set_setting(
+            "resume_window_minutes", str(body.resume_window_minutes)
+        )
 
     # On-deck pre-buffer (2026-06-21 plan U4): any change to a selection input
     # invalidates a buffered random pick so the next warm reflects the new
@@ -1210,6 +1750,47 @@ async def set_track_tags(body: TrackTagsRequest):
         raise HTTPException(status_code=422, detail="too many tags in request")
     stored = await database.set_tags(body.track_id, body.tags)
     return {"track_id": body.track_id, "tags": stored}
+
+
+# ── Play-data curation: prune plays / remove from Most Played (2026-07-03 U4) ─
+# Admin-only (router-level require_admin). Mutates the LOCAL play stores only.
+
+class RemovePlayRequest(BaseModel):
+    track_id: str
+    # added_at is matched by string equality against the in-memory history deque
+    # (not parsed or queried), so a length cap is sufficient (mirrors QueueUndoRequest).
+    added_at: str = Field(..., max_length=64)
+
+
+class RemoveFromMostPlayedRequest(BaseModel):
+    track_id: str
+
+
+@router.post("/history/remove-play")
+async def remove_play(body: RemovePlayRequest):
+    """Undo one recent play (R2/R3): roll back its contribution to the track,
+    album, and artist counts, then remove the history entry. Un-count first
+    (awaited) is the least-harm order — a DB failure leaves both stores unchanged.
+    404 when the entry is no longer in the current history (stale strip)."""
+    validate_plex_id(body.track_id)
+    q = state.queue_engine
+    entry = next((i for i in q.history
+                  if i.track_id == body.track_id and i.added_at == body.added_at), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="History entry not found")
+    await state.unrecord_play(body.track_id, entry.track.album, entry.track.artist)
+    await q.remove_history_entry(body.track_id, body.added_at)
+    return {"ok": True}
+
+
+@router.post("/most-played/remove")
+async def remove_from_most_played(body: RemoveFromMostPlayedRequest):
+    """Remove a track from Most Played (R5/R6): delete its accumulated count, its
+    re-mint sibling keys, and their captured meta. Track-scoped — album/artist
+    name-keyed aggregates are untouched."""
+    validate_plex_id(body.track_id)
+    await state.purge_play_track(body.track_id)
+    return {"ok": True}
 
 
 # ── Surprise Me: source-attribution readout (2026-06-17 plan U6) ─────────────

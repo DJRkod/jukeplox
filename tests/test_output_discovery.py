@@ -50,7 +50,7 @@ def test_aggregate_merges_three_protocols_at_same_host():
     post-strip name is overridden by higher-priority sources)."""
     per_backend = {
         "direct": [],
-        "airplay": [OutputDevice(id="192.168.1.50:7000", name="WiiM Pro-5868",
+        "airplay": [OutputDevice(id="192.168.1.50:7000", name="WiiM Pro-E5F6",
                                  backend_type="airplay", id_format="host_port")],
         "chromecast": [OutputDevice(id="uuid:cc-1", name="WiiM Pro",
                                     backend_type="chromecast")],
@@ -242,7 +242,7 @@ def test_aggregate_airplay_arrives_first_dlna_overrides_name():
     lands. Pins the rank-based priority rule."""
     per_backend = {
         "direct": [],
-        "airplay": [OutputDevice(id="192.168.1.50:7000", name="WiiM Pro-5868",
+        "airplay": [OutputDevice(id="192.168.1.50:7000", name="WiiM Pro-E5F6",
                                  backend_type="airplay", id_format="host_port")],
         "chromecast": [],
         "dlna": [OutputDevice(id="uuid:dlna-1", name="WiiM Pro",
@@ -527,11 +527,101 @@ async def test_build_devices_snapshot_serializes_payload_and_returns_aggregated(
             "device_id": "192.168.1.50:7000",
             "verified": True,
             "checked_at": 42.0,
+            "gapless": "unsupported",  # AirPlay stays per-track (plan U5)
         }],
     }]
     assert len(aggregated) == 1
     assert isinstance(aggregated[0], AggregatedDevice)
     assert aggregated[0].host == "192.168.1.50"
+
+
+async def test_build_devices_snapshot_carries_gapless_capability_per_backend():
+    """Supervisor plan U5 (R10/R12): every protocol entry carries its backend's
+    gapless capability — direct/chromecast "supported", dlna "unverified"
+    (hardcoded until U8's behavioral verdict), airplay "unsupported". Both the
+    GET route and the watcher broadcast serialize through this builder, so one
+    assertion covers the pull and push payloads (KTD5)."""
+    airplay = SimpleNamespace(_device_addr={
+        "192.168.1.50:7000": ("AA@WiiM", "192.168.1.50", 7000, {}),
+    })
+    chromecast = _stub_chromecast(
+        dbus_index={"uuid:cc-1": ("WiiM", "192.168.1.50", 8009)})
+    dlna = SimpleNamespace(_device_locations={
+        "uuid:dlna-1": "http://192.168.1.50:49152/desc.xml",
+    })
+    per_backend = {
+        "direct": [OutputDevice(id="default", name="System Audio",
+                                backend_type="direct")],
+        "airplay": [OutputDevice(id="192.168.1.50:7000", name="WiiM",
+                                 backend_type="airplay", id_format="host_port")],
+        "chromecast": [OutputDevice(id="uuid:cc-1", name="WiiM",
+                                    backend_type="chromecast")],
+        "dlna": [OutputDevice(id="uuid:dlna-1", name="WiiM",
+                              backend_type="dlna")],
+    }
+
+    with patch("app.output.probe_cache.fetch_all", AsyncMock(return_value={})):
+        payload, _ = await build_devices_snapshot(
+            per_backend,
+            backend_for=_fake_backends(
+                airplay=airplay, chromecast=chromecast, dlna=dlna))
+
+    gapless_by_backend = {
+        p["backend"]: p["gapless"] for d in payload for p in d["protocols"]
+    }
+    assert gapless_by_backend == {
+        "direct": "supported",
+        "chromecast": "supported",
+        "dlna": "unverified",
+        "airplay": "unsupported",
+    }
+
+
+async def test_build_devices_snapshot_overrides_dlna_gapless_with_cached_verdict():
+    """Supervisor plan U8: a DLNA device with a cached behavioral verdict
+    (gapless_verdict:dlna:{device_id}) carries it in the snapshot; devices
+    without one keep the static "unverified" default. Bulk-loaded from the
+    settings store per snapshot — the probe cache's fetch_all posture."""
+    dlna = SimpleNamespace(_device_locations={
+        "uuid:dlna-1": "http://192.168.1.50:49152/desc.xml",
+        "uuid:dlna-2": "http://192.168.1.60:49152/desc.xml",
+    })
+    per_backend = {
+        "dlna": [
+            OutputDevice(id="uuid:dlna-1", name="WiiM", backend_type="dlna"),
+            OutputDevice(id="uuid:dlna-2", name="JBL", backend_type="dlna"),
+        ],
+    }
+    with patch("app.output.probe_cache.fetch_all", AsyncMock(return_value={})), \
+         patch("app.database.get_gapless_verdicts",
+               AsyncMock(return_value={"uuid:dlna-1": "supported"})):
+        payload, _ = await build_devices_snapshot(
+            per_backend, backend_for=_fake_backends(dlna=dlna))
+
+    gapless = {p["device_id"]: p["gapless"]
+               for d in payload for p in d["protocols"]}
+    assert gapless == {"uuid:dlna-1": "supported",
+                       "uuid:dlna-2": "unverified"}
+
+
+async def test_build_devices_snapshot_survives_gapless_verdict_load_failure():
+    """A gapless-verdict bulk-load error degrades to the static capability
+    map — the same fail-soft posture as the probe cache — never an
+    exception out of the builder."""
+    dlna = SimpleNamespace(_device_locations={
+        "uuid:dlna-1": "http://192.168.1.50:49152/desc.xml",
+    })
+    per_backend = {
+        "dlna": [OutputDevice(id="uuid:dlna-1", name="WiiM",
+                              backend_type="dlna")],
+    }
+    with patch("app.output.probe_cache.fetch_all", AsyncMock(return_value={})), \
+         patch("app.database.get_gapless_verdicts",
+               AsyncMock(side_effect=RuntimeError("db down"))):
+        payload, _ = await build_devices_snapshot(
+            per_backend, backend_for=_fake_backends(dlna=dlna))
+
+    assert payload[0]["protocols"][0]["gapless"] == "unverified"
 
 
 async def test_build_devices_snapshot_survives_probe_cache_failure():

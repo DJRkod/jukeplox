@@ -144,7 +144,9 @@ async def resolve_surprise(
     if get_exclusions is None:
         from app.database import get_artist_exclusions as get_exclusions  # noqa: F811
     if get_enabled_libraries is None:
-        from app.database import get_enabled_libraries as get_enabled_libraries  # noqa: F811
+        # Effective = enabled minus vetoed sources, so Surprise's native similar
+        # path can't pick a whole-source-OFF library (Libraries-panel U2).
+        from app.database import get_effective_enabled_libraries as get_enabled_libraries  # noqa: F811
 
     # Anti-repeat (plan 005): the browser's recently-surprised track ids, excluded
     # from the smart sources so remove + re-press won't repeat. The floor ignores

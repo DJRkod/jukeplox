@@ -36,7 +36,7 @@ import uuid
 from typing import Any
 
 from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
-from app.plex.models import Track
+from app.models import Track
 
 _log = logging.getLogger(__name__)
 
@@ -126,6 +126,12 @@ _AIRPLAY_NTP_STARTUP_DELAY_S: dict[str, int] = {
     "cliraop": 0,
 }
 
+# Grace added on top of the NTP startup delay before the confirmed-start
+# PROXY fires (2026-07-11 supervisor plan U1): the point audio should be
+# reaching the speaker and the get_position() anchor has begun progressing.
+# See _confirm_start_body for why AirPlay can only ever offer a proxy.
+_AIRPLAY_CONFIRM_GRACE_S = 1.0
+
 
 def _cliap2_bin() -> str:
     return os.environ.get("JUKEPLOX_CLIAP2_BIN", _CLIAP2_BIN_DEFAULT)
@@ -168,7 +174,7 @@ def _strip_raop_mac_prefix(name: str) -> str:
     """Return *name* with the `<12-hex-mac>@` prefix removed for display.
 
     Avahi advertises RAOP service instances as `<12-hex-mac>@<friendly>`
-    (e.g. `42FDF3255868@WiiM Pro-5868`). The MAC prefix is meaningful to
+    (e.g. `A1B2C3D4E5F6@WiiM Pro-E5F6`). The MAC prefix is meaningful to
     cliap2 — `_ensure_deviceid` extracts it to synthesize the `deviceid`
     TXT entry — but it's unreadable noise for the admin device picker.
     The picker consumes this stripped form; `_device_addr` still stores
@@ -312,7 +318,7 @@ def _ensure_deviceid(name: str, txt: dict[str, str]) -> dict[str, str]:
     the TXT dict doesn't include `deviceid`, and the speaker name doesn't
     follow the `<MAC-no-colons>@<friendly>` shape cliap2 expects. On a
     WiiM Pro the avahi-advertised name has the right prefix
-    (`42FDF3255868@WiiM Pro-5868`) but the TXT dict didn't always include
+    (`A1B2C3D4E5F6@WiiM Pro-E5F6`) but the TXT dict didn't always include
     `deviceid` — extract the MAC from the name prefix, format with the
     colon separators cliap2's RAOP code matches against, and inject so
     the warning goes away and the pair-verify path has the id it needs.
@@ -603,6 +609,9 @@ class AirPlayBackend:
         self._stderr_reader_task: asyncio.Task | None = None
         self._ffmpeg_stderr_reader_task: asyncio.Task | None = None
         self._process_watcher_task: asyncio.Task | None = None
+        # Confirmed-start proxy task (2026-07-11 supervisor plan U1) — see
+        # _confirm_start_body. Cancelled in _teardown like the readers.
+        self._confirm_task: asyncio.Task | None = None
         # Tracks which AirPlay binary the current session was spawned
         # with ("cliap2" or "cliraop"); used by the stderr reader to
         # label log lines with the correct origin.
@@ -1254,6 +1263,18 @@ class AirPlayBackend:
         self._stop_requested = False
         self._exit_handled = False
 
+        # Confirmed-start PROXY (2026-07-11 supervisor plan U1). The token is
+        # passed into the task rather than read later so a back-to-back play()
+        # overwriting shared state can't leak the new token to the old session
+        # (the proc identity check in the body is the second guard).
+        from app.output import session
+        _confirm_token = session.get_supervisor().current_token()
+        if _confirm_token is not None:
+            self._confirm_task = asyncio.create_task(
+                self._confirm_start_body(
+                    self._cliap2_proc, ntp_delay_s, _confirm_token)
+            )
+
         # Push track metadata to the receiver. Title/artist/album/art appear
         # on speakers that surface AirPlay metadata (WiiM, JBL with companion
         # app, etc.). Failure is non-fatal — audio still plays.
@@ -1325,6 +1346,66 @@ class AirPlayBackend:
         except (BrokenPipeError, ConnectionResetError, OSError) as exc:
             _log.warning("AirPlay cmd pipe write failed (%s=%s): %s", key, value, exc)
 
+    async def _confirm_start_body(
+        self, proc: Any, ntp_delay_s: float, token: int,
+    ) -> None:
+        """Report a PROXY confirmed-start signal to the output-session
+        supervisor (2026-07-11 plan U1).
+
+        This is a proxy, not a data-plane confirmation: cliap2/cliraop (like
+        the pyatv era before them) expose no "audio is rendering" signal —
+        the AirPlay control plane returns 200s while the speaker stays silent
+        (docs/solutions/best-practices/control-plane-success-data-plane-
+        silent.md). The best available evidence is the sender subprocess
+        still running once the NTP startup delay + grace has elapsed — the
+        point audio should be reaching the speaker and the position anchor
+        (_playback_started_at) has started progressing.
+
+        A pre-startup crash never confirms: _process_watcher_body owns that
+        exit, this task's liveness checks simply decline, and the
+        supervisor's confirmation deadline classifies the dispatch."""
+        try:
+            await asyncio.sleep(ntp_delay_s + _AIRPLAY_CONFIRM_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        if self._stop_requested or not self._is_playing:
+            return  # stopped/superseded before audio could start
+        if proc is not self._cliap2_proc or proc.returncode is not None:
+            return  # superseded session, or the sender died during startup
+        if self._playback_started_at is None:
+            return  # torn down — no position anchor progressing
+        from app.output import session
+        session.notify_confirmed(token)
+
+    async def probe_liveness(self) -> tuple[bool, str | None]:
+        """R15 reachability probe (supervisor plan U2). The plan's KTD defines
+        probe semantics for Cast/DLNA/Direct only — AirPlay's equivalent is a
+        plain TCP connect to the receiver's cached address: cliap2 exposes no
+        transport state (the pyatv-era data-plane ceiling), but a socket that
+        answers proves the device is up, which is all the two-class tie-breaker
+        needs ("device demonstrably reachable" → track-level). No cached
+        address reads as unreachable-unknown → (False, None). Never raises."""
+        device_id = self._device_id
+        addr = self._device_addr.get(device_id) if device_id else None
+        if not addr:
+            return (False, None)
+        host, port = addr[1], addr[2]
+        writer = None
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=3.0,
+            )
+            return (True, None)
+        except Exception:
+            return (False, None)
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
     async def _process_watcher_body(self, proc: Any) -> None:
         """Await cliap2's exit and route the outcome.
 
@@ -1390,24 +1471,16 @@ class AirPlayBackend:
             self._teardown(send_stop=False, caller="watcher_eos")
         )
 
-        # Broadcast a crash event only for actual crashes (non-zero
-        # exit). A clean end-of-stream exit is the queue's job to chain
-        # to the next track — surfacing a "failed!" toast there would
-        # be a confusing UI signal.
+        # A nonzero exit is ambiguous — dead speaker or dead stream. Re-point
+        # it to the supervisor's outage classifier (supervisor plan U2, R16)
+        # instead of the old broadcast+advance: the classifier probes
+        # reachability and either holds the queue (device gone) or skips the
+        # track (device up — today's behavior, with the skip toast). A clean
+        # exit 0 stays the natural end-of-stream advance.
         if returncode != 0:
-            try:
-                from app.events.bus import manager
-                from app.events.types import OutputChangedEvent
-                event = OutputChangedEvent(
-                    backend_type="error",
-                    device_name=(
-                        f"AirPlay playback failed (exit {returncode}); "
-                        "advancing to next track"
-                    ),
-                )
-                await manager.broadcast_to_admins(event)
-            except Exception:
-                _log.warning("AirPlay watcher: crash broadcast failed", exc_info=True)
+            from app.output import session
+            session.notify_outage("process_crash")
+            return
 
         if self._advance_cb is not None:
             try:
@@ -1619,6 +1692,7 @@ class AirPlayBackend:
                 self._stderr_reader_task,
                 self._ffmpeg_stderr_reader_task,
                 self._process_watcher_task,
+                self._confirm_task,
             )
             if t is not None and not t.done()
         ]
@@ -1629,6 +1703,7 @@ class AirPlayBackend:
         self._stderr_reader_task = None
         self._ffmpeg_stderr_reader_task = None
         self._process_watcher_task = None
+        self._confirm_task = None
 
         # Release the DACP session so subsequent callbacks with this token
         # get 401 instead of routing to an inactive stream.

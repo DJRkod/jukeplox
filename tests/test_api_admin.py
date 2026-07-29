@@ -6,9 +6,12 @@ Transport-endpoint tests for POST /admin/playback/previous live in
 tests/test_api_playback.py.
 """
 
+import contextlib
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from app.output import hold  # the hold flag's home since the session decomposition
 from app.plex.models import Library, Track, Album, Artist
 from app.queue.models import QueueEndBehavior
 
@@ -30,6 +33,417 @@ def test_settings_requires_auth(anon_client, mock_session):
 def test_playback_pause_requires_auth(anon_client, mock_session):
     resp = anon_client.post("/admin/playback/pause")
     assert resp.status_code == 401
+
+
+# ── Multi-source Sources panel (U14) ──────────────────────────────────────────
+
+def test_sources_endpoints_require_auth(anon_client, mock_session):
+    # Security (R26): every source op rejects an unauthenticated request.
+    assert anon_client.get("/admin/sources").status_code == 401
+    assert anon_client.post("/admin/sources/jellyfin", json={}).status_code == 401
+    assert anon_client.delete("/admin/sources/jellyfin/x").status_code == 401
+    assert anon_client.post("/admin/sources/local", json={}).status_code == 401
+    assert anon_client.delete("/admin/sources/local/x").status_code == 401
+    assert anon_client.post("/admin/sources/rescan").status_code == 401
+    assert anon_client.get("/admin/scan-status").status_code == 401  # U15 (R26)
+
+
+def test_scan_status_returns_snapshot(client, mock_state):
+    # U15: the admin scan badge reads the shared scan_status snapshot.
+    snap = {"sources": 1, "scanning": True, "scanned": False, "empty": True}
+    with patch("app.state.scan_status", AsyncMock(return_value=snap)):
+        resp = client.get("/admin/scan-status")
+    assert resp.status_code == 200
+    assert resp.json() == snap
+
+
+def test_list_sources_combines_plex_and_jellyfin(client, mock_state):
+    with patch("app.api.admin.database.get_plex_servers",
+               AsyncMock(return_value=[{"machine_id": "m1", "name": "Home Plex"}])), \
+         patch("app.api.admin.database.get_jellyfin_sources",
+               AsyncMock(return_value=[{"source_id": "jf-1", "name": "Den Jelly"}])), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_local_sources", AsyncMock(return_value=[])):
+        resp = client.get("/admin/sources")
+    assert resp.status_code == 200
+    srcs = resp.json()["sources"]
+    assert {"source_id": "m1", "type": "plex", "name": "Home Plex", "enabled": True} in srcs
+    assert {"source_id": "jf-1", "type": "jellyfin", "name": "Den Jelly", "enabled": True} in srcs
+
+
+def test_connect_jellyfin_success_saves_token_only_and_scans(client, mock_state):
+    # Covers AE5: connect via the form → validated, saved, scan starts.
+    save = AsyncMock()
+    with patch("app.sources.jellyfin.authenticate",
+               AsyncMock(return_value={"token": "tok", "user_id": "u1",
+                                       "server_id": "srv9"})), \
+         patch("app.api.admin.database.save_jellyfin_source", save), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()) as scan, \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.post("/admin/sources/jellyfin", json={
+            "server_url": "http://jf.local:8096", "username": "admin",
+            "password": "secret", "name": "Den"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source_id"] == "jf-srv9" and body["name"] == "Den"
+    save.assert_awaited_once()
+    kwargs = save.call_args.kwargs
+    assert kwargs["token"] == "tok" and kwargs["user_id"] == "u1"
+    assert not ({"password", "pw"} & set(kwargs))  # token-only persisted (R24)
+    scan.assert_called_once()
+
+
+def test_connect_jellyfin_enables_its_library(client, mock_state):
+    """Regression (ce-debug 2026-07-24): the Jellyfin connect path must also enable
+    its libraries — same fix as connect_local, and the path where get_libraries()
+    actually does network I/O. Symmetry with connect_local is easy to break."""
+    from app.models import Library
+    sid = "jf-srv9"
+
+    class _FakeSrc:
+        source_id = sid
+        async def get_libraries(self):
+            return [Library(key=f"{sid}:music1", title="Music", type="artist", server_name="Den")]
+
+    class _Reg:
+        sources = [_FakeSrc()]
+
+    toggle = AsyncMock()
+    with patch("app.sources.jellyfin.authenticate",
+               AsyncMock(return_value={"token": "tok", "user_id": "u1", "server_id": "srv9"})), \
+         patch("app.api.admin.database.save_jellyfin_source", AsyncMock()), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=_Reg())), \
+         patch("app.database.toggle_library", toggle), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.post("/admin/sources/jellyfin", json={
+            "server_url": "http://jf.local:8096", "username": "admin",
+            "password": "secret", "name": "Den"})
+    assert resp.status_code == 200
+    toggle.assert_awaited_once_with(f"{sid}:music1", "Music", enabled=True)
+
+
+def test_connect_jellyfin_enable_failure_does_not_500(client, mock_state):
+    """A post-auth get_libraries() failure during enable must NOT fail the connect:
+    the source is already saved, so connect still returns 200 and the catalog
+    refresh still fires; the enable is best-effort (ce-code-review 2026-07-24, #1)."""
+    class _FakeSrc:
+        source_id = "jf-srv9"
+        async def get_libraries(self):
+            raise RuntimeError("jellyfin Views fetch failed")
+
+    class _Reg:
+        sources = [_FakeSrc()]
+
+    with patch("app.sources.jellyfin.authenticate",
+               AsyncMock(return_value={"token": "tok", "user_id": "u1", "server_id": "srv9"})), \
+         patch("app.api.admin.database.save_jellyfin_source", AsyncMock()), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=_Reg())), \
+         patch("app.database.toggle_library", AsyncMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()) as scan, \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.post("/admin/sources/jellyfin", json={
+            "server_url": "http://jf.local:8096", "username": "admin",
+            "password": "x", "name": "Den"})
+    assert resp.status_code == 200          # enable failure did not 500 the connect
+    scan.assert_called_once()               # and trigger_catalog_refresh still fired
+
+
+def test_connect_jellyfin_bad_credentials_not_saved(client, mock_state):
+    # Error path (R21): auth rejected → categorized inline, source not saved.
+    from app.sources.jellyfin import JellyfinAuthError
+    save = AsyncMock()
+    with patch("app.sources.jellyfin.authenticate",
+               AsyncMock(side_effect=JellyfinAuthError("nope"))), \
+         patch("app.api.admin.database.save_jellyfin_source", save):
+        resp = client.post("/admin/sources/jellyfin", json={
+            "server_url": "http://jf.local:8096", "username": "admin",
+            "password": "bad"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "auth_rejected"
+    save.assert_not_awaited()
+
+
+def test_connect_jellyfin_unreachable_not_saved(client, mock_state):
+    # Error path (R21): unreachable server → categorized inline, source not saved.
+    import httpx
+    save = AsyncMock()
+    with patch("app.sources.jellyfin.authenticate",
+               AsyncMock(side_effect=httpx.ConnectError("boom"))), \
+         patch("app.api.admin.database.save_jellyfin_source", save):
+        resp = client.post("/admin/sources/jellyfin", json={
+            "server_url": "http://nope.local:8096", "username": "admin",
+            "password": "x"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "unreachable"
+    save.assert_not_awaited()
+
+
+def test_remove_jellyfin_source(client, mock_state):
+    dele = AsyncMock()
+    with patch("app.api.admin.database.delete_jellyfin_source", dele), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.delete("/admin/sources/jellyfin/jf-1")
+    assert resp.status_code == 200
+    dele.assert_awaited_once_with("jf-1")
+
+
+def test_rescan_sources_triggers_refresh(client, mock_state):
+    with patch("app.state.trigger_catalog_refresh", MagicMock()) as scan, \
+         patch("app.state.trigger_browse_index_refresh", MagicMock()):
+        resp = client.post("/admin/sources/rescan")
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    scan.assert_called_once()
+
+
+def test_list_sources_includes_local(client, mock_state):
+    with patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_plex_config", AsyncMock(return_value=None)), \
+         patch("app.api.admin.database.get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_local_sources",
+               AsyncMock(return_value=[{"source_id": "local-abc", "name": "Vinyl Rips"}])):
+        resp = client.get("/admin/sources")
+    assert resp.status_code == 200
+    assert {"source_id": "local-abc", "type": "local", "name": "Vinyl Rips", "enabled": True} in resp.json()["sources"]
+
+
+def test_connect_local_success_saves_and_scans(client, mock_state, tmp_path):
+    # Covers AE1 onboarding: a real readable directory → validated, saved, scan.
+    music = tmp_path / "music"
+    music.mkdir()
+    save = AsyncMock()
+    with patch("app.api.admin.database.save_local_source", save), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()) as scan, \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.post("/admin/sources/local", json={"root_dir": str(music), "name": "My Music"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["type"] == "local" and body["name"] == "My Music"
+    assert body["source_id"].startswith("local-")
+    save.assert_awaited_once()
+    kwargs = save.call_args.kwargs
+    import os
+    assert kwargs["root_dir"] == os.path.realpath(str(music))  # canonical root stored
+    scan.assert_called_once()
+
+
+def test_connect_local_enables_its_library(client, mock_state, tmp_path):
+    """Regression (ce-debug 2026-07-24): connecting a local source must enable its
+    library. The catalog scan filters EVERY source's libraries by the enabled set,
+    which is populated only by the Plex dashboard — so without this, a local (or
+    Jellyfin) library is never enabled and the scan drops it, leaving an empty
+    catalog. Verified live on a Raspberry Pi: connect → 0 albums until enabled."""
+    import hashlib
+    import os
+    from app.models import Library
+    music = tmp_path / "music"
+    music.mkdir()
+    real = os.path.realpath(str(music))
+    sid = f"local-{hashlib.sha1(real.encode('utf-8')).hexdigest()[:12]}"
+
+    class _FakeSrc:
+        source_id = sid
+        async def get_libraries(self):
+            return [Library(key=f"{sid}:lib", title="My Music", type="artist", server_name="")]
+
+    class _Reg:
+        sources = [_FakeSrc()]
+
+    toggle = AsyncMock()
+    with patch("app.api.admin.database.save_local_source", AsyncMock()), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=_Reg())), \
+         patch("app.database.toggle_library", toggle), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.post("/admin/sources/local", json={"root_dir": str(music), "name": "My Music"})
+    assert resp.status_code == 200
+    toggle.assert_awaited_once_with(f"{sid}:lib", "My Music", enabled=True)
+
+
+def test_connect_local_missing_dir_not_saved(client, mock_state, tmp_path):
+    # Error path (R21): a non-existent directory → categorized inline, not saved.
+    save = AsyncMock()
+    with patch("app.api.admin.database.save_local_source", save):
+        resp = client.post("/admin/sources/local",
+                           json={"root_dir": str(tmp_path / "nope")})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "dir_not_found"
+    save.assert_not_awaited()
+
+
+def test_connect_local_derives_stable_id_from_path(client, mock_state, tmp_path):
+    # Reconnecting the same directory yields the same source_id (upsert, not dup).
+    music = tmp_path / "music"
+    music.mkdir()
+    ids = []
+    with patch("app.api.admin.database.save_local_source", AsyncMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        for _ in range(2):
+            r = client.post("/admin/sources/local", json={"root_dir": str(music)})
+            ids.append(r.json()["source_id"])
+    assert ids[0] == ids[1]
+
+
+def test_remove_local_source(client, mock_state):
+    dele = AsyncMock()
+    with patch("app.api.admin.database.delete_local_source", dele), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.delete("/admin/sources/local/local-abc")
+    assert resp.status_code == 200
+    dele.assert_awaited_once_with("local-abc")
+
+
+# ── Whole-source on/off switch + veto lifecycle (Libraries-panel U3) ──────────
+
+def test_list_sources_reports_veto_as_disabled(client, mock_state):
+    # The whole-source switch: a vetoed source_id reports enabled=False.
+    with patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_plex_config", AsyncMock(return_value=None)), \
+         patch("app.api.admin.database.get_jellyfin_sources",
+               AsyncMock(return_value=[{"source_id": "jf-1", "name": "Den"}])), \
+         patch("app.api.admin.database.get_local_sources",
+               AsyncMock(return_value=[{"source_id": "local-x", "name": "Vinyl"}])), \
+         patch("app.api.admin.database.get_disabled_sources",
+               AsyncMock(return_value=["jf-1"])):
+        resp = client.get("/admin/sources")
+    srcs = {s["source_id"]: s["enabled"] for s in resp.json()["sources"]}
+    assert srcs == {"jf-1": False, "local-x": True}
+
+
+def test_disable_source_writes_veto_and_reconciles(client, mock_state):
+    setv = AsyncMock()
+    with patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.set_disabled_sources", setv), \
+         patch("app.state.invalidate_plex_client", MagicMock()) as inval, \
+         patch("app.state.trigger_browse_index_refresh", MagicMock()) as bidx, \
+         patch("app.state.trigger_catalog_refresh", MagicMock()) as scan:
+        resp = client.post("/admin/sources/jf-1/disable")
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    setv.assert_awaited_once_with(["jf-1"])   # added to the veto set
+    inval.assert_called_once()                # SWR generation bumped (native immediacy)
+    bidx.assert_called_once()                 # browse index reconciled
+    scan.assert_called_once()                 # catalog reconciled
+
+
+def test_enable_source_clears_veto(client, mock_state):
+    setv = AsyncMock()
+    with patch("app.api.admin.database.get_disabled_sources",
+               AsyncMock(return_value=["jf-1", "local-x"])), \
+         patch("app.api.admin.database.set_disabled_sources", setv), \
+         patch("app.state.invalidate_plex_client", MagicMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()):
+        resp = client.post("/admin/sources/jf-1/enable")
+    assert resp.status_code == 200
+    setv.assert_awaited_once_with(["local-x"])   # jf-1 removed, local-x kept
+
+
+def test_source_toggle_does_not_touch_library_rows(client, mock_state):
+    # The remember guarantee: a source toggle only writes disabled_sources, never
+    # enabled_libraries — so an off->on toggle restores the exact selection.
+    toggle = AsyncMock()
+    with patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
+         patch("app.database.toggle_library", toggle), \
+         patch("app.state.invalidate_plex_client", MagicMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()):
+        client.post("/admin/sources/jf-1/disable")
+        client.post("/admin/sources/jf-1/enable")
+    toggle.assert_not_awaited()   # per-library rows untouched (remembered)
+
+
+def test_source_toggle_refresh_failure_does_not_500(client, mock_state):
+    # Best-effort reconcile: a refresh-trigger failure must not fail the toggle; the
+    # veto is already persisted (control-plane-success / best-effort-after-commit).
+    setv = AsyncMock()
+    with patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.set_disabled_sources", setv), \
+         patch("app.state.invalidate_plex_client", MagicMock()), \
+         patch("app.state.trigger_catalog_refresh",
+               MagicMock(side_effect=RuntimeError("boom"))):
+        resp = client.post("/admin/sources/jf-1/disable")
+    assert resp.status_code == 200           # did not 500
+    setv.assert_awaited_once_with(["jf-1"])  # veto still persisted before the reconcile
+
+
+def test_reconnect_clears_stale_veto(client, mock_state):
+    # A reconnect must not inherit a stale veto (source_ids are deterministic), else
+    # the source connects but stays invisible. connect_jellyfin clears it.
+    setv = AsyncMock()
+    with patch("app.sources.jellyfin.authenticate",
+               AsyncMock(return_value={"token": "t", "user_id": "u", "server_id": "srv9"})), \
+         patch("app.api.admin.database.save_jellyfin_source", AsyncMock()), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=["jf-srv9"])), \
+         patch("app.api.admin.database.set_disabled_sources", setv), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=None)), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.post("/admin/sources/jellyfin", json={
+            "server_url": "http://jf.local:8096", "username": "a",
+            "password": "b", "name": "Den"})
+    assert resp.status_code == 200
+    setv.assert_awaited_once_with([])   # jf-srv9 veto removed on reconnect
+
+
+def test_remove_source_clears_orphan_veto(client, mock_state):
+    setv = AsyncMock()
+    with patch("app.api.admin.database.delete_jellyfin_source", AsyncMock()), \
+         patch("app.api.admin.database.get_disabled_sources",
+               AsyncMock(return_value=["jf-1", "local-x"])), \
+         patch("app.api.admin.database.set_disabled_sources", setv), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.delete("/admin/sources/jellyfin/jf-1")
+    assert resp.status_code == 200
+    setv.assert_awaited_once_with(["local-x"])   # orphan veto for jf-1 dropped
+
+
+def test_list_sources_fails_open_when_veto_unreadable(client, mock_state):
+    # A veto-store read error must not 500 the panel — sources show enabled (U3).
+    with patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_plex_config", AsyncMock(return_value=None)), \
+         patch("app.api.admin.database.get_jellyfin_sources",
+               AsyncMock(return_value=[{"source_id": "jf-1", "name": "Den"}])), \
+         patch("app.api.admin.database.get_local_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_disabled_sources",
+               AsyncMock(side_effect=RuntimeError("settings read failed"))):
+        resp = client.get("/admin/sources")
+    assert resp.status_code == 200
+    assert resp.json()["sources"] == [{"source_id": "jf-1", "type": "jellyfin",
+                                       "name": "Den", "enabled": True}]
+
+
+def test_plex_poll_clears_veto_only_for_newly_added_server(client, mock_state):
+    # A reconnect that adds server B must clear B's veto but leave a deliberately-
+    # disabled, already-connected server A vetoed (ce-code-review 2026-07-28).
+    setv = AsyncMock()
+    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
+         patch("app.api.admin.database.get_plex_servers",
+               AsyncMock(side_effect=[[{"machine_id": "A"}], [{"machine_id": "A"}, {"machine_id": "B"}]])), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=["A", "B"])), \
+         patch("app.api.admin.database.set_disabled_sources", setv), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
+    assert resp.status_code == 200
+    setv.assert_awaited_once_with(["A"])   # B (newly added) cleared; A (already-connected) kept
+
+
+def test_plex_poll_does_not_clear_veto_of_already_connected_server(client, mock_state):
+    # Re-auth with NO new server must not touch an existing server's veto (no over-clear).
+    setv = AsyncMock()
+    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
+         patch("app.api.admin.database.get_plex_servers",
+               AsyncMock(side_effect=[[{"machine_id": "A"}], [{"machine_id": "A"}]])), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=["A"])), \
+         patch("app.api.admin.database.set_disabled_sources", setv), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
+    assert resp.status_code == 200
+    setv.assert_not_awaited()   # A stays vetoed — no over-clear on re-auth
 
 
 # ── Surprise Me settings (2026-06-17 plan U3) ────────────────────────────────
@@ -532,6 +946,123 @@ async def test_admin_queue_includes_closing_state(client, mock_state, monkeypatc
     assert data["closing_message"] == "Last call"
 
 
+async def test_playback_resume_during_hold_routes_to_manual_resume(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """Supervisor plan U3 (R17): Play while an outage holds the queue is the
+    MANUAL RESUME — routed to the supervisor (attach + held-position play),
+    never output_router.resume() (there is no live session to resume)."""
+    from app.output import session
+    qe, or_ = mock_state
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    manual = AsyncMock(return_value=True)
+    monkeypatch.setattr(sup, "manual_resume", manual)
+    resp = client.post("/admin/playback/resume")
+    assert resp.status_code == 200
+    manual.assert_awaited_once()
+    or_.resume.assert_not_awaited()
+
+
+async def test_playback_resume_during_hold_unreachable_409(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """Manual resume while the device is still gone → 409, hold intact.
+    F16 contract update: the detail is machine-readable — a
+    device_unreachable code plus a message naming the device (the old static
+    prose also fired for resolved landings and single-flight losses)."""
+    from app.output import session
+    qe, or_ = mock_state
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    ot = session._Outage("connection_lost")
+    ot.device_id = "dev-9"
+    sup._outage = ot
+    monkeypatch.setattr(sup, "manual_resume", AsyncMock(return_value=False))
+    resp = client.post("/admin/playback/resume")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["code"] == "device_unreachable"
+    assert "dev-9" in detail["message"]
+    or_.resume.assert_not_awaited()
+
+
+async def test_playback_resume_during_hold_inflight_race_409_attempt_in_progress(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """F16: losing the single-flight race is NOT 'unreachable' — the 409
+    carries attempt_in_progress so the UI can say 'try again shortly'.
+    Exercises the REAL manual_resume single-flight path."""
+    from app.output import session
+    qe, or_ = mock_state
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    ot = session._Outage("connection_lost")
+    ot.backend = MagicMock()
+    ot.device_id = "dev-9"
+    ot.attempt_inflight = True                   # another attempt is running
+    sup._outage = ot
+    resp = client.post("/admin/playback/resume")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "attempt_in_progress"
+    or_.resume.assert_not_awaited()
+
+
+async def test_playback_resume_during_hold_clears_closing_on_success(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """F2: a successful manual hold-resume restarts (or resolves) playback —
+    an active Closing Time freeze must clear exactly as on the live resume
+    path; the old early return left the banner frozen on every screen."""
+    import app.state as st
+    from app.events import bus as _bus
+    from app.output import session
+    qe, or_ = mock_state
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    monkeypatch.setattr(sup, "manual_resume", AsyncMock(return_value=True))
+    monkeypatch.setattr(st, "_closing_active", True)
+    monkeypatch.setattr(st, "_closing_message", "Last call")
+    with patch.object(_bus.manager, "broadcast_to_all", AsyncMock()) as bc:
+        resp = client.post("/admin/playback/resume")
+    assert resp.status_code == 200
+    assert st._closing_active is False
+    ev = bc.await_args.args[0]
+    assert ev.type == "closing_time" and ev.active is False
+
+
+async def test_playback_volume_during_hold_accepted_and_persisted(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """Supervisor plan U3 (R17): volume during a hold is accepted (200) and
+    persisted via the held-volume path — never a live device write, which
+    would raise against the dead output."""
+    from app.output import session
+    qe, or_ = mock_state
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    held = AsyncMock()
+    monkeypatch.setattr(session, "set_held_volume", held)
+    resp = client.post("/admin/playback/volume", json={"level": 0.7})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "level": 0.7}
+    held.assert_awaited_once_with(0.7)
+    or_.set_volume.assert_not_awaited()
+
+
+async def test_playback_skip_consumes_r19_mark(client, mock_state, fresh_supervisor):
+    """Supervisor plan U3 (R19): a held item dispatched via admin Skip carries
+    its play_recorded mark into the dispatch (confirm must not re-count) and
+    the mark is consumed on success so a later organic replay counts."""
+    qe, or_ = mock_state
+    sup, timers, rec = fresh_supervisor
+    item = await qe.append(make_track("held"), bypass_lock=True)
+    item.play_recorded = True
+    with patch("app.state.get_plex_client", AsyncMock(return_value=MagicMock())), \
+         patch("app.state._make_stream_url", return_value="http://stream/held"):
+        resp = client.post("/admin/playback/skip")
+    assert resp.status_code == 200
+    or_.play.assert_awaited_once()
+    assert qe.state.current.play_recorded is False   # mark consumed
+    sup.on_playback_confirmed(sup.current_token())   # dispatch carried it:
+    rec.assert_not_called()                          # no double count
+
+
 async def test_playback_volume(client, mock_state):
     qe, or_ = mock_state
     resp = client.post("/admin/playback/volume", json={"level": 0.8})
@@ -580,36 +1111,36 @@ async def test_playback_skip_stops_when_queue_empty(client, mock_state):
     or_.play.assert_not_awaited()
 
 
-async def test_playback_skip_increments_play_counts(client, mock_state):
-    """Skipping forward to a track is a real play and must count — mirrors
-    natural EOS advance (state._do_advance) and Skip Back. Regression guard:
-    skip historically incremented nothing, so a track only ever reached by
-    skipping never appeared on Most Played (the record_play unification fix)."""
-    import asyncio as _asyncio
+async def test_playback_skip_counts_via_confirmed_start_chokepoint(client, mock_state, fresh_supervisor):
+    """Skipping forward to a track is a real play and must count — but only
+    once the backend CONFIRMS playback started (2026-07-11 supervisor plan U1).
+    The endpoint reports the dispatch to the output-session supervisor and no
+    longer calls record_play itself; all three entry points (natural advance,
+    Skip, Skip Back) share that chokepoint."""
+    sup, timers, rec = fresh_supervisor
     qe, or_ = mock_state
     await qe.append(make_track("t1"), bypass_lock=True)
     await qe.append(make_track("t2"), bypass_lock=True)
-    inc = AsyncMock()
     with patch("app.state.get_plex_client", AsyncMock(return_value=MagicMock())), \
-         patch("app.state._make_stream_url", return_value="http://stream/t1"), \
-         patch("app.database.increment_play_count", inc), \
-         patch("app.database.set_play_track_meta", AsyncMock()):
+         patch("app.state._make_stream_url", return_value="http://stream/t1"):
         resp = client.post("/admin/playback/skip")
         assert resp.status_code == 200
-        # Counts are fire-and-forget tasks on the app loop; poll briefly.
-        for _ in range(100):
-            if inc.await_count >= 3:
-                break
-            await _asyncio.sleep(0.01)
-    kinds = {call.args[0] for call in inc.await_args_list}
-    assert kinds == {"track", "album", "artist"}
+        rec.assert_not_called()                  # dispatch alone must not count
+        token = sup.current_token()
+        assert token is not None                 # dispatch was reported
+        sup.on_playback_confirmed(token)         # backend confirms playback
+    rec.assert_called_once()
+    assert rec.call_args.args[0].id == "t1"      # the dispatched track counted
 
 
-async def test_playback_skip_captures_track_meta(client, mock_state):
+async def test_playback_skip_captures_track_meta_after_confirm(client, mock_state, monkeypatch):
     """Skip forward captures display metadata for the now-playing track so it
-    surfaces on Most Played even without a later Plex backfill — same shape as
-    _do_advance / Skip Back."""
+    surfaces on Most Played — via the real record_play, fired from the
+    supervisor's confirmed-start chokepoint (U1), not at dispatch."""
     import asyncio as _asyncio
+    from app.output import session
+    sup = session.OutputSessionSupervisor(timer_factory=lambda d, cb: MagicMock())
+    monkeypatch.setattr(session, "_supervisor", sup)
     qe, or_ = mock_state
     await qe.append(make_track("t1"), bypass_lock=True)
     await qe.append(make_track("t2"), bypass_lock=True)
@@ -620,6 +1151,9 @@ async def test_playback_skip_captures_track_meta(client, mock_state):
          patch("app.database.set_play_track_meta", meta):
         resp = client.post("/admin/playback/skip")
         assert resp.status_code == 200
+        assert meta.await_count == 0             # nothing captured at dispatch
+        sup.on_playback_confirmed(sup.current_token())
+        # record_play is fire-and-forget tasks on this loop; poll briefly.
         for _ in range(100):
             if meta.await_count >= 1:
                 break
@@ -781,6 +1315,128 @@ def test_get_settings_most_played_display_limit_default(client, mock_state):
     with patch("app.database.get_setting", AsyncMock(return_value=None)):
         body = client.get("/admin/settings").json()
     assert body["most_played_display_limit"] == 100
+
+
+# ── Gapless settings + auto-resume window (2026-07-11 supervisor plan U5) ────
+
+@contextlib.contextmanager
+def _gapless_state_reset():
+    """Save/restore app.state's live gapless flag + arming generation around a
+    test (module-level state, mirrors test_state.py's _ondeck_reset shape)."""
+    import app.state as st
+    saved = (st._gapless_enabled, st._arming_gen)
+    st._gapless_enabled, st._arming_gen = False, 0
+    try:
+        yield st
+    finally:
+        st._gapless_enabled, st._arming_gen = saved
+
+
+async def test_settings_gapless_round_trip_and_live_apply(client, mock_state):
+    """Plan U5: the toggle defaults off, persists as "1"/"0", reads back as a
+    bool, and the live flag flips WITHOUT a restart (accessor reflects the POST
+    immediately — the queue_end_behavior live-apply shape)."""
+    with _gapless_state_reset() as st:
+        # Default off when unset.
+        with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+             patch("app.database.set_setting", AsyncMock()) as set_mock:
+            assert client.get("/admin/settings").json()["gapless_enabled"] is False
+            # POST true → persisted "1" + live flag applied without restart.
+            assert client.post(
+                "/admin/settings", json={"gapless_enabled": True}
+            ).status_code == 200
+            set_mock.assert_any_call("gapless_enabled", "1")
+            assert st.gapless_enabled() is True
+            # POST false → persisted "0" + live flag back off.
+            client.post("/admin/settings", json={"gapless_enabled": False})
+            set_mock.assert_any_call("gapless_enabled", "0")
+            assert st.gapless_enabled() is False
+
+        # Omitted field: no write, no live-flag touch (per-field guard).
+        with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+             patch("app.database.set_setting", AsyncMock()) as set_mock:
+            client.post("/admin/settings", json={"queue_end_behavior": "stop"})
+            assert not any(
+                c.args and c.args[0] == "gapless_enabled"
+                for c in set_mock.call_args_list
+            )
+            assert st.gapless_enabled() is False
+
+    # Stored "1" reads back as bool true (GET hydration).
+    async def _get(key, default=None):
+        return "1" if key == "gapless_enabled" else None
+    with patch("app.database.get_setting", AsyncMock(side_effect=_get)), \
+         patch("app.database.set_setting", AsyncMock()):
+        assert client.get("/admin/settings").json()["gapless_enabled"] is True
+
+
+async def test_settings_gapless_flip_bumps_arming_generation(client, mock_state):
+    """Plan U5 → U6 hook: a toggle FLIP through the endpoint increments the
+    arming generation (U6 keys device-side revocation off it); a same-value
+    write does not bump (no revoke churn)."""
+    with _gapless_state_reset() as st:
+        with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+             patch("app.database.set_setting", AsyncMock()):
+            gen0 = st.arming_gen()
+            client.post("/admin/settings", json={"gapless_enabled": True})
+            assert st.arming_gen() == gen0 + 1
+            # Same value re-posted → no flip, no bump.
+            client.post("/admin/settings", json={"gapless_enabled": True})
+            assert st.arming_gen() == gen0 + 1
+            # Flip back off → bump again.
+            client.post("/admin/settings", json={"gapless_enabled": False})
+            assert st.arming_gen() == gen0 + 2
+
+
+def test_settings_persists_resume_window_minutes(client, mock_state):
+    with patch("app.api.admin.database.set_setting", AsyncMock()) as ss, \
+         patch("app.api.admin.database.get_setting", AsyncMock(return_value=None)):
+        resp = client.post("/admin/settings", json={"resume_window_minutes": 15})
+    assert resp.status_code == 200
+    persisted = {c.args[0]: c.args[1] for c in ss.call_args_list}
+    assert persisted.get("resume_window_minutes") == "15"
+
+
+def test_settings_rejects_resume_window_below_one(client, mock_state):
+    """Floor validation (plan U5): 0 and negative → 422, nothing persisted."""
+    for bad in (0, -5):
+        with patch("app.api.admin.database.set_setting", AsyncMock()) as ss, \
+             patch("app.api.admin.database.get_setting", AsyncMock(return_value=None)):
+            resp = client.post("/admin/settings", json={"resume_window_minutes": bad})
+        assert resp.status_code == 422
+        assert "resume_window_minutes" not in {c.args[0] for c in ss.call_args_list}
+
+
+async def test_settings_mixed_invalid_request_applies_nothing(client, mock_state):
+    """Validate-then-apply atomicity (2026-07-12 review C4): a mixed request
+    whose resume_window_minutes fails the >= 1 floor must apply NOTHING —
+    previously gapless_enabled was persisted + live-applied BEFORE the floor
+    check raised, leaving the request half-applied on a 422."""
+    with _gapless_state_reset() as st:
+        with patch("app.api.admin.database.set_setting", AsyncMock()) as ss, \
+             patch("app.api.admin.database.get_setting", AsyncMock(return_value=None)):
+            resp = client.post("/admin/settings", json={
+                "gapless_enabled": True, "resume_window_minutes": 0,
+            })
+        assert resp.status_code == 422
+        assert st.gapless_enabled() is False       # live flag never applied
+        assert ss.call_args_list == []             # nothing persisted at all
+
+
+def test_get_settings_resume_window_default(client, mock_state):
+    """Unset → resume window default 60 (the U3 accessor resolves it)."""
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        body = client.get("/admin/settings").json()
+    assert body["resume_window_minutes"] == 60
+
+
+async def test_get_settings_resume_window_reads_stored_value(client, mock_state):
+    """Stored 15 → accessor returns 15 on the GET (decision-time read; the
+    same accessor U3's supervisor consults at resume time)."""
+    async def _get(key, default=None):
+        return "15" if key == "resume_window_minutes" else None
+    with patch("app.database.get_setting", AsyncMock(side_effect=_get)):
+        assert client.get("/admin/settings").json()["resume_window_minutes"] == 15
 
 
 # ── Closing Time mode (2026-06-24 plan U1) ───────────────────────────────────
@@ -1102,6 +1758,25 @@ async def test_get_output_active_includes_mdns_status(client, mock_state):
         resp = client.get("/admin/output/active")
     assert resp.status_code == 200
     assert "mdns_status" in resp.json()
+
+
+# ── Libraries serializer: per-source-type indicator (ce-debug 2026-06-29) ─────
+
+def test_serialize_libraries_emits_source_type_and_server_name():
+    from app.api.admin import _serialize_libraries
+    libs = [
+        Library(key="m1:1", title="Music", type="artist", owner="Alice",
+                server_name="Home", source_type="plex"),
+        Library(key="jf:9", title="Music", type="artist",
+                server_name="Den", source_type="jellyfin"),
+    ]
+    out = _serialize_libraries(libs, {"m1:1"})
+    assert out[0]["source_type"] == "plex"
+    assert out[0]["server_name"] == "Home"
+    assert out[0]["enabled"] is True
+    assert out[1]["source_type"] == "jellyfin"
+    assert out[1]["server_name"] == "Den"
+    assert out[1]["enabled"] is False  # only m1:1 enabled
 
 
 # ── Admin queue append bypasses lock (U2) ─────────────────────────────────────
@@ -2503,3 +3178,380 @@ def test_settings_persists_visibility_and_facet_flags(client, mock_state):
     assert persisted.get("tags_visible_to_guests") == "0"
     assert persisted.get("facet_years") == "0"
     assert persisted.get("facet_highestrated") == "1"
+
+
+# ── Play-data curation endpoints (2026-07-03 plan U4) ────────────────────────
+
+def test_curation_endpoints_require_auth(anon_client, mock_session):
+    # AE6: both mutations reject an unauthenticated request.
+    assert anon_client.post("/admin/history/remove-play",
+                            json={"track_id": "t1", "added_at": "x"}).status_code == 401
+    assert anon_client.post("/admin/most-played/remove",
+                            json={"track_id": "t1"}).status_code == 401
+
+
+def test_remove_play_uncounts_then_removes_entry(client, mock_state):
+    qe, _ = mock_state
+    from app.queue.models import QueueItem
+    qe._history.appendleft(QueueItem(track=make_track("t1"), added_at="ts-1"))
+    with patch("app.state.unrecord_play", AsyncMock()) as un:
+        resp = client.post("/admin/history/remove-play",
+                           json={"track_id": "t1", "added_at": "ts-1"})
+    assert resp.status_code == 200 and resp.json() == {"ok": True}
+    un.assert_awaited_once_with("t1", "B", "A")          # album/artist from the entry
+    assert all(h.track_id != "t1" for h in qe.history)   # entry removed
+
+
+def test_remove_play_absent_entry_404_and_no_uncount(client, mock_state):
+    with patch("app.state.unrecord_play", AsyncMock()) as un:
+        resp = client.post("/admin/history/remove-play",
+                           json={"track_id": "t1", "added_at": "nope"})
+    assert resp.status_code == 404
+    un.assert_not_awaited()                              # no mutation on a miss
+
+
+def test_remove_play_uncount_failure_leaves_history_intact(client, mock_state):
+    qe, _ = mock_state
+    from app.queue.models import QueueItem
+    qe._history.appendleft(QueueItem(track=make_track("t1"), added_at="ts-1"))
+    with patch("app.state.unrecord_play", AsyncMock(side_effect=RuntimeError("db"))):
+        with pytest.raises(RuntimeError):
+            client.post("/admin/history/remove-play",
+                        json={"track_id": "t1", "added_at": "ts-1"})
+    # Least-harm order: un-count runs first; its failure leaves the entry in place.
+    assert any(h.track_id == "t1" for h in qe.history)
+
+
+def test_remove_from_most_played_purges_track(client, mock_state):
+    with patch("app.state.purge_play_track", AsyncMock()) as purge:
+        resp = client.post("/admin/most-played/remove", json={"track_id": "t1"})
+    assert resp.status_code == 200 and resp.json() == {"ok": True}
+    purge.assert_awaited_once_with("t1")
+
+
+# ── Outage-hold transport semantics + observability (supervisor plan U4) ──────
+# R17: skip/previous while held move the HELD POINTER only (no dispatch to the
+# dead device, no set_stopped destruction, no 502); queue clear drops the held
+# item and re-targets any in-flight resume; R20: both admin GET snapshots
+# mirror the OutputSessionEvent fields for late joiners / WS-gap resync.
+
+
+async def test_playback_skip_while_held_moves_pointer_no_dispatch(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """U4 scenario (b), the R17 regression: Skip during an outage hold retires
+    the held front to history (mark intact — it WAS counted) and the next
+    queued item becomes the held front (unplayed -> mark False). NOTHING
+    dispatches to the dead device and nothing set_stops — the old path 502'd
+    and destroyed the popped held item. Hold survives; the gen bump re-targets
+    any in-flight auto-resume at the new front from 0:00 (U3 contract)."""
+    import app.state as st
+    from app.output import session
+    qe, or_ = mock_state
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    held = await qe.append(make_track("held"), bypass_lock=True)
+    held.play_recorded = True                    # it played + counted pre-outage
+    await qe.append(make_track("t2"), bypass_lock=True)
+    gen = st._advance_gen
+
+    resp = client.post("/admin/playback/skip")
+
+    assert resp.status_code == 200               # regression: no 502
+    or_.play.assert_not_awaited()                # no dispatch to the dead device
+    or_.stop.assert_not_awaited()                # no set_stopped-style teardown
+    assert [i.track_id for i in qe.queue] == ["t2"]
+    assert qe.queue[0].play_recorded is False    # new held front: unplayed
+    assert qe.history[0].track_id == "held"      # retired where advance() would
+    assert qe.history[0].play_recorded is True   # skipped-away item keeps its mark
+    assert qe.state.current is None              # nothing pretends to play
+    assert session.output_hold_active() is True  # hold preserved
+    assert st._advance_gen == gen + 1            # in-flight resume re-targeted
+
+
+async def test_playback_skip_while_held_empty_queue_is_quiet_noop(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """Skip while held with an empty queue: 200, nothing dispatched, nothing
+    torn down — never a 5xx from a transport tap while held."""
+    from app.output import session
+    qe, or_ = mock_state
+    monkeypatch.setattr(hold, "_output_hold", True)
+    resp = client.post("/admin/playback/skip")
+    assert resp.status_code == 200
+    or_.play.assert_not_awaited()
+    or_.stop.assert_not_awaited()
+    assert session.output_hold_active() is True
+
+
+async def test_playback_previous_while_held_front_inserts_history(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """R17: Skip Back while held front-inserts the previous history item as
+    the new held front — a pure pointer move needing NO media source
+    (mock_state's get_plex_client is None, which 409s the live path), no
+    dispatch, hold preserved, gen bumped so the resume targets it at 0:00."""
+    import app.state as st
+    from app.output import session
+    from app.queue.models import QueueItem
+    qe, or_ = mock_state
+    monkeypatch.setattr(hold, "_output_hold", True)
+    await qe.append(make_track("held"), bypass_lock=True)
+    qe._history.appendleft(QueueItem(track=make_track("prev")))
+    gen = st._advance_gen
+
+    resp = client.post("/admin/playback/previous")
+
+    assert resp.status_code == 200
+    or_.play.assert_not_awaited()
+    or_.stop.assert_not_awaited()
+    assert [i.track_id for i in qe.queue] == ["prev", "held"]
+    assert qe.queue[0].play_recorded is False    # organic replay re-counts (R19)
+    assert not qe.history
+    assert qe.state.current is None
+    assert session.output_hold_active() is True
+    assert st._advance_gen == gen + 1
+
+
+async def test_playback_previous_while_held_empty_history_409(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """Skip Back while held with no history: same 409 contract as the live
+    path (button-race safety net) — and still no dispatch/teardown."""
+    from app.output import session
+    qe, or_ = mock_state
+    monkeypatch.setattr(hold, "_output_hold", True)
+    await qe.append(make_track("held"), bypass_lock=True)
+    resp = client.post("/admin/playback/previous")
+    assert resp.status_code == 409
+    or_.play.assert_not_awaited()
+    or_.stop.assert_not_awaited()
+    assert [i.track_id for i in qe.queue] == ["held"]
+
+
+async def test_queue_clear_while_held_drops_held_item_and_retargets_resume(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """U4 scenario (c), endpoint half: clearing during an outage drops the
+    held item with the rest of the queue. The hold STAYS (device still gone;
+    U3's resume path lands idle on an empty queue at re-attach — pinned in
+    tests/test_output_session.py), and the gen bump stops an in-flight resume
+    from seeking the dropped track's position into a later-queued front."""
+    import app.state as st
+    from app.output import session
+    qe, or_ = mock_state
+    monkeypatch.setattr(hold, "_output_hold", True)
+    await qe.append(make_track("held"), bypass_lock=True)
+    await qe.append(make_track("t2"), bypass_lock=True)
+    gen = st._advance_gen
+
+    resp = client.post("/admin/queue/clear", json={"confirmed": True})
+
+    assert resp.status_code == 200
+    assert qe.queue == []                        # held item dropped too (R17)
+    assert session.output_hold_active() is True  # hold stays; re-attach lands idle
+    assert st._advance_gen == gen + 1
+
+
+async def test_queue_clear_not_held_does_not_bump_gen(client, mock_state):
+    """Guard: the gen bump is held-path only — a normal clear keeps today's
+    behavior (no pending-advance invalidation side effect)."""
+    import app.state as st
+    qe, or_ = mock_state
+    await qe.append(make_track("t1"), bypass_lock=True)
+    gen = st._advance_gen
+    resp = client.post("/admin/queue/clear", json={"confirmed": True})
+    assert resp.status_code == 200
+    assert st._advance_gen == gen
+
+
+async def test_queue_remove_while_held_bumps_gen(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """F5: removing during an outage can drop the HELD front — the gen bump
+    (the queue_clear mechanic) stops an in-flight resume from seeking the
+    removed track's held position into whatever is in front next."""
+    import app.state as st
+    from app.output import session
+    qe, or_ = mock_state
+    monkeypatch.setattr(hold, "_output_hold", True)
+    await qe.append(make_track("held"), bypass_lock=True)
+    await qe.append(make_track("t2"), bypass_lock=True)
+    gen = st._advance_gen
+    resp = client.delete("/admin/queue/0")
+    assert resp.status_code == 200
+    assert [i.track_id for i in qe.queue] == ["t2"]
+    assert st._advance_gen == gen + 1
+    assert session.output_hold_active() is True
+
+
+async def test_queue_move_while_held_bumps_gen(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """F5: moving during an outage can change the HELD front — same gen-bump
+    contract as remove/clear."""
+    import app.state as st
+    from app.output import session
+    qe, or_ = mock_state
+    monkeypatch.setattr(hold, "_output_hold", True)
+    await qe.append(make_track("held"), bypass_lock=True)
+    await qe.append(make_track("t2"), bypass_lock=True)
+    gen = st._advance_gen
+    resp = client.post("/admin/queue/move",
+                       json={"from_position": 1, "to_position": 0})
+    assert resp.status_code == 200
+    assert [i.track_id for i in qe.queue] == ["t2", "held"]
+    assert st._advance_gen == gen + 1
+
+
+async def test_queue_play_next_while_held_bumps_gen(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """F5: promoting during an outage replaces the HELD front — same gen-bump
+    contract as remove/clear."""
+    import app.state as st
+    from app.output import session
+    qe, or_ = mock_state
+    monkeypatch.setattr(hold, "_output_hold", True)
+    await qe.append(make_track("held"), bypass_lock=True)
+    await qe.append(make_track("t2"), bypass_lock=True)
+    gen = st._advance_gen
+    resp = client.post("/admin/queue/1/play-next")
+    assert resp.status_code == 200
+    assert [i.track_id for i in qe.queue] == ["t2", "held"]
+    assert st._advance_gen == gen + 1
+
+
+async def test_queue_ops_not_held_do_not_bump_gen(client, mock_state):
+    """Guard (mirror of the clear guard): remove/move/promote bump the gen on
+    the held path only."""
+    import app.state as st
+    qe, or_ = mock_state
+    await qe.append(make_track("t1"), bypass_lock=True)
+    await qe.append(make_track("t2"), bypass_lock=True)
+    gen = st._advance_gen
+    assert client.delete("/admin/queue/1").status_code == 200
+    assert client.post("/admin/queue/move",
+                       json={"from_position": 0, "to_position": 0}).status_code == 200
+    assert client.post("/admin/queue/0/play-next").status_code == 200
+    assert st._advance_gen == gen
+
+
+async def test_playback_pause_during_hold_records_intent_no_device_write(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """F12: pause during an outage hold is an INTENT, not a device write —
+    200, no router.pause (the old path wrote to the dead device: DLNA's
+    unguarded async_pause → 500), was_paused recorded on the supervisor AND
+    the outage context so re-attach lands PAUSED instead of auto-playing."""
+    from app.output import session
+    qe, or_ = mock_state
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    ot = session._Outage("connection_lost")
+    sup._outage = ot
+    resp = client.post("/admin/playback/pause")
+    assert resp.status_code == 200 and resp.json() == {"ok": True}
+    or_.pause.assert_not_awaited()
+    assert sup.was_paused is True
+    assert ot.was_paused is True
+
+
+async def test_playback_skip_race_hold_cleared_while_waiting_takes_live_path(
+        mock_state, fresh_supervisor, monkeypatch):
+    """F10: an in-flight resume (holding _advance_lock) clears the hold while
+    Skip waits for the lock. Skip must re-check the hold INSIDE the lock and
+    take the LIVE path — the old pre-lock check pointer-popped the now-live
+    front into history without dispatching it (a queued track silently
+    vanished). Calls the endpoint coroutine directly so both tasks share
+    this test's event loop."""
+    import asyncio
+    import app.state as st
+    from app.api.admin import playback_skip
+    from app.output import session
+    qe, or_ = mock_state
+    monkeypatch.setattr(st, "_advance_lock", asyncio.Lock())  # loop-fresh lock
+    monkeypatch.setattr(hold, "_output_hold", True)
+    await qe.append(make_track("t2"), bypass_lock=True)
+    resume_done = asyncio.Event()
+
+    async def fake_resume():
+        async with st._advance_lock:
+            await resume_done.wait()             # Skip queues on the lock…
+            hold._output_hold = False            # …resume clears the hold
+
+    with patch("app.state.get_plex_client", AsyncMock(return_value=MagicMock())), \
+         patch("app.state._make_stream_url", return_value="http://stream/t2"):
+        resume_task = asyncio.create_task(fake_resume())
+        await asyncio.sleep(0)                   # resume owns the lock
+        assert st._advance_lock.locked()
+        skip_task = asyncio.create_task(playback_skip())
+        for _ in range(3):
+            await asyncio.sleep(0)               # Skip parks on the lock
+        resume_done.set()
+        _, skip_result = await asyncio.gather(resume_task, skip_task)
+
+    assert skip_result == {"ok": True}
+    or_.play.assert_awaited_once()               # LIVE path dispatched t2
+    assert qe.state.current.track_id == "t2"
+    assert not any(h.track_id == "t2" for h in qe.history)  # nothing vanished
+
+
+async def test_admin_now_playing_carries_output_session_snapshot(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """R20 (U4 scenario a, GET half): the admin now-playing snapshot mirrors
+    the OutputSessionEvent fields — admin-rich shape, present on the
+    no-current branch (the one a late joiner hits mid-outage, since the hold
+    clears `current`)."""
+    from app.output import session
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    monkeypatch.setattr(hold, "_output_hold_reason", "connection_lost")
+    sup.session_state = session.STATE_OUTAGE_PAUSED
+
+    data = client.get("/admin/playback/now-playing").json()
+
+    snap = data["output_session"]
+    assert snap["state"] == "outage_paused"
+    assert snap["held"] is True
+    assert snap["reason"] == "connection_lost"
+    # Admin-rich keys are always present (None when no reconnect context).
+    for key in ("backend_type", "device_id", "device_name", "attempts",
+                "next_retry_s", "window_remaining_s", "was_paused",
+                "flap_tripped", "idle_paused_reason"):
+        assert key in snap
+
+
+async def test_admin_queue_carries_output_session_snapshot(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """R20: /admin/queue — the page's actual resync pull (refreshQueueState on
+    load / WS reconnect / tab refocus) — carries the same admin-rich shape."""
+    from app.output import session
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(hold, "_output_hold", True)
+    monkeypatch.setattr(hold, "_output_hold_reason", "poll_errors")
+    sup.session_state = session.STATE_OUTAGE_PAUSED
+
+    data = client.get("/admin/queue").json()
+
+    snap = data["output_session"]
+    assert snap["state"] == "outage_paused" and snap["held"] is True
+    assert snap["reason"] == "poll_errors"
+    assert "window_remaining_s" in snap and "attempts" in snap
+
+
+async def test_admin_snapshots_not_held_read_idle_and_unheld(
+        client, mock_state, fresh_supervisor):
+    """No outage: both admin snapshots still carry the field (clients hide the
+    banner from it) with held=False."""
+    for path in ("/admin/playback/now-playing", "/admin/queue"):
+        snap = client.get(path).json()["output_session"]
+        assert snap["held"] is False
+        assert snap["state"] == "idle"
+
+
+async def test_playback_volume_during_hold_reflects_in_volume_snapshot(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """U4 scenario (d), snapshot half: the held volume write lands on the
+    backend's in-memory level — the source GET /admin/playback/volume reads —
+    so the slider re-hydrates to the accepted value while the device is still
+    gone. Runs the REAL set_held_volume (unlike the U3 routing test above);
+    the live device write path is never touched."""
+    from app.output import session
+    qe, or_ = mock_state
+    monkeypatch.setattr(hold, "_output_hold", True)
+    resp = client.post("/admin/playback/volume", json={"level": 0.35})
+    assert resp.status_code == 200
+    assert or_.active._volume == 0.35    # in-memory level = get_volume's source
+    or_.set_volume.assert_not_awaited()  # never a live write to the dead output
