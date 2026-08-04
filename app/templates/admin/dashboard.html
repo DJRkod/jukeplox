@@ -127,6 +127,30 @@
       border-radius: 50%; background: var(--accent-ui, var(--accent)); border: 2px solid var(--bg); margin-top: -4px; }
     #volume-slider::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%;
       background: var(--accent-ui, var(--accent)); border: 2px solid var(--bg); }
+    /* Volume nudge buttons (2026-08-04 volume rework U2): ±5% snap; transport
+       vocabulary at reduced size; disabled at the bounds (mockup pick). */
+    .vol-btn { min-width: 34px; min-height: 34px; padding: 0; background: var(--surface2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px; font-size: 1rem; line-height: 1; cursor: pointer; }
+    .vol-btn:hover { background: var(--surface); }
+    .vol-btn:disabled { opacity: .35; cursor: default; }
+    /* Volume group + orientation switch (2026-08-04 volume rework U3, mockup
+       picks: docked right rail, rotate(-90deg) technique). One render path —
+       body[data-vol-orient] flips the layout, JS never branches. */
+    .vol-group { display: flex; align-items: center; gap: .45rem; flex: 1; min-width: 0; }
+    .vol-rot-wrap { display: contents; }   /* horizontal: slider joins the group flex directly */
+    body[data-vol-orient="vertical"] #now-playing { position: relative; padding-right: 84px; min-height: 265px; }
+    body[data-vol-orient="vertical"] .vol-group { position: absolute; top: 1.25rem; bottom: 1.25rem; right: 1.25rem;
+      width: 48px; flex: none; flex-direction: column; justify-content: center; gap: .45rem;
+      border-left: 1px solid var(--divider); padding-left: .9rem; }
+    /* Rail order top→bottom: + / bar / − / label (mockup pick) */
+    body[data-vol-orient="vertical"] #vol-up { order: -1; }
+    body[data-vol-orient="vertical"] #vol-down { order: 1; }
+    body[data-vol-orient="vertical"] #vol-label { order: 2; }
+    body[data-vol-orient="vertical"] .vol-rot-wrap { display: block; width: 20px; height: 120px; position: relative; }
+    /* Rotated horizontal input: the 90deg --accent-grad runs ALONG the bar and
+       arrow keys keep their natural mapping (U1 keyboard check). */
+    body[data-vol-orient="vertical"] #volume-slider { position: absolute; top: 50%; left: 50%; width: 120px;
+      max-width: none; min-width: 0; flex: none; transform: translate(-50%, -50%) rotate(-90deg); }
 
     /* Queue list (shared playback module rows; admin decorates with DnD + actions) */
     .queue-item { display: flex; align-items: center; gap: .75rem; padding: .5rem; border-radius: 6px; cursor: grab; }
@@ -529,8 +553,16 @@
         <button class="btn btn-icon" id="btn-prev" title="Skip Back" disabled>⏮</button>
         <button class="btn btn-icon" id="btn-pause" title="Pause/Resume">⏸</button>
         <button class="btn btn-icon" id="btn-skip" title="Skip">⏭</button>
-        <input type="range" id="volume-slider" min="0" max="1" step="0.01" value="0.5">
-        <span id="vol-label" style="font-size:.8rem;color:#888">50%</span>
+        <!-- Volume group (2026-08-04 volume rework U3): one wrapper so the
+             vertical orientation can dock the whole unit as a right rail via
+             CSS only. .vol-rot-wrap is display:contents horizontally and the
+             sized box for the rotate(-90deg) technique vertically. -->
+        <div class="vol-group">
+          <button class="vol-btn" id="vol-down" title="Volume down" aria-label="Volume down">−</button>
+          <div class="vol-rot-wrap"><input type="range" id="volume-slider" min="0" max="1" step="0.01" value="0.5"></div>
+          <button class="vol-btn" id="vol-up" title="Volume up" aria-label="Volume up">+</button>
+          <span id="vol-label" style="font-size:.8rem;color:#888">50%</span>
+        </div>
         <span id="protocol-label" style="display:none;font-size:.75rem;color:#888;margin-left:.5rem"></span>
         <button class="btn btn-sm" id="btn-no-audio" style="display:none;margin-left:auto;background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:.8rem" title="Click if no audio is coming out of the AirPlay speaker — falls back to AirPlay 1 for this device">No audio?</button>
       </div>
@@ -752,6 +784,14 @@
           <input type="number" id="resume-window-minutes" min="1" style="width:64px" placeholder="60">
           minutes.
           <span class="field-note">(after that, resume manually)</span>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Volume bar:</label>
+        <div class="radio-group">
+          <label><input type="radio" name="volume-orientation" value="horizontal" checked> Horizontal</label>
+          <label><input type="radio" name="volume-orientation" value="vertical"> Vertical</label>
+          <button type="button" class="info-i" title="Render the Jukebox tab's volume control as a vertical bar docked at the right edge of the Now Playing card. Applies to all admin devices: this device switches when you save; others on their next load.">&#9432;</button>
         </div>
       </div>
       <div class="panel-row">

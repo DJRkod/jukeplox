@@ -1384,6 +1384,9 @@ async def get_settings():
         # output outage within which the supervisor may still auto-resume. The
         # getter resolves the default (60), so the box shows the live value.
         "resume_window_minutes": await database.get_resume_window_minutes(),
+        # Volume bar orientation (2026-08-04 volume rework U3): horizontal
+        # default; only Literal-validated values can be stored.
+        "volume_orientation": (await database.get_setting("volume_orientation")) or "horizontal",
     }
 
 
@@ -1465,6 +1468,12 @@ class SettingsRequest(BaseModel):
     # most_played_display_limit).
     gapless_enabled: bool | None = None
     resume_window_minutes: int | None = None
+    # Volume bar orientation (2026-08-04 volume rework U3): install-wide render
+    # orientation for the admin volume control. Literal → 422 on a bad value.
+    # Deliberately a single global setting — no per-device override (the
+    # surface is 1-2 admins) and no appearance broadcast (other open admin
+    # devices pick it up on next load; the saving admin applies it live).
+    volume_orientation: Literal['horizontal', 'vertical'] | None = None
 
 
 @router.post("/settings")
@@ -1659,6 +1668,12 @@ async def update_settings(body: SettingsRequest):
         await database.set_setting(
             "resume_window_minutes", str(body.resume_window_minutes)
         )
+
+    # Volume bar orientation (2026-08-04 volume rework U3): persist only —
+    # the saving admin's client applies it locally on save success; no
+    # broadcast by design (see SettingsRequest comment).
+    if body.volume_orientation is not None:
+        await database.set_setting("volume_orientation", body.volume_orientation)
 
     # On-deck pre-buffer (2026-06-21 plan U4): any change to a selection input
     # invalidates a buffered random pick so the next warm reflects the new

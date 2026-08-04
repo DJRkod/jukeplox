@@ -89,6 +89,10 @@ ADMIN_ALLOWED = {
     # Volume
     "volSlider", "volLabel", "volTimer", "_volUserLastSet",
     "loadVolume", "applyVolumeFromEvent",
+    # Volume nudge buttons (2026-08-04 volume rework U2): snap-to-5 helper +
+    # bounds-disable sync — admin-only controls chrome; the write path reuses
+    # the slider's input listener via synthetic dispatch (no parallel POST).
+    "_volSnap", "_volSyncButtons",
     # Queue management (admin chrome — row actions over shared-module rows)
     "queuePlayNext", "queueRemove",
     # Queue remove plan (unify-queue-remove): builds {singles, albums} for the

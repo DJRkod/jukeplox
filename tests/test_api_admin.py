@@ -615,6 +615,42 @@ def test_get_settings_echoes_international_rail(client, mock_state):
     assert body["rail_album_threshold"] == 4
 
 
+# ── Volume bar orientation (2026-08-04 volume rework U3) ─────────────────────
+
+def test_settings_persists_volume_orientation(client, mock_state):
+    """A valid orientation persists via set_setting (200)."""
+    with patch("app.api.admin.database.set_setting", AsyncMock()) as ss, \
+         patch("app.api.admin.database.get_setting", AsyncMock(return_value=None)):
+        resp = client.post("/admin/settings", json={"volume_orientation": "vertical"})
+    assert resp.status_code == 200
+    persisted = {c.args[0]: c.args[1] for c in ss.call_args_list}
+    assert persisted.get("volume_orientation") == "vertical"
+
+
+def test_settings_rejects_invalid_volume_orientation(client, mock_state):
+    """A bad orientation is rejected at the Pydantic layer (Literal) → 422,
+    and the atomic-validation rule means nothing persists."""
+    with patch("app.api.admin.database.set_setting", AsyncMock()) as ss:
+        resp = client.post("/admin/settings", json={"volume_orientation": "diagonal"})
+    assert resp.status_code == 422
+    assert not ss.call_args_list
+
+
+def test_get_settings_echoes_volume_orientation(client, mock_state):
+    """GET /settings echoes the stored orientation; unset reads horizontal."""
+    async def fake_get(key, default=None):
+        return {"volume_orientation": "vertical"}.get(key, default)
+    with patch("app.database.get_setting", AsyncMock(side_effect=fake_get)):
+        resp = client.get("/admin/settings")
+    assert resp.status_code == 200
+    assert resp.json()["volume_orientation"] == "vertical"
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        resp = client.get("/admin/settings")
+    assert resp.status_code == 200
+    assert resp.json()["volume_orientation"] == "horizontal"
+
+
 # ── Rating display style (2026-06-27 plan U1) ────────────────────────────────
 
 def test_settings_persists_rating_style(client, mock_state):
