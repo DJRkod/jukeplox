@@ -452,13 +452,17 @@ async def _plexplayer_clients_source() -> list:
     concurrent legs (dead-server lesson: gather with return_exceptions,
     connect=5 rides the companion client), every per-leg failure logged,
     merged/deduped by player machineIdentifier (first server wins — the
-    two-server dedupe). Raises ONLY when every leg of a non-empty fan-out
-    failed: that is "no scan data", and the watcher sweep must leave its
-    registry untouched (sweep_devices contract) instead of grace-flipping
-    known players over a server outage. Partial results are real data —
-    players seen only by a dead server age out through normal grace.
-    Capability filtering (playqueues-creation) stays in the backend's
-    sweep_devices — the single eligibility gate."""
+    two-server dedupe), PLUS a GDM broadcast probe leg filling the blind
+    spot of a GDM-deaf PMS (TrueNAS-app / bridge-network installs whose
+    /clients never learns LAN players — the Caldera-on-Banana case).
+    Raises ONLY when every server leg of a non-empty fan-out failed AND
+    GDM heard nothing: that is "no scan data", and the watcher sweep must
+    leave its registry untouched (sweep_devices contract) instead of
+    grace-flipping known players over a server outage. Partial results are
+    real data — players seen only by a dead server age out through normal
+    grace. Capability filtering (playqueues-creation) stays in the
+    backend's sweep_devices — the single eligibility gate."""
+    from app.plex import companion as companion_mod
     from app.plex.companion import PmsCompanionClient
     sources = await _plexplayer_enabled_sources()
     if not sources:
@@ -490,10 +494,22 @@ async def _plexplayer_clients_source() -> list:
                 continue
             seen.add(player.machine_identifier)
             merged.append(player)
-    if failures == len(sources):
+    # GDM leg: server entries win the dedupe; a raising probe is fail-soft
+    # (must never sink healthy /clients data).
+    try:
+        gdm_players = await companion_mod.gdm_probe_players()
+    except Exception as exc:
+        _log.warning("plexplayer GDM probe leg failed: %s", exc)
+        gdm_players = []
+    for player in gdm_players:
+        if player.machine_identifier in seen:
+            continue
+        seen.add(player.machine_identifier)
+        merged.append(player)
+    if failures == len(sources) and not merged:
         raise RuntimeError(
             f"plexplayer /clients sweep: all {failures} Plex server(s) "
-            "unreachable — no scan data")
+            "unreachable and no GDM replies — no scan data")
     return merged
 
 

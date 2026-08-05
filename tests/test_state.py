@@ -3854,3 +3854,72 @@ async def test_activate_backend_resets_lock_notice_debounce(
          patch("app.events.bus.manager.broadcast_to_guests", AsyncMock()):
         await st.activate_backend("plexplayer", "default")
     assert st._plex_lock_notice_sent is False
+
+
+async def test_plexplayer_clients_source_merges_gdm_players(caplog):
+    """A GDM-deaf PMS lists nothing in /clients; the GDM probe leg surfaces
+    LAN players anyway, deduped against /clients results by machineIdentifier
+    (server entries win)."""
+    import app.state as st
+    src_a = _plex_source("srv-A")
+    fakes = {"srv-A": _FakePms([_companion_player("p1", "Living Room")])}
+    gdm = [_companion_player("p1", "Living Room (GDM dup)"),
+           _companion_player("caldera-1", "Banana")]
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src_a))), \
+         patch("app.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.plex.companion.PmsCompanionClient", _pms_cls(fakes)), \
+         patch("app.plex.companion.gdm_probe_players",
+               AsyncMock(return_value=gdm)):
+        merged = await st._plexplayer_clients_source()
+    by_id = {p.machine_identifier: p.name for p in merged}
+    assert by_id == {"p1": "Living Room", "caldera-1": "Banana"}
+
+
+async def test_plexplayer_clients_source_gdm_only_survives_dead_servers():
+    """All /clients legs dead but GDM found a live player → that IS scan
+    data; return it instead of raising (registry keeps fresh evidence)."""
+    import app.state as st
+    src_a = _plex_source("srv-A")
+    fakes = {"srv-A": _FakePms(error=RuntimeError("dead"))}
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src_a))), \
+         patch("app.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.plex.companion.PmsCompanionClient", _pms_cls(fakes)), \
+         patch("app.plex.companion.gdm_probe_players",
+               AsyncMock(return_value=[_companion_player("caldera-1", "Banana")])):
+        merged = await st._plexplayer_clients_source()
+    assert [p.machine_identifier for p in merged] == ["caldera-1"]
+
+
+async def test_plexplayer_clients_source_all_dead_and_gdm_empty_still_raises():
+    """No server data AND nothing on GDM → 'no scan data' contract holds
+    (registry untouched, offline-grace owns aging)."""
+    import app.state as st
+    import pytest
+    src_a = _plex_source("srv-A")
+    fakes = {"srv-A": _FakePms(error=RuntimeError("dead"))}
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src_a))), \
+         patch("app.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.plex.companion.PmsCompanionClient", _pms_cls(fakes)), \
+         patch("app.plex.companion.gdm_probe_players",
+               AsyncMock(return_value=[])):
+        with pytest.raises(RuntimeError):
+            await st._plexplayer_clients_source()
+
+
+async def test_plexplayer_clients_source_gdm_probe_failure_is_fail_soft(caplog):
+    """A raising GDM probe (sandboxed env, broadcast blocked) must not sink
+    healthy /clients results."""
+    import app.state as st
+    src_a = _plex_source("srv-A")
+    fakes = {"srv-A": _FakePms([_companion_player("p1", "Living Room")])}
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src_a))), \
+         patch("app.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.plex.companion.PmsCompanionClient", _pms_cls(fakes)), \
+         patch("app.plex.companion.gdm_probe_players",
+               AsyncMock(side_effect=OSError("broadcast blocked"))):
+        merged = await st._plexplayer_clients_source()
+    assert [p.machine_identifier for p in merged] == ["p1"]

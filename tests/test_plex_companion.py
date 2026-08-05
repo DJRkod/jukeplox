@@ -496,3 +496,59 @@ def test_from_plex_client_reuses_coordinates():
     assert companion.server_url == "http://plex.local:32400"
     assert companion._headers["X-Plex-Token"] == "tokX"
     assert companion._headers["X-Plex-Client-Identifier"] == "cidX"
+
+
+# ── GDM discovery (fix/plexplayer-gdm-discovery) ─────────────────────────────
+# A GDM-deaf PMS (TrueNAS-app / bridge-network Docker) never lists LAN
+# players in /clients; jukeplox probes GDM itself — exactly what the phone
+# Plexamp does. Fixture reply below is the REAL Caldera answer captured from
+# the reporting install (device "Banana").
+
+from app.plex import companion  # noqa: E402  (GDM tests use the module)
+
+
+BANANA_GDM_REPLY = (
+    "HTTP/1.0 200 OK\r\n"
+    "Content-Type: plex/media-player\r\n"
+    "Port: 32500\r\n"
+    "Protocol: plex\r\n"
+    "Resource-Identifier: caldera-0123456789abcdef0123456789abcdef\r\n"
+    "Name: Banana\r\n"
+    "Version: 1.0.47\r\n"
+    "Product: Caldera Music\r\n"
+    "Protocol-Version: 1\r\n"
+    "Protocol-Capabilities: timeline,playback,playqueues,playqueues-creation\r\n"
+    "Device-Class: speaker\r\n"
+)
+
+
+def test_parse_gdm_reply_real_caldera_advertisement():
+    p = companion.parse_gdm_reply(BANANA_GDM_REPLY, "192.168.1.104")
+    assert p is not None
+    assert p.name == "Banana"
+    assert p.machine_identifier == "caldera-0123456789abcdef0123456789abcdef"
+    assert p.address == "192.168.1.104"
+    assert p.port == 32500
+    assert p.product == "Caldera Music"
+    assert p.supports_playqueues_creation
+
+
+def test_parse_gdm_reply_bytes_accepted():
+    p = companion.parse_gdm_reply(BANANA_GDM_REPLY.encode(), "192.168.1.104")
+    assert p is not None and p.port == 32500
+
+
+def test_parse_gdm_reply_missing_resource_identifier_skipped():
+    reply = BANANA_GDM_REPLY.replace(
+        "Resource-Identifier: caldera-0123456789abcdef0123456789abcdef\r\n", "")
+    assert companion.parse_gdm_reply(reply, "192.168.1.104") is None
+
+
+def test_parse_gdm_reply_missing_port_skipped():
+    reply = BANANA_GDM_REPLY.replace("Port: 32500\r\n", "")
+    assert companion.parse_gdm_reply(reply, "192.168.1.104") is None
+
+
+def test_parse_gdm_reply_garbage_returns_none():
+    assert companion.parse_gdm_reply(b"\x00\xff not a gdm reply", "10.0.0.1") is None
+    assert companion.parse_gdm_reply("", "10.0.0.1") is None

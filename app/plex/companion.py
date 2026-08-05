@@ -35,6 +35,7 @@ output-layer import): URL query strings are credential-bearing (PMS URLs
 ride ``?X-Plex-Token=…``) and are scrubbed before any log write.
 """
 
+import asyncio
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -318,6 +319,90 @@ def parse_clients(payload: bytes | str) -> list[CompanionPlayer]:
             protocol_capabilities=caps,
         ))
     return players
+
+
+# ── GDM player discovery ─────────────────────────────────────────────────────
+# A containerized PMS (TrueNAS app, bridge-network Docker) is often GDM-deaf:
+# LAN broadcasts never reach its network namespace, so its /clients list
+# never learns players like Caldera even with "Enable local network
+# discovery (GDM)" on. Phone Plexamp sees those players anyway because it
+# broadcasts its own GDM search — this probe is that same mechanism, run
+# from jukeplox (which ships with host networking for exactly this class of
+# discovery). /clients stays the primary source; GDM fills its blind spots.
+
+GDM_PLAYER_PORT = 32412
+_GDM_MSEARCH = b"M-SEARCH * HTTP/1.0\r\n\r\n"
+
+
+def parse_gdm_reply(payload: bytes | str, source_ip: str) -> CompanionPlayer | None:
+    """Parse one GDM M-SEARCH reply (header-style ``Key: value`` lines) into
+    a CompanionPlayer. GDM replies carry no address field — the datagram's
+    source IP is the player address. Replies missing the addressing
+    essentials (Resource-Identifier, Port) are skipped with a log line,
+    never a raise."""
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", "replace")
+    lines = payload.splitlines()
+    fields: dict[str, str] = {}
+    for line in lines[1:]:  # first line is the HTTP status
+        key, sep, value = line.partition(":")
+        if sep:
+            fields[key.strip().lower()] = value.strip()
+    machine_id = fields.get("resource-identifier")
+    port = _opt_int(fields.get("port"))
+    if not machine_id or port is None:
+        _log.info("GDM reply from %s skipped (incomplete): %r",
+                  source_ip, payload[:120])
+        return None
+    caps = frozenset(
+        c.strip()
+        for c in fields.get("protocol-capabilities", "").split(",")
+        if c.strip()
+    )
+    return CompanionPlayer(
+        name=fields.get("name", ""),
+        machine_identifier=machine_id,
+        address=source_ip,
+        port=port,
+        product=fields.get("product", ""),
+        protocol_capabilities=caps,
+    )
+
+
+async def gdm_probe_players(timeout: float = 2.0) -> list[CompanionPlayer]:
+    """Broadcast the GDM player search (M-SEARCH → 255.255.255.255:32412)
+    and collect replies for ``timeout`` seconds. Fail-soft by design: any
+    socket problem (broadcast blocked, sandboxed environment) logs and
+    returns [] so the /clients legs still deliver."""
+    loop = asyncio.get_running_loop()
+    found: dict[str, CompanionPlayer] = {}
+
+    class _GdmProtocol(asyncio.DatagramProtocol):
+        def datagram_received(self, data: bytes, addr) -> None:
+            player = parse_gdm_reply(data, addr[0])
+            if player is not None:
+                found[player.machine_identifier] = player
+
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            _GdmProtocol, local_addr=("0.0.0.0", 0), allow_broadcast=True)
+    except OSError as exc:
+        _log.warning("GDM probe: socket unavailable (%s)", exc)
+        return []
+    try:
+        for _ in range(2):
+            transport.sendto(_GDM_MSEARCH,
+                             ("255.255.255.255", GDM_PLAYER_PORT))
+        await asyncio.sleep(timeout)
+    except OSError as exc:
+        _log.warning("GDM probe: send failed (%s)", exc)
+    finally:
+        transport.close()
+    if found:
+        _log.info("GDM probe: %d player(s) answered: %s", len(found),
+                  ", ".join(sorted(p.name or p.machine_identifier
+                                   for p in found.values())))
+    return list(found.values())
 
 
 def parse_play_queue(payload: bytes | str) -> PlayQueueWindow:

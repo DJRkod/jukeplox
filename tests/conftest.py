@@ -184,3 +184,15 @@ def client(mock_state):
 def anon_client():
     from app.main import app
     return TestClient(app, raise_server_exceptions=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gdm_broadcast(monkeypatch):
+    """Hermetic default: the GDM probe must NEVER broadcast on the real LAN
+    during tests (it genuinely finds live players — Banana answered a test
+    run). Tests that exercise the GDM leg re-patch gdm_probe_players
+    explicitly; everyone else gets an empty ether."""
+    async def _silent(*args, **kwargs):
+        return []
+    import app.plex.companion as _companion
+    monkeypatch.setattr(_companion, "gdm_probe_players", _silent)
