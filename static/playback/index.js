@@ -600,6 +600,12 @@ window.mountPlayback = function mountPlayback(config) {
         items.forEach((item, idx) => {
           const row = document.createElement('div');
           row.className = 'queue-item';
+          // U5 source-lock gray-out: queued-but-unplayable rows (pre-switch
+          // leftovers until U6 removes them) dim exactly like browse rows.
+          // The class is ALWAYS stamped from the U4 plex_held flag (which
+          // rides both the queue GETs and the queue_changed WS payload);
+          // dimming activates only via body[data-source-lock="plex"] CSS.
+          if (item.plex_held === false) row.classList.add('no-plex-hold');
           row.dataset.idx = idx;
           row.innerHTML = `
             <span class="qi-pos">${idx + 1}</span>
@@ -645,6 +651,8 @@ window.mountPlayback = function mountPlayback(config) {
         items.forEach(item => {
           const div = document.createElement('div');
           div.className = 'qs-item qs-history';
+          // U5: history rows carry the same playability class as queue rows.
+          if (item.plex_held === false) div.classList.add('no-plex-hold');
           div.innerHTML = (item.thumb
             ? `<img class="qs-art" src="${_art(item.thumb)}" alt="">`
             : '<div class="qs-art qs-art-placeholder">🎷</div>')
@@ -673,6 +681,12 @@ window.mountPlayback = function mountPlayback(config) {
   function suspend() { _stopTick(); _stopSync(); }
 
   async function resume() {
+    // Output-session snapshot ordering guard (review fix JFR-1, the
+    // _recentPlaysGen house pattern): capture the generation BEFORE the
+    // fetch; a WS output_session push landing during the await bumps it,
+    // and the now-stale snapshot must not overwrite the newer push (e.g.
+    // re-lock the UI the push just unlocked).
+    const osGen = _osGen;
     try {
       const resp = await fetch('/api/now-playing');
       if (!resp.ok) {
@@ -692,7 +706,7 @@ window.mountPlayback = function mountPlayback(config) {
       // the snapshot so a client that missed the output_session delta (locked
       // phone, WS gap) converges on refetch — the WS/GET resync contract. Runs
       // in both branches because the hold clears `current`.
-      if (data && data.output_session) applyOutputSession(data.output_session);
+      if (data && data.output_session && osGen === _osGen) applyOutputSession(data.output_session);
       if (data && data.title) {
         applyNowPlaying(data);
         const p = await fetch('/api/playback/position');
@@ -848,8 +862,29 @@ window.mountPlayback = function mountPlayback(config) {
   // (device/retry/resume button) is page chrome layered via cfg.onOutputSession.
   // Deliberately minimal pending the interaction-state mockups pass (the plan
   // defers that UX): a state note, no elaborate treatment.
+  // JFR-1 snapshot/push ordering guard: bumped on EVERY applied
+  // output_session payload (WS pushes included), so an in-flight snapshot
+  // fetch that captured an older generation skips its stale apply.
+  // Exposed via outputSessionGen() for the admin page's refreshQueueState
+  // (its /admin/queue snapshot mirrors the same field).
+  let _osGen = 0;
   function applyOutputSession(data) {
     if (!data) return;
+    _osGen++;
+    // Source-lock render switch (2026-08-04-002 plan U5): ONE body-level
+    // attribute drives every gray-out (browse rows, queue rows, sheet
+    // guards) purely via CSS + the shared _plexLocked read. Set/cleared
+    // HERE because every output_session path on BOTH pages funnels through
+    // this function — WS push, load/reconnect snapshot hydration (resume()
+    // below; admin's refreshQueueState) — the same event+snapshot resync
+    // contract as the outage note. `in`-guarded so a payload without the
+    // field (foreign shapes) never wrongly clears the switch; attribute
+    // REMOVED (not set empty) when unlocked, the [data-...] selector's
+    // clean-absence contract (body[data-vol-orient] precedent).
+    if ('source_lock' in data) {
+      if (data.source_lock) document.body.dataset.sourceLock = data.source_lock;
+      else delete document.body.dataset.sourceLock;
+    }
     const held = !!data.held;
     if (_npEls && _npEls.outputNote) {
       if (held) {
@@ -911,5 +946,6 @@ window.mountPlayback = function mountPlayback(config) {
   _setIdle();
 
   return { applyNowPlaying, applyPlaybackState, applyQueue, applyClosingTime,
-           applyOutputSession, showSkipped, setIdle: _setIdle, suspend, resume };
+           applyOutputSession, outputSessionGen: () => _osGen,
+           showSkipped, setIdle: _setIdle, suspend, resume };
 };

@@ -35,6 +35,25 @@ async def _source_types() -> dict:
             for s in srcs if getattr(s, "source_id", None)}
 
 
+def holds_plex_held(holds, enabled_plex_ids: set) -> bool:
+    """The per-track playability predicate (plan U4, R6 data layer / AE4):
+    does this identity have ≥1 hold from an enabled source of type "plex"?
+
+    Sync + batch-friendly by design: callers build ``enabled_plex_ids`` ONCE
+    per request (``plex_enabled_source_ids``) and evaluate every row against
+    already-loaded holds — one registry read + one map build per request,
+    never per-row queries. Accepts every hold shape in the codebase (catalog
+    rows, ``views._track`` hold_list entries, ``_attach_holds`` playback
+    snapshots) since all carry ``source_id``. Tolerant of identities with no
+    Plex-shaped keys: local/Jellyfin-only rows, empty/None hold lists, or
+    malformed entries return False without raising."""
+    for h in holds or ():
+        sid = h.get("source_id") if isinstance(h, dict) else None
+        if sid and sid in enabled_plex_ids:
+            return True
+    return False
+
+
 def _artist(row: dict) -> Artist:
     return Artist(id=row["identity"], title=row["title"], thumb=row["thumb"],
                   release_count=row["release_count"])

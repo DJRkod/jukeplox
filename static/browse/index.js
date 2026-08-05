@@ -49,8 +49,16 @@
   let _railResizeObserver = null;
   let _condensationPending = false;
   let _condensationGen = 0;
-  let _alphaSortedOffsets = null;
+  // Bucket-start marker ELEMENTS, cached per activation ([el, key] in DOM
+  // order). Offsets are deliberately NOT cached — see _attachAlphaObserver.
+  let _alphaMarkers = null;
   let _alphaActiveRail = null;
+  // Last drag-scrubbed jump target; _settleJump converges onto it at release
+  // (pointerup). Cleared by cancelRailDrag so render paths never settle onto
+  // a detached row. _settleJumpGen invalidates an in-flight settle loop when
+  // a newer jump starts (two loops must never fight over the scroller).
+  let _railScrubTarget = null;
+  let _settleJumpGen = 0;
   // Plan 002 U2: singleton rail on document.body. Replaces per-column build.
   // _activeColumn is the .alpha-items-column the rail currently points at;
   // pointer handlers and the highlight observer read it at event time.
@@ -81,7 +89,13 @@
       headers: body ? { 'Content-Type': 'application/json' } : {},
       body: body ? JSON.stringify(body) : undefined,
     });
-    return [resp.status, resp.ok ? await resp.json() : null];
+    // Error bodies parse too (plexplayer plan U5): 4xx rejections carry a
+    // JSON `detail` callers branch on (409 output_source_lock vs the
+    // flood-control duplicate). Empty/non-JSON bodies degrade to null,
+    // exactly what error statuses returned before.
+    let data = null;
+    try { data = await resp.json(); } catch (_) { /* no JSON body */ }
+    return [resp.status, data];
   }
 
   // ── HTML helpers ──────────────────────────────────────────────────────────
@@ -292,6 +306,7 @@
     if (!_railDragging) return;
     _railDragging = false;
     _railBounds = null;
+    _railScrubTarget = null;
     if (_alphaOverlay) _alphaOverlay.style.opacity = '0';
   }
 
@@ -1019,7 +1034,7 @@
     }
     _alphaScrollPending = false;
     _alphaScrollAncestor = null;
-    _alphaSortedOffsets = null;
+    _alphaMarkers = null;
     _alphaActiveRail = null;
     if (_columnVisibilityObserver) {
       try { _columnVisibilityObserver.disconnect(); } catch (_) { /* noop */ }
@@ -1089,17 +1104,21 @@
     _alphaScrollPending = false;
     _alphaActiveRail = rail;
     _alphaScrollAncestor = _findScrollAncestor(column);
-    // Cache [data-bucket-start] offsets once at activation as a sorted
-    // [[offsetTop, bucketKey], ...] tuple. Walking the DOM on every scroll
-    // event would defeat the rAF throttle's purpose.
-    const colTop = column.offsetTop || 0;
-    const markers = column.querySelectorAll('[data-bucket-start]');
-    const offsets = [];
-    markers.forEach(el => {
-      offsets.push([el.offsetTop - colTop, el.dataset.bucketStart]);
+    // Cache the [data-bucket-start] marker ELEMENTS once at activation (the
+    // DOM walk is the per-scroll cost worth avoiding). Their offsetTop is
+    // deliberately read LIVE on every firing: under content-visibility render
+    // containment (rail.css), a not-yet-rendered cell's offset contribution is
+    // the contain-intrinsic-size ESTIMATE and shifts to the true value when
+    // the cell first renders — an activation-time offset snapshot drifts by
+    // thousands of px on a large library, highlighting a letter 2–3 behind
+    // the visible content (2026-08-04 debug). Live reads share the current
+    // frame's layout with scrollTop, so the comparison is always
+    // self-consistent — ~27 offset reads per firing, no DOM walk.
+    const markers = [];
+    column.querySelectorAll('[data-bucket-start]').forEach(el => {
+      markers.push([el, el.dataset.bucketStart]);
     });
-    offsets.sort((a, b) => a[0] - b[0]);
-    _alphaSortedOffsets = offsets;
+    _alphaMarkers = markers;
     // The scroll handler. Module-scope reference so _deactivateRail can
     // removeEventListener it cleanly.
     _alphaScrollHandler = () => {
@@ -1109,14 +1128,21 @@
         _alphaScrollPending = false;
         // _railDragging owns the indicator during scrub (U7 of plan 001).
         if (_railDragging) return;
-        if (!_alphaActiveRail || !_alphaSortedOffsets) return;
+        if (!_alphaActiveRail || !_alphaMarkers) return;
         const scrollRoot = _alphaScrollAncestor || document.scrollingElement;
         const scrollTop = (scrollRoot ? scrollRoot.scrollTop : 0) + _ALPHA_HIGHLIGHT_THRESHOLD;
-        let active = _alphaSortedOffsets.length ? _alphaSortedOffsets[0][1] : null;
-        for (const [top, L] of _alphaSortedOffsets) {
-          if (top <= scrollTop) active = L;
-          else break;
+        const colTop = column.offsetTop || 0;
+        // Active = the marker with the greatest offset at/above the threshold
+        // line; none above it (top of list) = the offset-lowest marker. A
+        // max-scan rather than a sorted walk: offsets are live, so a frozen
+        // sort order can't be assumed.
+        let active = null, bestTop = -Infinity, firstKey = null, firstTop = Infinity;
+        for (const [el, L] of _alphaMarkers) {
+          const top = el.offsetTop - colTop;
+          if (top < firstTop) { firstTop = top; firstKey = L; }
+          if (top <= scrollTop && top > bestTop) { bestTop = top; active = L; }
         }
+        if (active === null) active = firstKey;
         Array.from(_alphaActiveRail.children).forEach(child => {
           // Every mode's child carries data-bucket so the same lookup works.
           if (child.dataset && child.dataset.bucket !== undefined) {
@@ -1132,6 +1158,45 @@
     // Prime the highlight once so the active letter is correct without
     // requiring the user to scroll.
     _alphaScrollHandler();
+  }
+
+  // Instant jump with convergence. Under content-visibility render containment
+  // (rail.css), target.offsetTop is computed from contain-intrinsic-size
+  // ESTIMATES for every not-yet-rendered cell above it; a single scrollTop
+  // write therefore lands past the bucket start (~4 rows deep on a large
+  // library — 2026-08-04 debug), because the browser realizes the destination
+  // band at TRUE sizes right after the write and the content shifts. Re-read
+  // and re-write across frames until the target's offset stabilizes. Bounded;
+  // aborts on user input, when a newer jump takes over (generation), or when
+  // a re-render detaches the target.
+  function _settleJump(scrollRoot, col, target) {
+    const gen = ++_settleJumpGen;   // a newer jump owns the scroller now
+    // Abort on USER input only — scrollTop deltas can't distinguish the user
+    // from Chrome's scroll anchoring, which adjusts scrollTop while the
+    // destination band realizes (and would anchor the WRONG landing in place).
+    // Listeners go on window: wheel/touch/pointer bubble there from any
+    // scroller, and keydown never fires on an unfocused pane div.
+    const evs = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
+    let aborted = false;
+    const abort = () => { aborted = true; };
+    evs.forEach(e => window.addEventListener(e, abort, { passive: true, once: true }));
+    const cleanup = () => evs.forEach(e => window.removeEventListener(e, abort));
+    // Hold the watch for the FULL window — no early exit on an agreeing read.
+    // rAF callbacks run before the frame's render step, so the realization
+    // shift lands AFTER a tick that still saw estimate-consistent (matching)
+    // geometry; exiting on first agreement misses it. Corrections are
+    // viewport-rect-based (target top vs scroller top), which is exact in any
+    // offsetParent arrangement and self-corrects late realization trickle.
+    let tries = 20;
+    const tick = () => {
+      if (aborted || gen !== _settleJumpGen || !target.isConnected) { cleanup(); return; }
+      const delta = target.getBoundingClientRect().top - scrollRoot.getBoundingClientRect().top;
+      if (Math.abs(delta) > 1) scrollRoot.scrollTop += delta;
+      if (--tries < 0) { cleanup(); return; }
+      requestAnimationFrame(tick);
+    };
+    scrollRoot.scrollTop = target.offsetTop - ((col && col.offsetTop) || 0);
+    requestAnimationFrame(tick);
   }
 
   // U6 + U7: wire tap-to-jump (and pointer drag in U7). One-shot wiring on
@@ -1167,9 +1232,10 @@
         // the target, forcing render of the whole traversal; on a large library
         // that's ~0.6–1s of main-thread long tasks per tap (confirmed against the
         // live instance via tools/perf/browse-bench, A/B smooth vs instant —
-        // 2026-06-24). Instant renders only the destination region.
+        // 2026-06-24). Instant renders only the destination region. _settleJump
+        // converges the landing across frames (content-visibility estimates).
         const scrollRoot = _findScrollAncestor(col) || document.scrollingElement;
-        if (scrollRoot) scrollRoot.scrollTop = target.offsetTop - (col.offsetTop || 0);
+        if (scrollRoot) _settleJump(scrollRoot, col, target);
         else target.scrollIntoView({ block: 'start' });
       }
       // NOTE: deliberately no event.stopPropagation() — let any open overflow
@@ -1237,7 +1303,18 @@
       if (!_railDragging) return;
       _railPointerMove(e, rail);
     });
-    rail.addEventListener('pointerup', cancelRailDrag);
+    rail.addEventListener('pointerup', () => {
+      // Normal release: converge onto the last scrubbed bucket start (the
+      // scrub's per-move scrollTop writes used estimate-based offsets — see
+      // _settleJump). Interrupted gestures (pointercancel/lostpointercapture)
+      // deliberately don't settle: don't move content under a lost pointer.
+      const t = _railScrubTarget;
+      cancelRailDrag();
+      if (t && t.isConnected && _activeColumn) {
+        const scrollRoot = _findScrollAncestor(_activeColumn) || document.scrollingElement;
+        if (scrollRoot) _settleJump(scrollRoot, _activeColumn, t);
+      }
+    });
     rail.addEventListener('pointercancel', cancelRailDrag);
     rail.addEventListener('lostpointercapture', cancelRailDrag);
   }
@@ -1261,9 +1338,13 @@
     const target = (col && key != null) ? col.querySelector(`[data-bucket-start="${CSS.escape(key)}"]`) : null;
     const scrollRoot = _findScrollAncestor(col) || document.scrollingElement;
     if (target && scrollRoot) {
-      // Manual scrollTop (no smooth) — drag must feel real-time.
+      // Manual scrollTop (no smooth) — drag must feel real-time. Estimate
+      // drift during the scrub is tolerable (the finger is still moving);
+      // the pointerup wiring runs _settleJump on the LAST scrubbed target so
+      // the release lands flush on the bucket start.
       const colTop = (col && col.offsetTop) || 0;
       scrollRoot.scrollTop = target.offsetTop - colTop;
+      _railScrubTarget = target;
     }
     // The drag owns the indicator (the scroll handler defers via _railDragging),
     // so mirror the scrubbed bucket onto the rail — only for buckets with a jump
@@ -1295,8 +1376,26 @@
 
   // ── Queue-append ──────────────────────────────────────────────────────────
 
+  // Plex-player source lock (2026-08-04-002 plan U5). One client copy for
+  // every rejection/guard path; the SERVER gate (409 output_source_lock on
+  // both queue endpoints) is the enforcement — everything here is UX.
+  const _SOURCE_LOCK_MSG = 'This output can only play Plex tracks';
+
+  // Is queueing this track blocked by the active output's source lock? Live
+  // read of the body-level render switch (set by the shared playback module
+  // from the output_session channel) so guards built before an output
+  // switch still decide correctly at press time. Tracks without the U4
+  // plex_held flag (older payload shapes) fail open — the server decides.
+  function _plexLocked(t) {
+    return document.body.dataset.sourceLock === 'plex' && !!t && t.plex_held === false;
+  }
+
   async function addTrack(trackId, title, track, sourceServerName, sourceLabel) {
     if (_config.isLocked && _config.isLocked()) { _config.toast('Queuing is paused by the host'); return; }
+    // U5 click-guard: a dimmed row's tap toasts instead of POSTing (the
+    // isLocked guard above is the precedent). Server gate still backstops
+    // call sites that pass no track object.
+    if (_plexLocked(track)) { _config.toast(_SOURCE_LOCK_MSG); return; }
     // Catalog "Play From Source…" (parity U3): re-POST the same catalog track_id
     // plus the chosen source's server_name. The server reorders the track's
     // holds so that source plays first (a preference — U9 play-time fallback
@@ -1305,12 +1404,14 @@
     if (sourceServerName) body.source_server_name = sourceServerName;
     const [status, data] = await _api('POST', _queueEndpoint(), body);
     if (status === 423) { _config.toast('Queuing is paused by the host'); return; }
-    // Flood Control (2026-06-16): when the admin toggle is on, the guest
-    // endpoint hard-rejects a re-add of a playing/queued track with 409. Tell
-    // the guest it's already queued and that nothing was added — distinct from
-    // the 423 "paused" message. Only fires on /api/queue; admin's /admin/queue
-    // never returns 409.
-    if (status === 409) { _config.toast("That track's already in the queue"); return; }
+    // 409 disambiguation by detail (U5): output_source_lock (both endpoints —
+    // the admin gets no bypass) means the selected output can't play this
+    // track; the detail-less/duplicate 409 stays the Flood Control message
+    // (2026-06-16 — guest /api/queue only, re-add of a playing/queued track).
+    if (status === 409) {
+      if (data && data.detail === 'output_source_lock') { _config.toast(_SOURCE_LOCK_MSG); return; }
+      _config.toast("That track's already in the queue"); return;
+    }
     if (status === 200) {
       if (data && data.warning === 'already_in_queue') _config.toast('Already in queue — added anyway');
       else if (sourceLabel) _config.toast(`Added from ${sourceLabel}`);
@@ -1335,8 +1436,20 @@
     if (sourceServerName) body.source_server_name = sourceServerName;
     const [status, data] = await _api('POST', _queueEndpoint(), body);
     if (status === 423) { _config.toast('Queuing is paused by the host'); return; }
+    // U5: an album with ZERO playable tracks on this output rejects with the
+    // same shape as the per-track gate — same toast.
+    if (status === 409 && data && data.detail === 'output_source_lock') {
+      _config.toast(_SOURCE_LOCK_MSG); return;
+    }
     if (status === 200) {
-      if (sourceLabel) _config.toast(`Added from ${sourceLabel}: ${data.tracks_added} track(s)`);
+      // U5 partial add: the server enqueued only the playable subset and
+      // reported the withheld count — surface both numbers.
+      const filtered = (data && data.tracks_filtered) || 0;
+      if (filtered > 0) {
+        const total = data.tracks_added + filtered;
+        _config.toast(`Added ${data.tracks_added} of ${total} — ${filtered} unavailable on this output`);
+      }
+      else if (sourceLabel) _config.toast(`Added from ${sourceLabel}: ${data.tracks_added} track(s)`);
       else _config.toast(`Added ${data.tracks_added} track(s) to queue!`);
       // Album batch receipt → the page stores it as one group so the whole
       // album can be removed as a unit (U4). Guest-only, as above.
@@ -1370,6 +1483,12 @@
     const row = document.createElement('div');
     row.className = 'list-item track-row';
     row.dataset.trackId = track.track_id || track.id || '';
+    // U5 source-lock gray-out: the row ALWAYS carries its playability class
+    // (backend-independent, straight from the U4 plex_held flag); whether it
+    // DIMS is decided purely by the body[data-source-lock="plex"] CSS switch,
+    // so an output flip restyles live with no refetch. A missing flag (older
+    // payload shapes) means no class — fail open, the server gate enforces.
+    if (track.plex_held === false) row.classList.add('no-plex-hold');
     const dur = track.duration_ms ? _formatDuration(track.duration_ms) : '';
     row.innerHTML = `<div class="list-info"><div class="list-title">${_esc(track.title)}</div><div class="list-sub">${_trackSubHtml(track, dur)}</div></div><button class="kebab-btn" title="Track options" aria-haspopup="true">⋮</button>`;
     row.querySelector('.kebab-btn').addEventListener('click', (e) => {
@@ -1625,24 +1744,33 @@
     // catalog track_id plus the chosen source (a preference — U9 fallback still
     // applies), labelled by type. NATIVE mode: each `sources` entry carries its
     // own distinct per-server track (deduplicateTracks-built); enqueue that copy.
+    // U5: while a Plex-player output dims this row, its queue actions in the
+    // sheet disable too (the `disabled:` flag precedent); navigation (Go to
+    // artist/album) and ratings stay live. Evaluated ONCE at sheet-build
+    // time (S-6: the once-computed srcLocked serves the inner sheet entries
+    // too — a locked outer entry never opens the inner sheet anyway, and
+    // the addTrack press-time guard backstops any flip in between).
+    const srcLocked = _plexLocked(t);
     const catalogSources = Array.isArray(t.sources) ? t.sources : null;
     if (catalogSources && catalogSources.length > 1) {
       items.push({
         label: 'Play from source…',
         action: () => _openSheet(catalogSources.map(s => ({
           label: _sourceLabel(s),
-          disabled: locked,
+          disabled: locked || srcLocked,
           action: () => addTrack(t.track_id || t.id, t.title, t, s.server_name, _sourceLabel(s)),
         })), row.querySelector('.kebab-btn')),
+        disabled: srcLocked,
       });
     } else if (sources && sources.length > 1) {
       items.push({
         label: 'Play from source…',
         action: () => _openSheet(sources.map(s => ({
           label: `Play from ${s.server_name || 'Server'}`,
-          disabled: locked,
+          disabled: locked || srcLocked,
           action: () => addTrack(s.track.track_id || s.track.id, s.track.title, s.track),
         })), row.querySelector('.kebab-btn')),
+        disabled: srcLocked,
       });
     }
     // Admin curation (plan U5, R4/R7/R8): remove this track from Most Played.

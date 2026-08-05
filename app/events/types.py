@@ -35,6 +35,14 @@ class QueueItem:
     # paint straight from this WS payload (not a refetch). Unused for history
     # rows, which the guest never makes removable.
     added_at: str = ""
+    # Playability flag (2026-08-04-002 plexplayer plan U5): queue re-renders
+    # paint straight from this WS payload (see added_at above), so the U4
+    # backend-independent ``plex_held`` flag must ride the push exactly as it
+    # rides the queue GETs — otherwise a queue_changed re-render would strip
+    # the gray-out. Stamped by ``state._annotate_queue_event`` before
+    # broadcast; defaults True (fail-open — the server enqueue gate, not the
+    # client dim, is the enforcement).
+    plex_held: bool = True
 
 
 @dataclass
@@ -214,6 +222,13 @@ class OutputSessionEvent:
     state: str = "idle"
     held: bool = False
     gapless_flow_active: bool = False
+    # Source lock (2026-08-04-002 plexplayer plan U4): "plex" while the
+    # PERSISTED selected backend is plexplayer (state.output_requires_plex()
+    # — never the router's deferred-swap state), else None. Shared truth on
+    # both broadcasts AND the now-playing/queue GET snapshots, so the U5
+    # body-level gray-out attribute flips live on switch and rehydrates from
+    # the same shape.
+    source_lock: str | None = None
     # Admin-rich detail (None on the guest broadcast):
     reason: str | None = None
     backend_type: str | None = None

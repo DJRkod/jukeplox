@@ -1557,6 +1557,45 @@ async def test_stop_playback_revokes_armed_next():
         assert st.armed_next() is None
 
 
+async def test_remove_stranded_entries_revokes_armed_next():
+    """2026-08-04-002 plan U7 (the U6 seam): a stranded-removal set that
+    contains the ARMED next track revokes the arm slot on the owning
+    backend BEFORE the entry drops — the device must never natively advance
+    into a track the queue no longer holds."""
+    from types import SimpleNamespace
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    eng.remove_entries = AsyncMock(return_value=1)
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        assert be.calls == [("arm", "url:t1", t1)]
+        stranded = [SimpleNamespace(track_id="t1", added_at=123.0)]
+        with patch("app.output.hold._output_hold", False):
+            removed = await st.remove_stranded_entries(stranded)
+        assert removed == 1
+        assert be.calls[-1] == ("revoke",)
+        assert st.armed_next() is None
+        eng.remove_entries.assert_awaited_once_with([("t1", 123.0)])
+
+
+async def test_remove_stranded_entries_without_armed_track_no_revoke():
+    """Removal sets that do NOT contain the armed next leave the arm slot
+    untouched (no revoke churn on unrelated stranded removals)."""
+    from types import SimpleNamespace
+    t1 = _arm_track("t1")
+    be = _FakeArmingBackend()
+    eng = _arm_engine(queue_tracks=[t1], current=_arm_track("cur"))
+    eng.remove_entries = AsyncMock(return_value=1)
+    with _arming_env(engine=eng, backend=be) as (st, warm):
+        await st._reconcile_armed_next()
+        stranded = [SimpleNamespace(track_id="other", added_at=9.0)]
+        with patch("app.output.hold._output_hold", False):
+            await st.remove_stranded_entries(stranded)
+        assert be.revoke_count() == 0
+        assert st.armed_next() == (t1, "url:t1")
+
+
 async def test_arm_next_raising_leaves_slot_empty():
     """A device that rejects the arm is a gapped boundary, not an error path:
     the slot stays empty and no exception propagates."""
@@ -2202,6 +2241,59 @@ async def test_clear_closing_noop_when_inactive(monkeypatch):
     with patch.object(_bus.manager, "broadcast_to_all", bc):
         await st.clear_closing()
     bc.assert_not_awaited()
+
+
+# ── queue_changed frame ordering (review fix JFR-2) ──────────────────────────
+
+async def test_queue_changed_frames_arrive_in_mutation_order(monkeypatch):
+    """Review fix JFR-2 (verified red before the fix): the annotate await
+    between snapshot and broadcast let two overlapping queue mutations
+    invert frames — the OLDER snapshot's frame broadcast LAST, so clients
+    (which paint straight from the push, never a refetch) rendered a stale
+    queue until the next mutation. Snapshot must be taken INSIDE the
+    serialization lock: frames arrive in mutation order and the final
+    frame carries both tracks."""
+    import app.state as st
+    from app.events import bus as _bus
+    from app.plex.models import Track
+    from app.queue.engine import QueueEngine
+    qe = QueueEngine()
+    monkeypatch.setattr(st, "queue_engine", qe)
+    frames = []
+
+    async def capture(ev):
+        frames.append([q.track_id for q in ev.queue])
+
+    gate = asyncio.Event()
+    calls = {"n": 0}
+
+    async def gated_annotate(rows, tracks=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await gate.wait()      # first frame's annotate parks
+        return rows
+
+    def _t(tid):
+        return Track(id=tid, title=tid, artist="A", album="B",
+                     duration_ms=1000)
+
+    with patch("app.api.guest._annotate_plex_held", gated_annotate), \
+         patch.object(_bus.manager, "broadcast_to_all", capture), \
+         patch("app.database.save_queue", AsyncMock()):
+        await qe.append(_t("a"), bypass_lock=True)
+        first = asyncio.create_task(st._broadcast_queue_changed())
+        for _ in range(5):
+            await asyncio.sleep(0)             # first is parked mid-annotate
+        await qe.append(_t("b"), bypass_lock=True)
+        second = asyncio.create_task(st._broadcast_queue_changed())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gate.set()
+        await first
+        await second
+    assert frames == [["a"], ["a", "b"]], (
+        "frames must arrive in mutation order — the last frame on the wire "
+        f"is the newest queue (got {frames})")
 
 
 # ── U13: source-neutral random floor + catalog-active predicate ───────────────
@@ -3010,3 +3102,755 @@ async def test_activate_backend_failed_switch_reopens_reconnect_loop(
         assert handle.delay == RETRY_BACKOFF_START_S  # fresh backoff
         for _ in range(4):
             await asyncio.sleep(0)                    # settle _schedule_emit
+
+
+
+# ── plexplayer backend wiring (2026-08-04-002 plan U3) ───────────────────────
+
+def _plex_source(machine_id="srv-A", server_url="http://192.168.1.10:32400",
+                 token="tok-A", client_id="cid-1"):
+    from app.plex.client import PlexClient
+    from app.sources.plex import PlexSource
+    return PlexSource(PlexClient(
+        server_url=server_url, token=token, client_id=client_id,
+        machine_id=machine_id))
+
+
+def _registry(*sources):
+    from app.sources.registry import SourceRegistry
+    return SourceRegistry(list(sources))
+
+
+def _companion_player(mid, name="Caldera",
+                      caps=("playqueues-creation", "timeline")):
+    from app.plex.companion import CompanionPlayer
+    return CompanionPlayer(
+        name=name, machine_identifier=mid, address="192.168.1.88",
+        port=32500, product="Caldera",
+        protocol_capabilities=frozenset(caps))
+
+
+class _FakePms:
+    def __init__(self, players=None, error=None):
+        self._players = list(players or [])
+        self._error = error
+        self.closed = False
+
+    async def get_clients(self):
+        if self._error is not None:
+            raise self._error
+        return list(self._players)
+
+    async def aclose(self):
+        self.closed = True
+
+
+def _pms_cls(fakes_by_machine_id):
+    class _FakePmsCls:
+        @staticmethod
+        def from_plex_client(plex_client):
+            return fakes_by_machine_id[plex_client.machine_id]
+    return _FakePmsCls
+
+
+async def test_plexplayer_registered_in_backend_maps():
+    """plexplayer resolves through _get_backend and _backend_type_of — the
+    supervisor's reconnect mechanics and activate_backend key off these."""
+    import app.state as st
+    fake = object()
+    with patch("app.state.plexplayer_backend", fake):
+        assert st._get_backend("plexplayer") is fake
+        assert st._backend_type_of(fake) == "plexplayer"
+
+
+async def test_plexplayer_clients_source_merges_and_dedupes_by_machine_id():
+    """Two servers, concurrent legs, one player visible via both → one
+    merged entry (machineIdentifier dedupe, first server wins); every PMS
+    client is closed after its leg."""
+    import app.state as st
+    src_a = _plex_source("srv-A")
+    src_b = _plex_source("srv-B", server_url="http://192.168.1.11:32400",
+                         token="tok-B")
+    fakes = {
+        "srv-A": _FakePms([_companion_player("p1", "Living Room")]),
+        "srv-B": _FakePms([_companion_player("p1", "Living Room"),
+                           _companion_player("p2", "Den")]),
+    }
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src_a, src_b))), \
+         patch("app.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.plex.companion.PmsCompanionClient", _pms_cls(fakes)):
+        merged = await st._plexplayer_clients_source()
+    assert [p.machine_identifier for p in merged] == ["p1", "p2"]
+    assert all(f.closed for f in fakes.values())
+
+
+async def test_plexplayer_clients_source_partial_failure_returns_survivors(caplog):
+    """Dead-server lesson: one leg failing is LOGGED and skipped — the
+    healthy server's players still merge (never raise on partial data)."""
+    import logging
+    import app.state as st
+    src_a = _plex_source("srv-A")
+    src_b = _plex_source("srv-B", server_url="http://192.168.1.11:32400")
+    fakes = {
+        "srv-A": _FakePms(error=RuntimeError("connect timeout")),
+        "srv-B": _FakePms([_companion_player("p2", "Den")]),
+    }
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src_a, src_b))), \
+         patch("app.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.plex.companion.PmsCompanionClient", _pms_cls(fakes)):
+        with caplog.at_level(logging.WARNING, logger="app.state"):
+            merged = await st._plexplayer_clients_source()
+    assert [p.machine_identifier for p in merged] == ["p2"]
+    assert any("srv-A" in r.message for r in caplog.records)
+
+
+async def test_plexplayer_clients_source_all_legs_failed_raises():
+    """EVERY leg failing = "no scan data" → raise (the watcher's
+    sweep_devices contract: registry untouched, never a grace/eviction
+    pass over a server outage)."""
+    import app.state as st
+    src_a = _plex_source("srv-A")
+    fakes = {"srv-A": _FakePms(error=RuntimeError("dead"))}
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src_a))), \
+         patch("app.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.plex.companion.PmsCompanionClient", _pms_cls(fakes)):
+        with pytest.raises(RuntimeError):
+            await st._plexplayer_clients_source()
+
+
+async def test_plexplayer_clients_source_no_sources_returns_empty():
+    import app.state as st
+    with patch("app.state.get_plex_client", AsyncMock(return_value=None)):
+        assert await st._plexplayer_clients_source() == []
+
+
+async def test_plexplayer_clients_source_skips_vetoed_sources():
+    """A disabled_sources-vetoed server contributes no leg at all (the
+    Libraries-panel whole-source veto reaches Companion discovery too)."""
+    import app.state as st
+    src_a = _plex_source("srv-A")
+    src_b = _plex_source("srv-B", server_url="http://192.168.1.11:32400")
+    fakes = {"srv-A": _FakePms([_companion_player("p1")])}
+    # srv-B deliberately absent from fakes: a leg for it would KeyError.
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src_a, src_b))), \
+         patch("app.database.get_disabled_sources",
+               AsyncMock(return_value=["srv-B"])), \
+         patch("app.plex.companion.PmsCompanionClient", _pms_cls(fakes)):
+        merged = await st._plexplayer_clients_source()
+    assert [p.machine_identifier for p in merged] == ["p1"]
+
+
+async def test_plexplayer_server_info_resolver_builds_from_registry():
+    """server_info_resolver reads the CURRENT registry per call: the source
+    whose source_id == the holder's machine id yields protocol/address/port
+    (companion.server_coordinates over the reachability-probed server_url);
+    unknown machine id → None. No token field (S-4): player auth rides the
+    Companion client's header token."""
+    import app.state as st
+    src = _plex_source("srv-A", server_url="https://10.0.0.9:32400",
+                       token="tok-A")
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src))), \
+         patch("app.database.get_disabled_sources", AsyncMock(return_value=[])):
+        info = await st._plexplayer_server_info_resolver("srv-A")
+        missing = await st._plexplayer_server_info_resolver("srv-nope")
+    assert info is not None
+    assert (info.protocol, info.address, info.port) == ("https", "10.0.0.9", 32400)
+    assert info.machine_id == "srv-A"
+    assert not hasattr(info, "token")
+    assert missing is None
+
+
+async def test_plexplayer_server_info_resolver_excludes_vetoed_source():
+    import app.state as st
+    src = _plex_source("srv-A")
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=_registry(src))), \
+         patch("app.database.get_disabled_sources",
+               AsyncMock(return_value=["srv-A"])):
+        assert await st._plexplayer_server_info_resolver("srv-A") is None
+
+
+async def test_plexplayer_rating_key_resolver_via_alias_table():
+    """Catalog path: track id → identity → alias members; the member with
+    the requested server's machine-id prefix yields the bare rating key
+    (the compound local_key shape PlexClient._make_id mints). External ids
+    and other servers' members are skipped."""
+    import app.state as st
+    from app.models import Track
+    track = Track(id="mbid:abc", title="Song", artist="A", album="B",
+                  duration_ms=1000)
+    with patch("app.catalog.identity.identity_for_track_id",
+               AsyncMock(return_value="mbid:abc")), \
+         patch("app.catalog.store.get_aliases_for_identity",
+               AsyncMock(return_value=[
+                   "mbid:abc", "srv-A:42", "srv-B:77"])):
+        assert await st._plexplayer_rating_key_resolver(
+            "srv-B", "/library/parts/9/f.flac", track) == "77"
+        assert await st._plexplayer_rating_key_resolver(
+            "srv-A", "/library/parts/9/f.flac", track) == "42"
+
+
+async def test_plexplayer_rating_key_resolver_native_path_and_no_match():
+    """No catalog identity: the track id itself is prefix-matched (native
+    single-Plex path). No member for the server → None (the backend turns
+    that into a track-level HolderResolutionError)."""
+    import app.state as st
+    from app.models import Track
+    track = Track(id="srv-A:42", title="Song", artist="A", album="B",
+                  duration_ms=1000)
+    with patch("app.catalog.identity.identity_for_track_id",
+               AsyncMock(return_value=None)):
+        assert await st._plexplayer_rating_key_resolver(
+            "srv-A", "/library/parts/9/f.flac", track) == "42"
+        assert await st._plexplayer_rating_key_resolver(
+            "srv-B", "/library/parts/9/f.flac", track) is None
+
+
+def test_plexplayer_rating_key_member_shapes():
+    """Member-shape filter: only the bare ratingKey (_make_id shape) is
+    metadata-shaped; ANY path (part-paths — and /library/metadata/, which
+    no producer emits; S-6 dropped the dead tolerance) and empties are
+    not."""
+    import app.state as st
+    assert st._plexplayer_rating_key_from_member("42") == "42"
+    assert st._plexplayer_rating_key_from_member("/library/metadata/42") is None
+    assert st._plexplayer_rating_key_from_member("/library/parts/1/2/f.flac") is None
+    assert st._plexplayer_rating_key_from_member("") is None
+
+
+async def test_plexplayer_client_factory_uses_primary_source_identity():
+    """The sync factory builds a CompanionPlayerClient with the app's
+    controller id and the PRIMARY (first) Plex source's token — per-server
+    token selection at dispatch is server_info_resolver's job."""
+    import app.state as st
+    src = _plex_source("srv-A", token="tok-A", client_id="cid-1")
+    with patch("app.state._plex_client", _registry(src)):
+        client = st._plexplayer_client_factory("192.168.1.88", 32500,
+                                               "caldera-1")
+    try:
+        assert client.host == "192.168.1.88"
+        assert client.port == 32500
+        assert client.target_machine_id == "caldera-1"
+        assert client._headers["X-Plex-Token"] == "tok-A"
+        assert client._headers["X-Plex-Client-Identifier"] == "cid-1"
+        assert client._headers["X-Plex-Target-Client-Identifier"] == "caldera-1"
+    finally:
+        await client.aclose()
+
+
+async def test_plexplayer_client_factory_without_sources_raises_not_ready():
+    import app.state as st
+    from app.output.base import DeviceNotReadyError
+    with patch("app.state._plex_client", None):
+        with pytest.raises(DeviceNotReadyError):
+            st._plexplayer_client_factory("192.168.1.88", 32500, "caldera-1")
+
+
+async def test_setup_constructs_plexplayer_backend_with_wiring():
+    """The fifth backend carries advance_cb plus the four U2 injection
+    points wired to the state-layer resolvers; the source of setup() pins
+    that this exact construction runs at startup (running full setup would
+    drag in GStreamer/DACP/zeroconf)."""
+    import inspect
+    import app.state as st
+    from app.output.plexplayer import PlexPlayerBackend
+    backend = PlexPlayerBackend(
+        advance_cb=st._do_advance,
+        rating_key_resolver=st._plexplayer_rating_key_resolver,
+        server_info_resolver=st._plexplayer_server_info_resolver,
+        clients_source=st._plexplayer_clients_source,
+        client_factory=st._plexplayer_client_factory,
+    )
+    assert backend._advance_cb is st._do_advance
+    assert backend._rating_key_resolver is st._plexplayer_rating_key_resolver
+    assert backend._server_info_resolver is st._plexplayer_server_info_resolver
+    assert backend._clients_source is st._plexplayer_clients_source
+    assert backend._client_factory is st._plexplayer_client_factory
+    src = inspect.getsource(st.setup)
+    assert "plexplayer_backend = PlexPlayerBackend(" in src
+    assert "rating_key_resolver=_plexplayer_rating_key_resolver" in src
+    assert "client_factory=_plexplayer_client_factory" in src
+    # And the startup-reconnect set includes plexplayer (background
+    # reconnect path, not the direct set_device branch).
+    assert '"plexplayer"' in inspect.getsource(st.setup)
+
+
+async def test_activate_backend_plexplayer_builds_registry_and_persists():
+    """activate_backend('plexplayer', …) ensures the source registry is
+    built BEFORE set_device (the sync Companion client factory reads the
+    module global) and persists the standard output_* selection keys."""
+    import app.state as st
+    order = []
+    settings = {}
+
+    async def fake_set(key, value):
+        settings[key] = value
+
+    async def fake_registry():
+        order.append("registry")
+        return object()
+
+    backend = MagicMock()
+
+    async def fake_set_device(device_id):
+        order.append(("set_device", device_id))
+
+    backend.set_device = fake_set_device
+    with patch("app.state._get_backend", return_value=backend), \
+         patch("app.state.get_plex_client", side_effect=fake_registry), \
+         patch("app.database.set_setting", side_effect=fake_set):
+        await st.activate_backend("plexplayer", "caldera-1")
+
+    assert order == ["registry", ("set_device", "caldera-1")]
+    assert settings["output_backend_type"] == "plexplayer"
+    assert settings["output_device_id"] == "caldera-1"
+
+
+async def test_startup_reconnect_plexplayer_rebinds_from_persisted_address():
+    """Restart re-bind without a fresh sweep (plan U3 integration): the
+    persisted output_addr:{device_id} JSON is enough — the backend's
+    set_device reads it itself when its address cache is cold, and
+    _startup_reconnect pre-builds the source registry for the sync client
+    factory. discover_devices is never called."""
+    import json
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output.plexplayer import PlexPlayerBackend
+
+    built = []
+
+    def factory(host, port, device_id):
+        built.append((host, port, device_id))
+        client = MagicMock()
+        client.aclose = AsyncMock()
+        return client
+
+    backend = PlexPlayerBackend(client_factory=factory)
+    backend.discover_devices = AsyncMock()
+    cached = json.dumps(
+        {"host": "192.168.1.88", "port": 32500, "name": "Caldera"})
+    registry_build = AsyncMock(return_value=None)
+
+    async def get_setting(key, default=None):
+        return cached if key.startswith("output_addr:") else None
+
+    with patch.object(db, "get_setting", side_effect=get_setting), \
+         patch("app.database.set_setting", AsyncMock()), \
+         patch("app.state.get_plex_client", registry_build):
+        await _startup_reconnect(backend, "caldera-1")
+
+    registry_build.assert_awaited()
+    backend.discover_devices.assert_not_awaited()
+    assert built == [("192.168.1.88", 32500, "caldera-1")]
+    assert backend._device_id == "caldera-1"
+    assert backend._session is not None
+    assert backend.device_host("caldera-1") == "192.168.1.88"
+
+
+# ── dispatch holder handshake (2026-08-04-002 plan U3) ───────────────────────
+
+async def test_dispatch_play_hands_holder_key_to_capable_backend(fresh_supervisor):
+    """dispatch_play hands the CURRENT attempt's holder key to a backend
+    exposing set_dispatch_holder — unconditionally, so an explicit None
+    clears any stale key; the backend consumes it one-shot."""
+    import app.state as st
+    from app.models import Track
+    track = Track(id="srv-A:42", title="Song", artist="A", album="B",
+                  duration_ms=1000)
+    handed = []
+    backend = MagicMock()
+    backend.set_dispatch_holder = handed.append
+    router = MagicMock()
+    router.active = backend
+    router.effective_backend.return_value = backend   # no pending switch
+    router.play = AsyncMock()
+    with patch("app.state.output_router", router):
+        await st.dispatch_play("http://x", track,
+                               holder_key="srv-A:/library/parts/9/f.flac")
+        await st.dispatch_play("http://x", track)
+    assert handed == ["srv-A:/library/parts/9/f.flac", None]
+    assert router.play.await_count == 2
+
+
+async def test_dispatch_play_deposits_holder_on_pending_backend(fresh_supervisor):
+    """Review fix PLX-1: under a DEFERRED backend switch the holder key must
+    land on the PENDING backend — play() runs swap_pending() first, so the
+    pending backend is the one that consumes the key. Depositing on
+    router.active handed it to the outgoing backend (first boundary dispatch
+    degraded to metadata.id parsing / a stale key leaked into a later
+    unrelated dispatch)."""
+    import app.state as st
+    from app.models import Track
+    from app.output.router import OutputRouter
+    track = Track(id="srv-A:42", title="Song", artist="A", album="B",
+                  duration_ms=1000)
+    old = MagicMock()
+    old.is_playing = True                    # forces the deferred branch
+    old.play = AsyncMock()
+    old.stop = AsyncMock()
+    old_handed = []
+    old.set_dispatch_holder = old_handed.append
+    handed = []
+    new = MagicMock()
+    new.play = AsyncMock()
+    new.set_dispatch_holder = handed.append
+    router = OutputRouter()
+    router.set_backend(old)
+    router.set_backend(new)                  # deferred: old is playing
+    assert router.has_pending is True
+    with patch("app.state.output_router", router):
+        await st.dispatch_play("http://x", track, holder_key="srv-A:42")
+    assert handed == ["srv-A:42"]            # the PENDING backend got the key
+    # The outgoing backend never received this dispatch's key; the swap
+    # cleared any stale one it held (an explicit None at retire time).
+    assert "srv-A:42" not in old_handed
+    new.play.assert_awaited_once()
+    await asyncio.sleep(0)                   # drain the arming-eval task
+
+
+async def test_dispatch_play_without_hook_is_untouched(fresh_supervisor):
+    """A backend without set_dispatch_holder (all four existing ones) is
+    byte-identical — no attribute poke, dispatch proceeds."""
+    from types import SimpleNamespace
+    import app.state as st
+    from app.models import Track
+    track = Track(id="t1", title="Song", artist="A", album="B",
+                  duration_ms=1000)
+    backend = SimpleNamespace()   # no set_dispatch_holder, no probe_liveness
+    router = MagicMock()
+    router.active = backend
+    router.effective_backend = lambda: backend
+    router.play = AsyncMock()
+    with patch("app.state.output_router", router):
+        await st.dispatch_play("http://x", track, holder_key="srv-A:1")
+    router.play.assert_awaited_once()
+
+
+# ── U4 (2026-08-04-002): gate truth + R9 holder filter/ordering ──────────────
+
+class _RegSrc:
+    def __init__(self, sid, stype="plex"):
+        self.source_id = sid
+        self.source_type = stype
+
+
+class _Reg:
+    def __init__(self, sources):
+        self.sources = sources
+
+
+class _FakePlexPlayerBackend:
+    """last_dispatch_server is the only surface _holder_keys reads."""
+    def __init__(self, server=None):
+        self._server = server
+
+    def last_dispatch_server(self):
+        return self._server
+
+
+def _plex_env(monkeypatch, *, selected="plexplayer", sources=None,
+              disabled=(), bound=None):
+    """Install the sync mirrors _holder_keys reads: persisted-selection
+    mirror, registry module global, disabled-sources mirror, and the
+    plexplayer backend singleton (its bound-server accessor)."""
+    import app.state as st
+    monkeypatch.setattr(st, "_selected_output_backend", selected)
+    monkeypatch.setattr(st, "_plex_client", _Reg(sources if sources is not None
+                                                 else [_RegSrc("m1"), _RegSrc("m2"),
+                                                       _RegSrc("jelly", "jellyfin")]))
+    monkeypatch.setattr(st, "_disabled_sources_sync", set(disabled))
+    monkeypatch.setattr(st, "plexplayer_backend", _FakePlexPlayerBackend(bound))
+    return st
+
+
+def _mixed_holds_track(**kw):
+    from app.models import Track
+    return Track(id="x", title="Song", artist="Act", album="Rec",
+                 duration_ms=1000,
+                 stream_key=kw.get("stream_key", "jelly:k0"),
+                 holds=kw.get("holds", [
+                     {"source_id": "jelly", "key": "jelly:k1"},
+                     {"source_id": "m1", "key": "m1:k1"},
+                     {"source_id": "m2", "key": "m2:k1"},
+                 ]))
+
+
+def test_output_requires_plex_reads_persisted_mirror(monkeypatch):
+    """The gate keys off the PERSISTED selection mirror — deliberately NOT
+    output_router.active (deferred swap) — so it flips the moment
+    activate_backend commits, backend attach state notwithstanding."""
+    import app.state as st
+    monkeypatch.setattr(st, "_selected_output_backend", "direct")
+    assert st.output_requires_plex() is False
+    monkeypatch.setattr(st, "_selected_output_backend", "plexplayer")
+    assert st.output_requires_plex() is True
+
+
+def test_holder_keys_byte_identical_on_other_backends(monkeypatch):
+    """Explicit non-plexplayer guard: with any other persisted backend the
+    full mixed holder list comes back in snapshot order — even with a
+    registry, a disabled set, and a bound plexplayer backend installed."""
+    st = _plex_env(monkeypatch, selected="chromecast",
+                   disabled={"m1"}, bound="m2")
+    t = _mixed_holds_track()
+    assert st._holder_keys(t) == ["jelly:k1", "m1:k1", "m2:k1"]
+    assert st._holder_keys(_mixed_holds_track(holds=[], stream_key="p")) == ["p"]
+    assert st._holder_keys(_mixed_holds_track(holds=[], stream_key="")) == []
+
+
+def test_holder_keys_plexplayer_filters_to_enabled_plex_sources(monkeypatch):
+    """R9: under plexplayer only holders from enabled Plex sources survive;
+    non-Plex holders are skipped entirely. No binding → priority order."""
+    st = _plex_env(monkeypatch)
+    assert st._holder_keys(_mixed_holds_track()) == ["m1:k1", "m2:k1"]
+
+
+def test_holder_keys_plexplayer_same_server_first(monkeypatch):
+    """Same-server-first: the bound player's last-dispatch server leads;
+    the rest keep their priority order (stable partition)."""
+    st = _plex_env(monkeypatch, bound="m2")
+    assert st._holder_keys(_mixed_holds_track()) == ["m2:k1", "m1:k1"]
+
+
+def test_holder_keys_plexplayer_disabled_source_excluded(monkeypatch):
+    st = _plex_env(monkeypatch, disabled={"m2"})
+    assert st._holder_keys(_mixed_holds_track()) == ["m1:k1"]
+
+
+def test_holder_keys_plexplayer_stream_key_prefix_attribution(monkeypatch):
+    """The holds-less fallback path attributes the bare stream_key via its
+    compound prefix (Plex source_id == server machine_id): a Plex-prefixed
+    key survives, a non-Plex one yields an empty eligible list."""
+    st = _plex_env(monkeypatch)
+    assert st._holder_keys(
+        _mixed_holds_track(holds=[], stream_key="m1:p9")) == ["m1:p9"]
+    assert st._holder_keys(
+        _mixed_holds_track(holds=[], stream_key="jelly:p9")) == []
+    assert st._holder_keys(
+        _mixed_holds_track(holds=[], stream_key="bare-key")) == []
+
+
+async def test_play_with_fallback_dispatches_plex_holder_under_plexplayer(
+        monkeypatch, fresh_supervisor):
+    """AE4 dispatch half: a Jellyfin-primary track with a Plex holder plays
+    THROUGH the Plex holder on plexplayer — the filtered/ordered key is what
+    dispatch streams AND what the holder handshake hands the backend."""
+    from app.queue.models import QueueItem
+    st = _plex_env(monkeypatch)
+    item = QueueItem(track=_mixed_holds_track())
+    play = AsyncMock()
+    router = MagicMock(play=play)
+    # PLX-1: the holder handshake targets the router's EFFECTIVE backend
+    # (pending-or-active); with no pending switch that IS the active one.
+    router.effective_backend.return_value = router.active
+    client = MagicMock()
+    client.stream_url = lambda k: f"url:{k}"
+    with patch.object(st, "output_router", router), \
+         patch.object(st, "record_play", MagicMock()):
+        ok = await st._play_with_fallback(item, client)
+    assert ok is True
+    play.assert_awaited_once()
+    assert play.await_args.args[0] == "url:m1:k1"          # Plex holder streamed
+    router.active.set_dispatch_holder.assert_called_once_with("m1:k1")
+
+
+async def test_activate_backend_broadcasts_source_lock_from_persisted_truth(
+        monkeypatch, fresh_supervisor):
+    """Mid-play switch contract (plan U4): committing plexplayer broadcasts
+    OutputSessionEvent with source_lock "plex" IMMEDIATELY — from the
+    persisted-selection mirror — while output_router.active still points at
+    the old backend (the deferred-swap window). Switching back broadcasts
+    None. Snapshot GETs and the push share session_snapshot(), so shape
+    agreement is structural."""
+    import app.state as st
+    from app.output import session_events
+    monkeypatch.setattr(st, "_selected_output_backend", "direct")
+    guests, admins = AsyncMock(), AsyncMock()
+    prev_active = st.output_router.active
+    with patch("app.state._get_backend", return_value=None), \
+         patch("app.database.set_setting", AsyncMock()), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=object())), \
+         patch("app.events.bus.manager.broadcast_to_admins", admins), \
+         patch("app.events.bus.manager.broadcast_to_guests", guests):
+        await st.activate_backend("plexplayer", "default")
+        assert st.output_requires_plex() is True
+        # Router untouched (deferred truth ≠ gate truth): _get_backend was
+        # None, so the old active backend still owns the current track.
+        assert st.output_router.active is prev_active
+        ev = guests.await_args.args[0]
+        assert ev.type == "output_session" and ev.source_lock == "plex"
+        assert admins.await_args.args[0].source_lock == "plex"
+        # Push payload and snapshot GET agree (one render path).
+        assert session_events.session_snapshot()["source_lock"] == "plex"
+
+        await st.activate_backend("direct", "default")
+        assert st.output_requires_plex() is False
+        assert guests.await_args.args[0].source_lock is None
+
+
+# ── U8 autofill plexplayer source-lock gate (2026-08-04-002 plan U8, R11) ────
+# The playability check wraps _auto_fill_provider (post-selection, around the
+# selection call) — never _shuffle_provider, which other callers rely on
+# unfenced. Gate input resolves ONCE per cycle; give-up = no pick + one
+# debounced admin notice.
+
+
+def _held_track(tid, sid):
+    t = _shuf_track(tid, 200000)
+    t.holds = [{"source_id": sid, "key": f"{sid}:{tid}"}]
+    return t
+
+
+def _lock(monkeypatch_target, ids):
+    return patch.object(monkeypatch_target, "plex_lock_enabled_ids",
+                        AsyncMock(return_value=ids))
+
+
+async def test_autofill_lock_rerolls_unplayable_selection():
+    """An unplayable selection is re-rolled; the first Plex-playable pick is
+    returned and no notice fires."""
+    from app.queue.models import QueueEndBehavior
+    with _ondeck_reset() as st:
+        sel = AsyncMock(side_effect=[_held_track("bad", "jelly"),
+                                     _held_track("good", "m1")])
+        notify = AsyncMock()
+        with _lock(st, {"m1"}), \
+             patch.object(st, "_select_auto_fill_track", sel), \
+             patch.object(st, "notify_plex_lock_giveup", notify):
+            track = await st._auto_fill_provider(QueueEndBehavior.FULL_RANDOM)
+        assert track is not None and track.id == "good"
+        assert sel.await_count == 2
+        notify.assert_not_awaited()
+
+
+async def test_autofill_lock_bounded_giveup_notifies():
+    """Zero Plex-playable candidates: bounded re-rolls (no infinite loop),
+    no pick for the cycle, the give-up notice fires."""
+    from app.queue.models import QueueEndBehavior
+    with _ondeck_reset() as st:
+        sel = AsyncMock(return_value=_held_track("bad", "jelly"))
+        notify = AsyncMock()
+        with _lock(st, {"m1"}), \
+             patch.object(st, "_select_auto_fill_track", sel), \
+             patch.object(st, "notify_plex_lock_giveup", notify):
+            track = await st._auto_fill_provider(QueueEndBehavior.FULL_RANDOM)
+        assert track is None
+        assert sel.await_count == st._AUTOFILL_PLEX_LOCK_TRIES
+        notify.assert_awaited_once()
+
+
+async def test_autofill_lock_empty_library_quiet():
+    """A None selection (library genuinely empty) is the pre-existing no-pick
+    condition — quiet, not a lock give-up."""
+    from app.queue.models import QueueEndBehavior
+    with _ondeck_reset() as st:
+        notify = AsyncMock()
+        with _lock(st, {"m1"}), \
+             patch.object(st, "_select_auto_fill_track", AsyncMock(return_value=None)), \
+             patch.object(st, "notify_plex_lock_giveup", notify):
+            track = await st._auto_fill_provider(QueueEndBehavior.FULL_RANDOM)
+        assert track is None
+        notify.assert_not_awaited()
+
+
+async def test_autofill_lock_discards_unplayable_ondeck_and_rerolls():
+    """A buffered on-deck pick that pre-dates the lock (no enabled-Plex holder)
+    is discarded — slot cleared, gen bumped — and the cycle re-rolls to a
+    playable selection."""
+    from app.queue.models import QueueEndBehavior
+    with _ondeck_reset() as st:
+        st._ondeck = _held_track("stale", "jelly")
+        gen0 = st._ondeck_gen
+        sel = AsyncMock(return_value=_held_track("fresh", "m1"))
+        with _lock(st, {"m1"}), \
+             patch.object(st, "_select_auto_fill_track", sel), \
+             patch.object(st, "notify_plex_lock_giveup", AsyncMock()):
+            track = await st._auto_fill_provider(QueueEndBehavior.FULL_RANDOM)
+        assert track is not None and track.id == "fresh"
+        assert st._ondeck is None
+        assert st._ondeck_gen == gen0 + 1
+
+
+async def test_autofill_lock_serves_playable_ondeck_instantly():
+    """A Plex-playable buffered pick is served without re-selection (the
+    pre-buffer contract survives the gate)."""
+    from app.queue.models import QueueEndBehavior
+    with _ondeck_reset() as st:
+        st._ondeck = _held_track("ondeck", "m1")
+        sel = AsyncMock()
+        with _lock(st, {"m1"}), \
+             patch.object(st, "_select_auto_fill_track", sel):
+            track = await st._auto_fill_provider(QueueEndBehavior.FULL_RANDOM)
+        assert track is not None and track.id == "ondeck"
+        sel.assert_not_awaited()
+
+
+async def test_autofill_inert_other_backend_byte_identical():
+    """Filter inert (gate input None — non-plexplayer selection): a hold-less
+    pick returns on the first selection, no playability machinery, no notice."""
+    from app.queue.models import QueueEndBehavior
+    with _ondeck_reset() as st:
+        sel = AsyncMock(return_value=_shuf_track("bare", 200000))  # no holds
+        notify = AsyncMock()
+        with _lock(st, None), \
+             patch.object(st, "_select_auto_fill_track", sel), \
+             patch.object(st, "notify_plex_lock_giveup", notify):
+            track = await st._auto_fill_provider(QueueEndBehavior.FULL_RANDOM)
+        assert track is not None and track.id == "bare"
+        assert sel.await_count == 1
+        notify.assert_not_awaited()
+
+
+async def test_plex_lock_enabled_ids_gate_conditions(monkeypatch):
+    """None off-plexplayer; None on the native all-Plex path; the enabled-ids
+    set (even empty) while plexplayer is selected with the catalog active."""
+    import app.state as st
+    monkeypatch.setattr(st, "_selected_output_backend", "direct")
+    assert await st.plex_lock_enabled_ids() is None
+    monkeypatch.setattr(st, "_selected_output_backend", "plexplayer")
+    with patch.object(st, "catalog_active", AsyncMock(return_value=False)):
+        assert await st.plex_lock_enabled_ids() is None
+    with patch.object(st, "catalog_active", AsyncMock(return_value=True)), \
+         patch.object(st, "plex_enabled_source_ids",
+                      AsyncMock(return_value={"m1"})):
+        assert await st.plex_lock_enabled_ids() == {"m1"}
+    with patch.object(st, "catalog_active", AsyncMock(return_value=True)), \
+         patch.object(st, "plex_enabled_source_ids",
+                      AsyncMock(return_value=set())):
+        assert await st.plex_lock_enabled_ids() == set()
+
+
+async def test_notify_plex_lock_giveup_debounces_per_session(monkeypatch):
+    """The U6 notice vehicle fires ONCE per lock session (flag debounce):
+    a second give-up stays silent until the flag resets."""
+    import app.state as st
+    monkeypatch.setattr(st, "_plex_lock_notice_sent", False)
+    admins = AsyncMock()
+    with patch("app.events.bus.manager.broadcast_to_admins", admins):
+        await st.notify_plex_lock_giveup()
+        await st.notify_plex_lock_giveup()
+    admins.assert_awaited_once()
+    ev = admins.await_args.args[0]
+    assert ev.backend_type == "error"
+    assert "no Plex-playable" in ev.device_name
+
+
+async def test_activate_backend_resets_lock_notice_debounce(
+        monkeypatch, fresh_supervisor):
+    """Committing a selection starts a fresh lock session: the one-shot
+    give-up notice is re-armed by activate_backend."""
+    import app.state as st
+    monkeypatch.setattr(st, "_selected_output_backend", "direct")
+    monkeypatch.setattr(st, "_plex_lock_notice_sent", True)
+    with patch("app.state._get_backend", return_value=None), \
+         patch("app.database.set_setting", AsyncMock()), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=object())), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()), \
+         patch("app.events.bus.manager.broadcast_to_guests", AsyncMock()):
+        await st.activate_backend("plexplayer", "default")
+    assert st._plex_lock_notice_sent is False

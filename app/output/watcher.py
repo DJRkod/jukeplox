@@ -88,7 +88,11 @@ _SERVICE_BACKENDS: dict[str, str] = {
 
 # Shape-compatible with admin.py's _MdnsStatus map ("ok" | "unavailable"
 # per backend) so U5 can source /output/active's mdns_status from here
-# without translating.
+# without translating. Membership here drives ONLY the mdns_status surface;
+# "plexplayer" is deliberately absent (2026-08-04-002 plan U3): its liveness
+# rides authenticated PMS /clients polling, not mDNS, so it has no
+# availability story this banner should tell — the sweep/registry paths
+# below do not require membership.
 _ALL_BACKENDS = ("direct", "airplay", "chromecast", "dlna")
 
 
@@ -715,6 +719,10 @@ class DeviceWatcher:
         sit at the sweep ceiling.
         """
         await self._sweep_backend("dlna")
+        # plexplayer sweeps UNCONDITIONALLY (2026-08-04-002 plan U3): its
+        # discovery is an authenticated PMS /clients poll — no mDNS
+        # involved — so it must never be gated on _mdns_sweep_active.
+        await self._sweep_backend("plexplayer")
         if self._mdns_sweep_active:
             # Sequential keeps the LAN multicast / D-Bus burst gentle, same
             # as admin's _forced_one_shots._mdns ordering.
@@ -736,6 +744,14 @@ class DeviceWatcher:
                 # in-process CastBrowser (5s wait). We only reach here in
                 # sweep mode, where D-Bus is the only path.
                 found = await backend._dbus_discover()
+            elif backend_name == "plexplayer":
+                # RAISING variant on purpose (2026-08-04-002 plan U3): a
+                # total /clients failure (every Plex server unreachable)
+                # raises and lands in the except below — registry untouched,
+                # "no scan data" is never an eviction/grace source
+                # (push-discovery write-through lesson). discover_devices'
+                # fail-soft [] would grace-flip every known player instead.
+                found = await backend.sweep_devices()
             else:
                 found = await backend.discover_devices()
         except Exception:
@@ -755,6 +771,8 @@ class DeviceWatcher:
             found_ids.add(device.id)
             if backend_name == "dlna":
                 probe_host = self._dlna_host(device.id)
+            elif backend_name == "plexplayer":
+                probe_host = self._plexplayer_host(device.id)
             else:
                 probe_host = self._mdns_host(backend_name, device.id)
             self._apply_arrival(
@@ -778,6 +796,16 @@ class DeviceWatcher:
             addr = getattr(backend, "_dbus_index", {}).get(device_id)
             return addr[1] if addr else None  # (name, host, port)
         return None
+
+    def _plexplayer_host(self, device_id: str) -> str | None:
+        """Probe host for a swept Companion player, via the backend's public
+        ``device_host`` accessor over its ``_device_addresses`` cache — the
+        SAME cache discovery.host_for reads, so probe verdicts land under
+        the key the aggregator uses (2026-08-04-002 plan U3). None when the
+        backend (or its cache) doesn't know the device."""
+        backend = self._backend_for("plexplayer")
+        getter = getattr(backend, "device_host", None)
+        return getter(device_id) if callable(getter) else None
 
     def _dlna_host(self, device_id: str, location: str = "") -> str | None:
         """Probe host for a DLNA entry: the LOCATION URL's hostname —
@@ -1031,7 +1059,8 @@ class DeviceWatcher:
         if backend is None:
             return None
         name = None
-        for candidate in ("chromecast", "airplay", "dlna", "direct"):
+        for candidate in ("chromecast", "airplay", "dlna", "plexplayer",
+                          "direct"):
             if backend is getattr(state, f"{candidate}_backend", None):
                 name = candidate
                 break
@@ -1050,6 +1079,7 @@ class DeviceWatcher:
             "chromecast": state.chromecast_backend,
             "airplay": state.airplay_backend,
             "dlna": state.dlna_backend,
+            "plexplayer": state.plexplayer_backend,
         }.get(backend)
 
     async def _default_ssdp_listen(self, on_packet):

@@ -417,6 +417,22 @@ async def test_router_immediate_swap_when_idle():
     router.set_backend(new)
     assert not router.has_pending
     assert router.active is new
+    # Review fix PLX-2: the immediate branch STOPS the outgoing backend
+    # (idle includes paused — a retired backend must not keep poll loops /
+    # sessions alive). Scheduled as a task; drain it.
+    await asyncio.sleep(0)
+    old.stop.assert_awaited_once()
+
+
+async def test_router_immediate_swap_same_backend_not_stopped():
+    """Re-selecting the SAME backend (device change on one backend) must not
+    stop it — set_device owns its own session teardown."""
+    router = OutputRouter()
+    backend = make_mock_backend(playing=False)
+    router.set_backend(backend)
+    router.set_backend(backend)
+    await asyncio.sleep(0)
+    backend.stop.assert_not_awaited()
 
 
 async def test_router_set_volume_delegates():

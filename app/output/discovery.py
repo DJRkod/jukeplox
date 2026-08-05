@@ -61,11 +61,18 @@ _NAME_PRIORITY = {
     "airplay": 1,
     "chromecast": 2,
     "dlna": 2,
+    # Plex Companion players report the user-set player name via the PMS
+    # /clients list — friendly-name tier, same rank as DLNA/Chromecast
+    # (first-arrival wins among equals, so a Caldera sharing a host with a
+    # DLNA renderer keeps a stable label across cycles).
+    "plexplayer": 2,
 }
 
 # Deterministic walk order across backends. Direct first so its sentinel
 # entry seeds the result; otherwise alphabetical for predictability.
-_BACKEND_ORDER = ("direct", "airplay", "chromecast", "dlna")
+# plexplayer is appended last (2026-08-04-002 plan U3) so the pre-existing
+# backends' walk order — and therefore their name seeding — is unchanged.
+_BACKEND_ORDER = ("direct", "airplay", "chromecast", "dlna", "plexplayer")
 
 # Per-protocol gapless capability (2026-07-11 supervisor plan U5, R10/R12).
 # Static per-backend verdicts: Direct chains via GStreamer about-to-finish
@@ -83,7 +90,17 @@ GAPLESS_CAPABILITY = {
     "chromecast": "supported",
     "dlna": "unverified",
     "airplay": "unsupported",
+    # Plex Companion players (2026-08-04-002 plan U3): DLNA semantics —
+    # "unverified" is the no-evidence default, promoted per DEVICE by U7's
+    # behavioral verdict after the first successful armed boundary
+    # (PUT-append to a player-owned queue is a hardware-validation item).
+    "plexplayer": "unverified",
 }
+
+# Backends whose gapless verdict is per-DEVICE (behavioral, cached in the
+# settings store): the static map above is only their no-evidence default,
+# overridden in build_devices_snapshot by database.get_gapless_verdicts.
+_PER_DEVICE_GAPLESS_BACKENDS = ("dlna", "plexplayer")
 
 
 @dataclass
@@ -270,6 +287,7 @@ def _state_backend(backend: str) -> Any:
         "airplay": state.airplay_backend,
         "chromecast": state.chromecast_backend,
         "dlna": state.dlna_backend,
+        "plexplayer": state.plexplayer_backend,
     }.get(backend)
 
 
@@ -285,6 +303,9 @@ def host_for(d, backend: str, backend_for: Callable[[str], Any] | None = None,
                   or ``_cast_infos[d.id].host`` (live-browser path)
     - DLNA: ``_device_locations[d.id]`` is the LOCATION URL; the host
             comes from urlparse.
+    - PlexPlayer: the backend exposes ``device_host(d.id)`` over its
+            ``_device_addresses`` cache (fed by the /clients sweep and the
+            persisted-address re-bind).
 
     *backend_for* maps a backend name to its instance; defaults to the
     app.state singletons. Returns ``None`` when the backend doesn't carry
@@ -312,6 +333,9 @@ def host_for(d, backend: str, backend_for: Callable[[str], Any] | None = None,
             return None
         parsed = urlparse(location)
         return parsed.hostname
+    if backend == "plexplayer":
+        getter = getattr(backend_inst, "device_host", None)
+        return getter(d.id) if callable(getter) else None
     return None
 
 
@@ -339,7 +363,8 @@ async def build_devices_snapshot(
                      exc_info=True)
         verdicts = {}
 
-    # Per-device DLNA gapless verdicts (plan U8): the static map's
+    # Per-device gapless verdicts (supervisor plan U8; plexplayer joins in
+    # 2026-08-04-002 U3 with the same DLNA semantics): the static map's
     # "unverified" is only the no-evidence default — a device whose first
     # armed boundary decided a behavioral verdict carries that instead.
     # Bulk-loaded from the settings store exactly like the probe cache above
@@ -347,13 +372,16 @@ async def build_devices_snapshot(
     # read), which stays correct across restarts and for devices never
     # selected in this process — an in-memory-only read couldn't. Fail-soft:
     # on error the static default stands.
-    dlna_gapless: dict[str, str] = {}
+    device_gapless: dict[str, dict[str, str]] = {}
     try:
         from app import database
-        dlna_gapless = await database.get_gapless_verdicts("dlna")
+        for _backend_name in _PER_DEVICE_GAPLESS_BACKENDS:
+            device_gapless[_backend_name] = (
+                await database.get_gapless_verdicts(_backend_name))
     except Exception:
-        _log.warning("Gapless verdict bulk-load failed; DLNA entries read "
-                     "the static capability", exc_info=True)
+        _log.warning("Gapless verdict bulk-load failed; DLNA/plexplayer "
+                     "entries read the static capability", exc_info=True)
+        device_gapless = {}
 
     aggregated = aggregate_devices(
         per_backend,
@@ -378,13 +406,14 @@ async def build_devices_snapshot(
                     "checked_at": p.checked_at,
                     # Gapless capability chip (plan U5) — per backend type; an
                     # unknown future backend defaults to "unsupported" (honest
-                    # until it earns a verdict). DLNA is per DEVICE (plan U8):
-                    # the cached behavioral verdict overrides the static
-                    # "unverified" default.
+                    # until it earns a verdict). DLNA and plexplayer are per
+                    # DEVICE (plan U8 / 2026-08-04-002 U3): the cached
+                    # behavioral verdict overrides the static "unverified"
+                    # default.
                     "gapless": (
-                        dlna_gapless.get(p.device_id,
-                                         GAPLESS_CAPABILITY["dlna"])
-                        if p.backend == "dlna"
+                        device_gapless.get(p.backend, {}).get(
+                            p.device_id, GAPLESS_CAPABILITY[p.backend])
+                        if p.backend in _PER_DEVICE_GAPLESS_BACKENDS
                         else GAPLESS_CAPABILITY.get(p.backend, "unsupported")
                     ),
                 }

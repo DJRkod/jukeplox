@@ -26,6 +26,12 @@ _SHUFFLE_BAND_TRIES = 25
 # popular-track ids to try resolving (for a playable stream key) before giving up
 # and letting the caller fall back to Full Random. Bounds Plex load per advance.
 _POPULAR_RESOLVE_TRIES = 8
+# Autofill re-roll cap under the plexplayer source lock (2026-08-04-002 plan
+# U8): how many post-selection playability failures to re-roll through before
+# giving up for the cycle (no pick + one debounced admin notice). Small by
+# design — each roll is a whole-library selection; a pool with no Plex-playable
+# track must not spin the advance path.
+_AUTOFILL_PLEX_LOCK_TRIES = 4
 # Sentinel for _shuffle_provider's optional band arg: distinguishes "not passed
 # → fetch the admin band" (the Surprise Me floor's no-arg call) from an explicit
 # (None, None) "no band" passed by the queue-end caller.
@@ -62,6 +68,7 @@ from app.output.direct import DirectAudioBackend
 from app.output.chromecast import ChromecastBackend
 from app.output.dlna import DlnaBackend
 from app.output.airplay import AirPlayBackend
+from app.output.plexplayer import PlexPlayerBackend, ServerInfo
 from app.output.dacp import DacpServer
 from app.queue.engine import QueueEngine
 from app.lyrics.prefetch import schedule_prefetch
@@ -76,6 +83,7 @@ direct_backend: DirectAudioBackend | None = None
 chromecast_backend: ChromecastBackend | None = None
 dlna_backend: DlnaBackend | None = None
 airplay_backend: AirPlayBackend | None = None
+plexplayer_backend: PlexPlayerBackend | None = None
 
 # DACP HTTP server for speaker-initiated AirPlay volume callbacks. One per
 # process; created and started in setup(), injected into airplay_backend.
@@ -203,6 +211,340 @@ def invalidate_plex_client() -> None:
 # call-site and test-patch surface during the multi-source transition.
 get_source_registry = get_plex_client
 invalidate_source_registry = invalidate_plex_client
+
+
+# ── plexplayer backend wiring (2026-08-04-002 plan U3) ────────────────────────
+# The five injection points PlexPlayerBackend documents (its module
+# docstring is the contract): advance_cb plus the four resolvers below.
+# Every async resolver reads the CURRENT source registry through
+# get_plex_client() — fresh per call, never caching a client instance, so
+# invalidate_plex_client() (source add/remove/re-auth) takes effect on the
+# very next dispatch/sweep.
+
+
+# ── persisted-selection mirror + gate truth (2026-08-04-002 plan U4) ──────────
+
+# In-memory mirror of the PERSISTED ``output_backend_type`` setting: seeded at
+# startup from the DB, updated by activate_backend at the exact point it writes
+# the setting (a failed switch raises before either changes). Exists so SYNC
+# call sites — ``_holder_keys`` (the R9 dispatch filter) and the guest-lean
+# ``session_snapshot()`` — can read the selection truth without a DB round-trip.
+_selected_output_backend: str = "direct"
+
+
+def output_requires_plex() -> bool:
+    """Gate truth for every playability-dependent gate (plan U4; U5 enqueue
+    rejection, U6 stranded confirm, U8 auto-selection filter, and the
+    ``source_lock`` broadcast all key off THIS).
+
+    LOUD WARNING — this deliberately reads the persisted-selection mirror
+    (``output_backend_type``, written immediately by ``activate_backend``),
+    NOT ``output_router.active`` or ``_backend_type_of(...)``: the router's
+    swap is deferred under a mid-play switch (the old backend finishes the
+    current track), so router-derived truth would lag the admin's decision
+    and let guests queue soon-to-be-stranded tracks during the gap. Do not
+    "fix" a gate by pointing it at the router."""
+    return _selected_output_backend == "plexplayer"
+
+
+# U8 auto-selection give-up notice debounce (2026-08-04-002 plan U8): at most
+# ONE admin notice per lock session. Reset wherever the persisted selection is
+# (re)written — activate_backend and the startup restore — so re-selecting an
+# output re-arms exactly one fresh notice, while a queue that sits empty across
+# many autofill cycles never toasts the admin per cycle.
+_plex_lock_notice_sent: bool = False
+
+
+async def plex_lock_enabled_ids(*, assume_lock: bool = False) -> set | None:
+    """THE single source-lock gate entry (review fix S-1): the U8
+    auto-selection gate, the U5 enqueue gate (``guest._plex_playable_ids``
+    opens with this), and the U6 stranded pre-check all resolve their
+    inert-vs-active decision here, ONCE per request/cycle — never per
+    candidate.
+
+    ``None`` ⇒ gate inert: a non-plexplayer backend is selected (skipped
+    under ``assume_lock=True`` — the U6 switch-time pre-check evaluates a
+    TARGET backend before the selection persists), or the native all-Plex
+    path is active, where every candidate is Plex-backed by construction.
+    Otherwise the enabled Plex source-id set — possibly EMPTY (plexplayer
+    selected but every Plex source vetoed), which correctly makes nothing
+    playable."""
+    if not assume_lock and not output_requires_plex():
+        return None
+    if not await catalog_active():
+        return None
+    return await plex_enabled_source_ids()
+
+
+async def plex_enabled_source_ids() -> set:
+    """The source_ids that qualify a holder as Plex-playable (2026-08-04-002
+    plan U4): sources of TYPE "plex" in the live registry, minus the
+    Libraries-panel whole-source veto — delegating to
+    ``_plexplayer_enabled_sources`` below, the one "enabled Plex sources"
+    read (async, fresh, never cached), so the plex_held flag and the
+    plexplayer backend's own resolvers can never disagree about eligibility.
+    Empty when no registry / no Plex sources — every holder then fails the
+    predicate. getattr-tolerant: test registries/stubs may omit
+    ``source_id``; an id-less source can hold nothing anyway. (Moved here
+    from catalog.views by review fix S-1 — it always was a pure delegation
+    to this module.)"""
+    ids = {getattr(s, "source_id", None)
+           for s in await _plexplayer_enabled_sources()}
+    ids.discard(None)
+    return ids
+
+
+async def notify_plex_lock_giveup() -> None:
+    """Admin notice for the U8 empty-filtered-pool give-up: auto-selection
+    found no Plex-playable track for the selected output, so the queue simply
+    doesn't refill. Rides the U6 notice vehicle (``OutputChangedEvent`` with
+    ``backend_type="error"`` → admin toast), debounced to once per lock
+    session via ``_plex_lock_notice_sent``. Best-effort: a broadcast failure
+    is logged, never raised into the advance/surprise path."""
+    global _plex_lock_notice_sent
+    if _plex_lock_notice_sent:
+        return
+    _plex_lock_notice_sent = True
+    from app.events.bus import notify_admin_error
+    await notify_admin_error(
+        "Autofill paused — no Plex-playable tracks for this output")
+
+
+# Sync mirror of the disabled_sources veto for ``_holder_keys`` (which is sync
+# by contract — see its tests). Seeded at startup and refreshed by every
+# ``_plexplayer_enabled_sources()`` read (dispatch resolvers + watcher sweeps),
+# so it trails the async truth by at most one sweep/dispatch. Staleness is
+# safe: ``_plexplayer_server_info_resolver`` re-checks eligibility per dispatch
+# and consumes a stale holder as a track-level failure.
+_disabled_sources_sync: set = set()
+
+
+def _plexplayer_source_ids_sync() -> set:
+    """Sync view of the enabled Plex source ids for the R9 dispatch filter:
+    the registry module global read synchronously (the Companion client
+    factory's established pattern — see activate_backend), typed via each
+    source's ``source_type``, minus the disabled-sources mirror. Empty when
+    the registry hasn't been built — under plexplayer that also means no
+    dispatch can resolve, so an empty filter result is already the truth."""
+    registry = _plex_client
+    if registry is None:
+        return set()
+    return {s.source_id for s in getattr(registry, "sources", [])
+            if getattr(s, "source_type", "") == "plex"
+            and s.source_id not in _disabled_sources_sync}
+
+
+async def _plexplayer_enabled_sources() -> list:
+    """Enabled Plex sources from the current registry: type == "plex" minus
+    the Libraries-panel whole-source veto (disabled_sources). Empty when no
+    registry/no Plex sources — callers degrade (no players, no server)."""
+    global _disabled_sources_sync
+    registry = await get_plex_client()
+    if registry is None:
+        return []
+    # The same isinstance guard catalog_active() applies: a non-registry
+    # object (legacy single-client test double) has no real source list —
+    # degrade to [] BEFORE any DB read (the U4 read-time predicate routes
+    # payload requests through here, so this must never require a DB).
+    sources = getattr(registry, "sources", None)
+    if not isinstance(sources, list):
+        return []
+    from app import database
+    try:
+        disabled = set(await database.get_disabled_sources())
+        # Keep the sync mirror current for _holder_keys (plan U4) — every
+        # async read refreshes it, so the mirror rides the sweep/dispatch
+        # cadence without its own plumbing.
+        _disabled_sources_sync = disabled
+    except Exception:
+        _log.warning("plexplayer wiring: disabled_sources read failed — "
+                     "treating all sources as enabled", exc_info=True)
+        disabled = set()
+    # getattr on source_id: registry sources always carry it, but stub
+    # registries route through here too — an id-less source must degrade,
+    # not raise (its holders can't match).
+    return [s for s in sources
+            if getattr(s, "source_type", "") == "plex"
+            and getattr(s, "source_id", None) not in disabled]
+
+
+def _plexplayer_rating_key_from_member(member_tail: str) -> str | None:
+    """The rating key a prefix-stripped alias member carries, or None when
+    the member is not metadata-shaped. Alias members for a Plex-held track
+    are the compound local_key ``{machine_id}:{ratingKey}`` (catalog
+    scan.py: ``local_key = t.id`` via PlexClient._make_id), so the stripped
+    tail is the bare ratingKey. Any path shape (part-paths, other provider
+    keys) is skipped — no producer emits ``/library/metadata/`` members
+    (S-6: the old tolerance branch was dead)."""
+    if not member_tail or member_tail.startswith("/"):
+        return None
+    return member_tail              # bare ratingKey (the _make_id shape)
+
+
+async def _plexplayer_rating_key_resolver(
+    server_machine_id: str, holder_key_part: str, track,
+) -> str | None:
+    """Recover the rating key for a part-path holder key on one server via
+    the durable alias table: track id → catalog identity →
+    get_aliases_for_identity("track", …) → the member with the matching
+    ``{machine_id}:`` prefix, stripped. Native path (no catalog identity):
+    prefix-match ``track.id`` directly. None on no match — the backend
+    raises HolderResolutionError and the holder is consumed (track-level,
+    never an outage). Resolved LIVE per dispatch, never snapshotted, so
+    rescans that re-key a server's library are picked up immediately."""
+    from app.catalog import identity as catalog_identity
+    from app.catalog import store as catalog_store
+    prefix = f"{server_machine_id}:"
+    track_id = str(getattr(track, "id", "") or "")
+    identity = None
+    if track_id:
+        try:
+            identity = await catalog_identity.identity_for_track_id(track_id)
+        except Exception:
+            _log.warning("plexplayer: identity lookup failed for %r",
+                         track_id, exc_info=True)
+    if identity:
+        try:
+            aliases = await catalog_store.get_aliases_for_identity(
+                "track", identity)
+        except Exception:
+            _log.warning("plexplayer: alias lookup failed for identity %r",
+                         identity, exc_info=True)
+            aliases = []
+        for member in aliases:
+            if not member.startswith(prefix):
+                continue
+            rating_key = _plexplayer_rating_key_from_member(
+                member[len(prefix):])
+            if rating_key:
+                return rating_key
+    # Native single-Plex path: the track id IS the compound rating key.
+    if track_id.startswith(prefix):
+        return _plexplayer_rating_key_from_member(track_id[len(prefix):])
+    return None
+
+
+async def _plexplayer_server_info_resolver(machine_id: str) -> ServerInfo | None:
+    """Dispatch-time server binding for createPlayQueue params: the enabled
+    Plex source whose source_id == the holder's machine id (PlexSource keys
+    its namespace on the server machine_id). The address handed to the
+    player is the reachability-probed server_url from auth discovery
+    (plex-owned-server-local-url lesson). None → the backend consumes the
+    holder as a track-level failure."""
+    from app.plex import companion
+    for src in await _plexplayer_enabled_sources():
+        if src.source_id != machine_id:
+            continue
+        client = src.client
+        protocol, address, port = companion.server_coordinates(
+            client.server_url)
+        if not address:
+            _log.warning("plexplayer: source %s has no parseable server "
+                         "address (%r)", machine_id, client.server_url)
+            return None
+        return ServerInfo(machine_id=machine_id, protocol=protocol,
+                          address=address, port=port)
+    return None
+
+
+async def _plexplayer_clients_source() -> list:
+    """The merged ``GET /clients`` sweep across enabled Plex sources:
+    concurrent legs (dead-server lesson: gather with return_exceptions,
+    connect=5 rides the companion client), every per-leg failure logged,
+    merged/deduped by player machineIdentifier (first server wins — the
+    two-server dedupe). Raises ONLY when every leg of a non-empty fan-out
+    failed: that is "no scan data", and the watcher sweep must leave its
+    registry untouched (sweep_devices contract) instead of grace-flipping
+    known players over a server outage. Partial results are real data —
+    players seen only by a dead server age out through normal grace.
+    Capability filtering (playqueues-creation) stays in the backend's
+    sweep_devices — the single eligibility gate."""
+    from app.plex.companion import PmsCompanionClient
+    sources = await _plexplayer_enabled_sources()
+    if not sources:
+        return []
+
+    async def _leg(src):
+        pms = PmsCompanionClient.from_plex_client(src.client)
+        try:
+            return await pms.get_clients()
+        finally:
+            try:
+                await pms.aclose()
+            except Exception:
+                pass
+
+    results = await asyncio.gather(*(_leg(s) for s in sources),
+                                   return_exceptions=True)
+    merged: list = []
+    seen: set[str] = set()
+    failures = 0
+    for src, res in zip(sources, results):
+        if isinstance(res, BaseException):
+            failures += 1
+            _log.warning("plexplayer /clients sweep leg failed for source "
+                         "%s: %s", src.source_id, res)
+            continue
+        for player in res:
+            if player.machine_identifier in seen:
+                continue
+            seen.add(player.machine_identifier)
+            merged.append(player)
+    if failures == len(sources):
+        raise RuntimeError(
+            f"plexplayer /clients sweep: all {failures} Plex server(s) "
+            "unreachable — no scan data")
+    return merged
+
+
+async def _plexplayer_pms_factory(machine_id: str):
+    """Per-server PMS Companion client for the U7 play-queue window ops
+    (gapless-arm append / revoke delete / window read): the enabled Plex
+    source whose source_id == the server machine id, built FRESH per call
+    (never cached across invalidate_plex_client) — the backend closes it
+    after each op. None → no enabled source for that server (the backend
+    declines arming)."""
+    from app.plex.companion import PmsCompanionClient
+    for src in await _plexplayer_enabled_sources():
+        if src.source_id == machine_id:
+            return PmsCompanionClient.from_plex_client(src.client)
+    return None
+
+
+def _plexplayer_is_current() -> bool:
+    """Is the plexplayer backend still the router's active-or-pending
+    backend? (Review fix PLX-2.) The backend consults this before any
+    ``notify_outage`` so a RETIRED instance — switched away from while
+    paused/idle — can never plant a phantom outage in the NEW backend's
+    session. Reads the module global live (setup() rebinds it)."""
+    b = plexplayer_backend
+    return b is not None and (output_router.active is b
+                              or output_router.effective_backend() is b)
+
+
+def _plexplayer_client_factory(host: str, port: int, player_machine_id: str):
+    """Per-player Companion client with the app's controller identity
+    (client_id) and account token. Sync by contract (called from
+    set_device), so it reads the ALREADY-BUILT registry module global — the
+    plexplayer activation/startup-reconnect paths await get_plex_client()
+    first to guarantee it. The token/client id come from the FIRST Plex
+    source (the primary): player commands ride the account credential, and
+    per-SERVER token selection at dispatch time is
+    _plexplayer_server_info_resolver's job, not this factory's."""
+    from app.output.base import DeviceNotReadyError
+    from app.plex.companion import CompanionPlayerClient
+    sources = [s for s in getattr(_plex_client, "sources", None) or []
+               if getattr(s, "source_type", "") == "plex"]
+    if not sources:
+        raise DeviceNotReadyError(
+            "no Plex source configured — cannot control a Plex player")
+    client = sources[0].client
+    return CompanionPlayerClient(
+        host, port,
+        target_machine_id=player_machine_id,
+        controller_id=client.client_id,
+        token=client.token,
+    )
 
 
 # ── playback advance ──────────────────────────────────────────────────────────
@@ -348,6 +690,77 @@ async def catalog_active() -> bool:
     if not isinstance(srcs, list) or not srcs:
         return False
     return any(getattr(s, "source_type", "plex") != "plex" for s in srcs)
+
+
+async def _annotate_queue_event(ev) -> None:
+    """Stamp ``plex_held`` onto a QueueChangedEvent's queue + history rows
+    BEFORE broadcast (2026-08-04-002 plexplayer plan U5).
+
+    Queue re-renders paint straight from the WS payload, never a refetch
+    (the ``QueueItem.added_at`` receipt contract), so the U4 per-row flag
+    must ride the push or a queue mutation would strip the gray-out until
+    the next GET. Delegates to the API layer's annotator — the ONE
+    resolution path (identity-mode: one bulk holds read for queue + history
+    combined, exactly like the queue GETs). Fail-open by design: an
+    annotate failure (catalog mid-rebuild, DB closed in tests) leaves the
+    dataclass default True and never blocks the broadcast — the server
+    enqueue gate, not the client dim, is the enforcement."""
+    try:
+        from app.api.guest import _annotate_plex_held
+        items = list(ev.queue) + list(ev.history)
+        if not items:
+            return
+        rows = [{"track_id": qi.track_id} for qi in items]
+        await _annotate_plex_held(rows)
+        for qi, r in zip(items, rows):
+            qi.plex_held = bool(r.get("plex_held", True))
+    except Exception:
+        _log.debug("queue_changed: plex_held annotate failed (broadcasting "
+                   "with fail-open defaults)", exc_info=True)
+
+
+def _queue_event_item(item):
+    """Serialize one engine QueueItem into the WS event shape (hoisted out
+    of setup()'s _on_event closure so _broadcast_queue_changed is module-
+    level and testable — review fix JFR-2)."""
+    from app.events.types import QueueItem
+    t = item.track
+    return QueueItem(
+        track_id=t.id,
+        title=t.title,
+        artist=t.artist,
+        album=t.album,
+        thumb=t.thumb,
+        duration_ms=t.duration_ms,
+        album_id=t.album_id,
+        added_at=item.added_at,
+    )
+
+
+# Review fix JFR-2: serializes queue_changed snapshot→annotate→broadcast.
+# The annotate await between snapshot and broadcast let two overlapping
+# mutations invert frames on the wire (older snapshot broadcast last), and
+# queue re-renders paint straight from the push — a stale final frame stood
+# until the next mutation.
+_queue_broadcast_lock = asyncio.Lock()
+
+
+async def _broadcast_queue_changed() -> None:
+    """One queue_changed frame, serialized (JFR-2): the snapshot is taken
+    INSIDE the lock, then annotated, then broadcast — so the last frame on
+    the wire is always the newest queue state."""
+    from app.events.bus import manager
+    from app.events.types import QueueChangedEvent
+    async with _queue_broadcast_lock:
+        ev = QueueChangedEvent(
+            queue=[_queue_event_item(i) for i in queue_engine.queue],
+            history=[_queue_event_item(i) for i in queue_engine.history],
+            is_locked=queue_engine.is_locked,
+        )
+        # plex_held on every pushed row (plan U5): queue re-renders paint
+        # from this payload, not a refetch — see _annotate_queue_event.
+        await _annotate_queue_event(ev)
+        await manager.broadcast_to_all(ev)
 
 
 def _row_within_band(row, min_ms, max_ms) -> bool:
@@ -538,6 +951,28 @@ async def _select_auto_fill_track(behavior):
     return await _shuffle_provider(bounds)
 
 
+async def _plex_lock_track_playable(track, lock_ids: set) -> bool:
+    """One autofill candidate's playability under the plexplayer source lock
+    (2026-08-04-002 plan U8). Prefers the candidate's already-loaded holds —
+    catalog floor picks carry them (``views._track``) — so the common path is
+    a pure set lookup against the per-cycle ``lock_ids`` with zero extra
+    reads. A hold-less candidate (e.g. a Popular-Random native resolve) falls
+    back to ONE alias-bridging bulk-map resolve through the shared U5 gate
+    resolver, so autofill and enqueue can never disagree about playability."""
+    from app.catalog import views
+    holds = getattr(track, "holds", None)
+    if holds:
+        return views.holds_plex_held(holds, lock_ids)
+    tid = getattr(track, "id", None)
+    if not tid:
+        return False
+    from app.api.guest import _plex_playable_ids
+    # assume_lock: the caller already established the lock is active this
+    # cycle; a ``None`` (catalog flipped inert mid-cycle) reads as playable.
+    playable = await _plex_playable_ids([tid], assume_lock=True)
+    return playable is None or tid in playable
+
+
 async def _auto_fill_provider(behavior):
     """Return the next random auto-fill track for ``QueueEngine.advance()``.
 
@@ -547,15 +982,41 @@ async def _auto_fill_provider(behavior):
     this is byte-identical to the pre-buffer behavior, so liveness never depends on
     it (R4 never-dead-end fallback). Consuming the slot bumps ``_ondeck_gen`` so an
     in-flight warm cannot reinstall the just-consumed generation.
+
+    Plexplayer source lock (2026-08-04-002 plan U8, R11): the playability
+    check wraps THIS provider — post-selection, around the selection call —
+    never ``_shuffle_provider`` itself, which other callers (Surprise Me's
+    floor, warms) rely on unfenced. The gate input resolves once per cycle;
+    an unplayable selection is re-rolled a bounded number of times, then the
+    cycle gives up: no pick, one debounced admin notice, the queue simply
+    doesn't refill (the conscious never-dead-end inversion for a hard
+    playability constraint — see resolve_surprise's floor call site).
     """
     global _ondeck, _ondeck_gen
+    lock_ids = await plex_lock_enabled_ids()  # None ⇒ inert (sync short-circuit)
+    buffered = None
     async with _ondeck_lock:
         if _ondeck is not None:
-            track = _ondeck
+            buffered = _ondeck
             _ondeck = None
             _ondeck_gen += 1
+    if buffered is not None:
+        if lock_ids is None or await _plex_lock_track_playable(buffered, lock_ids):
+            return buffered
+        # The buffered pick pre-dates the lock (warmed before the switch, or
+        # a veto/rescan stripped its holder) — discard it and re-roll below.
+    if lock_ids is None:
+        return await _select_auto_fill_track(behavior)
+    for _ in range(_AUTOFILL_PLEX_LOCK_TRIES):
+        track = await _select_auto_fill_track(behavior)
+        if track is None:
+            # Library genuinely empty — the pre-existing no-pick condition,
+            # not a lock give-up; stay quiet (same as every other backend).
+            return None
+        if await _plex_lock_track_playable(track, lock_ids):
             return track
-    return await _select_auto_fill_track(behavior)
+    await notify_plex_lock_giveup()
+    return None
 
 
 async def invalidate_ondeck_if_track(track_id) -> bool:
@@ -1193,20 +1654,53 @@ async def _emit_track_skipped(track) -> None:
 def _holder_keys(track) -> list[str]:
     """Priority-ordered resolvable stream keys to try for a track: the
     enqueue-time holds snapshot (multi-source plan U9), else the single
-    ``stream_key`` (single-holder track / pre-snapshot queue item)."""
-    keys = [h["key"] for h in (getattr(track, "holds", None) or []) if h.get("key")]
-    return keys or ([track.stream_key] if track.stream_key else [])
+    ``stream_key`` (single-holder track / pre-snapshot queue item).
+
+    R9 (2026-08-04-002 plan U4): while the persisted selected backend is
+    ``plexplayer``, only holders from enabled Plex sources are eligible —
+    non-Plex holders are skipped entirely (the device plays Plex library
+    items, not stream URLs), ordered same-server-first: holders on the
+    server of the bound player's last dispatch lead, the rest keep their
+    priority order (stable partition — with no current binding the
+    priority order alone stands). Every other backend takes the early
+    return above the filter — byte-identical behavior."""
+    entries = [(h["key"], h.get("source_id"))
+               for h in (getattr(track, "holds", None) or []) if h.get("key")]
+    if not entries and track.stream_key:
+        entries = [(track.stream_key, None)]
+    if not output_requires_plex():
+        return [k for k, _ in entries]
+    plex_ids = _plexplayer_source_ids_sync()
+
+    def _src(key: str, sid) -> str:
+        # Holds snapshots carry source_id; the bare stream_key fallback (and
+        # any legacy hold without one) is attributed via its compound-key
+        # prefix — for Plex sources the source_id IS the server machine_id
+        # and every key is "{machine_id}:{...}".
+        if sid:
+            return sid
+        return key.split(":", 1)[0] if ":" in key else ""
+
+    attributed = [(k, _src(k, s)) for k, s in entries]
+    filtered = [(k, s) for k, s in attributed if s in plex_ids]
+    # S-5: last_dispatch_server is a plain sync read on the backend's own
+    # session struct — the only guard needed is the pre-setup() None.
+    bound = (plexplayer_backend.last_dispatch_server()
+             if plexplayer_backend else None)
+    if bound:
+        filtered.sort(key=lambda e: 0 if e[1] == bound else 1)  # stable
+    return [k for k, _ in filtered]
 
 
 def _backend_type_of(backend) -> str | None:
     """Which module singleton ``backend`` is ("direct" / "chromecast" /
-    "dlna" / "airplay"), or None for a foreign instance. The output-session
+    "dlna" / "airplay" / "plexplayer"), or None for a foreign instance. The output-session
     supervisor's reconnect loop (plan U3) keys its per-backend attach
     mechanics and cache seeding off this — identity comparison against the
     singletons, so a test fake patched into the module resolves too."""
     if backend is None:
         return None
-    for name in ("direct", "chromecast", "dlna", "airplay"):
+    for name in ("direct", "chromecast", "dlna", "airplay", "plexplayer"):
         if backend is globals().get(f"{name}_backend"):
             return name
     return None
@@ -1226,7 +1720,8 @@ def _output_probe():
     return probe if callable(probe) else None
 
 
-async def dispatch_play(url: str, track, *, play_recorded: bool = False) -> None:
+async def dispatch_play(url: str, track, *, play_recorded: bool = False,
+                        holder_key: str | None = None) -> None:
     """Dispatch one track to the active output, reporting it to the output-
     session supervisor (2026-07-11 supervisor plan U1).
 
@@ -1242,12 +1737,28 @@ async def dispatch_play(url: str, track, *, play_recorded: bool = False) -> None
 
     A dispatch that raises is withdrawn from the supervisor before the error
     propagates, so a failed holder/entry point cannot age into a spurious
-    outage-suspected emission."""
+    outage-suspected emission.
+
+    ``holder_key`` is the CURRENT attempt's holder key (2026-08-04-002 plan
+    U3 — the single-selection-authority handshake the plexplayer backend's
+    module docstring documents): backends exposing ``set_dispatch_holder``
+    receive it right before play(); the hand-off is unconditional — an
+    explicit None clears any stale key from a superseded dispatch — and the
+    backend consumes it one-shot. The key is deposited on the router's
+    EFFECTIVE backend (pending-or-active — review fix PLX-1): play() runs
+    swap_pending() first, so under a deferred switch the pending backend is
+    the one that will consume it; targeting ``active`` handed the key to
+    the outgoing backend instead. Backends without the hook (all four
+    existing ones) are byte-identical."""
     from app.output import session
     supervisor = session.get_supervisor()
     token = supervisor.on_dispatched(track, play_recorded=play_recorded,
                                      probe=_output_probe())
     try:
+        setter = getattr(output_router.effective_backend(),
+                         "set_dispatch_holder", None)
+        if callable(setter):
+            setter(holder_key)
         await output_router.play(url, track)
     except BaseException:
         supervisor.on_dispatch_failed(token)
@@ -1277,7 +1788,8 @@ async def _play_with_fallback(item, client) -> bool:
     for key in _holder_keys(item.track):
         url = _make_stream_url(key, client)
         try:
-            await dispatch_play(url, item.track, play_recorded=play_recorded)
+            await dispatch_play(url, item.track, play_recorded=play_recorded,
+                                holder_key=key)
             # The R19 mark protected THIS pending play; consume it so a later
             # organic replay (e.g. Skip Back after it finishes) counts again.
             # Safe: any re-hold re-stamps the mark from the supervisor's
@@ -1640,6 +2152,20 @@ async def _refresh_catalog() -> None:
         replaced = await scan.scan_and_replace(registry, enabled_keys)
         if replaced:
             await stamp_cache("catalog_computed_at")
+            # R12 mid-session re-validation (2026-08-04-002 plexplayer plan
+            # U6): a rescan can strip the last enabled-Plex hold of already-
+            # queued tracks (source removed, library disabled, track gone
+            # from the server). While a Plex player is the selected output
+            # those entries can never play — auto-remove them now, with an
+            # admin notice, instead of letting the queue accumulate dead
+            # entries the switch-time confirm already promised away (F1).
+            # Best-effort: a re-validation failure must not mark the whole
+            # refresh failed (the catalog itself replaced fine).
+            try:
+                await revalidate_plex_queue(trigger="rescan")
+            except Exception:
+                _log.warning("post-rescan queue re-validation failed",
+                             exc_info=True)
     except Exception:
         _log.exception("Catalog refresh failed")
     finally:
@@ -1797,6 +2323,18 @@ async def _startup_reconnect(backend, device_id: str) -> None:
     """Reconnect to the last-used device. Fire-and-forget; never raises."""
     from app import database
 
+    # plexplayer (2026-08-04-002 plan U3): its Companion client factory is
+    # sync and reads the source-registry module global, so build the
+    # registry BEFORE set_device. The cached-address path below needs no
+    # per-backend seeding branch — PlexPlayerBackend.set_device reads its
+    # own persisted output_addr:{device_id} when its address cache is cold.
+    if isinstance(backend, PlexPlayerBackend):
+        try:
+            await get_plex_client()
+        except Exception:
+            _log.warning("startup reconnect: source-registry build failed "
+                         "for plexplayer", exc_info=True)
+
     # R3: Try cached address first — no mDNS, no D-Bus, no socket mount required.
     addr_raw = await database.get_setting(f"output_addr:{device_id}")
     if addr_raw:
@@ -1856,6 +2394,7 @@ async def _startup_reconnect(backend, device_id: str) -> None:
 async def setup() -> None:
     """Initialize backends and wire event callbacks. Called at app startup."""
     global direct_backend, chromecast_backend, dlna_backend, airplay_backend
+    global plexplayer_backend
     global _mdns_port_unavailable, shared_aiozc
 
     # Enforce the art-cache size cap as a background task — it loads the
@@ -1882,6 +2421,18 @@ async def setup() -> None:
     chromecast_backend = ChromecastBackend(advance_cb=_do_advance)
     dlna_backend = DlnaBackend(advance_cb=_do_advance)
     airplay_backend = AirPlayBackend(advance_cb=_do_advance)
+    # Fifth backend (2026-08-04-002 plan U3): Plex Companion receivers.
+    # The resolvers are the U2/U7 injection contract — see the
+    # "plexplayer backend wiring" section above.
+    plexplayer_backend = PlexPlayerBackend(
+        advance_cb=_do_advance,
+        rating_key_resolver=_plexplayer_rating_key_resolver,
+        server_info_resolver=_plexplayer_server_info_resolver,
+        clients_source=_plexplayer_clients_source,
+        client_factory=_plexplayer_client_factory,
+        pms_factory=_plexplayer_pms_factory,
+        is_current=_plexplayer_is_current,
+    )
 
     # Create ONE shared AsyncZeroconf — the single in-process mDNS stack for
     # ALL passive discovery (2026-06-15 plan U5). Chromecast's CastBrowser and
@@ -1955,11 +2506,21 @@ async def setup() -> None:
     set_gapless_enabled(await database.get_gapless_enabled())
 
     # Restore last active backend from DB
+    global _selected_output_backend, _disabled_sources_sync, _plex_lock_notice_sent
     backend_type = await database.get_setting("output_backend_type") or "direct"
     device_id = await database.get_setting("output_device_id") or "default"
+    # Seed the persisted-selection mirror (plan U4): output_requires_plex()
+    # and _holder_keys read it sync; from here on activate_backend keeps it
+    # aligned with the setting it writes.
+    _selected_output_backend = backend_type
+    _plex_lock_notice_sent = False  # U8: a boot starts a fresh notice session
+    try:
+        _disabled_sources_sync = set(await database.get_disabled_sources())
+    except Exception:
+        _disabled_sources_sync = set()
     _set_backend_by_type(backend_type)
     if device_id != "default" and output_router.active:
-        if backend_type in {"chromecast", "airplay", "dlna"}:
+        if backend_type in {"chromecast", "airplay", "dlna", "plexplayer"}:
             # Discovery takes time — run in background to avoid blocking startup
             asyncio.create_task(_startup_reconnect(output_router.active, device_id))
         else:
@@ -1974,32 +2535,14 @@ async def setup() -> None:
         LockChangedEvent,
         NowPlayingEvent,
         PlaybackStateEvent,
-        QueueChangedEvent,
-        QueueItem,
     )
-
-    def _qi(item) -> QueueItem:
-        t = item.track
-        return QueueItem(
-            track_id=t.id,
-            title=t.title,
-            artist=t.artist,
-            album=t.album,
-            thumb=t.thumb,
-            duration_ms=t.duration_ms,
-            album_id=t.album_id,
-            added_at=item.added_at,
-        )
 
     async def _on_event(event: str, payload=None) -> None:
         global _auto_advance_pending
         if event == "queue_changed":
-            ev = QueueChangedEvent(
-                queue=[_qi(i) for i in queue_engine.queue],
-                history=[_qi(i) for i in queue_engine.history],
-                is_locked=queue_engine.is_locked,
-            )
-            await manager.broadcast_to_all(ev)
+            # Snapshot + annotate + broadcast, serialized (review fix
+            # JFR-2) — see _broadcast_queue_changed.
+            await _broadcast_queue_changed()
             # Warm lyrics for the next-up window. Re-runs on every queue mutation
             # (add / remove / reorder / Play-next), so a bumped track that lands in
             # the window is warmed immediately. Fire-and-forget — never blocks the
@@ -2065,6 +2608,7 @@ def _get_backend(backend_type: str):
         "chromecast": chromecast_backend,
         "dlna": dlna_backend,
         "airplay": airplay_backend,
+        "plexplayer": plexplayer_backend,
     }.get(backend_type, direct_backend)
 
 
@@ -2072,6 +2616,129 @@ def _set_backend_by_type(backend_type: str) -> None:
     backend = _get_backend(backend_type)
     if backend:
         output_router.set_backend(backend)
+
+
+# ── stranded-queue evaluation + removal (2026-08-04-002 plexplayer plan U6) ──
+# The switch-time confirm (R7/R8, POST /admin/output/active) and the R12
+# mid-session re-validation (rescan completion, Libraries-panel veto change)
+# share one evaluation and one removal path. Both live OUTSIDE
+# activate_backend on purpose: activate_backend's failure semantics are
+# "raise before any state changes" (router rollback + reopen_outage), and
+# queue mutation inside it would entangle removal with that rollback. The
+# API route runs the two-phase confirm and calls these helpers; the
+# re-validation hooks call revalidate_plex_queue directly.
+
+
+async def plex_stranded_entries(*, assume_lock: bool = False) -> list:
+    """The upcoming-queue entries with no enabled-Plex holder — the tracks a
+    Plex-player output can never play. Empty list when nothing is stranded
+    OR the gate is inert (non-plexplayer selection unless *assume_lock*,
+    native Plex-only path — see ``_plex_playable_ids``).
+
+    ``assume_lock=True`` evaluates against a hypothetical plexplayer
+    selection (the switch-time pre-check, before the selection persists).
+    The CURRENTLY-PLAYING track is not queue state (``queue_engine.queue``
+    excludes ``state.current``) and is deliberately absent: a confirmed
+    mid-play switch lets it finish on the old backend (deferred-swap
+    semantics), and the boundary handles it from there."""
+    entries = list(queue_engine.queue)
+    if not entries:
+        return []
+    from app.api.guest import _plex_playable_ids
+    playable = await _plex_playable_ids(
+        [i.track_id for i in entries], assume_lock=assume_lock)
+    if playable is None:
+        return []
+    return [i for i in entries if i.track_id not in playable]
+
+
+async def remove_stranded_entries(stranded: list) -> int:
+    """Remove previously-evaluated stranded entries by their
+    ``(track_id, added_at)`` receipts — ``queue_engine.remove_entries``, so
+    every surviving entry keeps its receipt (guest undo/remove intact) and
+    the single ``queue_changed`` broadcast re-annotates ``plex_held``.
+    Returns the count ACTUALLY removed (entries that played or were removed
+    since evaluation match nothing and contribute 0 — the confirm response
+    and the re-validation notice both report this live number).
+
+    Held-front discipline (the queue_clear/queue_remove mechanic): when an
+    outage hold is active, the queue front IS the held item — dropping it
+    must bump ``_advance_gen`` so an in-flight resume treats whatever
+    fronts next as fresh at 0:00 instead of seeking the removed track's
+    held position into it."""
+    global _advance_gen
+    if not stranded:
+        return 0
+    from app.output import session as output_session
+    front = queue_engine.queue[0] if queue_engine.queue else None
+    if (output_session.output_hold_active() and front is not None
+            and any(i.track_id == front.track_id
+                    and i.added_at == front.added_at for i in stranded)):
+        _advance_gen += 1
+    # U7 armed-next revocation (the seam U6 left): a removal set containing
+    # the ARMED next track revokes the arm slot on the owning backend
+    # (revoke_next + one-shot slot discard) BEFORE remove_entries drops the
+    # entry, or the device would natively advance into a track the queue no
+    # longer holds. _revoke_armed_next clears the orchestrator slot first
+    # and tolerates a failed device call (the backend's stale watch owns
+    # the correction).
+    armed = _armed_next_track
+    if armed is not None and any(
+            i.track_id == getattr(armed, "id", None) for i in stranded):
+        await _revoke_armed_next("stranded removal")
+    return await queue_engine.remove_entries(
+        [(i.track_id, i.added_at) for i in stranded])
+
+
+def snapshot_stranded_positions(stranded: list) -> list:
+    """``(position, item)`` pairs for the stranded entries as they sit in
+    the queue RIGHT NOW — captured immediately before ``
+    remove_stranded_entries`` so a failed ``activate_backend`` can restore
+    the queue byte-identically (review fix PLX-3: removal must not be
+    durable when the switch it paid for never happened). Matched by object
+    identity: ``plex_stranded_entries`` hands back the live QueueItem
+    objects, and identity can't confuse duplicate receipts."""
+    ids = {id(i) for i in stranded}
+    return [(idx, item) for idx, item in enumerate(queue_engine.queue)
+            if id(item) in ids]
+
+
+async def restore_stranded_entries(snapshot: list) -> int:
+    """Roll back a stranded removal after ``activate_backend`` raised
+    (PLX-3): re-insert the captured ``(position, item)`` pairs at their
+    original positions, receipts intact. Delegates to the queue engine's
+    batch restore (one lock/persist/broadcast)."""
+    return await queue_engine.restore_entries(snapshot)
+
+
+async def revalidate_plex_queue(*, trigger: str) -> int:
+    """R12 (2026-08-04-002 plexplayer plan U6): mid-session re-validation.
+    Called on rescan completion (``_refresh_catalog``) and on a
+    Libraries-panel whole-source veto change (``_set_source_disabled``)
+    — events that can strip queued tracks' last enabled-Plex hold while a
+    Plex player is already the selected output. Auto-removes the newly
+    stranded entries (no dialog — the admin's standing switch decision
+    already covered "unplayable entries get removed") and emits an admin
+    notice with the actual removed count. No-op (0) while the gate is
+    inert. *trigger* is human-readable notice text ("rescan",
+    "library change")."""
+    stranded = await plex_stranded_entries()
+    if not stranded:
+        return 0
+    removed = await remove_stranded_entries(stranded)
+    if removed:
+        _log.info("Queue re-validation (%s): removed %d track(s) with no "
+                  "enabled-Plex holder while plexplayer is selected",
+                  trigger, removed)
+        # Admin notice on the established admin-toast channel (S-2: the
+        # shared best-effort helper — startup reconnect + Chromecast
+        # failure notices ride the same vehicle).
+        from app.events.bus import notify_admin_error
+        plural = "" if removed == 1 else "s"
+        await notify_admin_error(
+            f"Removed {removed} queued track{plural} the Plex player "
+            f"can't play (after {trigger})")
+    return removed
 
 
 async def activate_backend(
@@ -2089,7 +2756,7 @@ async def activate_backend(
         next session pre-selects the same protocol without a second
         click.
     """
-    global _auto_advance_pending
+    global _auto_advance_pending, _selected_output_backend, _plex_lock_notice_sent
     from app import database
     from app.config import settings
     from app.output import session as output_session
@@ -2111,6 +2778,15 @@ async def activate_backend(
             backend_type,
         )
     new_backend = _get_backend(backend_type)
+    if backend_type == "plexplayer":
+        # The Companion client factory reads the source-registry module
+        # global synchronously inside set_device — make sure it's built
+        # before the switch (fresh installs may not have touched it yet).
+        try:
+            await get_plex_client()
+        except Exception:
+            _log.warning("activate_backend: source-registry build failed "
+                         "for plexplayer", exc_info=True)
     if new_backend:
         prev_backend = output_router.active
         output_router.set_backend(new_backend)
@@ -2132,6 +2808,14 @@ async def activate_backend(
                     # back (resume window keeps counting, R8).
                     output_session.get_supervisor().reopen_outage(prev_outage)
                 raise
+    # Persist the selection AND update its in-memory mirror at the same point
+    # (plan U4): output_requires_plex() / the source_lock broadcast key off
+    # this persisted truth — never the router, whose swap defers mid-play. A
+    # failed switch raised above, so neither changes on failure.
+    _selected_output_backend = backend_type
+    # U8: every committed selection starts a fresh lock session — re-arm the
+    # one-shot auto-selection give-up notice.
+    _plex_lock_notice_sent = False
     await database.set_setting("output_backend_type", backend_type)
     await database.set_setting("output_device_id", device_id)
     if host:
@@ -2143,6 +2827,14 @@ async def activate_backend(
     # the switch succeeded, so the auto-start below isn't gated and the held
     # item (queue front, play_recorded marked) dispatches restart-from-top.
     output_session.clear_output_hold()
+    # Broadcast the OutputSessionEvent unconditionally on every successful
+    # switch (plan U4): the lean payload's ``source_lock`` flips from the
+    # persisted-selection mirror set above, so open guest/admin pages learn
+    # the new gate truth immediately — even while the router's deferred swap
+    # lets the OLD backend finish the current track. (clear_output_hold only
+    # emits when a hold was actually cleared — not enough on a normal
+    # switch.) Best-effort by emit_session_event's own contract.
+    await output_session.emit_session_event()
     # If tracks are queued and nothing is playing, start now on the newly selected backend
     if (not queue_engine.state.is_playing
             and queue_engine.queue

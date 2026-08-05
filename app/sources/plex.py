@@ -36,6 +36,14 @@ class PlexSource(MusicSource):
         return "plex"
 
     @property
+    def client(self) -> PlexClient:
+        """The wrapped PlexClient — read-only. Plex Companion control
+        (plexplayer backend wiring, 2026-08-04-002 plan U3) needs the raw
+        server coordinates / token / controller id the client carries;
+        everything else should keep to the MusicSource surface."""
+        return self._client
+
+    @property
     def capabilities(self) -> Capabilities:
         return _PLEX_CAPS
 

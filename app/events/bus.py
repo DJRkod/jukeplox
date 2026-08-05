@@ -1,11 +1,14 @@
 """WebSocket connection manager and event broadcaster."""
 
 import asyncio
+import logging
 from dataclasses import asdict
 from typing import Any
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
+
+_log = logging.getLogger(__name__)
 
 
 class ConnectionManager:
@@ -72,3 +75,19 @@ class ConnectionManager:
 
 # Singleton — imported by routers
 manager = ConnectionManager()
+
+
+async def notify_admin_error(message: str) -> None:
+    """Best-effort admin toast on the established error channel
+    (``OutputChangedEvent`` with ``backend_type="error"`` → the admin WS
+    handler toasts ``device_name``). The ONE helper for every "tell the
+    admin something went wrong" emission (review fix S-2) — never raises
+    into the caller: a broadcast failure is logged and dropped, because
+    every call site treats the notice as advisory."""
+    try:
+        from app.events.types import OutputChangedEvent
+        await manager.broadcast_to_admins(OutputChangedEvent(
+            backend_type="error", device_name=message))
+    except Exception:
+        _log.warning("admin error notice broadcast failed: %r", message,
+                     exc_info=True)

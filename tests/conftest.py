@@ -135,6 +135,7 @@ def mock_state(mock_session):
          patch("app.state.chromecast_backend", None), \
          patch("app.state.dlna_backend", None), \
          patch("app.state.airplay_backend", None), \
+         patch("app.state.plexplayer_backend", None), \
          patch("app.output.probe_cache.fetch_all", AsyncMock(return_value={})), \
          patch("app.output.probe_cache.clear_all_verdicts", AsyncMock()), \
          patch("app.output.probe_cache.set_verdict", AsyncMock()):

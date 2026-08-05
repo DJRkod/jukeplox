@@ -174,6 +174,29 @@ class FakeDlnaBackend:
         return self.describe_result
 
 
+class FakePlexPlayerBackend:
+    """Stands in for PlexPlayerBackend on the watcher seams (2026-08-04-002
+    plan U3): ``sweep_devices`` replays scripted results or RAISES (the
+    total-/clients-failure "no scan data" contract), and ``device_host``
+    mirrors the public accessor over the ``_device_addresses`` cache the
+    aggregator's host_for reads."""
+
+    def __init__(self):
+        self.results: list[OutputDevice] = []
+        self.hosts: dict[str, str] = {}   # device_id → host
+        self.error: Exception | None = None
+        self.sweep_calls = 0
+
+    async def sweep_devices(self):
+        self.sweep_calls += 1
+        if self.error is not None:
+            raise self.error
+        return list(self.results)
+
+    def device_host(self, device_id):
+        return self.hosts.get(device_id)
+
+
 class FakeSsdpTransport:
     def __init__(self):
         self.closed = False
@@ -225,6 +248,7 @@ class Harness:
         self.cast_backend = ChromecastBackend()
         self.airplay_backend = AirPlayBackend()
         self.dlna_backend = FakeDlnaBackend()
+        self.plexplayer_backend = FakePlexPlayerBackend()
         self.ssdp = FakeSsdp(fail=ssdp_fail)
 
         async def _capture(event):
@@ -243,7 +267,8 @@ class Harness:
             unsubscribe=self.mdns.unsubscribe,
             backend_for={"chromecast": self.cast_backend,
                          "airplay": self.airplay_backend,
-                         "dlna": self.dlna_backend}.get,
+                         "dlna": self.dlna_backend,
+                         "plexplayer": self.plexplayer_backend}.get,
             probe=probe or _capture_probe,
             timer=self.timers.schedule,
             clock=lambda: self.clock.mono,
@@ -275,6 +300,7 @@ class Harness:
         for _ in range(4):
             await asyncio.sleep(0)
         self.dlna_backend.discover_calls = 0
+        self.plexplayer_backend.sweep_calls = 0
         return self
 
     def emit(self, service_type, kind, payload):
@@ -1487,3 +1513,106 @@ async def test_stop_clears_arrival_listeners():
                                    lambda: calls.append(1))
     await h.watcher.stop()
     assert h.watcher._arrival_listeners == {}
+
+
+# ── plexplayer sweep (2026-08-04-002 plan U3) ─────────────────────────────────
+
+PP_ID = "caldera-machine-1"
+PP_HOST = "192.168.1.88"
+
+
+def pp_dev(mid=PP_ID, name="Caldera"):
+    return OutputDevice(id=mid, name=name, backend_type="plexplayer",
+                        id_format="uuid")
+
+
+async def test_sweep_includes_plexplayer_unconditionally():
+    """_sweep_once sweeps plexplayer even with _mdns_sweep_active False —
+    its /clients discovery has nothing to do with mDNS. The found player
+    lands online with probe-on-arrival keyed by the backend's device_host
+    accessor (the same cache discovery.host_for reads)."""
+    h = await Harness().start()
+    assert h.watcher._mdns_sweep_active is False   # the gate under test
+    h.plexplayer_backend.results = [pp_dev()]
+    h.plexplayer_backend.hosts = {PP_ID: PP_HOST}
+    await h.run_sweep()
+
+    key = ("plexplayer", PP_ID)
+    assert h.watcher.registry[key].online is True
+    assert (PP_HOST, "plexplayer", PP_ID) in h.probes
+    assert h.plexplayer_backend.sweep_calls == 1
+
+
+async def test_plexplayer_two_server_dedupe_single_registry_entry():
+    """A player visible through two Plex servers is ONE registry entry —
+    the machineIdentifier is the id on both legs (the merge/dedupe lives
+    in the clients_source/sweep_devices layer; the registry keys by id, so
+    even duplicate rows in one sweep collapse to one entry)."""
+    h = await Harness().start()
+    h.plexplayer_backend.results = [pp_dev(), pp_dev()]   # seen via 2 servers
+    h.plexplayer_backend.hosts = {PP_ID: PP_HOST}
+    await h.run_sweep()
+
+    keys = [k for k in h.watcher.registry if k[0] == "plexplayer"]
+    assert keys == [("plexplayer", PP_ID)]
+
+
+async def test_plexplayer_sweep_failure_leaves_registry_untouched(caplog):
+    """Server-down leg: sweep_devices RAISES (total /clients failure = "no
+    scan data") → known players stay fully ONLINE — no grace timer, no
+    eviction (push-discovery-registry-must-write-through lesson). Only a
+    SUCCESSFUL sweep that omits a player may grace it."""
+    h = await Harness().start()
+    h.plexplayer_backend.results = [pp_dev()]
+    h.plexplayer_backend.hosts = {PP_ID: PP_HOST}
+    await h.run_sweep()
+    key = ("plexplayer", PP_ID)
+    assert h.watcher.registry[key].online is True
+
+    h.plexplayer_backend.error = RuntimeError("all Plex servers unreachable")
+    with caplog.at_level(logging.WARNING, logger="app.output.watcher"):
+        await h.run_sweep()
+    assert any("plexplayer sweep discover failed" in r.message
+               for r in caplog.records)
+    assert h.watcher.registry[key].online is True
+    assert h.watcher._grace_timers == {}
+
+    # Recovery: the next successful sweep is business as usual.
+    h.plexplayer_backend.error = None
+    await h.run_sweep()
+    assert h.watcher.registry[key].online is True
+
+
+async def test_plexplayer_sweep_miss_graces_then_offline_retained():
+    """A SUCCESSFUL sweep no longer listing the player (real absence, not
+    a server outage) follows the standard offline-grace contract: miss →
+    grace → offline-RETAINED, exactly like the DLNA sweep."""
+    h = await Harness().start()
+    h.plexplayer_backend.results = [pp_dev()]
+    h.plexplayer_backend.hosts = {PP_ID: PP_HOST}
+    await h.run_sweep()
+
+    h.plexplayer_backend.results = []
+    await h.run_sweep()
+    key = ("plexplayer", PP_ID)
+    assert h.watcher.registry[key].online is True   # only grace armed so far
+    assert [t.delay for t in h.pending if t.delay == GRACE_S] == [GRACE_S]
+
+    h.clock.wall += GRACE_S
+    h.timers.fire(GRACE_S)
+    entry = h.watcher.registry[key]
+    assert entry.online is False
+    assert entry.offline_since == h.clock.wall
+    assert key in h.watcher.registry   # retained, never silently evicted
+
+
+async def test_mdns_status_carries_no_plexplayer_key():
+    """plexplayer stays OUT of the mDNS-status surface: _ALL_BACKENDS
+    membership drives only mdns_status, its liveness rides /clients, and
+    the sweep path needs no membership — in normal AND degraded mode the
+    map has no plexplayer key (a missing key is what keeps the admin
+    banner from rendering it degraded)."""
+    h = await Harness().start()
+    assert "plexplayer" not in h.watcher.mdns_status()
+    h2 = await Harness(supported=False).start()
+    assert "plexplayer" not in h2.watcher.mdns_status()

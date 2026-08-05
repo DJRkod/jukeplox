@@ -205,6 +205,28 @@ class QueueEngine:
             await self._emit("queue_changed")
         return removed
 
+    async def restore_entries(self, entries: list[tuple[int, QueueItem]]) -> int:
+        """Re-insert previously removed QueueItem objects at their original
+        positions — the failed-switch rollback half of the stranded-removal
+        flow (review fix PLX-3). ``entries`` is ``[(position, item), ...]``
+        captured against the queue BEFORE the removal; re-inserting the SAME
+        objects in ascending position order restores the original relative
+        order byte-identically (receipts included, so guest remove-own still
+        works), with positions past the current end clamping to append.
+
+        One lock, one persist, one ``queue_changed`` emit — the same batch
+        contract as ``remove_entries``. Empty input is a quiet no-op."""
+        if not entries:
+            return 0
+        restored = 0
+        async with self._lock:
+            for pos, item in sorted(entries, key=lambda e: e[0]):
+                self._queue.insert(min(max(0, pos), len(self._queue)), item)
+                restored += 1
+            await self._persist()
+        await self._emit("queue_changed")
+        return restored
+
     # ── admin operations ──────────────────────────────────────────────────────
 
     async def remove(self, position: int) -> None:

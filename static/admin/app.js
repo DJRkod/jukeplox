@@ -31,7 +31,20 @@ async function api(method, path, body) {
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!resp.ok) throw new Error(`${method} ${path} → ${resp.status}`);
+  if (!resp.ok) {
+    // Attach status + parsed JSON detail so callers can branch on
+    // structured errors (plexplayer plan U6: the output-switch confirm
+    // rides a 409 whose detail is a DICT — reason/stranded_count — and
+    // must be distinguishable from plain-string 409s). detail stays
+    // undefined on a non-JSON body; every existing `catch {}` caller is
+    // unaffected (still a thrown Error).
+    let detail;
+    try { detail = (await resp.json()).detail; } catch { /* non-JSON body */ }
+    const err = new Error(`${method} ${path} → ${resp.status}`);
+    err.status = resp.status;
+    err.detail = detail;
+    throw err;
+  }
   return resp.json();
 }
 
@@ -225,6 +238,10 @@ const playbackHandle = mountPlayback({
 // the Skip Back button's disabled state and the queue list go stale until
 // the next queue mutation. Mirrors the loadVolume() onopen-resync pattern.
 async function refreshQueueState() {
+  // Snapshot ordering guard (review fix JFR-1, mirroring the shared
+  // module's resume()): a WS output_session push landing during the fetch
+  // await bumps the generation — the older snapshot must not overwrite it.
+  const osGen = playbackHandle.outputSessionGen();
   try {
     const state = await api('GET', '/admin/queue');
     playbackHandle.applyQueue(state.queue, state.history);
@@ -235,7 +252,7 @@ async function refreshQueueState() {
     // Output-session resync (supervisor plan U4): a WS gap can drop the
     // output_session delta, so every snapshot re-pull re-renders the outage
     // note + admin banner from the mirrored field (same shape as the event).
-    if (state.output_session) {
+    if (state.output_session && osGen === playbackHandle.outputSessionGen()) {
       playbackHandle.applyOutputSession(state.output_session);
       renderOutputSessionBanner(state.output_session);
     }
@@ -304,6 +321,15 @@ function renderOutputSessionBanner(data) {
   if (data.state === 'reconnecting') {
     msg = '⚠ “' + device + '” is offline — reconnecting (attempt '
       + (data.attempts || 1) + ')…';
+  } else if (data.state === 'idle_paused'
+      && data.idle_paused_reason === 'foreign_controller') {
+    // Plex player foreign-controller yield (2026-08-04-002 plan U7): the
+    // device is REACHABLE but another controller owns its queue — this is
+    // a yield, not an outage, so the copy asks for a re-activate (the
+    // banner's Resume button IS the re-activate) instead of implying a
+    // reconnect is coming.
+    msg = '⚠ Another Plex controller took the device — re-activate to '
+      + 'resume jukeplox control.';
   } else if (data.state === 'idle_paused') {
     const why = {
       window_expired: 'the resume window expired',
@@ -349,6 +375,7 @@ let _volUserLastSet = 0;
 volSlider.addEventListener('input', () => {
   volLabel.textContent = `${Math.round(volSlider.value * 100)}%`;
   volSlider.style.setProperty('--vol-fill', `${volSlider.value * 100}%`);  // gradient fill (2026-06-18)
+  _volSyncButtons();
   // Stamp on raw input (not inside the debounce) so the echo-guard window
   // covers the user's whole drag, not just the post-debounce write.
   _volUserLastSet = Date.now();
@@ -368,6 +395,7 @@ async function loadVolume() {
     volSlider.value = level;
     volLabel.textContent = `${Math.round(level * 100)}%`;
     volSlider.style.setProperty('--vol-fill', `${level * 100}%`);
+    _volSyncButtons();
   } catch {}
 }
 
@@ -381,7 +409,33 @@ function applyVolumeFromEvent(level) {
   volSlider.value = clamped;
   volLabel.textContent = `${Math.round(clamped * 100)}%`;
   volSlider.style.setProperty('--vol-fill', `${clamped * 100}%`);
+  _volSyncButtons();
 }
+
+// ±5% nudge buttons (2026-08-04 volume rework U2). Snap to the nearest
+// multiple of 5 in the pressed direction (47% → 50% up, 45% down); math in
+// the integer-percent domain so float artifacts can't miss the grid. The
+// write path is REUSED, not duplicated: set the slider value and dispatch a
+// synthetic 'input' so the existing listener does label/fill/echo-stamp/
+// debounced POST — rapid taps coalesce into one device write. Buttons carry
+// the disabled attribute at the bounds (mockup pick); synced everywhere the
+// slider value changes outside the input listener.
+function _volSyncButtons() {
+  const p = Math.round(volSlider.value * 100);
+  document.getElementById('vol-down').disabled = p <= 0;
+  document.getElementById('vol-up').disabled = p >= 100;
+}
+function _volSnap(dir) {
+  const p = Math.round(volSlider.value * 100);
+  // Branchless "nearest multiple of 5 in the pressed direction": off-grid
+  // snaps to it, on-grid moves a full step (floor(45/5)+1 = 50, etc.).
+  const next = (dir > 0 ? Math.floor(p / 5) + 1 : Math.ceil(p / 5) - 1) * 5;
+  volSlider.value = Math.min(100, Math.max(0, next)) / 100;
+  volSlider.dispatchEvent(new Event('input'));  // reuse the full slider pipeline
+}
+document.getElementById('vol-down').addEventListener('click', () => _volSnap(-1));
+document.getElementById('vol-up').addEventListener('click', () => _volSnap(1));
+_volSyncButtons();
 
 // ── Lock toggle ────────────────────────────────────────────────────────────
 
@@ -827,32 +881,115 @@ document.getElementById('btn-dismiss-mdns-banner').addEventListener('click', () 
   if (banner) banner.style.display = 'none';
 });
 
+// In-flight guard for the Apply click (review fix JFR-3, the house
+// _surpriseBusy pattern): a double-click raced two POSTs — two structured
+// 409s meant two stacked confirm overlays (both could then Confirm).
+let _applyOutputBusy = false;
 document.getElementById('btn-apply-output').addEventListener('click', async () => {
+  if (_applyOutputBusy) return;
   const sel = document.getElementById('connection-select');
   const opt = sel.selectedOptions[0];
   if (!opt || opt.disabled) { showToast('Select a verified protocol'); return; }
+  _applyOutputBusy = true;
   const backend_type = opt.dataset.backend;
   const device_id = opt.dataset.deviceId;
   const host = document.getElementById('device-select').value;
   const body = { backend_type, device_id };
   if (host && host !== '__direct__') body.host = host;
-  try {
-    await api('POST', '/admin/output/active', body);
+  // Success bookkeeping, shared by the direct path and the confirmed
+  // resend inside the stranded dialog (plexplayer plan U6).
+  const applySwitched = () => {
     currentActive = { backend_type, device_id, host: body.host || null, via: backend_type };
     updateDeviceSelect();
     _syncAirPlayProtocolUI();
+  };
+  try {
+    await api('POST', '/admin/output/active', body);
+    applySwitched();
     showToast('Output updated');
   } catch (err) {
-    // HTTP 409 from the server signals a stale-verdict failure on Apply
-    // — re-fetch with a bust to refresh the cache and re-probe.
-    if (err && err.status === 409) {
-      showToast((err.detail || 'Protocol check is stale') + ' — rechecking');
+    const d = err && err.detail;
+    if (d && typeof d === 'object' && d.reason === 'output_switch_confirm') {
+      // Plexplayer plan U6 two-phase switch: the server warned that queued
+      // tracks would be stranded — hand off to the confirm dialog, which
+      // resends the same body with confirmed:true. No state changed yet.
+      showOutputSwitchConfirm(d.stranded_count, body, applySwitched);
+    } else if (err && err.status === 409) {
+      // A plain-string HTTP 409 signals a stale-verdict failure on Apply
+      // — re-fetch with a bust to refresh the cache and re-probe. (The
+      // structured switch-confirm 409 branched above; any other dict
+      // detail falls back to the generic copy.)
+      showToast(((typeof d === 'string' && d) || 'Protocol check is stale') + ' — rechecking');
       loadDevices(true);
     } else {
       showToast('Failed to update output');
     }
+  } finally {
+    _applyOutputBusy = false;
   }
 });
+
+// ── Stranded-tracks switch confirm dialog (2026-08-04-002 plexplayer U6) ───
+// Admin-only chrome (never the shared module): shown ONLY on the structured
+// 409 from POST /admin/output/active. A native confirm() can't express the
+// in-flight loading state the two-phase flow needs, so this is a minimal
+// overlay dialog. Blocking-overlay lesson honored: the dialog's own
+// Confirm/Cancel sit inside the card ON TOP of the backdrop (never covered
+// by it), the state is purely client-side (a refresh recovers), and it is
+// deliberately NOT dismissable mid-flight — the confirmed POST must resolve
+// or fail before the dialog can go away, so the admin always sees the
+// outcome toast (actual removed count, or failure with the queue untouched).
+function showOutputSwitchConfirm(strandedCount, requestBody, onSwitched) {
+  // Singleton overlay (review fix JFR-3): any earlier confirm dialog is
+  // superseded — the LAST intent wins, so two dialogs can never stack and
+  // both be confirmed.
+  document.querySelectorAll('.switch-confirm-overlay')
+    .forEach((el) => el.remove());
+  const n = strandedCount || 0;
+  const overlay = document.createElement('div');
+  overlay.className = 'switch-confirm-overlay';
+  overlay.innerHTML = `
+    <div class="switch-confirm-card">
+      <p>${n} queued track${n === 1 ? '' : 's'} can't play on this device and will be removed.</p>
+      <div class="switch-confirm-actions">
+        <button type="button" class="btn btn-sm" data-act="cancel">Cancel</button>
+        <button type="button" class="btn btn-primary btn-sm" data-act="confirm">Confirm</button>
+      </div>
+    </div>`;
+  const confirmBtn = overlay.querySelector('[data-act="confirm"]');
+  const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+  let inFlight = false;
+  // Cancel / backdrop click → plain dismiss, nothing sent (AE2: reject is a
+  // no-op — queue and output untouched). Both refuse mid-flight.
+  cancelBtn.addEventListener('click', () => { if (!inFlight) overlay.remove(); });
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay && !inFlight) overlay.remove();
+  });
+  confirmBtn.addEventListener('click', async () => {
+    if (inFlight) return;
+    inFlight = true;
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+    confirmBtn.textContent = 'Switching…';
+    try {
+      const res = await api('POST', '/admin/output/active',
+        Object.assign({}, requestBody, { confirmed: true }));
+      overlay.remove();
+      onSwitched();
+      // Server recomputed the stranded set at confirm time — toast the
+      // ACTUAL removed count, never the warned one (race-safe).
+      const removed = (res && res.removed_count) || 0;
+      showToast(`Removed ${removed} unplayable track${removed === 1 ? '' : 's'}`);
+    } catch {
+      inFlight = false;
+      confirmBtn.disabled = false;
+      cancelBtn.disabled = false;
+      confirmBtn.textContent = 'Confirm';
+      showToast('Could not switch output — queue was not changed');
+    }
+  });
+  document.body.appendChild(overlay);
+}
 
 // ── AirPlay protocol indicator + No-audio + Re-test ───────────────────────
 // Cache of per-device cliap2-vs-cliraop verdicts. Hydrated on page load
@@ -1684,6 +1821,12 @@ async function loadSettings() {
     // box always shows the live value; the >= 1 floor is enforced server-side.
     const resumeWindow = document.getElementById('resume-window-minutes');
     if (resumeWindow) resumeWindow.value = s.resume_window_minutes || '';
+    // Volume bar orientation (2026-08-04 volume rework U3): hydrate the radio
+    // AND apply the render switch — the data-attribute is the single CSS hook
+    // (body[data-vol-orient]); JS never branches on orientation.
+    const volOrient = s.volume_orientation || 'horizontal';
+    document.querySelectorAll('[name=volume-orientation]').forEach(r => { r.checked = r.value === volOrient; });
+    document.body.dataset.volOrient = volOrient;
     // International rail (2026-06-22 plan 004): alpha-mode radios + the two
     // first-character thresholds (empty box → default 2 via placeholder). The
     // threshold row is ALWAYS visible — dimmed + disabled when International isn't
@@ -1776,7 +1919,15 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
   if (artistThreshEl) body.rail_artist_threshold = parseInt(artistThreshEl.value, 10) || 2;
   const albumThreshEl = document.getElementById('rail-album-threshold');
   if (albumThreshEl) body.rail_album_threshold = parseInt(albumThreshEl.value, 10) || 2;
-  try { await api('POST', '/admin/settings', body); showToast('Settings saved'); }
+  // Volume bar orientation (2026-08-04 volume rework U3): sent with the batch;
+  // applied locally on save success (other admin devices: next load).
+  const volOrientEl = document.querySelector('[name=volume-orientation]:checked');
+  if (volOrientEl) body.volume_orientation = volOrientEl.value;
+  try {
+    await api('POST', '/admin/settings', body);
+    showToast('Settings saved');
+    if (volOrientEl) document.body.dataset.volOrient = volOrientEl.value;
+  }
   catch { showToast('Failed to save settings'); }
 });
 

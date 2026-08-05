@@ -627,3 +627,163 @@ async def test_resolve_surprise_band_excludes_all_in_source_falls_through():
         length_bounds=(30000, 600000))
     assert source == SOURCE_RANDOM
     assert track.id == "rand"
+
+
+# ── Plexplayer source-lock gate (2026-08-04-002 plan U8, R11) ─────────────────
+# The acceptable() closure gates the smart sources; the floor is constrained at
+# its call site with a bounded re-roll and a give-up (the CONSCIOUS inversion of
+# never-dead-end for a hard playability constraint). lock getter None ⇒ inert.
+
+from app.queue.surprise import _PLEX_LOCK_FLOOR_TRIES  # noqa: E402
+
+
+def plexable(t, sid="m1"):
+    """Stamp *t* with one enabled-Plex-shaped hold."""
+    t.holds = [{"source_id": sid, "key": f"{sid}:{t.id}"}]
+    return t
+
+
+def make_lock(ids):
+    async def _l():
+        return ids
+    return _l
+
+
+def make_notify():
+    calls = []
+
+    async def _n():
+        calls.append(1)
+    _n.calls = calls
+    return _n
+
+
+def make_shuffle_seq(tracks):
+    """Floor returning a scripted sequence; repeats the last entry forever."""
+    seq = list(tracks)
+    calls = []
+
+    async def _s():
+        calls.append(1)
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+    _s.calls = calls
+    return _s
+
+
+async def test_lock_smart_source_filters_unplayable_candidates():
+    """Mixed sonic candidates + lock active: only the enabled-Plex-held one
+    can win; a Jellyfin-held and a hold-less candidate are both rejected
+    (fail closed) inside acceptable()."""
+    jelly = mk_track("cj", artist="X")
+    jelly.holds = [{"source_id": "jelly", "key": "jelly:cj"}]
+    bare = mk_track("cb", artist="X")          # no holds at all
+    good = plexable(mk_track("cp", artist="X"))
+    fc = FakeClient(sonic={"s1": [jelly, bare, good]})
+    track, source = await resolve_surprise(
+        SEED, "plex", **_kw(client=fc),
+        get_plex_lock_ids=make_lock({"m1"}), notify_lock_giveup=make_notify())
+    assert source == SOURCE_PLEX_SONIC
+    assert track.id == "cp"
+
+
+async def test_lock_native_candidate_attributes_via_compound_id():
+    """Review fix PLX-8: native smart-source candidates (sonic/similar/
+    heuristic on an all-Plex install) carry NO holds — their compound id
+    "{machine_id}:{ratingKey}" attributes them to the owning server, so a
+    candidate from an ENABLED server passes instead of failing closed and
+    starving the smart chain. A foreign-server id and an unattributable
+    bare id still fail closed."""
+    native_bad = mk_track("m9:44", artist="X")     # disabled/unknown server
+    bare = mk_track("cb", artist="X")              # no holds, no prefix
+    native_good = mk_track("m1:101", artist="X")   # enabled server
+    fc = FakeClient(sonic={"s1": [native_bad, bare, native_good]})
+    track, source = await resolve_surprise(
+        SEED, "plex", **_kw(client=fc),
+        get_plex_lock_ids=make_lock({"m1"}), notify_lock_giveup=make_notify())
+    assert source == SOURCE_PLEX_SONIC
+    assert track.id == "m1:101"
+
+
+async def test_lock_floor_rerolls_to_playable():
+    """The floor call site re-rolls an unplayable pick and returns the first
+    Plex-playable one."""
+    bad = mk_track("bad", artist="F")
+    bad.holds = [{"source_id": "jelly", "key": "jelly:bad"}]
+    good = plexable(mk_track("good", artist="F"))
+    shuffle = make_shuffle_seq([bad, good])
+    track, source = await resolve_surprise(
+        SEED, "random", **_kw(client=FakeClient(), shuffle_provider=shuffle),
+        get_plex_lock_ids=make_lock({"m1"}), notify_lock_giveup=make_notify())
+    assert source == SOURCE_RANDOM
+    assert track.id == "good"
+    assert len(shuffle.calls) == 2
+
+
+async def test_lock_floor_gives_up_bounded_and_notifies_once():
+    """Zero Plex-playable candidates: the floor stops at the bounded cap
+    (no infinite loop), returns no pick, and emits the give-up notice once."""
+    bad = mk_track("bad", artist="F")
+    bad.holds = [{"source_id": "jelly", "key": "jelly:bad"}]
+    shuffle = make_shuffle_seq([bad])
+    notify = make_notify()
+    track, source = await resolve_surprise(
+        SEED, "random", **_kw(client=FakeClient(), shuffle_provider=shuffle),
+        get_plex_lock_ids=make_lock({"m1"}), notify_lock_giveup=notify)
+    assert (track, source) == (None, None)
+    assert len(shuffle.calls) == _PLEX_LOCK_FLOOR_TRIES
+    assert len(notify.calls) == 1
+
+
+async def test_lock_floor_empty_ids_set_rejects_everything():
+    """Every-Plex-source-vetoed edge: an EMPTY (non-None) id set keeps the gate
+    active and no holder can qualify — give-up, not inert."""
+    held = plexable(mk_track("held", artist="F"))
+    notify = make_notify()
+    track, source = await resolve_surprise(
+        SEED, "random",
+        **_kw(client=FakeClient(), shuffle_provider=make_shuffle(held)),
+        get_plex_lock_ids=make_lock(set()), notify_lock_giveup=notify)
+    assert (track, source) == (None, None)
+    assert len(notify.calls) == 1
+
+
+async def test_lock_floor_empty_library_stays_quiet():
+    """An empty floor (None on the first draw) is the PRE-EXISTING no-pick
+    condition, not a lock give-up — no notice."""
+    notify = make_notify()
+    track, source = await resolve_surprise(
+        SEED, "random",
+        **_kw(client=FakeClient(), shuffle_provider=make_shuffle(None)),
+        get_plex_lock_ids=make_lock({"m1"}), notify_lock_giveup=notify)
+    assert (track, source) == (None, None)
+    assert notify.calls == []
+
+
+async def test_lock_inert_other_backend_byte_identical():
+    """Filter inert (getter returns None): a hold-less floor pick is returned
+    on the FIRST draw — no re-roll, no playability read, no notice — exactly
+    the pre-U8 behavior."""
+    bare = mk_track("bare", artist="F")        # no holds; would fail the gate
+    shuffle = make_shuffle_seq([bare])
+    notify = make_notify()
+    track, source = await resolve_surprise(
+        SEED, "random", **_kw(client=FakeClient(), shuffle_provider=shuffle),
+        get_plex_lock_ids=make_lock(None), notify_lock_giveup=notify)
+    assert source == SOURCE_RANDOM
+    assert track.id == "bare"
+    assert len(shuffle.calls) == 1
+    assert notify.calls == []
+
+
+async def test_lock_default_getter_is_inert_off_plexplayer():
+    """Composition guard: with NO injected lock getter the default
+    (app.state.plex_lock_enabled_ids) reads the persisted-selection mirror —
+    'direct' ⇒ inert, hold-less picks flow exactly as before."""
+    import app.state as st
+    from unittest.mock import patch
+    bare = mk_track("bare", artist="F")
+    with patch.object(st, "_selected_output_backend", "direct"):
+        track, source = await resolve_surprise(
+            SEED, "random",
+            **_kw(client=FakeClient(), shuffle_provider=make_shuffle(bare)))
+    assert source == SOURCE_RANDOM and track.id == "bare"

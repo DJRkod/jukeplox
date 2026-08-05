@@ -1044,6 +1044,70 @@ def test_volume_and_kebab_use_gradient():
     )
 
 
+def test_volume_snap_buttons_wired():
+    """2026-08-04 volume rework U2: ±5% nudge buttons flank the admin volume
+    slider, snap in the pressed direction via integer-percent math, and REUSE
+    the slider's input pipeline (synthetic dispatch) instead of growing a
+    second write path. Buttons disable at the bounds (U1 mockup pick)."""
+    admin = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert 'id="vol-down"' in admin and 'id="vol-up"' in admin, (
+        "The admin controls row must carry the vol-down / vol-up nudge buttons."
+    )
+    assert 'aria-label="Volume down"' in admin and 'aria-label="Volume up"' in admin, (
+        "Nudge buttons must carry accessible labels (transport-button pattern)."
+    )
+    assert ".vol-btn:disabled" in admin, (
+        "The at-bound treatment is DISABLED (U1 pick) — the template must style it."
+    )
+    assert "function _volSnap" in js and "function _volSyncButtons" in js, (
+        "admin app.js must define the snap + bounds-sync helpers."
+    )
+    assert "dir > 0 ? Math.floor(p / 5) + 1 : Math.ceil(p / 5) - 1" in js, (
+        "Snap must round to the nearest multiple of 5 in the pressed direction "
+        "(exact pairing pinned — a swapped ceil/floor would still contain both "
+        "substrings individually)."
+    )
+    assert "dispatchEvent(new Event('input'))" in js, (
+        "Button writes must reuse the slider input pipeline via synthetic "
+        "dispatch — label/fill/echo-stamp/debounce live there."
+    )
+    assert js.count("'/admin/playback/volume'") == 2, (
+        "Exactly one GET + one POST call site for the volume endpoint — the "
+        "nudge buttons must not add a parallel write path."
+    )
+
+
+def test_volume_orientation_setting_wired():
+    """2026-08-04 volume rework U3: the volume_orientation setting reaches every
+    layer — Settings-form radios, admin JS hydrate/save + data-attribute apply,
+    and the vertical (docked right rail, rotated-input) CSS variant."""
+    admin = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert 'name="volume-orientation"' in admin, (
+        "Setup → Settings must carry the volume-orientation radio pair."
+    )
+    assert 'body[data-vol-orient="vertical"]' in admin, (
+        "The vertical render variant must be a data-attribute CSS switch "
+        "(one render path, no JS fork)."
+    )
+    assert re.search(r'data-vol-orient="vertical"\][^{]*\.vol-group', admin), (
+        "Vertical must dock the .vol-group (right-rail mockup pick)."
+    )
+    assert "rotate(-90deg)" in admin, (
+        "Vertical uses the rotated-horizontal-input technique (U1 pick: scheme "
+        "gradient runs along the bar; arrow keys keep their natural mapping)."
+    )
+    assert "s.volume_orientation" in js and "body.volume_orientation" in js, (
+        "admin app.js must BOTH hydrate (loadSettings) and save (Save Settings "
+        "collection) the volume_orientation key — either site alone regresses."
+    )
+    assert "dataset.volOrient" in js, (
+        "admin app.js must apply the orientation as the body data-attribute "
+        "(at load and on save success)."
+    )
+
+
 def test_release_subtitle_links_and_kebab_parity():
     """2026-06-20 release-view redesign: the artist + year under the cover are
     accent name-links (artist once, here; year drills its releases via
@@ -2071,6 +2135,42 @@ def test_rail_tap_jump_is_instant_not_smooth():
     )
 
 
+def test_rail_geometry_is_containment_safe_structural():
+    """Rail geometry must not trust one-shot offset reads under
+    content-visibility render containment (2026-08-04 rail-tracking debug).
+
+    Off-screen cells occupy their contain-intrinsic-size ESTIMATE (rail.css)
+    until first rendered, so:
+    - a single scrollTop write from target.offsetTop lands past the bucket
+      start (~4 rows deep on a large library) once the destination band
+      realizes at true sizes — jumps must go through _settleJump, which
+      re-corrects across frames until the target is flush;
+    - an activation-time snapshot of marker offsets drifts by thousands of px
+      as cells realize while scrolling (highlight lagged 2-3 letters) — the
+      highlight handler must cache marker ELEMENTS (_alphaMarkers) and read
+      offsetTop live each firing.
+    Behavioral proof: tools/perf/browse-bench.html driven headless (drift
+    -266px -> -0.1px with the fix)."""
+    browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    assert "function _settleJump" in browse, (
+        "rail jumps need the _settleJump convergence loop: one scrollTop write "
+        "lands mid-letter under content-visibility size estimates."
+    )
+    call_sites = browse.count("_settleJump(scrollRoot")
+    assert call_sites >= 2, (
+        f"_settleJump must run on BOTH jump paths (tap handler + drag release); "
+        f"found {call_sites} call site(s)."
+    )
+    assert "_alphaMarkers" in browse, (
+        "the highlight handler must keep the marker-element cache (_alphaMarkers) "
+        "and read offsets live per firing."
+    )
+    assert "offsets.push([el.offsetTop" not in browse and "_alphaSortedOffsets" not in browse, (
+        "no frozen offset snapshots: an activation-time [offsetTop, key] table "
+        "goes stale as content-visibility cells realize their true size."
+    )
+
+
 def test_browse_top_level_rows_use_event_delegation_structural():
     browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
     assert "function _wireListDelegation(" in browse, (
@@ -2293,3 +2393,257 @@ def test_broad_stale_chain_is_bounded():
     )
     # Failures count toward the chain so a dead source can't retry-loop forever.
     assert "if (_broad === b) b.stale++;" in src
+
+
+# ── Plex-player source-lock gray-out (2026-08-04-002 plan U5) ────────────────
+# Structural pins for the shared gray-out surface: row class emission in the
+# shared renderers, the body-level CSS switch in BOTH templates, the
+# dataset.sourceLock wiring in the shared output channel, and the two client
+# copies (rejection toast + album partial-add toast).
+
+
+def test_shared_renderer_stamps_playability_class():
+    browse = BROWSE_JS.read_text(encoding="utf-8")
+    assert "plex_held === false" in browse and "no-plex-hold" in browse, (
+        "makeTrackRow must ALWAYS stamp the no-plex-hold class from the U4 "
+        "plex_held flag (backend-independent — dimming is CSS-only via the "
+        "body attribute, so an output flip needs no refetch)."
+    )
+
+
+def test_queue_and_history_rows_stamp_playability_class():
+    pb = PLAYBACK_JS.read_text(encoding="utf-8")
+    assert pb.count("no-plex-hold") >= 2 and "plex_held === false" in pb, (
+        "applyQueue must stamp no-plex-hold on queue AND history rows — "
+        "pre-switch leftovers (until U6 removes them) dim like browse rows, "
+        "and the queue_changed WS payload carries plex_held for exactly this."
+    )
+
+
+def test_source_lock_css_switch_in_both_templates():
+    for tpl in (GUEST_TEMPLATE, ADMIN_TEMPLATE):
+        src = tpl.read_text(encoding="utf-8")
+        assert 'body[data-source-lock="plex"]' in src, (
+            f"{tpl.name}: dimming must activate ONLY via the body-level "
+            "render switch (css-attribute-render-switch shape) — chrome "
+            "per-template, behavior shared."
+        )
+        assert ".no-plex-hold" in src, (
+            f"{tpl.name}: the switch must target the shared renderers' "
+            "playability class."
+        )
+
+
+def test_source_lock_dataset_wiring_covers_push_and_snapshot():
+    pb = PLAYBACK_JS.read_text(encoding="utf-8")
+    assert "dataset.sourceLock" in pb, (
+        "applyOutputSession must set body.dataset.sourceLock from the "
+        "output_session channel's source_lock field."
+    )
+    assert "delete document.body.dataset.sourceLock" in pb, (
+        "A null source_lock must REMOVE the attribute (clean-absence "
+        "selector contract, the body[data-vol-orient] precedent) — not set "
+        "an empty string."
+    )
+    # Both pages funnel EVERY output_session path (WS push + load/reconnect
+    # snapshot hydration via resume()/refreshQueueState) through the shared
+    # applyOutputSession, so the one wiring above covers reload + reconnect +
+    # live flip on guest and admin alike.
+    for page in (GUEST_APP, ADMIN_APP):
+        src = page.read_text(encoding="utf-8")
+        assert "applyOutputSession" in src, (
+            f"{page.name}: the output_session event/snapshot must route "
+            "through the shared playback module's applyOutputSession."
+        )
+
+
+def test_output_source_lock_toast_is_shared_single_source():
+    browse = BROWSE_JS.read_text(encoding="utf-8")
+    assert "output_source_lock" in browse, (
+        "The shared module must branch the 409 rejection on the "
+        "output_source_lock detail (mirroring the 423 queue_locked toast "
+        "precedent) — status alone collides with the Flood Control 409."
+    )
+    assert "This output can only play Plex tracks" in browse, (
+        "The client copy for the source-lock rejection lives in the shared "
+        "module (one copy for guest + admin)."
+    )
+    # Single source: the copy must not be forked into the per-page files.
+    for page in (GUEST_APP, ADMIN_APP):
+        assert "can only play Plex tracks" not in page.read_text(encoding="utf-8")
+
+
+def test_album_partial_add_toast_reports_filtered_count():
+    browse = BROWSE_JS.read_text(encoding="utf-8")
+    assert "tracks_filtered" in browse, (
+        "addAlbum must read the server's added-vs-filtered counts from the "
+        "extended tracks_added response shape."
+    )
+    assert "unavailable on this output" in browse, (
+        'The partial-add toast ("Added N of M — K unavailable on this '
+        'output") lives in the shared module.'
+    )
+
+
+# ── Output-switch stranded-tracks confirm dialog (2026-08-04-002 plan U6) ────
+# Structural pins for the two-phase switch flow in the admin chrome: the
+# structured-409 branch in the Apply handler, the in-page dialog's loading
+# discipline, both outcome toast copies, and the cancel no-op.
+
+
+def test_output_switch_confirm_dialog_wired_on_structured_409():
+    src = ADMIN_APP.read_text(encoding="utf-8")
+    # api() must surface status + parsed detail — without these the Apply
+    # handler cannot distinguish the structured 409 from any other failure.
+    assert "err.status = resp.status" in src and "err.detail = detail" in src, (
+        "The admin api() helper must attach status and the parsed JSON "
+        "detail to thrown errors (the U6 dialog branches on them)."
+    )
+    assert "d.reason === 'output_switch_confirm'" in src, (
+        "The Apply handler must open the confirm dialog ONLY on the "
+        "structured 409 (detail.reason === 'output_switch_confirm') — a "
+        "plain-string 409 (stale verdict / activate failure) must keep its "
+        "existing recheck path, never the dialog."
+    )
+    assert "showOutputSwitchConfirm(d.stranded_count" in src, (
+        "The dialog must receive the server's stranded_count for its copy."
+    )
+    assert "can't play on this device and will be removed" in src, (
+        "The dialog copy must warn what the confirm does."
+    )
+    tpl = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    assert ".switch-confirm-overlay" in tpl and ".switch-confirm-card" in tpl, (
+        "The dialog styles live in the admin template (admin-only chrome)."
+    )
+
+
+def test_output_switch_confirm_loading_state_disables_controls():
+    src = ADMIN_APP.read_text(encoding="utf-8")
+    assert "if (inFlight) return;" in src, (
+        "The Confirm click must be guarded against double-submit while the "
+        "second POST is in flight."
+    )
+    assert "confirmBtn.disabled = true" in src and "cancelBtn.disabled = true" in src, (
+        "Both dialog controls must disable during the in-flight POST (the "
+        "dialog is not dismissable mid-flight)."
+    )
+    assert "confirmBtn.disabled = false" in src and "cancelBtn.disabled = false" in src, (
+        "A failed confirm must re-enable the controls so the admin can "
+        "retry or cancel."
+    )
+
+
+def test_output_switch_confirm_toast_copies():
+    src = ADMIN_APP.read_text(encoding="utf-8")
+    assert "res.removed_count" in src, (
+        "The success toast must report the server's ACTUAL removed count "
+        "(recomputed at confirm time), never the warned count."
+    )
+    assert "Removed ${removed} unplayable track" in src, (
+        'Success toast copy ("Removed N unplayable tracks") must live in '
+        "the dialog's confirm path."
+    )
+    assert "Could not switch output — queue was not changed" in src, (
+        "Failure toast copy must state that the queue was not changed."
+    )
+
+
+def test_output_switch_confirm_cancel_is_noop():
+    src = ADMIN_APP.read_text(encoding="utf-8")
+    assert ("cancelBtn.addEventListener('click', () => { "
+            "if (!inFlight) overlay.remove(); });") in src, (
+        "Cancel must be a pure dismiss — no request, no state change "
+        "(AE2: reject leaves queue and output untouched) — and refuse "
+        "dismissal mid-flight."
+    )
+    assert "e.target === overlay && !inFlight" in src, (
+        "The backdrop click-dismiss must carry the same mid-flight guard."
+    )
+
+
+# ── Review fixes JFR-1 / JFR-3 (feat/plex-player-output consolidated pass) ───
+
+
+def test_output_session_snapshot_paths_guarded_by_generation():
+    """JFR-1: the output_session snapshot/push ordering guard. A WS push
+    landing during a snapshot fetch's await bumps the generation; the stale
+    snapshot must skip its applyOutputSession (never re-locking UI the push
+    just unlocked). Pins the guard symbol plus BOTH snapshot paths — the
+    shared module's resume() and admin's refreshQueueState."""
+    pb = PLAYBACK_JS.read_text(encoding="utf-8")
+    assert "let _osGen = 0;" in pb, (
+        "The shared playback module must own the output_session generation "
+        "counter (_recentPlaysGen house pattern)."
+    )
+    assert "_osGen++" in pb, (
+        "Every applied output_session payload must bump the generation so "
+        "in-flight snapshot fetches see it moved."
+    )
+    assert "const osGen = _osGen;" in pb, (
+        "resume() must capture the generation BEFORE its fetch await."
+    )
+    assert "osGen === _osGen) applyOutputSession(" in pb, (
+        "resume()'s snapshot apply must be generation-guarded post-await."
+    )
+    assert "outputSessionGen" in pb, (
+        "The handle must expose the generation for the admin page's own "
+        "snapshot path."
+    )
+    admin = ADMIN_APP.read_text(encoding="utf-8")
+    assert "const osGen = playbackHandle.outputSessionGen();" in admin, (
+        "refreshQueueState must capture the generation before its fetch."
+    )
+    assert "osGen === playbackHandle.outputSessionGen()" in admin, (
+        "refreshQueueState's snapshot apply must be generation-guarded."
+    )
+
+
+def test_output_switch_confirm_overlay_is_singleton():
+    """JFR-3a: showOutputSwitchConfirm removes any existing overlay before
+    appending — last intent wins; two dialogs can never stack and both be
+    confirmed."""
+    src = ADMIN_APP.read_text(encoding="utf-8")
+    fn = src.split("function showOutputSwitchConfirm", 1)[1]
+    create = fn.index("document.createElement")
+    assert ("querySelectorAll('.switch-confirm-overlay')" in fn[:create]
+            and ".remove()" in fn[:create]), (
+        "showOutputSwitchConfirm must remove existing .switch-confirm-overlay "
+        "elements BEFORE building the new dialog (singleton, last intent wins)."
+    )
+
+
+def test_apply_output_click_has_inflight_guard():
+    """JFR-3b: the Apply handler carries an in-flight busy guard (the house
+    _surpriseBusy pattern) so a double-click cannot race two POSTs (and
+    two structured 409s → two dialogs)."""
+    src = ADMIN_APP.read_text(encoding="utf-8")
+    assert "let _applyOutputBusy = false;" in src
+    assert "if (_applyOutputBusy) return;" in src, (
+        "The Apply click must bail while a press is in flight."
+    )
+    assert "_applyOutputBusy = true;" in src
+    handler = src.split("btn-apply-output", 2)[-1]
+    assert "finally" in handler and "_applyOutputBusy = false;" in handler, (
+        "The busy flag must clear in a finally so a failed Apply re-enables "
+        "the button path."
+    )
+
+
+# ── Foreign-controller banner copy (2026-08-04-002 plexplayer plan U7) ───────
+# The plexplayer backend yields to a foreign Plex controller by landing the
+# session IDLE_PAUSED with idle_paused_reason="foreign_controller"; the admin
+# banner must render the dedicated re-activate copy for that reason (not the
+# generic "is back but playback stays paused" outage phrasing — the device
+# never went away).
+
+
+def test_admin_banner_has_foreign_controller_copy():
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    fn = js.split("function renderOutputSessionBanner", 1)[1]
+    fn = fn.split("\nfunction ", 1)[0] if "\nfunction " in fn else fn
+    assert "foreign_controller" in fn, (
+        "renderOutputSessionBanner must branch on "
+        "idle_paused_reason === 'foreign_controller'"
+    )
+    assert "Another Plex controller took the device" in fn
+    assert "re-activate to " in fn and "resume jukeplox control" in fn

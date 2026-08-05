@@ -195,6 +195,31 @@ async def get_holds(entity_type: str, identity: str) -> list[dict]:
         return [dict(row) async for row in cur]
 
 
+async def get_holds_map(entity_type: str, identities: list[str]) -> dict[str, list[dict]]:
+    """Holds for MANY identities in one query — the bulk read behind the
+    per-track ``plex_held`` playability flag (2026-08-04-002 plan U4): list
+    payloads stamp every row per request, so this must be one holds pass,
+    never per-row ``get_holds`` calls. Same row shape/order as ``get_holds``
+    (priority-ascending, ``source_id`` tie-break). Identities with no holds
+    simply have no entry (callers treat a miss as "no holders")."""
+    ids = [i for i in dict.fromkeys(identities) if i]
+    out: dict[str, list[dict]] = {}
+    # Chunked to stay clear of SQLite's bound-parameter cap (999 in older
+    # builds); one query per 500 identities is still "one pass" in practice.
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        marks = ",".join("?" * len(chunk))
+        async with database._conn().execute(
+            f"SELECT {_HOLD_COLS} FROM catalog_holds"
+            f" WHERE entity_type = ? AND identity IN ({marks})"
+            " ORDER BY priority, source_id",
+            (entity_type, *chunk),
+        ) as cur:
+            async for row in cur:
+                out.setdefault(row["identity"], []).append(dict(row))
+    return out
+
+
 async def get_identities_held_by_source(
     source_id: str, entity_type: str = "track"
 ) -> list[str]:
