@@ -1147,9 +1147,10 @@ const _togglingSources = new Set();  // source_ids with an in-flight switch POST
 let _loadSourcesGen = 0;             // monotonic guard: a slower loadSources() must not overwrite a fresher render
 
 // One source-grouped list: each source is a row carrying a whole-source on/off
-// switch, priority arrows, (non-Plex) Remove, and — when it holds more than one
-// library — an "Edit libraries…" drill-in that reveals nested per-library
-// checkboxes. Source-off greys AND disables those checkboxes (source-off wins).
+// switch, priority arrows, (non-Plex) Remove, and an "Edit libraries…" drill-in
+// that reveals nested per-library checkboxes (rendered for every source with
+// libraries — single-library sources included, fresh-install audit F1).
+// Source-off greys AND disables those checkboxes (source-off wins).
 // Grouping replaces the old "(Type — owner)" disambiguation tags (Libraries-panel).
 function renderSourcesList(sources, libs) {
   _currentSources = sources.slice();
@@ -1192,7 +1193,6 @@ function renderSourcesList(sources, libs) {
   sources.forEach((src, i) => {
     const sid = src.source_id;
     const srcLibs = bySource[sid] || [];
-    const multi = srcLibs.length > 1;
     let on = src.enabled !== false;
 
     const block = document.createElement('div');
@@ -1208,8 +1208,10 @@ function renderSourcesList(sources, libs) {
     const meta = document.createElement('span');
     meta.className = 'src-meta';
     const setMeta = () => {
+      // State-aware for every source size: the old single-library "1 library" label
+      // hid a disabled library behind healthy-looking text (fresh-install audit F1).
       const n = srcLibs.filter(l => l.enabled).length;
-      meta.textContent = !srcLibs.length ? '' : (multi ? `${n} of ${srcLibs.length} on` : '1 library');
+      meta.textContent = !srcLibs.length ? '' : `${n} of ${srcLibs.length} on`;
     };
 
     // Nested per-library checkboxes (source-off greys + disables them).
@@ -1238,8 +1240,11 @@ function renderSourcesList(sources, libs) {
       children.appendChild(label);
     });
 
-    // "Edit libraries…" drill-in — only when the source holds more than one library.
-    if (multi) {
+    // "Edit libraries…" drill-in — for every source with libraries. Gating this on
+    // more-than-one library left a single-library Plex source's checkbox unreachable
+    // (no expander, nothing seeded on connect → permanently empty catalog on fresh
+    // installs; fresh-install audit F1, 2026-08-06).
+    if (srcLibs.length > 0) {
       const drill = document.createElement('button');
       drill.type = 'button';
       drill.className = 'drill';
@@ -1311,7 +1316,7 @@ function renderSourcesList(sources, libs) {
     row.appendChild(controls);
     row.appendChild(sw);
     block.appendChild(row);
-    if (multi) block.appendChild(children);
+    if (srcLibs.length > 0) block.appendChild(children);
     sourcesList.appendChild(block);
   });
   syncSurpriseSourceNote();
