@@ -202,6 +202,21 @@
       .release-main { flex: 1; min-width: 0; }
     }
     .overflow-menu button:disabled, .overflow-menu button.sheet-disabled { color: #555; cursor: default; }
+    /* Plex-player source lock (2026-08-04-002 plan U5): the shared renderers
+       stamp .no-plex-hold on every row whose track has no enabled-Plex holder
+       (backend-independent); dimming activates ONLY through this body-level
+       render switch (set from the output_session channel by the shared
+       playback module), so an output flip restyles live with no refetch.
+       Opacity .45 matches the aria-disabled rail dim (text stays readable);
+       queue affordances get the not-allowed cursor cue but NEVER
+       pointer-events:none — taps must still reach the shared click-guard /
+       server gate, and the kebab's navigation stays fully usable. Covers
+       browse/search rows (.list-item), the queue pane (.queue-item), and the
+       recents strip (.qs-history). */
+    body[data-source-lock="plex"] .no-plex-hold { opacity: .45; }
+    body[data-source-lock="plex"] .list-item.no-plex-hold,
+    body[data-source-lock="plex"] .queue-item.no-plex-hold { cursor: not-allowed; }
+    body[data-source-lock="plex"] .no-plex-hold .kebab-btn { cursor: pointer; }
     /* Appearance gear + panel (2026-06-11 glow-up U5). The DOM is built by
        shared.js mountAppearance (single-source component on both pages);
        this styles it. Gear bottom-right; the undo snack's max-width cap

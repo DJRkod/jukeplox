@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app import database
+from app import database, state
 from app.api import guest
 from app.catalog import store, views
 from app.config import Settings
@@ -317,3 +317,109 @@ async def test_genre_albums_unknown_style_empty(db):
     await _seed_genre_catalog(db)
     assert await views.genre_albums("jazz") == []
     assert await views.genre_albums("  ") == []
+
+
+# ── plex_held playability predicate (2026-08-04-002 plexplayer plan U4) ──────
+
+async def _seed_mixed_playability(db):
+    """t1 = Jellyfin PRIMARY + Plex secondary holder (AE4's shape);
+    t2 = Jellyfin-only (no Plex-shaped keys at all)."""
+    await store.replace_catalog(
+        artists=[{"identity": "ar", "title": "Act", "base_key": "act"}],
+        albums=[{"identity": "al", "title": "Rec", "title_base": "rec", "artist": "Act",
+                 "artist_base_key": "act", "year": 2020, "track_count": 2}],
+        tracks=[
+            {"identity": "t1", "title": "Both", "title_base": "both", "artist": "Act",
+             "artist_base_key": "act", "album": "Rec", "album_identity": "al",
+             "duration_ms": 180000, "disc_number": 1, "track_number": 1},
+            {"identity": "t2", "title": "Jelly Only", "title_base": "jelly only",
+             "artist": "Act", "artist_base_key": "act", "album": "Rec",
+             "album_identity": "al", "duration_ms": 200000, "disc_number": 1,
+             "track_number": 2},
+        ],
+        holds=[
+            {"entity_type": "track", "identity": "t1", "source_id": "jelly", "provider_local_key": "jelly:p1", "priority": 0, "server_name": "Jelly"},
+            {"entity_type": "track", "identity": "t1", "source_id": "m1", "provider_local_key": "m1:p1", "priority": 1, "server_name": "Plex"},
+            {"entity_type": "track", "identity": "t2", "source_id": "jelly", "provider_local_key": "jelly:p2", "priority": 0, "server_name": "Jelly"},
+        ],
+    )
+
+
+async def test_plex_held_true_with_jellyfin_primary_and_plex_holder(db):
+    """Covers AE4: the primary being Jellyfin doesn't matter — ≥1 hold from an
+    enabled source of TYPE plex (registry map, never count) makes it True."""
+    await _seed_mixed_playability(db)
+    with patch("app.state.get_plex_client", AsyncMock(return_value=_typed_registry())):
+        enabled = await state.plex_enabled_source_ids()
+    assert enabled == {"m1"}
+    assert views.holds_plex_held(await store.get_holds("track", "t1"), enabled) is True
+
+
+async def test_plex_held_false_for_non_plex_only_identity(db):
+    """A Jellyfin/local-only identity has no Plex-shaped keys → False, without
+    raising (the tolerance half of AE4)."""
+    await _seed_mixed_playability(db)
+    with patch("app.state.get_plex_client", AsyncMock(return_value=_typed_registry())):
+        enabled = await state.plex_enabled_source_ids()
+    assert views.holds_plex_held(await store.get_holds("track", "t2"), enabled) is False
+
+
+async def test_plex_held_disabled_plex_source_disqualifies_its_holders(db):
+    """Libraries-panel whole-source veto: a disabled Plex source's holders no
+    longer qualify — read live per request, no rescan needed."""
+    await _seed_mixed_playability(db)
+    await database.set_disabled_sources(["m1"])
+    with patch("app.state.get_plex_client", AsyncMock(return_value=_typed_registry())):
+        enabled = await state.plex_enabled_source_ids()
+    assert enabled == set()
+    assert views.holds_plex_held(await store.get_holds("track", "t1"), enabled) is False
+
+
+def test_holds_plex_held_tolerates_malformed_and_empty_holds():
+    """No hold list / odd shapes → False, never a raise."""
+    enabled = {"m1"}
+    assert views.holds_plex_held(None, enabled) is False
+    assert views.holds_plex_held([], enabled) is False
+    assert views.holds_plex_held([{"key": "x"}], enabled) is False       # no source_id
+    assert views.holds_plex_held(["not-a-dict", 7], enabled) is False    # junk entries
+    assert views.holds_plex_held([{"source_id": "jelly", "key": "jelly:p"}], enabled) is False
+
+
+async def test_plex_enabled_source_ids_empty_without_registry():
+    with patch("app.state.get_plex_client", AsyncMock(return_value=None)):
+        assert await state.plex_enabled_source_ids() == set()
+
+
+async def test_get_holds_map_bulk_matches_per_identity_reads(db):
+    """The one-query bulk read (list-payload perf guard) agrees with
+    get_holds row-for-row; unknown/empty identities simply have no entry."""
+    await _seed_mixed_playability(db)
+    m = await store.get_holds_map("track", ["t1", "t2", "ghost", "", "t1"])
+    assert set(m) == {"t1", "t2"}
+    assert m["t1"] == await store.get_holds("track", "t1")
+    assert m["t2"] == await store.get_holds("track", "t2")
+
+
+async def test_browse_album_tracks_catalog_rows_carry_live_plex_held(db):
+    """Endpoint-level (catalog floor): every row carries the backend-
+    independent flag from THIS request's holds; disabling the Plex source
+    flips it live on the next request (no rescan, no refetch semantics)."""
+    await _seed_mixed_playability(db)
+    with patch("app.state.get_plex_client", AsyncMock(return_value=_typed_registry())):
+        rows = await guest.browse_album_tracks("al")
+        assert [(r["track_id"], r["plex_held"]) for r in rows] == [
+            ("t1", True), ("t2", False)]
+        await database.set_disabled_sources(["m1"])
+        rows2 = await guest.browse_album_tracks("al")
+        assert [r["plex_held"] for r in rows2] == [False, False]
+
+
+async def test_annotate_plex_held_identity_mode_resolves_live(db):
+    """The tracks-less mode (queue snapshots / persisted most-played rows):
+    one bulk holds read keyed by identity; an uncatalogued id degrades to
+    False without raising."""
+    await _seed_mixed_playability(db)
+    rows = [{"track_id": "t1"}, {"track_id": "t2"}, {"track_id": "ghost"}]
+    with patch("app.state.get_plex_client", AsyncMock(return_value=_typed_registry())):
+        await guest._annotate_plex_held(rows)
+    assert [r["plex_held"] for r in rows] == [True, False, False]

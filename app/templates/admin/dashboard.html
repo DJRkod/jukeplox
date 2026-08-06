@@ -339,6 +339,18 @@
       .admin-shell .release-main { flex: 1; min-width: 0; }
     }
     .admin-shell .overflow-menu button:disabled, .admin-shell .overflow-menu button.sheet-disabled { color: #555; cursor: default; }
+    /* Plex-player source lock (2026-08-04-002 plan U5): same body-level
+       render switch as the guest template — the shared modules stamp
+       .no-plex-hold from the U4 plex_held flag; this attribute (set by the
+       shared playback module from the output_session channel) is the ONLY
+       thing that makes it dim. No admin bypass on the visual either: the
+       admin's queue endpoints reject the same 409 output_source_lock.
+       Queue-pane rows keep their drag/remove affordances usable (dim only —
+       removing a stranded leftover is exactly what the admin wants);
+       cursor cue on browse rows, kebab navigation stays live. */
+    body[data-source-lock="plex"] .no-plex-hold { opacity: .45; }
+    body[data-source-lock="plex"] .admin-shell .list-item.no-plex-hold { cursor: not-allowed; }
+    body[data-source-lock="plex"] .admin-shell .no-plex-hold .kebab-btn { cursor: pointer; }
     .undo-snack { position: fixed; left: 50%; transform: translateX(-50%); bottom: 18px; z-index: 200; display: flex; align-items: center; gap: 1rem; background: var(--surface2); color: var(--text); padding: .6rem .9rem; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.5); font-size: .9rem; max-width: calc(100vw - 112px); }
     .undo-snack-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .undo-snack button { background: none; border: none; color: var(--accent); font-size: .9rem; font-weight: 600; cursor: pointer; padding: .2rem .4rem; }
@@ -479,6 +491,15 @@
     .overflow-menu button:hover:not(:disabled) { background: var(--surface2); }
     .overflow-menu button:last-child { border-bottom: none; color: var(--muted); }
     .overflow-menu button:disabled { color: #555; cursor: not-allowed; }
+    /* Stranded-tracks switch confirm (plexplayer plan U6): admin-only chrome
+       dialog for the structured 409 on POST /admin/output/active. The card
+       carries its own Confirm/Cancel ON TOP of the backdrop (blocking-overlay
+       lesson: a blocking overlay must never cover its own dismiss control);
+       sits under the toast (z 9999) so the outcome toast stays visible. */
+    .switch-confirm-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 1200; display: flex; align-items: center; justify-content: center; }
+    .switch-confirm-card { background: var(--surface2); color: var(--text); border-radius: 10px; padding: 1.25rem 1.5rem; max-width: 380px; margin: 1rem; box-shadow: 0 8px 32px rgba(0,0,0,.5); }
+    .switch-confirm-card p { margin: 0; }
+    .switch-confirm-actions { display: flex; gap: .75rem; justify-content: flex-end; margin-top: 1rem; }
     .overflow-menu button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
     /* ── Recent Plays curation panel (2026-07-03 plan; Direction A) ──────────

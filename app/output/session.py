@@ -1363,6 +1363,41 @@ def notify_reconnect_trigger(trigger: str) -> None:
     _spawn_supervised(sup._attempt_reattach(ot, trigger))
 
 
+async def hold_foreign_controller() -> None:
+    """Foreign-controller yield (2026-08-04-002 plexplayer plan U7): another
+    Plex controller took the device's play queue, so jukeplox stops
+    dispatching until the admin re-activates.
+
+    Mechanically this is the standard outage hold (queue frozen, the
+    current item re-front-inserted with its R19 mark — a resume never
+    re-counts a confirmed play) — but the device is REACHABLE, so the
+    reconnect machinery must NOT run: an auto re-attach would re-dispatch
+    and fight the other controller for the queue. The retry timer and
+    arrival watch retire immediately, the outage context is marked
+    ``attached`` (a manual resume goes straight to the dispatch, which IS
+    the re-activate), and the session lands IDLE_PAUSED with reason
+    ``foreign_controller`` — the reason rides ``idle_paused_reason`` into
+    the admin ``output_session`` payload, where
+    ``renderOutputSessionBanner`` (static/admin/app.js) shows the dedicated
+    banner copy. MUST run on the event loop (backend poll tasks do)."""
+    sup = get_supervisor()
+    token = sup.current_token()
+    play_recorded = (sup.dispatch_play_recorded(token)
+                     if token is not None else None)
+    await hold.enter_output_hold("foreign_controller",
+                                 play_recorded=play_recorded)
+    if not hold.output_hold_active():
+        return  # hold entry did not take — nothing to land
+    ot = sup._outage
+    if ot is not None:
+        ot.cancel_timer()
+        sup._unwatch_arrival(ot)
+        ot.attached = True  # reachable device: manual resume dispatches directly
+    sup.session_state = STATE_IDLE_PAUSED
+    sup.idle_paused_reason = "foreign_controller"
+    await session_events.emit_session_event()
+
+
 async def set_held_volume(level: float) -> None:
     """R17: a volume change during a hold is accepted + persisted + applied at
     re-attach before audio — never a live device write to a dead output (the

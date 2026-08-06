@@ -117,14 +117,20 @@ async def get_queue():
     m = manager.guest_m
     queue = q.queue[:n] if n is not None else q.queue
     history = q.history[:m] if m is not None else q.history
+    # added_at is the per-entry half of the append receipt (track_id is
+    # the other); the guest UI matches it against its stored receipts to
+    # show a remove (✕) on the entries this browser queued. Upcoming only
+    # — history/now-playing are not guest-removable. (mirrors admin's
+    # per-item `position` merge in app/api/admin.py get_queue)
+    queue_rows = [{**_track_dict(i.track), "added_at": i.added_at} for i in queue]
+    history_rows = [_track_dict(i.track) for i in history]
+    # plex_held: identity-mode annotate (queue rows carry enqueue-time hold
+    # SNAPSHOTS — the flag must resolve live; plan U4). One combined pass so
+    # queue + history (the recents strip) share a single bulk holds read.
+    await _annotate_plex_held(queue_rows + history_rows)
     return {
-        # added_at is the per-entry half of the append receipt (track_id is
-        # the other); the guest UI matches it against its stored receipts to
-        # show a remove (✕) on the entries this browser queued. Upcoming only
-        # — history/now-playing are not guest-removable. (mirrors admin's
-        # per-item `position` merge in app/api/admin.py get_queue)
-        "queue": [{**_track_dict(i.track), "added_at": i.added_at} for i in queue],
-        "history": [_track_dict(i.track) for i in history],
+        "queue": queue_rows,
+        "history": history_rows,
         "is_locked": q.is_locked,
     }
 
@@ -169,6 +175,86 @@ def _track_dict(t) -> dict:
     if len(src) > 1:
         d["sources"] = src
     return d
+
+
+async def _annotate_plex_held(rows: list[dict],
+                              tracks: list | None = None) -> list[dict]:
+    """Stamp the per-track ``plex_held`` flag on serialized track rows, in
+    place (2026-08-04-002 plexplayer plan U4, R6 data layer).
+
+    ALWAYS emitted, true/false, regardless of the active backend — the flag
+    is the plain fact "this identity has ≥1 hold from an enabled Plex
+    source", resolved live at render time (rescan-safe), with zero
+    conditional-on-backend logic; whether a row *dims* is decided purely by
+    the client's body-level ``source_lock`` switch (U5).
+
+    Two resolution modes, both one registry read + one map build per request
+    (never per-row queries — the browse-latency guard):
+
+    * ``tracks`` given (catalog browse/search assembly): the parallel model
+      objects already carry this request's freshly-loaded holds
+      (``views._track``) — derive from them, no extra queries.
+    * ``tracks`` omitted (queue snapshots, persisted most-played/
+      highest-rated metadata rows): resolve live by identity through ONE
+      bulk ``catalog_holds`` read (``store.get_holds_map``) — enqueue-time
+      hold snapshots and record-time metadata both go stale across rescans.
+
+    Native single-Plex path (no catalog floor): every served track IS
+    Plex-backed — constant True, no catalog reads."""
+    if not rows:
+        return rows
+    if not await _catalog_active():
+        for r in rows:
+            r["plex_held"] = True
+        return rows
+    from app.catalog import store, views
+    enabled = await state.plex_enabled_source_ids()
+    if not enabled:
+        # No enabled Plex source exists — no holder can qualify. Constant
+        # False without the holds read (also keeps annotate DB-free on
+        # registry-less/mixed test doubles).
+        for r in rows:
+            r["plex_held"] = False
+        return rows
+    if tracks is not None:
+        for r, t in zip(rows, tracks):
+            r["plex_held"] = views.holds_plex_held(
+                getattr(t, "holds", None), enabled)
+        return rows
+    # PLX-9: the same alias-bridged holds read the enqueue gate uses — a
+    # native-id queue entry (admin album append shape) must annotate
+    # exactly as the gate would decide it, or flag and gate disagree.
+    holds_map = await _bridged_holds_map(
+        [r.get("track_id") for r in rows if r.get("track_id")])
+    for r in rows:
+        r["plex_held"] = views.holds_plex_held(
+            holds_map.get(r.get("track_id")), enabled)
+    return rows
+
+
+async def _bridged_holds_map(track_ids: list[str]) -> dict:
+    """Bulk track-holds lookup WITH the alias bridge (review fix PLX-9 —
+    factored out of the enqueue gate so ``_plex_playable_ids`` and
+    ``_annotate_plex_held`` can never disagree): ids the holds table doesn't
+    know directly (native provider ids — the admin album branch resolves
+    those in catalog mode, and they land in the queue as entry track_ids)
+    get one identity-resolution attempt through ``catalog_identity_alias``;
+    a bridged identity's holds are surfaced under the ORIGINAL id."""
+    from app.catalog import identity as cat_identity, store
+    holds_map = await store.get_holds_map("track", track_ids)
+    aliases = {}
+    for tid in track_ids:
+        if tid not in holds_map:
+            ident = await cat_identity.identity_for_track_id(tid)
+            if ident and ident != tid:
+                aliases[tid] = ident
+    if aliases:
+        alias_holds = await store.get_holds_map(
+            "track", list(dict.fromkeys(aliases.values())))
+        for tid, ident in aliases.items():
+            if ident in alias_holds:
+                holds_map[tid] = alias_holds[ident]
+    return holds_map
 
 
 # ── Lyrics (Now Playing → Lyrics, plan 2026-06-17-008 U2) ─────────────────────
@@ -873,9 +959,13 @@ async def browse_artist_songs(artist_id: str):
             return {"popular_available": False, "releases": [], "tracks": []}
         releases = [{"id": a["identity"], "title": a["title"], "year": a["year"], "kind": "own"}
                     for a in await store.get_albums_for_artist(artist["base_key"])]
+        songs = await views.artist_songs(artist_id)
         tracks = [{**_track_dict(t), "release": t.album, "release_year": t.year,
                    "kind": "own", "pop_rank": None}
-                  for t in await views.artist_songs(artist_id)]
+                  for t in songs]
+        # plex_held from the holds views.artist_songs just loaded (plan U4 —
+        # no second holds pass).
+        await _annotate_plex_held(tracks, songs)
         counts = await database.get_play_counts("track", [t["track_id"] for t in tracks])
         for t in tracks:
             t["plays"] = counts.get(t["track_id"], 0)
@@ -929,6 +1019,7 @@ async def browse_artist_songs(artist_id: str):
                 "release_year": rel["year"],
                 "kind": rel["kind"],
             })
+    await _annotate_plex_held(tracks)  # native branch → constant True (plan U4)
 
     # Most Played source: the app's local play_counts store (NOT Plex viewCount).
     from app import database
@@ -1228,7 +1319,10 @@ async def _resolve_album_tracks(client, album_id: str, *, source_server_name: st
 async def browse_album_tracks(album_id: str):
     if await _catalog_active():
         from app.catalog import views
-        return [_track_dict(t) for t in await views.album_tracks(album_id)]
+        cat_tracks = await views.album_tracks(album_id)
+        # plex_held from the holds views.album_tracks just loaded (plan U4).
+        return await _annotate_plex_held(
+            [_track_dict(t) for t in cat_tracks], cat_tracks)
     validate_plex_id(album_id)
     client = await state.get_plex_client()
     if not client:
@@ -1237,7 +1331,7 @@ async def browse_album_tracks(album_id: str):
         tracks = await _resolve_album_tracks(client, album_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Album not found")
-    return [_track_dict(t) for t in tracks]
+    return await _annotate_plex_held([_track_dict(t) for t in tracks])
 
 
 @router.get("/api/browse/genres")
@@ -1406,10 +1500,12 @@ async def most_played():
                 _bt = asyncio.create_task(database.set_play_track_meta(r["track_id"], r["metadata"]))
                 _bt.add_done_callback(state._log_task_exc)
     await _refresh_album_drill(rows)
-    return [
+    # plex_held: identity-mode annotate — metadata rows are RECORD-TIME
+    # snapshots; the flag must resolve live from current holds (plan U4).
+    return await _annotate_plex_held([
         {**r["metadata"], "play_count": r["count"]}
         for r in rows if r["metadata"] is not None
-    ]
+    ])
 
 
 # ── Track ratings + tags read paths (2026-06-26 ratings-and-tags plan U3) ────
@@ -1471,10 +1567,12 @@ async def highest_rated(request: Request):
                 _bt = asyncio.create_task(database.set_play_track_meta(r["track_id"], r["metadata"]))
                 _bt.add_done_callback(state._log_task_exc)
     await _refresh_album_drill(rows)
-    return [
+    # plex_held: identity-mode annotate (record-time snapshots — resolve
+    # live; plan U4, same as /api/most-played).
+    return await _annotate_plex_held([
         {**r["metadata"], "rating": r["stars"], "play_count": r["play_count"]}
         for r in rows if r["metadata"] is not None
-    ]
+    ])
 
 
 def _dedup_by_id(items):
@@ -1494,7 +1592,10 @@ async def search(q: str = Query(..., min_length=1)):
     if await _catalog_active():
         from app.catalog import views
         res = await views.search(q)
-        res["tracks"] = [_track_dict(t) for t in res["tracks"]]
+        found = res["tracks"]
+        # plex_held from the holds views.search just loaded (plan U4).
+        res["tracks"] = await _annotate_plex_held(
+            [_track_dict(t) for t in found], found)
         return res
     client = await state.get_plex_client()
     if not client:
@@ -1520,7 +1621,8 @@ async def search(q: str = Query(..., min_length=1)):
     # this, _dedup_artists would wrongly suppress its release count, and
     # tracks (which have no server-side dedup at all) would duplicate in
     # the payload.
-    all_tracks = [_track_dict(t) for t in _dedup_by_id([t for r in ok for t in r.tracks])]
+    all_tracks = await _annotate_plex_held(
+        [_track_dict(t) for t in _dedup_by_id([t for r in ok for t in r.tracks])])
     # Albums keep their library attribution (plan U2): per_call order is
     # [lib × variant], so zip against the same pairs; _by_id collapse runs
     # on the tagged stream (same id ⇒ same server, first tag wins).
@@ -1615,11 +1717,11 @@ async def search_broad(
     )
     out: dict = {"tracks": [], "albums": []}
     if "track" in want:
-        out["tracks"] = [
+        out["tracks"] = await _annotate_plex_held([
             _track_dict(t) for t in _dedup_by_id(
                 [t for r in per_call if not isinstance(r, BaseException) for t in r.tracks]
             )
-        ]
+        ])
     if "album" in want:
         # Same lib×variant zip + id-tag pattern as /api/search (first tag wins).
         pairs = [(lib, v) for lib in libs for v in variants]
@@ -1710,6 +1812,75 @@ async def _catalog_album_tracks(album_id: str) -> list:
     return [await views._track(r) for r in rows]
 
 
+async def _plex_playable_ids(track_ids: list[str], *,
+                             assume_lock: bool = False) -> set[str] | None:
+    """The server-side enqueue gate's resolver (2026-08-04-002 plexplayer
+    plan U5; R6, AE3, F2): which of *track_ids* may be enqueued while the
+    selected output can only play Plex tracks — or ``None`` when the gate
+    is inert. Shared verbatim by the guest AND admin queue endpoints (no
+    admin bypass); the client's gray-out is UX, THIS is the gate.
+
+    Inert (``None``) when:
+    * ``state.output_requires_plex()`` is False — the U4 gate truth, read
+      from the PERSISTED selected backend, never ``output_router.active``
+      (whose swap defers mid-play; see the loud warning on the predicate).
+      ``assume_lock=True`` skips ONLY this check: the U6 switch-time
+      stranded pre-check needs the answer for a TARGET backend before
+      ``activate_backend`` persists the selection (the lock isn't active
+      yet, but the caller is deciding whether to make it so);
+    * the catalog floor is inactive — the native single/multi-Plex path,
+      where every served track IS Plex-backed (mirrors
+      ``_annotate_plex_held``'s constant-True branch exactly). This check
+      is NEVER skipped — on the native path every track is Plex-held, so
+      there is nothing to strand regardless of the target.
+
+    Active: resolved LIVE from catalog holds via the U4 predicate pieces
+    (one registry read + one bulk holds read — never a client-supplied
+    flag, never the enqueue-time hold snapshots, which go stale across
+    rescans). Ids the holds table doesn't know directly (admin album
+    appends resolve native provider ids, not identities, in catalog mode)
+    get one alias-bridge attempt through ``catalog_identity_alias`` before
+    failing the predicate."""
+    from app.catalog import views
+    # S-1: the ONE gate entry decides inert-vs-active (persisted-selection
+    # mirror + catalog-floor check + enabled-id build all live there).
+    enabled = await state.plex_lock_enabled_ids(assume_lock=assume_lock)
+    if enabled is None:
+        return None
+    if not enabled:
+        # No enabled Plex source can hold anything — nothing is playable.
+        return set()
+    ids = [t for t in track_ids if t]
+    holds_map = await _bridged_holds_map(ids)
+    return {tid for tid in ids
+            if views.holds_plex_held(holds_map.get(tid), enabled)}
+
+
+async def _require_playable(track_id: str) -> None:
+    """U5 per-track enqueue gate (S-3: defined once beside the resolver,
+    shared verbatim by the guest AND admin queue endpoints — no admin
+    bypass): while the selected output can only play Plex tracks, a track
+    with no enabled-Plex holder is rejected 409 ``output_source_lock``
+    (the detail the shared module toasts distinctly)."""
+    playable = await _plex_playable_ids([track_id])
+    if playable is not None and track_id not in playable:
+        raise HTTPException(status_code=409, detail="output_source_lock")
+
+
+async def _filter_playable(tracks: list) -> tuple[list, int]:
+    """U5 album-subset policy (S-3, both queue endpoints): keep only the
+    playable subset and report the withheld count; a zero-playable batch
+    gets the same 409 shape as the per-track rejection. Gate inert →
+    ``(tracks, 0)`` untouched."""
+    playable = await _plex_playable_ids([t.id for t in tracks])
+    if playable is None:
+        return tracks, 0
+    kept = [t for t in tracks if t.id in playable]
+    if not kept:
+        raise HTTPException(status_code=409, detail="output_source_lock")
+    return kept, len(tracks) - len(kept)
+
+
 class QueueAppendRequest(BaseModel):
     track_id: str | None = None
     album_id: str | None = None
@@ -1738,7 +1909,9 @@ async def append_to_queue(body: QueueAppendRequest):
     validate_plex_id(body.album_id)
 
     if body.track_id:
-        # Single track
+        # Single track. U5 source-lock gate FIRST (R6/AE3): the fundamental
+        # "can't play here" outranks the incidental "already queued".
+        await _require_playable(body.track_id)
         is_dup = q.is_duplicate(body.track_id)
         # Flood Control (2026-06-16): when the admin toggle is on, a guest may
         # not re-add a track that's currently playing or already in the upcoming
@@ -1791,6 +1964,11 @@ async def append_to_queue(body: QueueAppendRequest):
     if not tracks:
         raise HTTPException(status_code=404, detail="Album not found or no tracks")
 
+    # U5 subset policy (batch path): only the playable subset is enqueued;
+    # the response reports the filtered count so the shared module can
+    # toast "Added N of M" (S-3 shared helper).
+    tracks, tracks_filtered = await _filter_playable(tracks)
+
     # All-or-nothing batch append: validate full batch under one lock so a
     # partial album never lands when the queue is at the cap (was: per-track
     # appends could land N tracks then 423 on the N+1th, leaving the queue
@@ -1807,7 +1985,10 @@ async def append_to_queue(body: QueueAppendRequest):
     # one receipt per created entry so the guest UI can group them and offer
     # "remove these N tracks I added" as a unit. The single-track branch keeps
     # its `entry` (singular) shape; albums use `entries` (plural).
+    # tracks_filtered (plan U5): how many of the album's tracks the source
+    # lock withheld — 0 whenever the gate is inert, so the shape is stable.
     return {"ok": True, "tracks_added": len(items),
+            "tracks_filtered": tracks_filtered,
             "entries": [{"track_id": it.track_id, "added_at": it.added_at}
                         for it in items]}
 

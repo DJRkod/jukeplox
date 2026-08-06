@@ -135,6 +135,7 @@ def mock_state(mock_session):
          patch("app.state.chromecast_backend", None), \
          patch("app.state.dlna_backend", None), \
          patch("app.state.airplay_backend", None), \
+         patch("app.state.plexplayer_backend", None), \
          patch("app.output.probe_cache.fetch_all", AsyncMock(return_value={})), \
          patch("app.output.probe_cache.clear_all_verdicts", AsyncMock()), \
          patch("app.output.probe_cache.set_verdict", AsyncMock()):
@@ -183,3 +184,15 @@ def client(mock_state):
 def anon_client():
     from app.main import app
     return TestClient(app, raise_server_exceptions=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gdm_broadcast(monkeypatch):
+    """Hermetic default: the GDM probe must NEVER broadcast on the real LAN
+    during tests (it genuinely finds live players — Banana answered a test
+    run). Tests that exercise the GDM leg re-patch gdm_probe_players
+    explicitly; everyone else gets an empty ether."""
+    async def _silent(*args, **kwargs):
+        return []
+    import app.plex.companion as _companion
+    monkeypatch.setattr(_companion, "gdm_probe_players", _silent)

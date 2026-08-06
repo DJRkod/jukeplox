@@ -680,3 +680,90 @@ async def test_build_registry_snapshot_direct_failure_is_fail_soft():
             {}, backend_for={"direct": direct}.get)
 
     assert payload == []
+
+
+# ── plexplayer (2026-08-04-002 plan U3) ──────────────────────────────────────
+
+
+def test_backend_maps_include_plexplayer():
+    """plexplayer is first-class in every enumeration map: appended LAST in
+    the walk order (pre-existing backends' name seeding unchanged),
+    friendly-name tier alongside DLNA/Chromecast, and gapless "unverified"
+    (DLNA semantics — promoted per device by U7's behavioral verdict)."""
+    from app.output.discovery import (
+        _BACKEND_ORDER,
+        _NAME_PRIORITY,
+        GAPLESS_CAPABILITY,
+    )
+    assert _BACKEND_ORDER == (
+        "direct", "airplay", "chromecast", "dlna", "plexplayer")
+    assert _NAME_PRIORITY["plexplayer"] == _NAME_PRIORITY["dlna"]
+    assert GAPLESS_CAPABILITY["plexplayer"] == "unverified"
+
+
+def test_host_for_plexplayer_reads_device_host_accessor():
+    """host_for resolves plexplayer entries through the backend's public
+    device_host accessor (its _device_addresses cache); unknown device or
+    missing backend → None (dropped, never bucketed under junk)."""
+    from types import SimpleNamespace
+    backend = SimpleNamespace(
+        device_host=lambda did: {"caldera-1": "192.168.1.88"}.get(did))
+    d = OutputDevice(id="caldera-1", name="Caldera",
+                     backend_type="plexplayer", id_format="uuid")
+    assert host_for(d, "plexplayer", {"plexplayer": backend}.get) == "192.168.1.88"
+    ghost = OutputDevice(id="ghost", name="Ghost",
+                         backend_type="plexplayer", id_format="uuid")
+    assert host_for(ghost, "plexplayer", {"plexplayer": backend}.get) is None
+    assert host_for(d, "plexplayer", {"plexplayer": None}.get) is None
+
+
+def test_aggregate_merges_plexplayer_with_dlna_at_same_host():
+    """Host-merge pin (plan U3 open check): a Companion player sharing an
+    IP with a DLNA renderer merges into ONE multi-protocol picker entry —
+    deliberate and acceptable per plan (no DIRECT_HOST-style sentinel).
+    Equal name rank, so the DLNA name wins by first arrival (walk order:
+    dlna before plexplayer)."""
+    per_backend = {
+        "dlna": [OutputDevice(id="uuid:dlna-1", name="WiiM DLNA",
+                              backend_type="dlna")],
+        "plexplayer": [OutputDevice(id="caldera-1", name="Caldera",
+                                    backend_type="plexplayer",
+                                    id_format="uuid")],
+    }
+    hf = _make_host_for({
+        ("uuid:dlna-1", "dlna"): "192.168.1.88",
+        ("caldera-1", "plexplayer"): "192.168.1.88",
+    })
+    result = aggregate_devices(per_backend, hf, {})
+    assert len(result) == 1
+    assert result[0].host == "192.168.1.88"
+    assert result[0].name == "WiiM DLNA"
+    assert {p.backend for p in result[0].protocols} == {"dlna", "plexplayer"}
+
+
+async def test_build_devices_snapshot_plexplayer_gapless_unverified_and_override():
+    """plexplayer entries serialize gapless "unverified" until a cached
+    per-device behavioral verdict exists, which then overrides — the DLNA
+    per-device semantics, shared verbatim (U7 writes the verdicts)."""
+    from types import SimpleNamespace
+    hosts = {"caldera-1": "192.168.1.88", "caldera-2": "192.168.1.89"}
+    pp = SimpleNamespace(device_host=lambda did: hosts.get(did))
+    per_backend = {
+        "plexplayer": [
+            OutputDevice(id="caldera-1", name="Living Room",
+                         backend_type="plexplayer", id_format="uuid"),
+            OutputDevice(id="caldera-2", name="Den",
+                         backend_type="plexplayer", id_format="uuid"),
+        ],
+    }
+    with patch("app.output.probe_cache.fetch_all", AsyncMock(return_value={})), \
+         patch("app.database.get_gapless_verdicts",
+               AsyncMock(side_effect=lambda backend: (
+                   {"caldera-1": "supported"}
+                   if backend == "plexplayer" else {}))):
+        payload, _ = await build_devices_snapshot(
+            per_backend, backend_for={"plexplayer": pp}.get)
+
+    gapless = {p["device_id"]: p["gapless"]
+               for d in payload for p in d["protocols"]}
+    assert gapless == {"caldera-1": "supported", "caldera-2": "unverified"}

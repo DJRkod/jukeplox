@@ -123,6 +123,17 @@ ADMIN_ALLOWED = {
     # Shared playback module mount + transport chrome
     "playbackHandle", "btnPrev", "isPlaying", "_historyEmpty", "_syncPrevEnabled",
     "decorateQueueRow", "refreshQueueState",
+    # Stranded-tracks switch confirm dialog (2026-08-04-002 plexplayer plan
+    # U6): admin-only Output chrome — the two-phase confirm on the structured
+    # 409 from POST /admin/output/active. Output switching is admin-only by
+    # design (guests have no output control), so this is page chrome, not a
+    # shared-module concern; the SHARED gray-out/toast surfaces stay in
+    # static/browse + static/playback per the U5 forbidden entries below.
+    "showOutputSwitchConfirm",
+    # Apply-click in-flight guard (review fix JFR-3b, the _surpriseBusy house
+    # pattern): admin-only Output chrome — a double-click on Apply must not
+    # race two POSTs (two structured 409s would stack two confirm dialogs).
+    "_applyOutputBusy",
     # Output-session outage banner (2026-07-11 supervisor plan U4): admin-only
     # rich detail (device / attempts / retry / Resume button) layered over the
     # shared lean note, which lives in static/playback/index.js
@@ -271,6 +282,14 @@ FORBIDDEN_SYMBOLS = {
     "renderYearsList", "renderSearchResults",
     "showOverflowMenu", "hideOverflowMenu",
     "mountBrowser",
+    # 2026-08-04-002 plexplayer plan U5: the source-lock gray-out is a SHARED
+    # surface — the row class stamp + click-guard + rejection toast live only
+    # in static/browse/index.js (_plexLocked / _SOURCE_LOCK_MSG), and the
+    # body[data-source-lock] render-switch wiring lives only in
+    # static/playback/index.js (applyOutputSession, already forbidden above).
+    # Forbidding the names here fires on a per-page fork attempt, which would
+    # let one page dim rows the other still queues.
+    "_plexLocked", "_SOURCE_LOCK_MSG",
     # Past-tense admin-prefixed forms — explicit denylist so a future LLM
     # can't reintroduce them under the old names either.
     "adminAddTrack", "adminShowSourcePicker", "adminTrackRowMulti",

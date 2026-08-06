@@ -89,7 +89,13 @@
       headers: body ? { 'Content-Type': 'application/json' } : {},
       body: body ? JSON.stringify(body) : undefined,
     });
-    return [resp.status, resp.ok ? await resp.json() : null];
+    // Error bodies parse too (plexplayer plan U5): 4xx rejections carry a
+    // JSON `detail` callers branch on (409 output_source_lock vs the
+    // flood-control duplicate). Empty/non-JSON bodies degrade to null,
+    // exactly what error statuses returned before.
+    let data = null;
+    try { data = await resp.json(); } catch (_) { /* no JSON body */ }
+    return [resp.status, data];
   }
 
   // ── HTML helpers ──────────────────────────────────────────────────────────
@@ -1370,8 +1376,26 @@
 
   // ── Queue-append ──────────────────────────────────────────────────────────
 
+  // Plex-player source lock (2026-08-04-002 plan U5). One client copy for
+  // every rejection/guard path; the SERVER gate (409 output_source_lock on
+  // both queue endpoints) is the enforcement — everything here is UX.
+  const _SOURCE_LOCK_MSG = 'This output can only play Plex tracks';
+
+  // Is queueing this track blocked by the active output's source lock? Live
+  // read of the body-level render switch (set by the shared playback module
+  // from the output_session channel) so guards built before an output
+  // switch still decide correctly at press time. Tracks without the U4
+  // plex_held flag (older payload shapes) fail open — the server decides.
+  function _plexLocked(t) {
+    return document.body.dataset.sourceLock === 'plex' && !!t && t.plex_held === false;
+  }
+
   async function addTrack(trackId, title, track, sourceServerName, sourceLabel) {
     if (_config.isLocked && _config.isLocked()) { _config.toast('Queuing is paused by the host'); return; }
+    // U5 click-guard: a dimmed row's tap toasts instead of POSTing (the
+    // isLocked guard above is the precedent). Server gate still backstops
+    // call sites that pass no track object.
+    if (_plexLocked(track)) { _config.toast(_SOURCE_LOCK_MSG); return; }
     // Catalog "Play From Source…" (parity U3): re-POST the same catalog track_id
     // plus the chosen source's server_name. The server reorders the track's
     // holds so that source plays first (a preference — U9 play-time fallback
@@ -1380,12 +1404,14 @@
     if (sourceServerName) body.source_server_name = sourceServerName;
     const [status, data] = await _api('POST', _queueEndpoint(), body);
     if (status === 423) { _config.toast('Queuing is paused by the host'); return; }
-    // Flood Control (2026-06-16): when the admin toggle is on, the guest
-    // endpoint hard-rejects a re-add of a playing/queued track with 409. Tell
-    // the guest it's already queued and that nothing was added — distinct from
-    // the 423 "paused" message. Only fires on /api/queue; admin's /admin/queue
-    // never returns 409.
-    if (status === 409) { _config.toast("That track's already in the queue"); return; }
+    // 409 disambiguation by detail (U5): output_source_lock (both endpoints —
+    // the admin gets no bypass) means the selected output can't play this
+    // track; the detail-less/duplicate 409 stays the Flood Control message
+    // (2026-06-16 — guest /api/queue only, re-add of a playing/queued track).
+    if (status === 409) {
+      if (data && data.detail === 'output_source_lock') { _config.toast(_SOURCE_LOCK_MSG); return; }
+      _config.toast("That track's already in the queue"); return;
+    }
     if (status === 200) {
       if (data && data.warning === 'already_in_queue') _config.toast('Already in queue — added anyway');
       else if (sourceLabel) _config.toast(`Added from ${sourceLabel}`);
@@ -1410,8 +1436,20 @@
     if (sourceServerName) body.source_server_name = sourceServerName;
     const [status, data] = await _api('POST', _queueEndpoint(), body);
     if (status === 423) { _config.toast('Queuing is paused by the host'); return; }
+    // U5: an album with ZERO playable tracks on this output rejects with the
+    // same shape as the per-track gate — same toast.
+    if (status === 409 && data && data.detail === 'output_source_lock') {
+      _config.toast(_SOURCE_LOCK_MSG); return;
+    }
     if (status === 200) {
-      if (sourceLabel) _config.toast(`Added from ${sourceLabel}: ${data.tracks_added} track(s)`);
+      // U5 partial add: the server enqueued only the playable subset and
+      // reported the withheld count — surface both numbers.
+      const filtered = (data && data.tracks_filtered) || 0;
+      if (filtered > 0) {
+        const total = data.tracks_added + filtered;
+        _config.toast(`Added ${data.tracks_added} of ${total} — ${filtered} unavailable on this output`);
+      }
+      else if (sourceLabel) _config.toast(`Added from ${sourceLabel}: ${data.tracks_added} track(s)`);
       else _config.toast(`Added ${data.tracks_added} track(s) to queue!`);
       // Album batch receipt → the page stores it as one group so the whole
       // album can be removed as a unit (U4). Guest-only, as above.
@@ -1445,6 +1483,12 @@
     const row = document.createElement('div');
     row.className = 'list-item track-row';
     row.dataset.trackId = track.track_id || track.id || '';
+    // U5 source-lock gray-out: the row ALWAYS carries its playability class
+    // (backend-independent, straight from the U4 plex_held flag); whether it
+    // DIMS is decided purely by the body[data-source-lock="plex"] CSS switch,
+    // so an output flip restyles live with no refetch. A missing flag (older
+    // payload shapes) means no class — fail open, the server gate enforces.
+    if (track.plex_held === false) row.classList.add('no-plex-hold');
     const dur = track.duration_ms ? _formatDuration(track.duration_ms) : '';
     row.innerHTML = `<div class="list-info"><div class="list-title">${_esc(track.title)}</div><div class="list-sub">${_trackSubHtml(track, dur)}</div></div><button class="kebab-btn" title="Track options" aria-haspopup="true">⋮</button>`;
     row.querySelector('.kebab-btn').addEventListener('click', (e) => {
@@ -1700,24 +1744,33 @@
     // catalog track_id plus the chosen source (a preference — U9 fallback still
     // applies), labelled by type. NATIVE mode: each `sources` entry carries its
     // own distinct per-server track (deduplicateTracks-built); enqueue that copy.
+    // U5: while a Plex-player output dims this row, its queue actions in the
+    // sheet disable too (the `disabled:` flag precedent); navigation (Go to
+    // artist/album) and ratings stay live. Evaluated ONCE at sheet-build
+    // time (S-6: the once-computed srcLocked serves the inner sheet entries
+    // too — a locked outer entry never opens the inner sheet anyway, and
+    // the addTrack press-time guard backstops any flip in between).
+    const srcLocked = _plexLocked(t);
     const catalogSources = Array.isArray(t.sources) ? t.sources : null;
     if (catalogSources && catalogSources.length > 1) {
       items.push({
         label: 'Play from source…',
         action: () => _openSheet(catalogSources.map(s => ({
           label: _sourceLabel(s),
-          disabled: locked,
+          disabled: locked || srcLocked,
           action: () => addTrack(t.track_id || t.id, t.title, t, s.server_name, _sourceLabel(s)),
         })), row.querySelector('.kebab-btn')),
+        disabled: srcLocked,
       });
     } else if (sources && sources.length > 1) {
       items.push({
         label: 'Play from source…',
         action: () => _openSheet(sources.map(s => ({
           label: `Play from ${s.server_name || 'Server'}`,
-          disabled: locked,
+          disabled: locked || srcLocked,
           action: () => addTrack(s.track.track_id || s.track.id, s.track.title, s.track),
         })), row.querySelector('.kebab-btn')),
+        disabled: srcLocked,
       });
     }
     // Admin curation (plan U5, R4/R7/R8): remove this track from Most Played.

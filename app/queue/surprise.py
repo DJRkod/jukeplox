@@ -19,7 +19,15 @@ import random
 import time
 from collections import deque
 
+from app.catalog.views import holds_plex_held
+
 _log = logging.getLogger(__name__)
+
+# Bounded re-roll budget for the random floor while the plexplayer source lock
+# is active (2026-08-04-002 plan U8): the floor draws whole-catalog randoms, so
+# each try is an independent shot at a Plex-playable pick; past the budget the
+# resolve gives up (see the CONSCIOUS INVERSION note at the floor call site).
+_PLEX_LOCK_FLOOR_TRIES = 8
 
 SOURCE_PLEX_SONIC = "plex_sonic"
 SOURCE_PLEX_SIMILAR = "plex_similar_artist"
@@ -38,6 +46,27 @@ _CHAINS = {
 
 def _norm(s: str | None) -> str:
     return (s or "").strip().lower()
+
+
+def _plex_lock_ok(t, lock_ids) -> bool:
+    """Per-candidate plexplayer source-lock check (review fix PLX-8).
+
+    ``lock_ids is None`` ⇒ gate inert. Otherwise a candidate qualifies when
+    its loaded holds name an enabled Plex source (the catalog-floor shape) —
+    OR, for hold-less candidates, when its compound id attributes to one:
+    the smart sources (sonic/similar/heuristic) return NATIVE tracks whose
+    ids are ``"{machine_id}:{ratingKey}"`` and which carry no holds, so the
+    holds-only check failed every native candidate closed and starved the
+    smart chain down to the floor. Fails closed only when NEITHER holds nor
+    the id prefix attribute the candidate (the same compound-key
+    attribution ``state._holder_keys`` uses for bare stream keys)."""
+    if lock_ids is None:
+        return True
+    if holds_plex_held(getattr(t, "holds", None), lock_ids):
+        return True
+    tid = str(getattr(t, "id", "") or "")
+    machine_id, sep, _rest = tid.partition(":")
+    return bool(sep and machine_id in lock_ids)
 
 
 def _within_length(t, min_ms: int | None, max_ms: int | None) -> bool:
@@ -127,6 +156,8 @@ async def resolve_surprise(
     get_enabled_libraries=None,
     sonic_seed_tries: int = 2,
     similar_name_tries: int = 12,
+    get_plex_lock_ids=None,
+    notify_lock_giveup=None,
 ):
     """Return ``(track, source_label)`` for one Surprise pick.
 
@@ -147,6 +178,10 @@ async def resolve_surprise(
         # Effective = enabled minus vetoed sources, so Surprise's native similar
         # path can't pick a whole-source-OFF library (Libraries-panel U2).
         from app.database import get_effective_enabled_libraries as get_enabled_libraries  # noqa: F811
+    if get_plex_lock_ids is None:
+        from app.state import plex_lock_enabled_ids as get_plex_lock_ids  # noqa: F811
+    if notify_lock_giveup is None:
+        from app.state import notify_plex_lock_giveup as notify_lock_giveup  # noqa: F811
 
     # Anti-repeat (plan 005): the browser's recently-surprised track ids, excluded
     # from the smart sources so remove + re-press won't repeat. The floor ignores
@@ -173,10 +208,28 @@ async def resolve_surprise(
     # its own band filtering + never-dead-end fallback (plan U3).
     min_ms, max_ms = length_bounds or (None, None)
 
+    # Plexplayer source lock (2026-08-04-002 plan U8, R11): the enabled-Plex-
+    # source ids, prefetched ONCE per resolve — async, before the sync
+    # acceptable() loop, exactly how the exclusions/band inputs above are
+    # gathered — so the per-candidate check below is a pure set lookup over the
+    # candidate's already-loaded holds. ``None`` ⇒ gate inert (another backend
+    # selected, or the native all-Plex path where every candidate is Plex-backed
+    # by construction); a set (possibly empty) ⇒ only candidates holding a copy
+    # on an enabled Plex source may be picked.
+    lock_ids = await get_plex_lock_ids()
+
     def acceptable(t) -> bool:
         if t is None or t.id in seed_ids or t.id in exclude_ids:
             return False
         if not _within_length(t, min_ms, max_ms):
+            return False
+        if not _plex_lock_ok(t, lock_ids):
+            # U8: the selected output can only play Plex-held tracks. A
+            # candidate neither holds nor id-prefix can attribute to an
+            # enabled Plex source fails CLOSED: suggesting it would strand
+            # an unplayable track behind the U5 enqueue gate. (PLX-8:
+            # native smart-source candidates attribute via their compound
+            # id — see _plex_lock_ok.)
             return False
         if _norm(getattr(t, "artist", "")) in excl:
             return False
@@ -325,9 +378,35 @@ async def resolve_surprise(
                 if t is not None:
                     return t, SOURCE_HEURISTIC
             elif source == "random":
-                t = await shuffle_provider()
-                if t is not None:
-                    return t, SOURCE_RANDOM
+                if lock_ids is None:
+                    t = await shuffle_provider()
+                    if t is not None:
+                        return t, SOURCE_RANDOM
+                else:
+                    # CONSCIOUS INVERSION of the never-dead-end floor rule
+                    # (2026-08-04-002 plan U8, R11). docs/solutions/design-
+                    # patterns/constrained-random-selection-filter-chokepoints-
+                    # exempt-explicit-never-dead-end.md mandates a final
+                    # UNFILTERED pick so a constrained floor never dead-ends —
+                    # for VALUE constraints (length band, diversity), where an
+                    # out-of-band track still plays. The plexplayer source lock
+                    # is a HARD playability constraint: an unfiltered pick
+                    # would hand the queue a track the selected output cannot
+                    # play at all. For THIS backend only, the floor re-rolls a
+                    # bounded number of times and then gives up — no pick, one
+                    # debounced admin notice, the queue simply doesn't refill.
+                    saw_candidate = False
+                    for _ in range(_PLEX_LOCK_FLOOR_TRIES):
+                        t = await shuffle_provider()
+                        if t is None:
+                            break  # library genuinely empty — the pre-existing
+                            #        no-pick condition, not a lock give-up
+                        saw_candidate = True
+                        if _plex_lock_ok(t, lock_ids):
+                            return t, SOURCE_RANDOM
+                    if saw_candidate:
+                        await notify_lock_giveup()
+                    return None, None
         except Exception as e:
             _log.warning("surprise source %r failed, degrading: %r", source, e)
             continue

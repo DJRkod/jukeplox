@@ -15,7 +15,14 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.auth_routes import require_admin, SESSION_COOKIE
-from app.api.guest import enabled_libraries, validate_plex_id, _resolve_album_tracks
+from app.api.guest import (
+    enabled_libraries,
+    validate_plex_id,
+    _annotate_plex_held,
+    _filter_playable,
+    _require_playable,
+    _resolve_album_tracks,
+)
 from app import database, state
 from app.auth import plex_oauth
 # Snapshot building lives output-side since the live-discovery plan U5
@@ -379,6 +386,20 @@ async def _set_source_disabled(source_id: str, *, disabled: bool) -> None:
     except Exception:
         _log.warning("source-toggle reconcile failed for %s (disabled=%s) — veto saved; "
                      "reconciles on next scan", source_id, disabled, exc_info=True)
+    # R12 mid-session re-validation (2026-08-04-002 plexplayer plan U6): the
+    # whole-source veto flips the READ-TIME playability predicate immediately
+    # (plex_enabled_source_ids reads disabled_sources live), so while a Plex
+    # player is the selected output, queued tracks whose only Plex holder just
+    # got vetoed are stranded NOW — remove them here rather than waiting for
+    # the triggered background rescan to finish (that hook still runs; a
+    # second pass finds nothing and stays silent). Runs on enable too:
+    # harmless no-op (enabling can only widen playability). Best-effort — a
+    # re-validation failure must not fail the persisted veto toggle.
+    try:
+        await state.revalidate_plex_queue(trigger="library change")
+    except Exception:
+        _log.warning("post-veto queue re-validation failed for %s",
+                     source_id, exc_info=True)
 
 
 @router.post("/sources/{source_id}/enable")
@@ -582,13 +603,20 @@ async def list_output_devices(bust: bool = Query(False)):
         "chromecast": state.chromecast_backend,
         "dlna": state.dlna_backend,
         "airplay": state.airplay_backend,
+        "plexplayer": state.plexplayer_backend,
     }
     results: dict = {name: [] for name in backends}
-    mdns_status: _MdnsStatus = {name: "ok" for name in backends}
+    # plexplayer is deliberately ABSENT from mdns_status (2026-08-04-002
+    # plan U3): its liveness rides authenticated PMS /clients polling, not
+    # mDNS, and the frontend banner treats a missing key as fine while an
+    # "unavailable" value would render the backend degraded.
+    mdns_status: _MdnsStatus = {
+        name: "ok" for name in backends if name != "plexplayer"}
 
     async def _discover(name, backend):
         if not backend:
-            mdns_status[name] = "unavailable"
+            if name in mdns_status:
+                mdns_status[name] = "unavailable"
             return
         try:
             found = await backend.discover_devices()
@@ -597,7 +625,8 @@ async def list_output_devices(bust: bool = Query(False)):
         except Exception:
             _log.exception("Discovery [%s]: exception during scan", name)
             results[name] = []
-            mdns_status[name] = "unavailable"
+            if name in mdns_status:
+                mdns_status[name] = "unavailable"
 
     # AirPlay and Chromecast both bind UDP 5353 for mDNS; run them sequentially
     # (via _discover_mdns) so the shared Zeroconf socket is reused rather than
@@ -609,6 +638,9 @@ async def list_output_devices(bust: bool = Query(False)):
     await asyncio.gather(
         _discover("direct", state.direct_backend),
         _discover("dlna", state.dlna_backend),
+        # plexplayer is HTTP to the PMS (/clients) — no shared socket, safe
+        # to run concurrently with everything else.
+        _discover("plexplayer", state.plexplayer_backend),
         _discover_mdns(),
         return_exceptions=True,
     )
@@ -633,9 +665,16 @@ async def list_output_devices(bust: bool = Query(False)):
 
 
 class SetOutputRequest(BaseModel):
-    backend_type: Literal['direct', 'chromecast', 'dlna', 'airplay']
+    backend_type: Literal['direct', 'chromecast', 'dlna', 'airplay',
+                          'plexplayer']
     device_id: str = "default"
     host: str | None = None
+    # Two-phase stranded-tracks switch confirm (2026-08-04-002 plan U6 —
+    # field added with U3's Literal change per the plan's single-model-edit
+    # note). Consumed by _switch_stranded_gate: a plexplayer target with
+    # stranded queue entries 409s until the client resends confirmed=true;
+    # defaults False so every existing caller is unchanged.
+    confirmed: bool = False
 
     @field_validator("device_id")
     @classmethod
@@ -680,6 +719,9 @@ async def _current_mdns_status() -> _MdnsStatus:
     watcher = get_watcher()
     if watcher is not None and watcher.running:
         return watcher.mdns_status()
+    # plexplayer is deliberately absent here AND from the watcher's map
+    # (2026-08-04-002 plan U3): no mDNS involvement, and a missing key is
+    # what keeps the frontend from rendering it degraded.
     status = {name: "ok" for name in ("direct", "airplay", "chromecast", "dlna")}
     status["discovery"] = "ok" if await _discovery_available() else "unavailable"
     return status
@@ -700,13 +742,70 @@ async def _discovery_available() -> bool:
         return False
 
 
+async def _switch_stranded_gate(body: SetOutputRequest) -> int:
+    """Two-phase stranded-tracks confirm for a switch TO plexplayer
+    (2026-08-04-002 plan U6; R7/R8, AE1/AE2, F1). Runs in the route, OUTSIDE
+    ``activate_backend`` — the switch itself keeps its raise-before-any-
+    state-change rollback semantics, and the 409 lives with the API layer's
+    other 409s. Recomputes the stranded set LIVE on EVERY call (both
+    phases), so a guest enqueue between warning and confirm is caught by
+    the confirm-phase recompute (race-safe; the response reports the
+    actual removed count).
+
+    * stranded + not confirmed → 409 with a STRUCTURED dict detail
+      (``reason: "output_switch_confirm"``) — deliberately distinguishable
+      from the plain-string 409s on this endpoint (``output_source_lock``
+      enqueue gate, activate_backend RuntimeErrors), so a genuine switch
+      failure can never open the client's confirm dialog. NO state change.
+    * stranded + confirmed → remove the stranded entries (receipts kept,
+      held-front ``_advance_gen`` discipline inside the state helper),
+      return the actual removed count PLUS a positional restore snapshot;
+      the caller proceeds to activate and ROLLS THE REMOVAL BACK if the
+      activate raises (review fix PLX-3 — a failed switch leaves the old
+      backend playing, so the guests' tracks must not stay silently gone).
+      Removal-before-activate is the plan's order: the activate path
+      auto-starts playback when the queue has items, so a stranded front
+      entry must be gone before that dispatch can pick it.
+    * all-playable queue / gate inert → (0, []), straight activate (no 409).
+
+    Switching AWAY from plexplayer never routes here (plan scope: every
+    track is playable on URL-dispatch backends)."""
+    stranded = await state.plex_stranded_entries(assume_lock=True)
+    if not stranded:
+        return 0, []
+    if not body.confirmed:
+        raise HTTPException(status_code=409, detail={
+            "reason": "output_switch_confirm",
+            "stranded_count": len(stranded),
+            "confirm_required": True,
+        })
+    snapshot = state.snapshot_stranded_positions(stranded)
+    return await state.remove_stranded_entries(stranded), snapshot
+
+
 @router.post("/output/active")
 async def set_output_active(body: SetOutputRequest):
+    removed_count, restore_snapshot = 0, []
+    if body.backend_type == "plexplayer":
+        removed_count, restore_snapshot = await _switch_stranded_gate(body)
     try:
         await state.activate_backend(body.backend_type, body.device_id, host=body.host)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:
+        # PLX-3 rollback: the switch did NOT happen (activate raises before
+        # any state change), so a confirmed stranded removal must be undone
+        # — re-insert the captured entries at their original positions
+        # (receipts intact) before reporting the failure. The error response
+        # never claims a removal.
+        if restore_snapshot:
+            try:
+                await state.restore_stranded_entries(restore_snapshot)
+            except Exception:
+                _log.warning("stranded-removal rollback failed after "
+                             "activate_backend error", exc_info=True)
+        if isinstance(exc, HTTPException):
+            raise
+        if isinstance(exc, RuntimeError):
+            raise HTTPException(status_code=409, detail=str(exc))
         raise HTTPException(status_code=502, detail=str(exc))
     from app.events.bus import manager
     from app.events.types import OutputChangedEvent
@@ -719,6 +818,10 @@ async def set_output_active(body: SetOutputRequest):
         "backend_type": body.backend_type,
         "device_id": body.device_id,
         "host": body.host,
+        # U6: the confirmed-switch response carries the ACTUAL number of
+        # stranded entries removed (0 on every non-plexplayer / all-playable
+        # switch) — the admin dialog toasts this, never the warned count.
+        "removed_count": removed_count,
     }
 
 
@@ -747,6 +850,10 @@ async def admin_append_to_queue(body: AdminQueueAppendRequest):
         raise HTTPException(status_code=503, detail="No media source configured")
     q = state.queue_engine
     if body.track_id:
+        # U5 source-lock gate — IDENTICAL to the guest endpoint's (no admin
+        # bypass, R6): the SAME shared helper from app/api/guest.py (S-3),
+        # evaluated live server-side.
+        await _require_playable(body.track_id)
         track = await client.get_track(body.track_id)
         item = await q.append(track, bypass_lock=True)
         # Undo receipt (collected-library plan U5): same shape as the guest
@@ -766,19 +873,31 @@ async def admin_append_to_queue(body: AdminQueueAppendRequest):
         raise HTTPException(status_code=404, detail="Album not found")
     if not tracks:
         raise HTTPException(status_code=404, detail="Album not found or no tracks")
+    # U5 subset policy — the guest album branch's SAME shared helper (S-3).
+    # (The resolver alias-bridges the native provider ids this branch yields
+    # in catalog mode back to catalog identities before deciding.)
+    tracks, tracks_filtered = await _filter_playable(tracks)
     # All-or-nothing batch append: validate full batch under one lock so a
     # partial album never lands when the queue is at the cap.
     await q.append_many(tracks, bypass_lock=True)
-    return {"ok": True, "tracks_added": len(tracks)}
+    return {"ok": True, "tracks_added": len(tracks),
+            "tracks_filtered": tracks_filtered}
 
 
 @router.get("/queue")
 async def get_queue():
     from app.output import session as output_session
     q = state.queue_engine
+    queue_rows = [{**_queue_item_dict(i), "position": idx}
+                  for idx, i in enumerate(q.queue)]
+    history_rows = [_queue_item_dict(i) for i in q.history]
+    # plex_held on the admin queue/recents rows too (plan U4) — the shared
+    # queue renderer paints both pages from one payload shape. One combined
+    # pass so queue + history share a single bulk holds read.
+    await _annotate_plex_held(queue_rows + history_rows)
     return {
-        "queue": [{**_queue_item_dict(i), "position": idx} for idx, i in enumerate(q.queue)],
-        "history": [_queue_item_dict(i) for i in q.history],
+        "queue": queue_rows,
+        "history": history_rows,
         "is_locked": q.is_locked,
         "current": _queue_item_dict(q.state.current) if q.state.current else None,
         "is_playing": q.state.is_playing,
@@ -1183,6 +1302,9 @@ async def playback_skip():
                     await state.dispatch_play(
                         url, next_item.track,
                         play_recorded=bool(getattr(next_item, "play_recorded", False)),
+                        # Holder handshake (2026-08-04-002 U3): this site
+                        # dispatches the primary holder's stream_key.
+                        holder_key=next_item.track.stream_key or None,
                     )
                     # The R19 mark protected THIS pending play; consume it so
                     # a later organic replay counts again (supervisor plan U3
@@ -1257,6 +1379,9 @@ async def playback_previous():
             await state.dispatch_play(
                 url, prev_item.track,
                 play_recorded=bool(getattr(prev_item, "play_recorded", False)),
+                # Holder handshake (2026-08-04-002 U3): this site dispatches
+                # the primary holder's stream_key.
+                holder_key=prev_item.track.stream_key or None,
             )
             # The R19 mark protected THIS pending play; consume it so a later
             # organic replay counts again (supervisor plan U3 unified this

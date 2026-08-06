@@ -51,9 +51,11 @@ async def test_default_backends_mapping_names():
     a backend the route knows but the map misses would silently skip
     every watcher-triggered probe for it."""
     with patch("app.state.direct_backend"), patch("app.state.chromecast_backend"), \
-         patch("app.state.dlna_backend"), patch("app.state.airplay_backend"):
+         patch("app.state.dlna_backend"), patch("app.state.airplay_backend"), \
+         patch("app.state.plexplayer_backend"):
         backends = probe_runner._default_backends()
-    assert set(backends) == {"direct", "chromecast", "dlna", "airplay"}
+    assert set(backends) == {"direct", "chromecast", "dlna", "airplay",
+                             "plexplayer"}
 
 
 # ── probe_host (the watcher's trigger) ────────────────────────────────────────
@@ -79,3 +81,19 @@ async def test_probe_host_failure_writes_false_verdict_and_never_raises():
         await _drain()
 
     verdicts.assert_awaited_once_with("192.168.1.50", "airplay", False)
+
+
+# ── plexplayer (2026-08-04-002 plan U3) ───────────────────────────────────────
+
+async def test_probe_host_routes_plexplayer_to_backend_probe_device():
+    """The watcher's single-entry trigger reaches the plexplayer backend's
+    probe_device (the U2 wait=0 timeline read) through the lazy default
+    map, and its verdict lands in the probe cache like every backend's."""
+    with patch("app.state.plexplayer_backend") as pp, \
+         patch("app.output.probe_cache.set_verdict", AsyncMock()) as verdicts:
+        pp.probe_device = AsyncMock(return_value=True)
+        probe_runner.probe_host("192.168.1.88", "plexplayer", "caldera-1")
+        await _drain()
+
+    pp.probe_device.assert_awaited_once_with("caldera-1")
+    verdicts.assert_awaited_once_with("192.168.1.88", "plexplayer", True)

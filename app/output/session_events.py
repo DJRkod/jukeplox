@@ -33,7 +33,14 @@ def session_snapshot() -> dict:
     riding the stitched flow stream right now; the registry's liveness
     check, never the session id, which is the flow route's capability
     credential). The same fields lead the admin snapshot, so guest and
-    admin can never disagree about the state itself."""
+    admin can never disagree about the state itself.
+
+    ``source_lock`` (2026-08-04-002 plexplayer plan U4): "plex" while the
+    PERSISTED selected backend is plexplayer — ``state.output_requires_plex``
+    is the one gate truth (loud warning there: never the router's
+    deferred-swap state) — else None. Guests key the U5 gray-out body
+    attribute off this field."""
+    from app import state
     from app.output import session
     from app.output.flow import current_flow_session
     sup = session.get_supervisor()
@@ -41,6 +48,7 @@ def session_snapshot() -> dict:
         "state": sup.session_state,
         "held": hold.output_hold_active(),
         "gapless_flow_active": current_flow_session() is not None,
+        "source_lock": "plex" if state.output_requires_plex() else None,
     }
 
 

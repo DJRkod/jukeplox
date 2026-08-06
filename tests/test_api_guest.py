@@ -4194,9 +4194,9 @@ async def test_now_playing_includes_lean_output_session(
     """A guest loading mid-outage learns the held state from the GET snapshot
     (the hold clears `current`, so this rides the no-current branch — the
     ClosingTime late-joiner pattern). The guest shape is LEAN: exactly
-    {state, held, gapless_flow_active}, the same state truth as the admin's
-    rich snapshot but none of the outage detail (reason/device/retry stay
-    admin-only)."""
+    {state, held, gapless_flow_active, source_lock}, the same state truth as
+    the admin's rich snapshot but none of the outage detail
+    (reason/device/retry stay admin-only)."""
     from app.output import session
     sup, timers, rec = fresh_supervisor
     monkeypatch.setattr(hold, "_output_hold", True)
@@ -4205,7 +4205,8 @@ async def test_now_playing_includes_lean_output_session(
     data = client.get("/api/now-playing").json()
 
     assert data["output_session"] == {"state": "outage_paused", "held": True,
-                                      "gapless_flow_active": False}
+                                      "gapless_flow_active": False,
+                                      "source_lock": None}
 
 
 async def test_now_playing_output_session_default_unheld(
@@ -4214,7 +4215,8 @@ async def test_now_playing_output_session_default_unheld(
     and reads idle/unheld."""
     data = client.get("/api/now-playing").json()
     assert data["output_session"] == {"state": "idle", "held": False,
-                                      "gapless_flow_active": False}
+                                      "gapless_flow_active": False,
+                                      "source_lock": None}
 
 
 # ── enabled_libraries: stale-while-revalidate (2026-07-17 ce-debug) ───────────
@@ -4349,3 +4351,349 @@ async def test_enabled_libraries_stale_refresh_dropped_on_invalidation(monkeypat
     assert g._enabled_libs_cache is None, (
         "a refresh that started before invalidation must not resurrect the cache")
     assert calls["n"] == 1
+
+
+# ── plex_held flag + source_lock lean channel (2026-08-04-002 plan U4) ───────
+# The flag is backend-INDEPENDENT (always emitted, true/false); only the
+# body-level source_lock switch (U5) decides dimming. On the native
+# single-Plex path every served track IS Plex-backed → constant True.
+
+
+async def test_search_rows_carry_plex_held_regardless_of_backend(
+        client, mock_deps, monkeypatch):
+    import app.state as st
+    body = client.get("/api/search?q=song").json()
+    assert body["tracks"] and all(t["plex_held"] is True for t in body["tracks"])
+    # Flip the persisted selection to plexplayer — the flag must not change
+    # (zero conditional-on-backend logic in the flag itself).
+    monkeypatch.setattr(st, "_selected_output_backend", "plexplayer")
+    body2 = client.get("/api/search?q=song").json()
+    assert [t["plex_held"] for t in body2["tracks"]] == \
+           [t["plex_held"] for t in body["tracks"]]
+
+
+async def test_search_broad_rows_carry_plex_held(client, mock_deps):
+    _, plex = mock_deps
+    plex.search_titles = AsyncMock(return_value=SearchResults(
+        tracks=[make_track("bt1")], albums=[], artists=[]))
+    body = client.get("/api/search/broad?q=song").json()
+    assert body["tracks"] and all(t["plex_held"] is True for t in body["tracks"])
+
+
+async def test_queue_and_history_rows_carry_plex_held(client, mock_deps):
+    qe, _ = mock_deps
+    await qe.append(make_track("t1"), bypass_lock=True)
+    await qe.append(make_track("t2"), bypass_lock=True)
+    data = client.get("/api/queue").json()
+    assert data["queue"] and all(r["plex_held"] is True for r in data["queue"])
+
+
+def test_most_played_rows_carry_plex_held(mock_deps):
+    rows = [_mp_row("t5", 5), _mp_row("t3", 3)]
+    with patch("app.database.get_top_played_tracks", AsyncMock(return_value=rows)):
+        from app.main import app
+        data = TestClient(app, raise_server_exceptions=True).get("/api/most-played").json()
+    # Persisted record-time snapshots gain the LIVE flag at render time.
+    assert data and all(d["plex_held"] is True for d in data)
+
+
+def test_highest_rated_rows_carry_plex_held(mock_deps):
+    rows = [{"track_id": "t1", "stars": 5, "play_count": 2,
+             "metadata": {"track_id": "t1", "title": "Song", "artist": "A",
+                          "album": "B", "album_id": None}}]
+    with patch("app.database.get_ratings_visible_to_guests", AsyncMock(return_value=True)), \
+         patch("app.database.get_most_played_display_limit", AsyncMock(return_value=100)), \
+         patch("app.database.get_top_rated_tracks", AsyncMock(return_value=rows)):
+        from app.main import app
+        data = TestClient(app, raise_server_exceptions=True).get("/api/highest-rated").json()
+    assert data and all(d["plex_held"] is True for d in data)
+
+
+def test_browse_artist_songs_rows_carry_plex_held(mock_deps):
+    _, plex = mock_deps
+
+    async def fake_artists(section_key):
+        return [Artist(id="machineA:42", title="Prince")] if section_key == "machineA:1" else []
+
+    async def fake_albums(section_key, artist_id=None, **kw):
+        if section_key == "machineA:1" and artist_id == "machineA:42":
+            return [Album(id="machineA:100", title="Album A", artist="Prince", year=1999)]
+        return []
+
+    async def fake_tracks(section_key, album_id=None, **kw):
+        if album_id == "machineA:100":
+            return [Track(id="machineA:t1", title="Kiss", artist="Prince",
+                          album="Album A", duration_ms=1, stream_key="/k",
+                          server_name="Host")]
+        return []
+
+    plex.get_artists.side_effect = fake_artists
+    plex.get_albums.side_effect = fake_albums
+    plex.get_tracks.side_effect = fake_tracks
+
+    with patch("app.api.guest.enabled_libraries", AsyncMock(return_value=_one_lib())), \
+         patch("app.database.get_play_counts", AsyncMock(return_value={})):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True) \
+            .get("/api/browse/artists/machineA:42/songs").json()
+    assert body["tracks"] and all(t["plex_held"] is True for t in body["tracks"])
+
+
+async def test_now_playing_source_lock_follows_persisted_selection(
+        client, mock_deps, fresh_supervisor, monkeypatch):
+    """The lean output channel: source_lock rides the now-playing snapshot,
+    keyed off the PERSISTED selected backend (output_requires_plex), so a
+    late-joining guest hydrates the same truth the WS push carries."""
+    import app.state as st
+    data = client.get("/api/now-playing").json()
+    assert data["output_session"]["source_lock"] is None
+    monkeypatch.setattr(st, "_selected_output_backend", "plexplayer")
+    data2 = client.get("/api/now-playing").json()
+    assert data2["output_session"]["source_lock"] == "plex"
+
+
+# ── U5 enqueue gate (2026-08-04-002 plan U5; R6, AE3, F2) ────────────────────
+# Server-side enforcement over the catalog_env seed (t1 = Plex m1 + Jellyfin,
+# t2 = Plex-only, tjo = Jellyfin-only). The gate keys off the PERSISTED
+# selected backend and resolves holds LIVE — never a client-supplied flag.
+
+
+def _plexplayer_selected():
+    import app.state as st
+    return patch.object(st, "_selected_output_backend", "plexplayer")
+
+
+import contextlib as _ctx
+
+
+@_ctx.contextmanager
+def _enabled_plex(ids=("m1",)):
+    # S-1: the enabled-id builder + the gate's catalog check both live in
+    # app.state now (plex_lock_enabled_ids is the one gate entry), so the
+    # gate-active env patches the state seams.
+    with patch("app.state.plex_enabled_source_ids",
+               AsyncMock(return_value=set(ids))), \
+         patch("app.state.catalog_active", AsyncMock(return_value=True)):
+        yield
+
+
+async def test_gate_rejects_no_plex_holder_while_plexplayer_selected(catalog_env):
+    # AE3: Jellyfin-only track + plexplayer selected → 409 output_source_lock,
+    # nothing queued.
+    from fastapi import HTTPException
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    with _plexplayer_selected(), _enabled_plex():
+        with pytest.raises(HTTPException) as ei:
+            await append_to_queue(QueueAppendRequest(track_id="tjo"))
+    assert ei.value.status_code == 409
+    assert ei.value.detail == "output_source_lock"
+    assert catalog_env.queue == []
+
+
+async def test_gate_allows_plex_held_track_while_plexplayer_selected(catalog_env):
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    with _plexplayer_selected(), _enabled_plex():
+        res = await append_to_queue(QueueAppendRequest(track_id="t1"))
+    assert res["ok"] is True and res["tracks_added"] == 1
+    assert catalog_env.queue[0].track_id == "t1"
+
+
+async def test_gate_inert_on_other_backend(catalog_env):
+    # Same Jellyfin-only POST on a non-plexplayer backend → queued as always.
+    import app.state as st
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    with patch.object(st, "_selected_output_backend", "direct"):
+        res = await append_to_queue(QueueAppendRequest(track_id="tjo"))
+    assert res["tracks_added"] == 1
+    assert catalog_env.queue[0].track_id == "tjo"
+
+
+async def test_gate_ignores_client_supplied_flag(catalog_env):
+    # A forged plex_held on the request body changes nothing — the gate
+    # resolves holds live server-side (unknown body fields are dropped).
+    from app.main import app
+    c = TestClient(app, raise_server_exceptions=True)
+    with _plexplayer_selected(), _enabled_plex():
+        resp = c.post("/api/queue", json={"track_id": "tjo", "plex_held": True})
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "output_source_lock"
+    assert catalog_env.queue == []
+
+
+async def test_gate_uses_persisted_selection_not_router(catalog_env):
+    # Mid-play switch truth: activate_backend wrote the selection but the
+    # router still runs the OLD backend (deferred swap) — the gate rejects
+    # immediately, never consulting output_router.
+    import app.state as st
+    from fastapi import HTTPException
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    old_router = MagicMock()
+    old_router.active = MagicMock()  # previous backend still attached
+    with _plexplayer_selected(), _enabled_plex(), \
+         patch.object(st, "output_router", old_router):
+        with pytest.raises(HTTPException) as ei:
+            await append_to_queue(QueueAppendRequest(track_id="tjo"))
+    assert ei.value.status_code == 409
+    assert catalog_env.queue == []
+
+
+async def test_gate_album_mixed_enqueues_playable_subset(catalog_env):
+    # Subset policy: strip t2's only Plex hold so album 'al' = t1 (playable)
+    # + t2 (not) → only t1 lands; response reports added vs filtered, and
+    # the batch receipt covers exactly the enqueued subset.
+    from app import database
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    conn = database._conn()
+    await conn.execute(
+        "DELETE FROM catalog_holds WHERE identity='t2' AND source_id='m1'")
+    await conn.commit()
+    with _plexplayer_selected(), _enabled_plex():
+        res = await append_to_queue(QueueAppendRequest(album_id="al"))
+    assert res["tracks_added"] == 1
+    assert res["tracks_filtered"] == 1
+    assert [e["track_id"] for e in res["entries"]] == ["t1"]
+    assert [it.track_id for it in catalog_env.queue] == ["t1"]
+
+
+async def test_gate_album_zero_playable_rejected(catalog_env):
+    from fastapi import HTTPException
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    with _plexplayer_selected(), _enabled_plex():
+        with pytest.raises(HTTPException) as ei:
+            await append_to_queue(QueueAppendRequest(album_id="jonly"))
+    assert ei.value.status_code == 409
+    assert ei.value.detail == "output_source_lock"
+    assert catalog_env.queue == []
+
+
+async def test_gate_album_reports_zero_filtered_when_inert(catalog_env):
+    # Shape stability: tracks_filtered rides every album response, 0 while
+    # the gate is inert, so the shared toast logic never branches on absence.
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    res = await append_to_queue(QueueAppendRequest(album_id="jonly"))
+    assert res["tracks_added"] == 1 and res["tracks_filtered"] == 0
+
+
+async def test_gate_alias_bridge_resolves_provider_ids(catalog_env):
+    # Admin album appends resolve NATIVE provider ids (not identities) in
+    # catalog mode — the resolver bridges them through catalog_identity_alias
+    # before failing the predicate.
+    from app.catalog import store
+    from app.api.guest import _plex_playable_ids
+    await store.register_alias("track", "m1:rawp1", "t1")
+    with _plexplayer_selected(), _enabled_plex():
+        assert await _plex_playable_ids(["m1:rawp1", "jelly:pjo"]) == {"m1:rawp1"}
+
+
+async def test_annotate_alias_bridges_native_ids(catalog_env):
+    # Review fix PLX-9: _annotate_plex_held rides the SAME alias-bridged
+    # holds read as the enqueue gate — a native-id queue entry (the admin
+    # album append shape) annotates plex_held true when its server is
+    # enabled, so flag and gate can never disagree. An unbridgeable id
+    # still annotates False.
+    from app.catalog import store
+    from app.api.guest import _annotate_plex_held
+    await store.register_alias("track", "m1:rawp1", "t1")
+    rows = [{"track_id": "m1:rawp1"}, {"track_id": "zz:unknown"}]
+    with _enabled_plex():
+        await _annotate_plex_held(rows)
+    assert rows[0]["plex_held"] is True, (
+        "native-id entry must bridge to its identity's holds")
+    assert rows[1]["plex_held"] is False
+
+
+async def test_gate_no_enabled_plex_sources_rejects_everything(catalog_env):
+    # Libraries-panel veto edge: plexplayer selected but every Plex source
+    # disabled → no holder can qualify.
+    from fastapi import HTTPException
+    from app.api.guest import append_to_queue, QueueAppendRequest
+    with _plexplayer_selected(), _enabled_plex(ids=()):
+        with pytest.raises(HTTPException) as ei:
+            await append_to_queue(QueueAppendRequest(track_id="t1"))
+    assert ei.value.status_code == 409
+    assert catalog_env.queue == []
+
+
+# ── U8 auto-selection gate: guest surprise endpoint (plan U8, R11) ───────────
+# POST /api/queue/surprise routes through resolve_surprise with DEFAULT lock
+# wiring, so it inherits the acceptable()/floor playability gate — pinned here
+# end-to-end over the seeded catalog_env.
+
+
+async def test_surprise_endpoint_inherits_lock_gate(catalog_env):
+    # The endpoint's resolve_surprise call (no injected lock deps) re-rolls a
+    # Jellyfin-only floor pick and queues the Plex-playable one while
+    # plexplayer is selected.
+    import app.state as st
+    from app.api.guest import surprise_me, SurpriseRequest
+    bad = Track(id="tjo", title="J Song", artist="Act", album="JOnly",
+                duration_ms=150000,
+                holds=[{"source_id": "jelly", "key": "jelly:pjo"}])
+    good = Track(id="t1", title="Song One", artist="Act", album="Rec",
+                 duration_ms=180000,
+                 holds=[{"source_id": "m1", "key": "m1:p1"}])
+    seq = [bad, good]
+
+    async def scripted_floor(bounds=None):
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    with _plexplayer_selected(), _enabled_plex(), \
+         patch.object(st, "catalog_active", AsyncMock(return_value=True)), \
+         patch.object(st, "_shuffle_provider", scripted_floor):
+        res = await surprise_me(SurpriseRequest())
+    assert res["ok"] is True
+    assert res["source"] == "random"
+    assert [it.track_id for it in catalog_env.queue] == ["t1"]
+
+
+async def test_surprise_endpoint_lock_giveup_quiet_with_one_notice(
+        catalog_env, monkeypatch):
+    # Zero Plex-playable candidates (every Plex source vetoed): the REAL
+    # catalog floor re-rolls its bounded budget, the guest gets a quiet
+    # {"ok": False}, nothing queues, and admins get exactly one debounced
+    # give-up notice on the U6 vehicle.
+    import app.state as st
+    from app.api.guest import surprise_me, SurpriseRequest
+    monkeypatch.setattr(st, "_plex_lock_notice_sent", False)
+    admins = AsyncMock()
+    with _plexplayer_selected(), _enabled_plex(ids=()), \
+         patch.object(st, "catalog_active", AsyncMock(return_value=True)), \
+         patch("app.events.bus.manager.broadcast_to_admins", admins):
+        res = await surprise_me(SurpriseRequest())
+        res2 = await surprise_me(SurpriseRequest())  # second press: debounced
+    assert res == {"ok": False} and res2 == {"ok": False}
+    assert catalog_env.queue == []
+    admins.assert_awaited_once()
+    ev = admins.await_args.args[0]
+    assert ev.backend_type == "error"
+    assert "no Plex-playable" in ev.device_name
+
+
+async def test_queue_changed_event_rows_carry_plex_held(catalog_env):
+    # The queue_changed WS payload paints queue re-renders directly (never a
+    # refetch — the added_at receipt contract), so state annotates plex_held
+    # onto queue + history rows pre-broadcast. Backend-independent, like the
+    # GET annotator it delegates to.
+    from app.events.types import QueueChangedEvent, QueueItem
+    from app.state import _annotate_queue_event
+    ev = QueueChangedEvent(
+        queue=[QueueItem(track_id="t1", title="Song One", artist="Act", album="Rec")],
+        history=[QueueItem(track_id="tjo", title="J Song", artist="Act", album="JOnly")],
+    )
+    with _enabled_plex():
+        await _annotate_queue_event(ev)
+    assert ev.queue[0].plex_held is True
+    assert ev.history[0].plex_held is False
+
+
+async def test_queue_changed_annotate_failure_fails_open(catalog_env):
+    # A broken annotator must never block the broadcast — rows keep the
+    # fail-open default True (the server gate is the enforcement).
+    from app.events.types import QueueChangedEvent, QueueItem
+    from app.state import _annotate_queue_event
+    ev = QueueChangedEvent(queue=[QueueItem(track_id="tjo", title="J Song",
+                                            artist="Act", album="JOnly")])
+    with patch("app.api.guest._annotate_plex_held",
+               AsyncMock(side_effect=RuntimeError("boom"))):
+        await _annotate_queue_event(ev)
+    assert ev.queue[0].plex_held is True

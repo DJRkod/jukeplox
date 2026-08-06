@@ -55,6 +55,7 @@ def _default_backends() -> dict[str, Any]:
         "chromecast": state.chromecast_backend,
         "dlna": state.dlna_backend,
         "airplay": state.airplay_backend,
+        "plexplayer": state.plexplayer_backend,
     }
 
 

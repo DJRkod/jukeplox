@@ -816,7 +816,10 @@ def _wire_resume(stack, backend, qe=None):
         qe = QueueEngine()
     router = SimpleNamespace(active=backend, play=AsyncMock(),
                              stop=AsyncMock(), pause=AsyncMock(),
-                             resume=AsyncMock())
+                             resume=AsyncMock(),
+                             # PLX-1: dispatch_play deposits the holder key
+                             # on the router's EFFECTIVE backend.
+                             effective_backend=lambda: backend)
     stack.enter_context(patch.object(st, "queue_engine", qe))
     stack.enter_context(patch("app.queue.engine.database.save_queue", AsyncMock()))
     stack.enter_context(patch("app.queue.engine.database.save_history", AsyncMock()))
@@ -1698,7 +1701,7 @@ async def test_snapshots_mirror_event_fields_admin_rich_guest_lean(monkeypatch):
 
         lean = session.session_snapshot()
         assert lean == {"state": STATE_OUTAGE_PAUSED, "held": True,
-                        "gapless_flow_active": False}
+                        "gapless_flow_active": False, "source_lock": None}
 
         adm = await session.session_snapshot_admin()
         assert adm["state"] == STATE_OUTAGE_PAUSED and adm["held"] is True
@@ -2641,3 +2644,116 @@ async def test_late_deadline_callback_after_defer_is_noop():
     assert outages == []
     sup.on_playback_confirmed(token)   # the crossing still counts
     rec.assert_called_once()
+
+
+# ── U7 (2026-08-04-002 plexplayer plan): boundary producer + foreign hold ─────
+
+async def test_gapless_boundary_from_plexplayer_producer_counts_once(
+        monkeypatch):
+    """AE5 (supervisor half): the plexplayer timeline watch reports the
+    itemID-edge boundary through notify_gapless_boundary — one advance, one
+    count for the chained track, NO dispatch at the boundary (the fourth
+    producer rides the same chokepoint as Direct/DLNA)."""
+    from app.output import session
+    sup, timers, rec = _fresh(monkeypatch)
+    with contextlib.ExitStack() as stack:
+        qe, skipped, advance = _wire_state(stack)
+        item1 = await _start_playing(qe, make_track("t1"))
+        t2 = make_track("t2")
+        await qe.append(t2)
+        token1 = sup.on_dispatched(item1.track)
+        sup.on_playback_confirmed(token1)
+        rec.assert_called_once()                 # first track counted
+
+        await session.notify_gapless_boundary(t2)
+
+        assert qe.state.current.track_id == "t2"     # queue advanced
+        assert [i.track_id for i in qe.history] == ["t1"]
+        assert rec.call_count == 2                   # exactly one count each
+        assert rec.call_args.args[0] is t2
+        advance.assert_not_called()                  # no dispatch at boundary
+        skipped.assert_not_called()
+
+
+async def test_hold_foreign_controller_enters_idle_paused_hold(monkeypatch):
+    """Foreign-controller yield: the standard hold (queue frozen, R19 mark
+    intact) but NO reconnect machinery — the device is reachable, so
+    auto-reattach would fight the other controller. Lands IDLE_PAUSED with
+    reason 'foreign_controller', serialized on the admin output_session
+    payload (the banner switch input)."""
+    from app.output import session
+    sup, timers, rec, clock = _fresh_u3(monkeypatch)
+    backend = FakeResumeBackend()
+    with contextlib.ExitStack() as stack:
+        qe, router = _wire_resume(stack, backend)
+        item = await _start_playing(qe, make_track("t1"))
+        token = sup.on_dispatched(item.track)
+        sup.on_playback_confirmed(token)         # play counted
+        rec.assert_called_once()
+
+        await session.hold_foreign_controller()
+
+        assert session.output_hold_active() is True
+        assert session.output_hold_reason() == "foreign_controller"
+        assert sup.session_state == STATE_IDLE_PAUSED
+        assert sup.idle_paused_reason == "foreign_controller"
+        # R19: the confirmed play re-fronts already counted.
+        assert qe.queue[0].play_recorded is True
+        # No reconnect loop may run: every armed timer is cancelled and the
+        # context reads attached (manual resume goes straight to dispatch).
+        assert all(t.cancelled for t in timers.timers)
+        ot = sup._outage
+        assert ot is not None and ot.attached is True
+        admin = await session.session_snapshot_admin()
+        assert admin["held"] is True
+        assert admin["state"] == "idle_paused"
+        assert admin["idle_paused_reason"] == "foreign_controller"
+        assert admin["reason"] == "foreign_controller"
+
+
+async def test_hold_foreign_controller_backoff_never_redispatches(monkeypatch):
+    """Even a timer that slipped through must not re-dispatch while the
+    foreign hold stands: the retry timer is cancelled at yield time and no
+    new one is armed — router.play stays untouched."""
+    from app.output import session
+    sup, timers, rec, clock = _fresh_u3(monkeypatch)
+    backend = FakeResumeBackend()
+    with contextlib.ExitStack() as stack:
+        qe, router = _wire_resume(stack, backend)
+        await _start_playing(qe, make_track("t1"))
+
+        await session.hold_foreign_controller()
+
+        for t in list(timers.timers):
+            t.cb()                   # late callbacks racing their cancels
+        await _drain()
+        router.play.assert_not_awaited()
+        assert session.output_hold_active() is True
+        assert sup.session_state == STATE_IDLE_PAUSED
+
+
+async def test_hold_foreign_controller_manual_resume_reactivates(monkeypatch):
+    """The banner's Resume press IS the re-activate: manual resume bypasses
+    the auto gates, dispatches the held front fresh (taking the device
+    back), clears the hold, and never re-counts the held play."""
+    from app.output import session
+    sup, timers, rec, clock = _fresh_u3(monkeypatch)
+    backend = FakeResumeBackend()
+    with contextlib.ExitStack() as stack:
+        qe, router = _wire_resume(stack, backend)
+        item = await _start_playing(qe, make_track("t1"))
+        token = sup.on_dispatched(item.track)
+        sup.on_playback_confirmed(token)
+        rec.assert_called_once()
+
+        await session.hold_foreign_controller()
+        ok = await sup.manual_resume()
+
+        assert ok is True
+        router.play.assert_awaited_once()        # fresh dispatch = takeover
+        assert session.output_hold_active() is False
+        assert sup.session_state == STATE_PLAYING
+        assert sup.idle_paused_reason == ""
+        # R19: confirming the resume dispatch must not re-count.
+        sup.on_playback_confirmed(sup.current_token())
+        rec.assert_called_once()

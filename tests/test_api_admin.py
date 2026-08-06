@@ -3591,3 +3591,514 @@ async def test_playback_volume_during_hold_reflects_in_volume_snapshot(
     assert resp.status_code == 200
     assert or_.active._volume == 0.35    # in-memory level = get_volume's source
     or_.set_volume.assert_not_awaited()  # never a live write to the dead output
+
+
+# ── plexplayer backend plumbing (2026-08-04-002 plan U3) ──────────────────────
+
+async def test_set_output_accepts_plexplayer(client, mock_state):
+    """SetOutputRequest's Literal gained 'plexplayer' — the route routes it
+    to activate_backend like any other backend type."""
+    with patch("app.state.activate_backend", AsyncMock()) as act:
+        resp = client.post(
+            "/admin/output/active",
+            json={"backend_type": "plexplayer", "device_id": "caldera-1"})
+    assert resp.status_code == 200
+    act.assert_awaited_once_with("plexplayer", "caldera-1", host=None)
+    body = resp.json()
+    assert body["backend_type"] == "plexplayer"
+    assert body["device_id"] == "caldera-1"
+
+
+def test_set_output_request_confirmed_defaults_false():
+    """The two-phase switch-confirm field (U6) rides the model from U3's
+    single Literal edit: defaults False, accepts an explicit value."""
+    from app.api.admin import SetOutputRequest
+    assert SetOutputRequest(backend_type="plexplayer").confirmed is False
+    assert SetOutputRequest(backend_type="direct", confirmed=True).confirmed \
+        is True
+
+
+async def test_set_output_confirmed_accepted_on_wire_and_ignored(client, mock_state):
+    """A confirmed:true POST validates and behaves identically today — the
+    route consumes the field only from U6 on."""
+    with patch("app.state.activate_backend", AsyncMock()) as act:
+        resp = client.post(
+            "/admin/output/active",
+            json={"backend_type": "direct", "device_id": "default",
+                  "confirmed": True})
+    assert resp.status_code == 200
+    act.assert_awaited_once_with("direct", "default", host=None)
+
+
+async def test_legacy_pull_lists_plexplayer_devices_without_mdns_key(client, mock_state):
+    """Legacy (watcher-absent) GET /output/devices: plexplayer devices show
+    up in the aggregated payload with gapless "unverified", while
+    mdns_status carries NO plexplayer key — its liveness rides /clients,
+    and key-absence (never "unavailable") is what keeps the frontend
+    banner from rendering the backend degraded (availability decision,
+    plan U3)."""
+    from types import SimpleNamespace
+    from app.output.base import OutputDevice
+    pp = SimpleNamespace(
+        discover_devices=AsyncMock(return_value=[
+            OutputDevice(id="caldera-1", name="Caldera",
+                         backend_type="plexplayer", id_format="uuid")]),
+        device_host=lambda did: "192.168.1.88",
+        probe_device=AsyncMock(return_value=True),
+    )
+    with patch("app.state.plexplayer_backend", pp):
+        resp = client.get("/admin/output/devices")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "plexplayer" not in body["mdns_status"]
+    entry = next(d for d in body["devices"] if d["host"] == "192.168.1.88")
+    assert entry["name"] == "Caldera"
+    protos = {p["backend"]: p for p in entry["protocols"]}
+    assert protos["plexplayer"]["device_id"] == "caldera-1"
+    assert protos["plexplayer"]["gapless"] == "unverified"
+
+
+async def test_legacy_pull_missing_plexplayer_backend_stays_silent(client, mock_state):
+    """A None plexplayer backend (state not set up) must not surface an
+    "unavailable" flag — the guarded mdns_status writes skip it (the
+    frontend would otherwise show a 'plexplayer scan unavailable'
+    banner)."""
+    resp = client.get("/admin/output/devices")  # mock_state: all backends None
+    assert resp.status_code == 200
+    assert "plexplayer" not in resp.json()["mdns_status"]
+
+
+# ── plex_held on admin queue rows + source_lock snapshot (plan U4) ───────────
+
+
+async def test_admin_queue_rows_carry_plex_held(client, mock_state):
+    """The admin queue/recents payload carries the backend-independent
+    per-track flag too — the shared queue renderer paints both pages from
+    one shape. Native single-Plex path → constant True."""
+    qe, _ = mock_state
+    await qe.append(make_track("t1"), bypass_lock=True)
+    await qe.append(make_track("t2"), bypass_lock=True)
+    data = client.get("/admin/queue").json()
+    assert data["queue"] and all(r["plex_held"] is True for r in data["queue"])
+
+
+async def test_admin_queue_output_session_carries_source_lock(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    """The admin-rich snapshot inherits the lean truth: source_lock rides
+    /admin/queue's output_session (the page's resync pull), keyed off the
+    persisted selection — same field the OutputSessionEvent push carries."""
+    import app.state as st
+    data = client.get("/admin/queue").json()
+    assert data["output_session"]["source_lock"] is None
+    monkeypatch.setattr(st, "_selected_output_backend", "plexplayer")
+    data2 = client.get("/admin/queue").json()
+    assert data2["output_session"]["source_lock"] == "plex"
+
+
+async def test_admin_now_playing_output_session_carries_source_lock(
+        client, mock_state, fresh_supervisor, monkeypatch):
+    import app.state as st
+    monkeypatch.setattr(st, "_selected_output_backend", "plexplayer")
+    data = client.get("/admin/playback/now-playing").json()
+    assert data["output_session"]["source_lock"] == "plex"
+
+
+# ── U5 enqueue gate — admin endpoints (2026-08-04-002 plan U5; R6) ────────────
+# The admin queue endpoints run the SAME server-side gate as the guest's (no
+# admin bypass): the shared resolver in app/api/guest.py keys off the
+# persisted selection and resolves holds live from the catalog.
+
+
+@pytest.fixture
+async def admin_catalog_env(tmp_path, monkeypatch):
+    """Seeded catalog + real QueueEngine with plexplayer selected, for the
+    admin gate: t1 = Plex-held (m1), tjo = Jellyfin-only; album 'mix' holds
+    both. Mirrors tests/test_api_guest.py's catalog_env shape."""
+    from app import database, state
+    from app.catalog import store
+    from app.config import Settings
+    from app.queue.engine import QueueEngine
+
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    await database.init_db()
+    await store.replace_catalog(
+        artists=[{"identity": "ar", "title": "Act", "base_key": "act"}],
+        albums=[
+            {"identity": "mix", "title": "Mix", "title_base": "mix", "artist": "Act",
+             "artist_base_key": "act", "year": 2020, "track_count": 2},
+        ],
+        tracks=[
+            {"identity": "t1", "title": "Song One", "title_base": "song one", "artist": "Act",
+             "artist_base_key": "act", "album": "Mix", "album_identity": "mix",
+             "duration_ms": 180000, "disc_number": 1, "track_number": 1},
+            {"identity": "tjo", "title": "J Song", "title_base": "j song", "artist": "Act",
+             "artist_base_key": "act", "album": "Mix", "album_identity": "mix",
+             "duration_ms": 150000, "disc_number": 1, "track_number": 2},
+        ],
+        holds=[
+            {"entity_type": "track", "identity": "t1", "source_id": "m1",
+             "provider_local_key": "m1:p1", "priority": 0, "server_name": "Plex"},
+            {"entity_type": "track", "identity": "tjo", "source_id": "jelly",
+             "provider_local_key": "jelly:pjo", "priority": 1, "server_name": "Jelly"},
+        ],
+    )
+    qe = QueueEngine()
+    registry = MagicMock()
+    registry.get_track = AsyncMock(return_value=make_track("t1"))
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("app.state.queue_engine", qe))
+        stack.enter_context(patch("app.state.get_plex_client",
+                                  AsyncMock(return_value=registry)))
+        stack.enter_context(patch("app.api.guest._catalog_active",
+                                  AsyncMock(return_value=True)))
+        stack.enter_context(patch("app.database.save_queue", AsyncMock()))
+        stack.enter_context(patch("app.database.save_history", AsyncMock()))
+        stack.enter_context(patch.object(state, "_selected_output_backend", "plexplayer"))
+        # S-1: the gate entry (state.plex_lock_enabled_ids) owns the catalog
+        # check + enabled-id build - patch the state seams.
+        stack.enter_context(patch("app.state.catalog_active",
+                                  AsyncMock(return_value=True)))
+        stack.enter_context(patch("app.state.plex_enabled_source_ids",
+                                  AsyncMock(return_value={"m1"})))
+        try:
+            yield qe
+        finally:
+            await database.close_db()
+
+
+async def test_admin_append_track_gated_no_bypass(admin_catalog_env):
+    # bypass_lock is an admin privilege; the source lock is NOT — same 409
+    # shape as the guest endpoint, nothing queued.
+    from fastapi import HTTPException
+    from app.api.admin import admin_append_to_queue, AdminQueueAppendRequest
+    with pytest.raises(HTTPException) as ei:
+        await admin_append_to_queue(AdminQueueAppendRequest(track_id="tjo"))
+    assert ei.value.status_code == 409
+    assert ei.value.detail == "output_source_lock"
+    assert admin_catalog_env.queue == []
+
+
+async def test_admin_append_plex_held_track_allowed(admin_catalog_env):
+    from app.api.admin import admin_append_to_queue, AdminQueueAppendRequest
+    res = await admin_append_to_queue(AdminQueueAppendRequest(track_id="t1"))
+    assert res["ok"] is True and res["tracks_added"] == 1
+    assert admin_catalog_env.queue[0].track_id == "t1"
+
+
+async def test_admin_append_gate_inert_on_other_backend(admin_catalog_env):
+    import app.state as st
+    from app.api.admin import admin_append_to_queue, AdminQueueAppendRequest
+    with patch.object(st, "_selected_output_backend", "direct"):
+        res = await admin_append_to_queue(AdminQueueAppendRequest(track_id="tjo"))
+    assert res["tracks_added"] == 1
+    assert len(admin_catalog_env.queue) == 1
+
+
+async def test_admin_album_mixed_enqueues_playable_subset(admin_catalog_env):
+    # Subset policy on the admin batch path: only the Plex-held track lands;
+    # the response reports added vs filtered counts.
+    from app.api.admin import admin_append_to_queue, AdminQueueAppendRequest
+    with patch("app.api.admin._resolve_album_tracks",
+               AsyncMock(return_value=[make_track("t1"), make_track("tjo")])):
+        res = await admin_append_to_queue(AdminQueueAppendRequest(album_id="mix"))
+    assert res["tracks_added"] == 1
+    assert res["tracks_filtered"] == 1
+    assert [it.track_id for it in admin_catalog_env.queue] == ["t1"]
+
+
+async def test_admin_album_zero_playable_rejected(admin_catalog_env):
+    from fastapi import HTTPException
+    from app.api.admin import admin_append_to_queue, AdminQueueAppendRequest
+    with patch("app.api.admin._resolve_album_tracks",
+               AsyncMock(return_value=[make_track("tjo")])):
+        with pytest.raises(HTTPException) as ei:
+            await admin_append_to_queue(AdminQueueAppendRequest(album_id="mix"))
+    assert ei.value.status_code == 409
+    assert ei.value.detail == "output_source_lock"
+    assert admin_catalog_env.queue == []
+
+
+# ── U6 two-phase switch confirm + mid-session re-validation ──────────────────
+# (2026-08-04-002 plan U6; R7/R8/R12, AE1/AE2, F1.) The stranded evaluation
+# runs in the route (outside activate_backend — rollback semantics stay
+# clean); removal + held-front gen-bump live in the shared state helpers the
+# R12 re-validation hooks reuse.
+
+
+_U6_CONFIRM_DETAIL = {"reason": "output_switch_confirm", "stranded_count": 3,
+                      "confirm_required": True}
+
+
+@pytest.fixture
+async def switch_catalog_env(tmp_path, monkeypatch):
+    """Seeded catalog + real QueueEngine for the U6 stranded flows:
+    p1/p2 Plex-held (m1), j1..j4 Jellyfin-only (stranded under the lock).
+    The persisted selection starts on 'direct' — the switch-time pre-check
+    evaluates the TARGET backend via assume_lock, so it must work while the
+    current selection is NOT plexplayer; re-validation tests flip the
+    selection themselves. Mirrors admin_catalog_env's patch surface."""
+    from app import database, state
+    from app.catalog import store
+    from app.config import Settings
+    from app.queue.engine import QueueEngine
+
+    s = Settings(data_dir=tmp_path, secret_key="test")
+    monkeypatch.setattr(database, "settings", s)
+    await database.init_db()
+    tracks, holds = [], []
+    for tid, src, server in (("p1", "m1", "Plex"), ("p2", "m1", "Plex"),
+                             ("j1", "jelly", "Jelly"), ("j2", "jelly", "Jelly"),
+                             ("j3", "jelly", "Jelly"), ("j4", "jelly", "Jelly")):
+        tracks.append({"identity": tid, "title": tid, "title_base": tid,
+                       "artist": "Act", "artist_base_key": "act",
+                       "album": "Mix", "album_identity": "mix",
+                       "duration_ms": 180000, "disc_number": 1,
+                       "track_number": len(tracks) + 1})
+        holds.append({"entity_type": "track", "identity": tid,
+                      "source_id": src, "provider_local_key": f"{src}:{tid}",
+                      "priority": 0, "server_name": server})
+    await store.replace_catalog(
+        artists=[{"identity": "ar", "title": "Act", "base_key": "act"}],
+        albums=[{"identity": "mix", "title": "Mix", "title_base": "mix",
+                 "artist": "Act", "artist_base_key": "act", "year": 2020,
+                 "track_count": 6}],
+        tracks=tracks, holds=holds)
+    qe = QueueEngine()
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("app.state.queue_engine", qe))
+        stack.enter_context(patch("app.api.guest._catalog_active",
+                                  AsyncMock(return_value=True)))
+        stack.enter_context(patch("app.database.save_queue", AsyncMock()))
+        stack.enter_context(patch("app.database.save_history", AsyncMock()))
+        stack.enter_context(patch.object(state, "_selected_output_backend",
+                                         "direct"))
+        # S-1: the gate entry (state.plex_lock_enabled_ids) owns the catalog
+        # check + enabled-id build - patch the state seams.
+        stack.enter_context(patch("app.state.catalog_active",
+                                  AsyncMock(return_value=True)))
+        stack.enter_context(patch("app.state.plex_enabled_source_ids",
+                                  AsyncMock(return_value={"m1"})))
+        try:
+            yield qe
+        finally:
+            await database.close_db()
+
+
+async def _seed_queue(qe, ids):
+    for tid in ids:
+        await qe.append(make_track(tid), bypass_lock=True)
+
+
+async def test_switch_warns_then_confirmed_resend_removes_stranded(switch_catalog_env):
+    """Covers AE1: mixed queue → 409 with stranded_count 3 and NO state
+    change; the confirmed resend removes exactly those 3 (order of the rest
+    preserved, receipts matched), reports the actual removed count, and
+    proceeds to activate."""
+    from fastapi import HTTPException
+    from app.api.admin import set_output_active, SetOutputRequest
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("p1", "j1", "p2", "j2", "j3"))
+    with patch("app.state.activate_backend", AsyncMock()) as act:
+        with pytest.raises(HTTPException) as ei:
+            await set_output_active(SetOutputRequest(
+                backend_type="plexplayer", device_id="c1"))
+        assert ei.value.status_code == 409
+        assert ei.value.detail == _U6_CONFIRM_DETAIL
+        act.assert_not_awaited()  # warning phase: output untouched
+        assert [i.track_id for i in qe.queue] == ["p1", "j1", "p2", "j2", "j3"]
+        res = await set_output_active(SetOutputRequest(
+            backend_type="plexplayer", device_id="c1", confirmed=True))
+    assert res["removed_count"] == 3
+    assert [i.track_id for i in qe.queue] == ["p1", "p2"]
+    act.assert_awaited_once_with("plexplayer", "c1", host=None)
+
+
+async def test_switch_reject_leaves_queue_and_output_untouched(switch_catalog_env):
+    """Covers AE2: the admin rejects (never resends confirmed) — the 409
+    changed nothing, so queue and output stay exactly as they were."""
+    from fastapi import HTTPException
+    from app.api.admin import set_output_active, SetOutputRequest
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("p1", "j1"))
+    with patch("app.state.activate_backend", AsyncMock()) as act:
+        with pytest.raises(HTTPException) as ei:
+            await set_output_active(SetOutputRequest(
+                backend_type="plexplayer", device_id="c1"))
+    assert ei.value.status_code == 409
+    assert [i.track_id for i in qe.queue] == ["p1", "j1"]
+    act.assert_not_awaited()
+
+
+async def test_confirmed_switch_activate_failure_restores_queue(switch_catalog_env):
+    """Review fix PLX-3: activate_backend raising AFTER the confirmed
+    removal (DeviceNotReadyError → plain-string 409, network 502, ...)
+    means the switch never happened and the old backend keeps playing —
+    the removed stranded entries must be restored at their original
+    positions, receipts intact (guest remove-own still works), and the
+    failure response must not claim a removal."""
+    from fastapi import HTTPException
+    from app.api.admin import set_output_active, SetOutputRequest
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("p1", "j1", "p2", "j2", "j3"))
+    before_ids = [id(i) for i in qe.queue]
+    before = [(i.track_id, i.added_at) for i in qe.queue]
+    act = AsyncMock(side_effect=RuntimeError("device not ready — rescan"))
+    with patch("app.state.activate_backend", act):
+        with pytest.raises(HTTPException) as ei:
+            await set_output_active(SetOutputRequest(
+                backend_type="plexplayer", device_id="c1", confirmed=True))
+    assert ei.value.status_code == 409
+    assert isinstance(ei.value.detail, str)          # no removal claim
+    act.assert_awaited_once()
+    # Byte-identical queue: same receipts, same order, the SAME objects.
+    assert [(i.track_id, i.added_at) for i in qe.queue] == before
+    assert [id(i) for i in qe.queue] == before_ids
+
+
+async def test_switch_confirm_recomputes_live_stranded_set(switch_catalog_env):
+    """Race case: a guest enqueues a 4th unplayable track between warning
+    and confirm — the confirm-phase recompute wins and removal reports 4."""
+    from fastapi import HTTPException
+    from app.api.admin import set_output_active, SetOutputRequest
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("p1", "j1", "j2", "j3"))
+    with patch("app.state.activate_backend", AsyncMock()) as act:
+        with pytest.raises(HTTPException) as ei:
+            await set_output_active(SetOutputRequest(
+                backend_type="plexplayer", device_id="c1"))
+        assert ei.value.detail["stranded_count"] == 3
+        await _seed_queue(qe, ("j4",))  # guest slips one in mid-dialog
+        res = await set_output_active(SetOutputRequest(
+            backend_type="plexplayer", device_id="c1", confirmed=True))
+    assert res["removed_count"] == 4
+    assert [i.track_id for i in qe.queue] == ["p1"]
+    act.assert_awaited_once()
+
+
+async def test_switch_all_playable_queue_activates_directly(switch_catalog_env):
+    """All-playable queue → no 409, no dialog round-trip: the switch
+    behaves exactly like every pre-U6 switch (removed_count 0)."""
+    from app.api.admin import set_output_active, SetOutputRequest
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("p1", "p2"))
+    with patch("app.state.activate_backend", AsyncMock()) as act:
+        res = await set_output_active(SetOutputRequest(
+            backend_type="plexplayer", device_id="c1"))
+    assert res["ok"] is True and res["removed_count"] == 0
+    assert [i.track_id for i in qe.queue] == ["p1", "p2"]
+    act.assert_awaited_once_with("plexplayer", "c1", host=None)
+
+
+async def test_switch_non_plexplayer_target_never_gated(switch_catalog_env):
+    """A non-plexplayer target skips the gate entirely — byte-identical
+    existing behavior even with a fully stranded queue (switching AWAY from
+    the lock never warns; plan scope)."""
+    from app.api.admin import set_output_active, SetOutputRequest
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("j1", "j2"))
+    with patch("app.state.activate_backend", AsyncMock()) as act:
+        res = await set_output_active(SetOutputRequest(
+            backend_type="chromecast", device_id="cc-1"))
+    assert res["ok"] is True and res["removed_count"] == 0
+    assert [i.track_id for i in qe.queue] == ["j1", "j2"]
+    act.assert_awaited_once_with("chromecast", "cc-1", host=None)
+
+
+async def test_switch_confirm_409_wire_shape_distinguishable(client, mock_state):
+    """Pins the wire shape: the confirm 409's detail serializes as a JSON
+    OBJECT with reason 'output_switch_confirm' — structurally distinguishable
+    from this endpoint's plain-STRING 409 details (activate_backend failures)
+    and from the queue endpoints' 'output_source_lock', so a genuine switch
+    failure can never open the client's confirm dialog."""
+    qe, _ = mock_state
+    item = await qe.append(make_track("tjo"), bypass_lock=True)
+    with patch("app.state.plex_stranded_entries",
+               AsyncMock(return_value=[item])):
+        resp = client.post(
+            "/admin/output/active",
+            json={"backend_type": "plexplayer", "device_id": "c1"})
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert isinstance(detail, dict) and detail != "output_source_lock"
+    assert detail == {"reason": "output_switch_confirm", "stranded_count": 1,
+                      "confirm_required": True}
+
+
+async def test_confirmed_removal_of_held_front_bumps_advance_gen(
+        switch_catalog_env, monkeypatch):
+    """Held-front discipline (the queue_clear mechanic): confirming a switch
+    during an outage hold whose HELD front entry is stranded must bump
+    _advance_gen so an in-flight resume treats the new front as fresh at
+    0:00 — never seeking the removed track's held position into it."""
+    import app.state as st
+    from app.api.admin import set_output_active, SetOutputRequest
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("j1", "p1"))
+    monkeypatch.setattr(st, "_advance_gen", 41)
+    with patch("app.state.activate_backend", AsyncMock()), \
+         patch("app.output.session.output_hold_active",
+               MagicMock(return_value=True)):
+        res = await set_output_active(SetOutputRequest(
+            backend_type="plexplayer", device_id="c1", confirmed=True))
+    assert res["removed_count"] == 1
+    assert st._advance_gen == 42
+    assert [i.track_id for i in qe.queue] == ["p1"]
+
+
+async def test_rescan_completion_removes_newly_stranded(
+        switch_catalog_env, monkeypatch):
+    """R12: catalog-refresh completion runs the re-validation pass while
+    plexplayer is selected — the newly stranded entry is auto-removed (no
+    dialog) and the admin notice carries the removed count. The currently-
+    playing track is not queue state, so it is untouched by construction."""
+    import app.state as st
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("p1", "j1"))
+    monkeypatch.setattr(st, "_selected_output_backend", "plexplayer")
+    notice = AsyncMock()
+    with patch("app.catalog.scan.scan_and_replace",
+               AsyncMock(return_value=True)), \
+         patch("app.state.get_plex_client",
+               AsyncMock(return_value=MagicMock())), \
+         patch("app.events.bus.manager.broadcast_to_admins", notice):
+        await st._refresh_catalog()
+    assert [i.track_id for i in qe.queue] == ["p1"]
+    notice.assert_awaited_once()
+    ev = notice.call_args.args[0]
+    assert ev.backend_type == "error"
+    assert "1" in ev.device_name  # the count rides the notice copy
+
+
+async def test_disabled_sources_change_revalidates_queue(
+        switch_catalog_env, monkeypatch):
+    """R12: a Libraries-panel whole-source veto change triggers the same
+    re-validation immediately (the read-time predicate flips at veto save,
+    before any rescan completes)."""
+    import app.state as st
+    from app.api.admin import _set_source_disabled
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("p1", "j1"))
+    monkeypatch.setattr(st, "_selected_output_backend", "plexplayer")
+    notice = AsyncMock()
+    with patch("app.state.trigger_browse_index_refresh", MagicMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_ondeck", AsyncMock()), \
+         patch("app.events.bus.manager.broadcast_to_admins", notice):
+        await _set_source_disabled("jelly", disabled=True)
+    assert [i.track_id for i in qe.queue] == ["p1"]
+    notice.assert_awaited_once()
+
+
+async def test_revalidate_noop_without_lock(switch_catalog_env):
+    """No lock active (non-plexplayer selection) → re-validation is a
+    no-op: nothing removed, no notice."""
+    from app import state
+    qe = switch_catalog_env
+    await _seed_queue(qe, ("p1", "j1"))
+    notice = AsyncMock()
+    with patch("app.events.bus.manager.broadcast_to_admins", notice):
+        removed = await state.revalidate_plex_queue(trigger="rescan")
+    assert removed == 0
+    assert [i.track_id for i in qe.queue] == ["p1", "j1"]
+    notice.assert_not_awaited()
