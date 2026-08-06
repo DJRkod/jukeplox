@@ -49,8 +49,16 @@
   let _railResizeObserver = null;
   let _condensationPending = false;
   let _condensationGen = 0;
-  let _alphaSortedOffsets = null;
+  // Bucket-start marker ELEMENTS, cached per activation ([el, key] in DOM
+  // order). Offsets are deliberately NOT cached — see _attachAlphaObserver.
+  let _alphaMarkers = null;
   let _alphaActiveRail = null;
+  // Last drag-scrubbed jump target; _settleJump converges onto it at release
+  // (pointerup). Cleared by cancelRailDrag so render paths never settle onto
+  // a detached row. _settleJumpGen invalidates an in-flight settle loop when
+  // a newer jump starts (two loops must never fight over the scroller).
+  let _railScrubTarget = null;
+  let _settleJumpGen = 0;
   // Plan 002 U2: singleton rail on document.body. Replaces per-column build.
   // _activeColumn is the .alpha-items-column the rail currently points at;
   // pointer handlers and the highlight observer read it at event time.
@@ -292,6 +300,7 @@
     if (!_railDragging) return;
     _railDragging = false;
     _railBounds = null;
+    _railScrubTarget = null;
     if (_alphaOverlay) _alphaOverlay.style.opacity = '0';
   }
 
@@ -1019,7 +1028,7 @@
     }
     _alphaScrollPending = false;
     _alphaScrollAncestor = null;
-    _alphaSortedOffsets = null;
+    _alphaMarkers = null;
     _alphaActiveRail = null;
     if (_columnVisibilityObserver) {
       try { _columnVisibilityObserver.disconnect(); } catch (_) { /* noop */ }
@@ -1089,17 +1098,21 @@
     _alphaScrollPending = false;
     _alphaActiveRail = rail;
     _alphaScrollAncestor = _findScrollAncestor(column);
-    // Cache [data-bucket-start] offsets once at activation as a sorted
-    // [[offsetTop, bucketKey], ...] tuple. Walking the DOM on every scroll
-    // event would defeat the rAF throttle's purpose.
-    const colTop = column.offsetTop || 0;
-    const markers = column.querySelectorAll('[data-bucket-start]');
-    const offsets = [];
-    markers.forEach(el => {
-      offsets.push([el.offsetTop - colTop, el.dataset.bucketStart]);
+    // Cache the [data-bucket-start] marker ELEMENTS once at activation (the
+    // DOM walk is the per-scroll cost worth avoiding). Their offsetTop is
+    // deliberately read LIVE on every firing: under content-visibility render
+    // containment (rail.css), a not-yet-rendered cell's offset contribution is
+    // the contain-intrinsic-size ESTIMATE and shifts to the true value when
+    // the cell first renders — an activation-time offset snapshot drifts by
+    // thousands of px on a large library, highlighting a letter 2–3 behind
+    // the visible content (2026-08-04 debug). Live reads share the current
+    // frame's layout with scrollTop, so the comparison is always
+    // self-consistent — ~27 offset reads per firing, no DOM walk.
+    const markers = [];
+    column.querySelectorAll('[data-bucket-start]').forEach(el => {
+      markers.push([el, el.dataset.bucketStart]);
     });
-    offsets.sort((a, b) => a[0] - b[0]);
-    _alphaSortedOffsets = offsets;
+    _alphaMarkers = markers;
     // The scroll handler. Module-scope reference so _deactivateRail can
     // removeEventListener it cleanly.
     _alphaScrollHandler = () => {
@@ -1109,14 +1122,21 @@
         _alphaScrollPending = false;
         // _railDragging owns the indicator during scrub (U7 of plan 001).
         if (_railDragging) return;
-        if (!_alphaActiveRail || !_alphaSortedOffsets) return;
+        if (!_alphaActiveRail || !_alphaMarkers) return;
         const scrollRoot = _alphaScrollAncestor || document.scrollingElement;
         const scrollTop = (scrollRoot ? scrollRoot.scrollTop : 0) + _ALPHA_HIGHLIGHT_THRESHOLD;
-        let active = _alphaSortedOffsets.length ? _alphaSortedOffsets[0][1] : null;
-        for (const [top, L] of _alphaSortedOffsets) {
-          if (top <= scrollTop) active = L;
-          else break;
+        const colTop = column.offsetTop || 0;
+        // Active = the marker with the greatest offset at/above the threshold
+        // line; none above it (top of list) = the offset-lowest marker. A
+        // max-scan rather than a sorted walk: offsets are live, so a frozen
+        // sort order can't be assumed.
+        let active = null, bestTop = -Infinity, firstKey = null, firstTop = Infinity;
+        for (const [el, L] of _alphaMarkers) {
+          const top = el.offsetTop - colTop;
+          if (top < firstTop) { firstTop = top; firstKey = L; }
+          if (top <= scrollTop && top > bestTop) { bestTop = top; active = L; }
         }
+        if (active === null) active = firstKey;
         Array.from(_alphaActiveRail.children).forEach(child => {
           // Every mode's child carries data-bucket so the same lookup works.
           if (child.dataset && child.dataset.bucket !== undefined) {
@@ -1132,6 +1152,45 @@
     // Prime the highlight once so the active letter is correct without
     // requiring the user to scroll.
     _alphaScrollHandler();
+  }
+
+  // Instant jump with convergence. Under content-visibility render containment
+  // (rail.css), target.offsetTop is computed from contain-intrinsic-size
+  // ESTIMATES for every not-yet-rendered cell above it; a single scrollTop
+  // write therefore lands past the bucket start (~4 rows deep on a large
+  // library — 2026-08-04 debug), because the browser realizes the destination
+  // band at TRUE sizes right after the write and the content shifts. Re-read
+  // and re-write across frames until the target's offset stabilizes. Bounded;
+  // aborts on user input, when a newer jump takes over (generation), or when
+  // a re-render detaches the target.
+  function _settleJump(scrollRoot, col, target) {
+    const gen = ++_settleJumpGen;   // a newer jump owns the scroller now
+    // Abort on USER input only — scrollTop deltas can't distinguish the user
+    // from Chrome's scroll anchoring, which adjusts scrollTop while the
+    // destination band realizes (and would anchor the WRONG landing in place).
+    // Listeners go on window: wheel/touch/pointer bubble there from any
+    // scroller, and keydown never fires on an unfocused pane div.
+    const evs = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
+    let aborted = false;
+    const abort = () => { aborted = true; };
+    evs.forEach(e => window.addEventListener(e, abort, { passive: true, once: true }));
+    const cleanup = () => evs.forEach(e => window.removeEventListener(e, abort));
+    // Hold the watch for the FULL window — no early exit on an agreeing read.
+    // rAF callbacks run before the frame's render step, so the realization
+    // shift lands AFTER a tick that still saw estimate-consistent (matching)
+    // geometry; exiting on first agreement misses it. Corrections are
+    // viewport-rect-based (target top vs scroller top), which is exact in any
+    // offsetParent arrangement and self-corrects late realization trickle.
+    let tries = 20;
+    const tick = () => {
+      if (aborted || gen !== _settleJumpGen || !target.isConnected) { cleanup(); return; }
+      const delta = target.getBoundingClientRect().top - scrollRoot.getBoundingClientRect().top;
+      if (Math.abs(delta) > 1) scrollRoot.scrollTop += delta;
+      if (--tries < 0) { cleanup(); return; }
+      requestAnimationFrame(tick);
+    };
+    scrollRoot.scrollTop = target.offsetTop - ((col && col.offsetTop) || 0);
+    requestAnimationFrame(tick);
   }
 
   // U6 + U7: wire tap-to-jump (and pointer drag in U7). One-shot wiring on
@@ -1167,9 +1226,10 @@
         // the target, forcing render of the whole traversal; on a large library
         // that's ~0.6–1s of main-thread long tasks per tap (confirmed against the
         // live instance via tools/perf/browse-bench, A/B smooth vs instant —
-        // 2026-06-24). Instant renders only the destination region.
+        // 2026-06-24). Instant renders only the destination region. _settleJump
+        // converges the landing across frames (content-visibility estimates).
         const scrollRoot = _findScrollAncestor(col) || document.scrollingElement;
-        if (scrollRoot) scrollRoot.scrollTop = target.offsetTop - (col.offsetTop || 0);
+        if (scrollRoot) _settleJump(scrollRoot, col, target);
         else target.scrollIntoView({ block: 'start' });
       }
       // NOTE: deliberately no event.stopPropagation() — let any open overflow
@@ -1237,7 +1297,18 @@
       if (!_railDragging) return;
       _railPointerMove(e, rail);
     });
-    rail.addEventListener('pointerup', cancelRailDrag);
+    rail.addEventListener('pointerup', () => {
+      // Normal release: converge onto the last scrubbed bucket start (the
+      // scrub's per-move scrollTop writes used estimate-based offsets — see
+      // _settleJump). Interrupted gestures (pointercancel/lostpointercapture)
+      // deliberately don't settle: don't move content under a lost pointer.
+      const t = _railScrubTarget;
+      cancelRailDrag();
+      if (t && t.isConnected && _activeColumn) {
+        const scrollRoot = _findScrollAncestor(_activeColumn) || document.scrollingElement;
+        if (scrollRoot) _settleJump(scrollRoot, _activeColumn, t);
+      }
+    });
     rail.addEventListener('pointercancel', cancelRailDrag);
     rail.addEventListener('lostpointercapture', cancelRailDrag);
   }
@@ -1261,9 +1332,13 @@
     const target = (col && key != null) ? col.querySelector(`[data-bucket-start="${CSS.escape(key)}"]`) : null;
     const scrollRoot = _findScrollAncestor(col) || document.scrollingElement;
     if (target && scrollRoot) {
-      // Manual scrollTop (no smooth) — drag must feel real-time.
+      // Manual scrollTop (no smooth) — drag must feel real-time. Estimate
+      // drift during the scrub is tolerable (the finger is still moving);
+      // the pointerup wiring runs _settleJump on the LAST scrubbed target so
+      // the release lands flush on the bucket start.
       const colTop = (col && col.offsetTop) || 0;
       scrollRoot.scrollTop = target.offsetTop - colTop;
+      _railScrubTarget = target;
     }
     // The drag owns the indicator (the scroll handler defers via _railDragging),
     // so mirror the scrubbed bucket onto the rail — only for buckets with a jump

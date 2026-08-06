@@ -2071,6 +2071,42 @@ def test_rail_tap_jump_is_instant_not_smooth():
     )
 
 
+def test_rail_geometry_is_containment_safe_structural():
+    """Rail geometry must not trust one-shot offset reads under
+    content-visibility render containment (2026-08-04 rail-tracking debug).
+
+    Off-screen cells occupy their contain-intrinsic-size ESTIMATE (rail.css)
+    until first rendered, so:
+    - a single scrollTop write from target.offsetTop lands past the bucket
+      start (~4 rows deep on a large library) once the destination band
+      realizes at true sizes — jumps must go through _settleJump, which
+      re-corrects across frames until the target is flush;
+    - an activation-time snapshot of marker offsets drifts by thousands of px
+      as cells realize while scrolling (highlight lagged 2-3 letters) — the
+      highlight handler must cache marker ELEMENTS (_alphaMarkers) and read
+      offsetTop live each firing.
+    Behavioral proof: tools/perf/browse-bench.html driven headless (drift
+    -266px -> -0.1px with the fix)."""
+    browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    assert "function _settleJump" in browse, (
+        "rail jumps need the _settleJump convergence loop: one scrollTop write "
+        "lands mid-letter under content-visibility size estimates."
+    )
+    call_sites = browse.count("_settleJump(scrollRoot")
+    assert call_sites >= 2, (
+        f"_settleJump must run on BOTH jump paths (tap handler + drag release); "
+        f"found {call_sites} call site(s)."
+    )
+    assert "_alphaMarkers" in browse, (
+        "the highlight handler must keep the marker-element cache (_alphaMarkers) "
+        "and read offsets live per firing."
+    )
+    assert "offsets.push([el.offsetTop" not in browse and "_alphaSortedOffsets" not in browse, (
+        "no frozen offset snapshots: an activation-time [offsetTop, key] table "
+        "goes stale as content-visibility cells realize their true size."
+    )
+
+
 def test_browse_top_level_rows_use_event_delegation_structural():
     browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
     assert "function _wireListDelegation(" in browse, (
