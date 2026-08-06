@@ -426,6 +426,8 @@ def test_plex_poll_clears_veto_only_for_newly_added_server(client, mock_state):
                AsyncMock(side_effect=[[{"machine_id": "A"}], [{"machine_id": "A"}, {"machine_id": "B"}]])), \
          patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=["A", "B"])), \
          patch("app.api.admin.database.set_disabled_sources", setv), \
+         patch("app.api.admin._enable_new_source_libraries", AsyncMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
          patch("app.state.invalidate_plex_client", MagicMock()):
         resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
     assert resp.status_code == 200
@@ -440,10 +442,53 @@ def test_plex_poll_does_not_clear_veto_of_already_connected_server(client, mock_
                AsyncMock(side_effect=[[{"machine_id": "A"}], [{"machine_id": "A"}]])), \
          patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=["A"])), \
          patch("app.api.admin.database.set_disabled_sources", setv), \
+         patch("app.api.admin._enable_new_source_libraries", AsyncMock()), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
          patch("app.state.invalidate_plex_client", MagicMock()):
         resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
     assert resp.status_code == 200
     setv.assert_not_awaited()   # A stays vetoed — no over-clear on re-auth
+
+
+def test_plex_poll_seeds_new_server_libraries_and_scans(client, mock_state):
+    # Fresh-install audit F1 (2026-08-06): a NEWLY connected Plex server's libraries
+    # seed enabled-by-default — a single-library server rendered no per-library
+    # control, so without seeding a doc-following fresh install dead-ended with a
+    # permanently empty catalog. A crawl also kicks off without a manual Rescan,
+    # matching the Jellyfin/local connect handlers.
+    seed = AsyncMock()
+    trig = MagicMock()
+    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
+         patch("app.api.admin.database.get_plex_servers",
+               AsyncMock(side_effect=[[], [{"machine_id": "B"}]])), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
+         patch("app.api.admin._enable_new_source_libraries", seed), \
+         patch("app.state.trigger_catalog_refresh", trig), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
+    assert resp.status_code == 200
+    seed.assert_awaited_once_with("B")
+    trig.assert_called_once()
+
+
+def test_plex_poll_reauth_never_reseeds_libraries(client, mock_state):
+    # A RE-auth (no new machine_id) must never overwrite a remembered per-library
+    # selection: no seeding, no auto-crawl (fresh-install audit F1 scope guard).
+    seed = AsyncMock()
+    trig = MagicMock()
+    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
+         patch("app.api.admin.database.get_plex_servers",
+               AsyncMock(side_effect=[[{"machine_id": "A"}], [{"machine_id": "A"}]])), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
+         patch("app.api.admin._enable_new_source_libraries", seed), \
+         patch("app.state.trigger_catalog_refresh", trig), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
+    assert resp.status_code == 200
+    seed.assert_not_awaited()
+    trig.assert_not_called()
 
 
 # ── Surprise Me settings (2026-06-17 plan U3) ────────────────────────────────

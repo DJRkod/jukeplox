@@ -238,16 +238,18 @@ async def scan_status():
 
 
 async def _enable_new_source_libraries(source_id: str) -> None:
-    """Enable a freshly-connected non-Plex source's libraries by default.
+    """Enable a freshly-connected source's libraries by default.
 
-    Plex libraries are toggled manually in the dashboard (``/plex/libraries/{key}/
-    enable``), so a Plex server's checkboxes gate its import. Local-folder and
-    Jellyfin sources have NO per-library enable UI, yet the catalog scan filters
-    EVERY source's libraries by the enabled-library set (uniform gating, ce-debug
-    2026-06-29). Without seeding that set on connect, a local/Jellyfin library is
-    never enabled → the scan drops it → an empty catalog for any local-folder or
-    Jellyfin install (ce-debug 2026-07-24). Enable the new source's libraries here
-    so they crawl by default; a future per-library disable UI can still remove them.
+    The catalog scan filters EVERY source's libraries by the enabled-library set
+    (uniform gating, ce-debug 2026-06-29), so an unseeded source is silently
+    dropped → an empty catalog. Local-folder and Jellyfin connects have always
+    seeded here (ce-debug 2026-07-24); NEWLY connected Plex servers seed too
+    (fresh-install audit F1, 2026-08-06 — a single-library server had no UI path
+    to its checkbox, so a doc-following fresh install dead-ended empty). The
+    Libraries panel remains the opt-out: per-library checkboxes and the
+    whole-source switch can still exclude content, and a Plex RE-auth never
+    reaches this (callers scope it to newly-added machine_ids), so a remembered
+    selection is never overwritten.
     """
     # Best-effort, mirroring scan.py's _safe posture. By the time this runs the
     # source is already saved and invalidate_plex_client() has cleared the cache,
@@ -464,6 +466,7 @@ async def plex_connect_poll(pin_id: int, client_id: str):
         # A NEWLY (re)connected Plex server honors its default-ON switch: clear its veto
         # so it can't come back invisible (U3). Plex has no panel Remove, so there is no
         # Plex-disconnect veto path. Best-effort — a veto-store hiccup must not fail connect.
+        new_ids: set[str] = set()
         try:
             after = {s["machine_id"] for s in await database.get_plex_servers()}
             new_ids = after - before
@@ -474,6 +477,16 @@ async def plex_connect_poll(pin_id: int, client_id: str):
                 state.invalidate_plex_client()  # veto set changed -> bump the SWR generation
         except Exception:
             _log.warning("plex-connect veto clear failed", exc_info=True)
+        # Seed a NEWLY connected server's libraries enabled-by-default, matching the
+        # non-Plex connects above. Without this, a fresh install whose server holds a
+        # single music library dead-ends: no enabled_libraries row is ever written, the
+        # panel renders no per-library control for single-library sources, and Rescan
+        # clears an already-empty catalog (fresh-install audit F1, 2026-08-06). Scoped
+        # to new_ids so a RE-auth never overwrites a remembered per-library selection.
+        for sid in new_ids:
+            await _enable_new_source_libraries(sid)
+        if new_ids:
+            state.trigger_catalog_refresh()  # crawl the new server without a manual Rescan
     return {"resolved": resolved}
 
 
