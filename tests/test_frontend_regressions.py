@@ -1044,6 +1044,70 @@ def test_volume_and_kebab_use_gradient():
     )
 
 
+def test_volume_snap_buttons_wired():
+    """2026-08-04 volume rework U2: ±5% nudge buttons flank the admin volume
+    slider, snap in the pressed direction via integer-percent math, and REUSE
+    the slider's input pipeline (synthetic dispatch) instead of growing a
+    second write path. Buttons disable at the bounds (U1 mockup pick)."""
+    admin = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert 'id="vol-down"' in admin and 'id="vol-up"' in admin, (
+        "The admin controls row must carry the vol-down / vol-up nudge buttons."
+    )
+    assert 'aria-label="Volume down"' in admin and 'aria-label="Volume up"' in admin, (
+        "Nudge buttons must carry accessible labels (transport-button pattern)."
+    )
+    assert ".vol-btn:disabled" in admin, (
+        "The at-bound treatment is DISABLED (U1 pick) — the template must style it."
+    )
+    assert "function _volSnap" in js and "function _volSyncButtons" in js, (
+        "admin app.js must define the snap + bounds-sync helpers."
+    )
+    assert "dir > 0 ? Math.floor(p / 5) + 1 : Math.ceil(p / 5) - 1" in js, (
+        "Snap must round to the nearest multiple of 5 in the pressed direction "
+        "(exact pairing pinned — a swapped ceil/floor would still contain both "
+        "substrings individually)."
+    )
+    assert "dispatchEvent(new Event('input'))" in js, (
+        "Button writes must reuse the slider input pipeline via synthetic "
+        "dispatch — label/fill/echo-stamp/debounce live there."
+    )
+    assert js.count("'/admin/playback/volume'") == 2, (
+        "Exactly one GET + one POST call site for the volume endpoint — the "
+        "nudge buttons must not add a parallel write path."
+    )
+
+
+def test_volume_orientation_setting_wired():
+    """2026-08-04 volume rework U3: the volume_orientation setting reaches every
+    layer — Settings-form radios, admin JS hydrate/save + data-attribute apply,
+    and the vertical (docked right rail, rotated-input) CSS variant."""
+    admin = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert 'name="volume-orientation"' in admin, (
+        "Setup → Settings must carry the volume-orientation radio pair."
+    )
+    assert 'body[data-vol-orient="vertical"]' in admin, (
+        "The vertical render variant must be a data-attribute CSS switch "
+        "(one render path, no JS fork)."
+    )
+    assert re.search(r'data-vol-orient="vertical"\][^{]*\.vol-group', admin), (
+        "Vertical must dock the .vol-group (right-rail mockup pick)."
+    )
+    assert "rotate(-90deg)" in admin, (
+        "Vertical uses the rotated-horizontal-input technique (U1 pick: scheme "
+        "gradient runs along the bar; arrow keys keep their natural mapping)."
+    )
+    assert "s.volume_orientation" in js and "body.volume_orientation" in js, (
+        "admin app.js must BOTH hydrate (loadSettings) and save (Save Settings "
+        "collection) the volume_orientation key — either site alone regresses."
+    )
+    assert "dataset.volOrient" in js, (
+        "admin app.js must apply the orientation as the body data-attribute "
+        "(at load and on save success)."
+    )
+
+
 def test_release_subtitle_links_and_kebab_parity():
     """2026-06-20 release-view redesign: the artist + year under the cover are
     accent name-links (artist once, here; year drills its releases via

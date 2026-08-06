@@ -349,6 +349,7 @@ let _volUserLastSet = 0;
 volSlider.addEventListener('input', () => {
   volLabel.textContent = `${Math.round(volSlider.value * 100)}%`;
   volSlider.style.setProperty('--vol-fill', `${volSlider.value * 100}%`);  // gradient fill (2026-06-18)
+  _volSyncButtons();
   // Stamp on raw input (not inside the debounce) so the echo-guard window
   // covers the user's whole drag, not just the post-debounce write.
   _volUserLastSet = Date.now();
@@ -368,6 +369,7 @@ async function loadVolume() {
     volSlider.value = level;
     volLabel.textContent = `${Math.round(level * 100)}%`;
     volSlider.style.setProperty('--vol-fill', `${level * 100}%`);
+    _volSyncButtons();
   } catch {}
 }
 
@@ -381,7 +383,33 @@ function applyVolumeFromEvent(level) {
   volSlider.value = clamped;
   volLabel.textContent = `${Math.round(clamped * 100)}%`;
   volSlider.style.setProperty('--vol-fill', `${clamped * 100}%`);
+  _volSyncButtons();
 }
+
+// ±5% nudge buttons (2026-08-04 volume rework U2). Snap to the nearest
+// multiple of 5 in the pressed direction (47% → 50% up, 45% down); math in
+// the integer-percent domain so float artifacts can't miss the grid. The
+// write path is REUSED, not duplicated: set the slider value and dispatch a
+// synthetic 'input' so the existing listener does label/fill/echo-stamp/
+// debounced POST — rapid taps coalesce into one device write. Buttons carry
+// the disabled attribute at the bounds (mockup pick); synced everywhere the
+// slider value changes outside the input listener.
+function _volSyncButtons() {
+  const p = Math.round(volSlider.value * 100);
+  document.getElementById('vol-down').disabled = p <= 0;
+  document.getElementById('vol-up').disabled = p >= 100;
+}
+function _volSnap(dir) {
+  const p = Math.round(volSlider.value * 100);
+  // Branchless "nearest multiple of 5 in the pressed direction": off-grid
+  // snaps to it, on-grid moves a full step (floor(45/5)+1 = 50, etc.).
+  const next = (dir > 0 ? Math.floor(p / 5) + 1 : Math.ceil(p / 5) - 1) * 5;
+  volSlider.value = Math.min(100, Math.max(0, next)) / 100;
+  volSlider.dispatchEvent(new Event('input'));  // reuse the full slider pipeline
+}
+document.getElementById('vol-down').addEventListener('click', () => _volSnap(-1));
+document.getElementById('vol-up').addEventListener('click', () => _volSnap(1));
+_volSyncButtons();
 
 // ── Lock toggle ────────────────────────────────────────────────────────────
 
@@ -1684,6 +1712,12 @@ async function loadSettings() {
     // box always shows the live value; the >= 1 floor is enforced server-side.
     const resumeWindow = document.getElementById('resume-window-minutes');
     if (resumeWindow) resumeWindow.value = s.resume_window_minutes || '';
+    // Volume bar orientation (2026-08-04 volume rework U3): hydrate the radio
+    // AND apply the render switch — the data-attribute is the single CSS hook
+    // (body[data-vol-orient]); JS never branches on orientation.
+    const volOrient = s.volume_orientation || 'horizontal';
+    document.querySelectorAll('[name=volume-orientation]').forEach(r => { r.checked = r.value === volOrient; });
+    document.body.dataset.volOrient = volOrient;
     // International rail (2026-06-22 plan 004): alpha-mode radios + the two
     // first-character thresholds (empty box → default 2 via placeholder). The
     // threshold row is ALWAYS visible — dimmed + disabled when International isn't
@@ -1776,7 +1810,15 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
   if (artistThreshEl) body.rail_artist_threshold = parseInt(artistThreshEl.value, 10) || 2;
   const albumThreshEl = document.getElementById('rail-album-threshold');
   if (albumThreshEl) body.rail_album_threshold = parseInt(albumThreshEl.value, 10) || 2;
-  try { await api('POST', '/admin/settings', body); showToast('Settings saved'); }
+  // Volume bar orientation (2026-08-04 volume rework U3): sent with the batch;
+  // applied locally on save success (other admin devices: next load).
+  const volOrientEl = document.querySelector('[name=volume-orientation]:checked');
+  if (volOrientEl) body.volume_orientation = volOrientEl.value;
+  try {
+    await api('POST', '/admin/settings', body);
+    showToast('Settings saved');
+    if (volOrientEl) document.body.dataset.volOrient = volOrientEl.value;
+  }
   catch { showToast('Failed to save settings'); }
 });
 
