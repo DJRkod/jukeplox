@@ -49,7 +49,8 @@ docker run -d --name jukeplox \
 UI instead), also add `-v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket` to borrow the
 host's speaker-finder. Regular Linux (desktop, Pi, generic server) uses in-process discovery and
 doesn't need it — that socket usually doesn't exist there, and mounting a missing path just makes
-Docker create a stray directory.
+Docker create a stray directory. (The quick-start `install.sh` detects this automatically and
+mounts the socket only when it exists.)
 
 **Port 80 taken?** Add `-e PORT=8096`; if you cast, also `-e STREAM_BASE_URL=http://<IP>:8096`.
 
@@ -75,7 +76,11 @@ Open `http://<IP>` and:
 
 1. Set an admin password — **≥12 chars, no reset** (forgetting it means wiping data).
 2. Add a music source under **Setup → Libraries** — Plex (enter the code at plex.tv),
-   Jellyfin (sign in), or a local folder (`/music` from the mount above). Then **Rescan**.
+   Jellyfin (sign in), or a local folder (`/music` from the mount above). Your own
+   servers' music libraries switch on and start indexing automatically; untick any
+   under **Edit libraries…**. A server *shared with you* connects too but stays off
+   until you tick its libraries there. A big library indexes in the background —
+   search fills in as it runs.
 3. Pick a speaker under **Setup → Output**.
 
 Share `http://<IP>` with guests — no app or password needed.
@@ -100,7 +105,8 @@ docker rm -f jukeplox
 ```
 
 Data is kept; **run-flags aren't** — `docker inspect jukeplox` first to recover them.
-Confirm the build at `http://<IP>/api/version`.
+Confirm the build via the `git_sha` at `http://<IP>/api/version` (the `image_tag` field
+may show an internal release-train name rather than `latest` — that's expected).
 
 ## Troubleshooting
 
@@ -109,4 +115,5 @@ Confirm the build at `http://<IP>/api/version`.
 - **No speakers** — needs `--network host`. On NAS the dbus mount is required ("Falling back to avahi over D-Bus" is normal).
 - **No sound from local speakers** — desktop: use the PulseAudio route, not `/dev/snd`. Headless: confirm `--device /dev/snd --group-add audio` and **System Audio** in Setup → Output; `-e GST_DEBUG=3` shows the error.
 - **Forgot admin password** — no reset; start fresh: `docker rm -f jukeplox && docker volume rm jukeplox-data` (keeps your Plex library; clears settings + queue).
+- **Plex plays via the internet instead of your LAN** — a containerized Plex server (e.g. a TrueNAS app) may only advertise an internal container address, so Jukeplox falls back to your public address. Fix it server-side: in Plex, **Settings → Network → Custom server access URLs**, add `http://<plex-LAN-IP>:32400`, then reconnect Plex in Jukeplox.
 - **Security** — exposes the admin port on all interfaces. Run on a trusted LAN; firewall if internet-reachable — guest pages need no login.

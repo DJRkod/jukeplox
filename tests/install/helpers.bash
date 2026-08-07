@@ -29,17 +29,17 @@ make_stub() {
 
 # assert_line_eq HAYSTACK LINE — fail unless LINE appears as a whole line.
 assert_line_eq() {
-  printf '%s\n' "$1" | grep -qxF "$2" || { echo "expected line: $2" >&2; return 1; }
+  printf '%s\n' "$1" | grep -qxF -- "$2" || { echo "expected line: $2" >&2; return 1; }
 }
 
 # refute_line_eq HAYSTACK LINE — fail if LINE appears as a whole line.
 refute_line_eq() {
-  if printf '%s\n' "$1" | grep -qxF "$2"; then echo "unexpected line: $2" >&2; return 1; fi
+  if printf '%s\n' "$1" | grep -qxF -- "$2"; then echo "unexpected line: $2" >&2; return 1; fi
   return 0
 }
 
 # refute_substr HAYSTACK SUBSTR — fail if SUBSTR appears anywhere.
 refute_substr() {
-  if printf '%s\n' "$1" | grep -qF "$2"; then echo "unexpected substring: $2" >&2; return 1; fi
+  if printf '%s\n' "$1" | grep -qF -- "$2"; then echo "unexpected substring: $2" >&2; return 1; fi
   return 0
 }

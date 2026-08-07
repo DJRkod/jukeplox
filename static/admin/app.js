@@ -1377,7 +1377,11 @@ async function renderSourceScanStatus() {
   try { s = await api('GET', '/admin/scan-status'); } catch { el.style.display = 'none'; return; }
   let msg = '';
   if (s.scanning) {
+    // Precedence: a refresh in flight beats a standing failure — the running
+    // retry is the more useful signal; the failure re-shows if it fails again.
     msg = 'Scanning sources… the library will populate as it runs.';
+  } else if (s.refresh_failed) {
+    msg = 'The last library refresh failed — check the server logs, then Rescan.';
   } else if (s.sources > 0 && s.scanned && s.empty) {
     msg = 'Scan complete, but no music was found — the connected sources returned nothing.';
   }

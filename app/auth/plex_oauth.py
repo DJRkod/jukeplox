@@ -23,7 +23,16 @@ async def complete_flow(pin_id: int, client_id: str) -> bool:
 
     # Discover all accessible Plex servers and persist them
     try:
-        servers = await plex_auth.discover_servers(token, client_id)
+        # Pass the currently-persisted URLs so a re-auth probes each known
+        # (possibly hand-pinned) URL first and never downgrades a working
+        # server_url to a WAN hairpin (audit F9). Best-effort: an unreadable
+        # table just means no preferences.
+        try:
+            known_urls = {s["machine_id"]: s["server_url"]
+                          for s in await database.get_plex_servers()}
+        except Exception:
+            known_urls = {}
+        servers = await plex_auth.discover_servers(token, client_id, known_urls=known_urls)
         if servers:
             await database.save_plex_servers(servers)
         else:

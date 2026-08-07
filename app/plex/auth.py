@@ -7,9 +7,12 @@ Flow:
 """
 
 import asyncio
+import logging
 import uuid
 
 import httpx
+
+_log = logging.getLogger(__name__)
 
 PLEX_TV = "https://plex.tv/api/v2"
 POLL_INTERVAL = 3       # seconds between polls
@@ -94,28 +97,59 @@ def _best_url(connections: list[dict], owned: bool = True) -> str | None:
 _PROBE_TIMEOUT = 2.5
 
 
-def _ordered_candidates(connections: list[dict], owned: bool) -> list[str]:
-    """Connection URIs in the order to probe for reachability.
+def _ordered_candidates(
+    connections: list[dict], owned: bool, preferred: str | None = None
+) -> list[tuple[str, bool]]:
+    """(uri, is_raw_http) pairs in the order to probe for reachability.
 
-    Owned: local (fast on-LAN) → remote (public) → relay (always works, slower).
-    Shared: remote → relay → local last (local = someone else's LAN). De-duped,
+    Owned: preferred (a previously-working persisted URL — stability wins; a
+    re-auth must never downgrade a good URL to a WAN hairpin) → local https →
+    remote https → RAW http://{address}:{port} synthesized from local entries
+    (rescues routers whose DNS-rebind protection kills plex.direct hostnames;
+    plaintext-token path, so strictly after every HTTPS candidate; audit F9)
+    → relay last. Shared: remote → relay → local last (local = someone else's
+    LAN; no raw synthesis — those addresses are never ours to reach). De-duped,
     order preserved.
+
+    Known limit (characterized on the rig, 2026-08-06): a bridge-networked PMS
+    (e.g. a TrueNAS app) may advertise ONLY its container IP as the local
+    connection — the real LAN address appears nowhere in the payload, so no
+    client-side candidate can reach it and discovery lands on the WAN hairpin.
+    The fix for that population is server-side (Plex's "Custom server access
+    URLs"), documented in the install docs.
     """
     local = [c for c in connections if c.get("local")]
     relay = [c for c in connections if c.get("relay") and not c.get("local")]
     remote = [c for c in connections if not c.get("local") and not c.get("relay")]
-    ordered = (local + remote + relay) if owned else (remote + relay + local)
+    ordered: list[tuple[dict, bool]]
+    if owned:
+        raw = [
+            {"uri": f"http://{c['address']}:{c['port']}"}
+            for c in local
+            if c.get("address") and c.get("port")
+        ]
+        ordered = ([({"uri": preferred}, False)] if preferred else []) \
+            + [(c, False) for c in local + remote] \
+            + [(c, True) for c in raw] \
+            + [(c, False) for c in relay]
+    else:
+        ordered = [(c, False) for c in remote + relay + local]
     seen: set[str] = set()
-    out: list[str] = []
-    for c in ordered:
+    out: list[tuple[str, bool]] = []
+    for c, is_raw in ordered:
         uri = c.get("uri")
         if uri and uri not in seen:
             seen.add(uri)
-            out.append(uri)
+            out.append((uri, is_raw))
     return out
 
 
-async def _reachable_url(connections: list[dict], owned: bool, client: "httpx.AsyncClient") -> str | None:
+async def _reachable_url(
+    connections: list[dict],
+    owned: bool,
+    client: "httpx.AsyncClient",
+    preferred: str | None = None,
+) -> str | None:
     """Pick the first connection that actually answers, in preference order.
 
     Fixes the deploy-location assumption baked into `_best_url`: an owned server's
@@ -126,20 +160,43 @@ async def _reachable_url(connections: list[dict], owned: bool, client: "httpx.As
     regardless of where Jukeplox runs. Falls back to the static best pick so a
     server with no currently-reachable connection is still saved, not dropped —
     re-connecting re-discovers if the network later changes.
+
+    Raw-http candidates (synthesized; audit F9) carry a stricter bar: the
+    /identity probe must return a NON-error response before the plaintext form
+    is persisted — servers set to "Secure connections: Required" answer HTTP
+    probes while refusing HTTP API calls, and persisting such a URL would be
+    strictly worse than the hairpin it replaces. Every candidate verdict is
+    logged at INFO (loud probes — the dead-server stall lesson).
     """
-    for uri in _ordered_candidates(connections, owned):
+    for uri, is_raw in _ordered_candidates(connections, owned, preferred=preferred):
         try:
-            await client.get(f"{uri}/identity", timeout=_PROBE_TIMEOUT)
-            return uri  # any HTTP response means the connection is reachable
-        except Exception:
+            resp = await client.get(f"{uri}/identity", timeout=_PROBE_TIMEOUT)
+            if is_raw and resp.status_code >= 400:
+                _log.info("plex url probe: %s answered HTTP %s but raw-http needs "
+                          "a non-error /identity — skipping", uri, resp.status_code)
+                continue
+            _log.info("plex url probe: %s reachable (HTTP %s) — selected",
+                      uri, resp.status_code)
+            return uri  # reachable (and API-usable where required)
+        except Exception as e:
+            _log.info("plex url probe: %s unreachable (%s: %s)",
+                      uri, type(e).__name__, e)
             continue
+    _log.info("plex url probe: no candidate answered — falling back to static pick")
     return _best_url(connections, owned=owned)
 
 
-async def discover_servers(token: str, client_id: str) -> list[dict]:
+async def discover_servers(
+    token: str, client_id: str, known_urls: dict[str, str] | None = None
+) -> list[dict]:
     """Return all accessible Plex servers with per-server access tokens.
 
     Each dict: {machine_id, server_url, name, owner, token, client_id}
+
+    ``known_urls`` maps machine_id → the currently-persisted server_url; when a
+    server is already connected, its known URL is probed FIRST so a re-auth
+    keeps a working (possibly hand-pinned LAN) URL instead of downgrading it
+    to a WAN hairpin (audit F9).
     """
     headers = {**_headers(client_id), "X-Plex-Token": token}
     servers = []
@@ -171,7 +228,10 @@ async def discover_servers(token: str, client_id: str) -> list[dict]:
             source_title = resource.get("sourceTitle", "")
             owner = admin_username if owned else (source_title or name)
             access_token = resource.get("accessToken") or token
-            url = await _reachable_url(resource.get("connections", []), bool(owned), client)
+            url = await _reachable_url(
+                resource.get("connections", []), bool(owned), client,
+                preferred=(known_urls or {}).get(machine_id),
+            )
             if not url or not machine_id:
                 continue
             servers.append({

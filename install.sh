@@ -20,7 +20,7 @@
 IMAGE_REPO="djrkod/jukeplox"
 CONTAINER_NAME="jukeplox"
 DATA_VOLUME="jukeplox-data"
-DBUS_SOCKET="/run/dbus/system_bus_socket"
+DBUS_SOCKET="${JUKEPLOX_DBUS_SOCKET:-/run/dbus/system_bus_socket}"  # overridable for tests
 DEFAULT_PORT="80"
 PORT_CANDIDATES="8096 8080 8686 9090 9595"
 DOCKER_INSTALL_URL="https://get.docker.com"
@@ -98,7 +98,10 @@ maybe_sudo() {
 confirm() {
   [ "$OPT_YES" -eq 1 ] && return 0
   printf '%s [Y/n] ' "$1" >&2
-  if [ -r /dev/tty ]; then read -r _ans </dev/tty || _ans=""; else read -r _ans || _ans=""; fi
+  # 2>/dev/null must come FIRST: redirections process left-to-right, and a
+  # failing /dev/tty open aborts the command before a later 2> takes effect
+  # (detached/no-TTY contexts printed "cannot open /dev/tty"; audit F8).
+  if [ -r /dev/tty ]; then read -r _ans 2>/dev/null </dev/tty || _ans=""; else read -r _ans || _ans=""; fi
   case "$_ans" in n|N|no|NO|No) return 1 ;; *) return 0 ;; esac
 }
 
@@ -150,7 +153,7 @@ PY
   fi
 }
 
-# Informational only: the dbus mount is added unconditionally (harmless when unused).
+# Informational only (summary line); the dbus MOUNT decision is detect_dbus's.
 detect_mdns() {
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet avahi-daemon 2>/dev/null; then
     printf 'avahi\n'
@@ -169,7 +172,8 @@ choose_port() {
   fi
   if [ "$OPT_YES" -eq 1 ]; then printf '%s\n' "$_default"; return 0; fi
   printf 'HTTP port [%s]: ' "$_default" >&2
-  if [ -r /dev/tty ]; then read -r _p </dev/tty || _p=""; else read -r _p || _p=""; fi
+  # stderr first — see the redirection-order note in confirm() (audit F8).
+  if [ -r /dev/tty ]; then read -r _p 2>/dev/null </dev/tty || _p=""; else read -r _p || _p=""; fi
   [ -n "$_p" ] && printf '%s\n' "$_p" || printf '%s\n' "$_default"
 }
 
@@ -198,14 +202,26 @@ preflight_docker() {
   die "Docker is installed but its daemon isn't reachable. Start it and re-run."
 }
 
+# dbus fact: the avahi-over-D-Bus discovery fallback needs the host socket
+# (NAS distros like TrueNAS), but mounting a NONEXISTENT path makes Docker
+# create a stray root-owned directory at /run/dbus/system_bus_socket — which
+# INSTALL.md warns about, and which would break a host dbus daemon started
+# later (its socket bind finds a directory in the way). Mount only when the
+# socket actually exists. (fresh-install audit F5)
+detect_dbus() {
+  if [ -S "$DBUS_SOCKET" ]; then printf 'yes\n'; else printf 'no\n'; fi
+}
+
 # ── flag assembly (the decision matrix) ───────────────────────────────────────
 # Pure: prints the `docker run` arguments, one per line, from detected facts.
-#   $1 audio (pulse|alsa|none)  $2 lan_ip  $3 port  $4 uid  $5 version
+#   $1 audio (pulse|alsa|none)  $2 lan_ip  $3 port  $4 uid  $5 version  $6 dbus (yes|no)
 assemble_args() {
-  _audio="$1"; _ip="$2"; _port="$3"; _uid="$4"; _ver="$5"
+  _audio="$1"; _ip="$2"; _port="$3"; _uid="$4"; _ver="$5"; _dbus="${6:-no}"
   printf '%s\n' --name "$CONTAINER_NAME" --network host --restart unless-stopped
   printf '%s\n' -v "${DATA_VOLUME}:/data"
-  printf '%s\n' -v "${DBUS_SOCKET}:${DBUS_SOCKET}"
+  if [ "$_dbus" = "yes" ]; then
+    printf '%s\n' -v "${DBUS_SOCKET}:${DBUS_SOCKET}"
+  fi
   printf '%s\n' -e "BIND_HOST=${_ip}"
   if [ "$_port" != "80" ]; then
     printf '%s\n' -e "PORT=${_port}"
@@ -230,7 +246,7 @@ container_exists() {
 }
 
 run_container() {
-  _audio="$1"; _ip="$2"; _port="$3"; _uid="$4"; _ver="$5"
+  _audio="$1"; _ip="$2"; _port="$3"; _uid="$4"; _ver="$5"; _dbus="${6:-no}"
   if container_exists; then
     confirm "A '${CONTAINER_NAME}' container already exists. Replace it (your data is kept)?" \
       || die "Leaving the existing container in place."
@@ -244,7 +260,7 @@ run_container() {
   IFS='
 '
   # shellcheck disable=SC2046
-  set -- $(assemble_args "$_audio" "$_ip" "$_port" "$_uid" "$_ver")
+  set -- $(assemble_args "$_audio" "$_ip" "$_port" "$_uid" "$_ver" "$_dbus")
   IFS=$_oldifs
   docker_q run -d "$@" >/dev/null || die "Failed to start the container."
 }
@@ -296,9 +312,10 @@ main() {
   _ip="$(detect_lan_ip)"
   _audio="$(detect_audio)"
   _mdns="$(detect_mdns)"
+  _dbus="$(detect_dbus)"
   _port="$(choose_port)"
 
-  run_container "$_audio" "$_ip" "$_port" "$REAL_UID" "$OPT_VERSION"
+  run_container "$_audio" "$_ip" "$_port" "$REAL_UID" "$OPT_VERSION" "$_dbus"
 
   _url="http://${_ip}:${_port}"
   if wait_healthy "$_url"; then

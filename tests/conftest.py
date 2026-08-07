@@ -187,6 +187,20 @@ def anon_client():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_write_tx_lock():
+    """Re-mint database._write_tx_lock per test. asyncio.Lock binds to the
+    event loop active at first use (same lifecycle issue as the probe
+    semaphore above), and every async test / TestClient runs its own loop —
+    a lock first used under test A's loop raises 'bound to a different event
+    loop' under test B's. Production has a single loop, so this is
+    test-lifecycle hygiene only."""
+    import asyncio as _asyncio
+    from app import database as _database
+    _database._write_tx_lock = _asyncio.Lock()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_real_gdm_broadcast(monkeypatch):
     """Hermetic default: the GDM probe must NEVER broadcast on the real LAN
     during tests (it genuinely finds live players — Banana answered a test

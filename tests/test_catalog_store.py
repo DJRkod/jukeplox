@@ -223,3 +223,62 @@ async def test_coexists_with_ratings_and_play_counts(db):
     assert await database.get_play_count("track", "ident-1") == 1
     # Catalog still intact after writing to the sibling tables.
     assert (await store.get_track("ident-1"))["identity"] == "ident-1"
+
+
+# ── write-lock serialization (fresh-install audit F2, 2026-08-06) ────────────
+# The browse-index and catalog refreshes collided on the shared connection's
+# empty-enabled fast path ("cannot start a transaction within a transaction",
+# reproduced 3x in one minute live). Every explicit-transaction writer — and
+# the crawl-scale implicit alias writers — now holds database._write_tx_lock.
+
+import asyncio
+
+
+async def test_concurrent_explicit_writers_never_nest_transactions(db):
+    # The audit's deterministic collision: instant empty writes racing on one
+    # connection. 25 rounds of three concurrent explicit-transaction writers.
+    for _ in range(25):
+        await asyncio.gather(
+            database.set_browse_index([], []),
+            store.replace_catalog([], [], [], []),
+            database.set_genre_cache([]),
+        )
+
+
+async def test_save_plex_servers_races_replace_catalog(db):
+    # The connect-time window: complete_flow saves servers while the
+    # connect-triggered catalog refresh writes.
+    server = {"machine_id": "m1", "server_url": "http://192.168.1.50:32400",
+              "name": "S", "owner": "o", "token": "t", "client_id": "c", "owned": 1}
+    for _ in range(25):
+        await asyncio.gather(
+            database.save_plex_servers([server]),
+            store.replace_catalog([], [], [], []),
+        )
+    assert (await database.get_plex_servers())[0]["machine_id"] == "m1"
+
+
+async def test_alias_writes_race_browse_index(db):
+    # Identity resolution's per-entity implicit-transaction writes (hundreds of
+    # thousands at crawl scale) racing the browse-index replace.
+    async def alias_burst():
+        for i in range(40):
+            await store.register_alias("track", f"hash:{i}", f"ident-{i}")
+            await store.repoint_alias("track", f"hash:{i}", f"ident-{i}-fixed")
+
+    await asyncio.gather(
+        alias_burst(),
+        database.set_browse_index([], []),
+        store.replace_catalog([], [], [], []),
+        database.set_browse_index([], []),
+    )
+    assert await store.find_identity("track", "hash:0") == "ident-0-fixed"
+
+
+async def test_lock_released_after_writer_raises(db):
+    # A writer failing mid-transaction must roll back AND release the lock so
+    # the next writer proceeds.
+    with pytest.raises(AttributeError):  # None has no .get — fails inside the open transaction
+        await store.replace_catalog([None], [], [], [])
+    await store.replace_catalog([_artist("ar1")], [], [], [])
+    assert (await store.get_artist("ar1"))["identity"] == "ar1"

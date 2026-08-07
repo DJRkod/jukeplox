@@ -2647,3 +2647,52 @@ def test_admin_banner_has_foreign_controller_copy():
     )
     assert "Another Plex controller took the device" in fn
     assert "re-activate to " in fn and "resume jukeplox control" in fn
+
+
+# ── admin scan badge surfaces refresh failures (fresh-install audit F2) ──────
+# A failed catalog/browse refresh was logs-only while the rescan endpoint
+# returned ok — the badge stayed green over a broken refresh. The badge must
+# have a refresh_failed branch, and 'scanning' must take precedence over it
+# (a running retry is the more useful signal).
+
+def test_admin_scan_badge_has_refresh_failed_branch():
+    src = ADMIN_APP.read_text(encoding="utf-8")
+    fn = src[src.index("async function renderSourceScanStatus"):]
+    fn = fn[:fn.index("\n}")]
+    assert "refresh_failed" in fn, (
+        "renderSourceScanStatus must render the scan-status refresh_failed field"
+    )
+    assert "refresh failed" in fn.lower()
+    # Precedence: the scanning branch must be checked before the failure branch.
+    assert fn.index("s.scanning") < fn.index("refresh_failed")
+
+
+# ── guest search explains the first-crawl indexing window (audit F10) ────────
+# During the initial catalog crawl the browse index fills in seconds while the
+# track catalog takes ~30 minutes: search showed albums with silently absent
+# tracks, or a bare "No results." when nothing matched yet. The shared search
+# renderer must consult /api/scan-status BEFORE assembling the DOM and explain
+# indexing in BOTH shapes (empty tracks with other hits, and all-empty).
+
+BROWSE_JS = ROOT / "static/browse/index.js"
+
+
+def test_search_renderer_consults_scan_status_before_dom_assembly():
+    src = BROWSE_JS.read_text(encoding="utf-8")
+    fn = src[src.index("async function renderSearchResults"):]
+    fn = fn[:fn.index("\n  // ── Tier 2")]
+    # Status is awaited before the DOM wipe (single render pass, no reflow).
+    assert fn.index("_searchScanStatus") < fn.index("el.innerHTML = ''")
+    # Mixed-results shape: hint rendered in the Tracks slot while scanning.
+    assert "Tracks are still being indexed" in fn
+    # All-empty (!any) shape: scanning-aware replacement for "No results."
+    assert "still being indexed" in fn[fn.index("if (!any)"):]
+
+
+def test_search_indexing_hint_is_single_source_shared_module():
+    for rel in ("static/guest/app.js", "static/admin/app.js"):
+        src = (ROOT / rel).read_text(encoding="utf-8")
+        assert "still being indexed" not in src, (
+            f"{rel} must not fork the search indexing hint — it lives in "
+            "static/browse/index.js (shared-module discipline)"
+        )

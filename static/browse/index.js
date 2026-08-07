@@ -3578,7 +3578,28 @@
     return row;
   }
 
-  function renderSearchResults(data) {
+  // Fresh-install audit F10: during the first catalog crawl the browse index
+  // (artists/albums) fills in seconds while the track catalog takes ~30 min —
+  // a guest's search showed albums but silently zero tracks, or a bare
+  // "No results." when nothing matched yet. When the track section would be
+  // empty, consult /api/scan-status BEFORE assembling the DOM (single render
+  // pass — no async arrival, no reflow) and explain that indexing is running.
+  let _searchRenderGen = 0;
+
+  async function _searchScanStatus(data, f) {
+    const tracksEmpty = (f === 'all' || f === 'tracks')
+      && !(data.tracks && data.tracks.length);
+    if (!tracksEmpty) return null;   // hint can't apply — skip the fetch
+    try { const [, s] = await _api('GET', '/api/scan-status'); return s; }
+    catch (_) { return null; }       // status probe down → today's behavior
+  }
+
+  async function renderSearchResults(data) {
+    // Status fetch happens before any DOM work; the generation guard drops a
+    // stale render if a newer query/tab-tap superseded us during the await.
+    const gen = ++_searchRenderGen;
+    const scanStatus = await _searchScanStatus(data, searchFilter);
+    if (gen !== _searchRenderGen) return;
     // Single chokepoint for every #search-results rebuild (new query,
     // filter-tab tap, back-from-drill-in): bump the search drill-in's
     // generation FIRST so an in-flight style-albums fetch bails instead of
@@ -3592,6 +3613,7 @@
     el.innerHTML = '';
     const f = searchFilter;
     let any = false;
+    const scanning = !!(scanStatus && scanStatus.scanning);
 
     if ((f === 'all' || f === 'artists') && data.artists && data.artists.length) {
       any = true;
@@ -3624,6 +3646,14 @@
       any = true;
       el.insertAdjacentHTML('beforeend', '<div class="section-header cat-head"><h3>Tracks</h3></div>');
       renderTracksDeduped(data.tracks, el);
+    } else if ((f === 'all' || f === 'tracks') && scanning && any) {
+      // Mixed results during the first crawl (audit F10): artists/albums hit
+      // but the track catalog is still filling — say so in the Tracks slot
+      // instead of silently omitting the section. Rendered in the same pass
+      // as the results (status pre-fetched), so nothing reflows.
+      el.insertAdjacentHTML('beforeend',
+        '<div class="section-header cat-head"><h3>Tracks</h3></div>'
+        + '<div class="loading">Tracks are still being indexed — check back shortly.</div>');
     }
     // Genres LAST in All per origin R2 (broadest, least-specific match
     // type). Chip cluster reuses the Genres tab's presentation.
@@ -3645,7 +3675,14 @@
     // Distinct empty state for the genres filter (review fix): a bare
     // empty div reads as stuck-loading to party guests.
     if (!any) {
-      el.innerHTML = `<div class="loading">${f === 'genres' ? 'No genres found.' : 'No results.'}</div>`;
+      if (scanning && f !== 'genres') {
+        // All-empty during the first crawl — the most common shape early on,
+        // while the browse index itself is still building (audit F10): an
+        // unexplained "No results." here looks like a broken jukebox.
+        el.innerHTML = '<div class="loading">Your library is still being indexed — check back shortly.</div>';
+      } else {
+        el.innerHTML = `<div class="loading">${f === 'genres' ? 'No genres found.' : 'No results.'}</div>`;
+      }
     } else {
       // Tier 2: with Tier-1 hits on screen to scroll past, arm the broad
       // pass (tracks/albums only; artist/genre filters opt out via

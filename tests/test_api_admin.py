@@ -450,17 +450,17 @@ def test_plex_poll_does_not_clear_veto_of_already_connected_server(client, mock_
     setv.assert_not_awaited()   # A stays vetoed — no over-clear on re-auth
 
 
-def test_plex_poll_seeds_new_server_libraries_and_scans(client, mock_state):
-    # Fresh-install audit F1 (2026-08-06): a NEWLY connected Plex server's libraries
-    # seed enabled-by-default — a single-library server rendered no per-library
-    # control, so without seeding a doc-following fresh install dead-ended with a
-    # permanently empty catalog. A crawl also kicks off without a manual Rescan,
-    # matching the Jellyfin/local connect handlers.
+def test_plex_poll_seeds_new_owned_server_libraries_and_scans(client, mock_state):
+    # Fresh-install audit F1 (2026-08-06): a NEWLY connected OWNED Plex server's
+    # libraries seed enabled-by-default — a single-library server rendered no
+    # per-library control, so without seeding a doc-following fresh install
+    # dead-ended with a permanently empty catalog. A crawl also kicks off without
+    # a manual Rescan, matching the Jellyfin/local connect handlers.
     seed = AsyncMock()
     trig = MagicMock()
     with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
          patch("app.api.admin.database.get_plex_servers",
-               AsyncMock(side_effect=[[], [{"machine_id": "B"}]])), \
+               AsyncMock(side_effect=[[], [{"machine_id": "B", "owned": 1}]])), \
          patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
          patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
          patch("app.api.admin._enable_new_source_libraries", seed), \
@@ -469,6 +469,47 @@ def test_plex_poll_seeds_new_server_libraries_and_scans(client, mock_state):
         resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
     assert resp.status_code == 200
     seed.assert_awaited_once_with("B")
+    trig.assert_called_once()
+
+
+def test_plex_poll_never_seeds_shared_server_libraries(client, mock_state):
+    # Owned-only seeding policy (2026-08-06): a friend's shared library must not
+    # auto-crawl into the party catalog. Shared (owned=0) and legacy (owned=NULL)
+    # servers stay opt-in via the always-rendered Libraries drill-in.
+    seed = AsyncMock()
+    trig = MagicMock()
+    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
+         patch("app.api.admin.database.get_plex_servers",
+               AsyncMock(side_effect=[[], [{"machine_id": "S", "owned": 0},
+                                           {"machine_id": "L", "owned": None}]])), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
+         patch("app.api.admin._enable_new_source_libraries", seed), \
+         patch("app.state.trigger_catalog_refresh", trig), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
+    assert resp.status_code == 200
+    seed.assert_not_awaited()
+    trig.assert_not_called()   # nothing seeded → no auto-crawl
+
+
+def test_plex_poll_mixed_batch_seeds_only_the_owned_server(client, mock_state):
+    # One connect adding an owned NAS + a shared server: only the owned one
+    # seeds; the crawl fires once.
+    seed = AsyncMock()
+    trig = MagicMock()
+    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
+         patch("app.api.admin.database.get_plex_servers",
+               AsyncMock(side_effect=[[], [{"machine_id": "OWN", "owned": 1},
+                                           {"machine_id": "SHARED", "owned": 0}]])), \
+         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
+         patch("app.api.admin._enable_new_source_libraries", seed), \
+         patch("app.state.trigger_catalog_refresh", trig), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
+    assert resp.status_code == 200
+    seed.assert_awaited_once_with("OWN")
     trig.assert_called_once()
 
 

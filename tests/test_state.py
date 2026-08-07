@@ -2397,6 +2397,10 @@ async def _u15_status_db(tmp_path, monkeypatch, scanning):
     s = Settings(data_dir=tmp_path, secret_key="test")
     monkeypatch.setattr(database, "settings", s)
     monkeypatch.setattr(st, "_catalog_refresh_running", scanning)
+    # Audit F2: per-refresher failure flags are module globals — pin them False
+    # so cross-test pollution can't flip the refresh_failed payload field.
+    monkeypatch.setattr(st, "_catalog_refresh_failed", False)
+    monkeypatch.setattr(st, "_browse_refresh_failed", False)
     await database.init_db()
     return st, database
 
@@ -2406,7 +2410,8 @@ async def test_scan_status_zero_sources(tmp_path, monkeypatch):
     try:
         with patch.object(st, "get_plex_client", AsyncMock(return_value=None)):
             status = await st.scan_status()
-        assert status == {"sources": 0, "scanning": False, "scanned": False, "empty": True}
+        assert status == {"sources": 0, "scanning": False, "scanned": False, "empty": True,
+                          "refresh_failed": False}
     finally:
         await database.close_db()
 
@@ -2418,7 +2423,8 @@ async def test_scan_status_first_scan_building(tmp_path, monkeypatch):
         with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
             status = await st.scan_status()
         # First scan: a source connected, crawl in flight, nothing stamped/stored.
-        assert status == {"sources": 1, "scanning": True, "scanned": False, "empty": True}
+        assert status == {"sources": 1, "scanning": True, "scanned": False, "empty": True,
+                          "refresh_failed": False}
     finally:
         await database.close_db()
 
@@ -2437,7 +2443,8 @@ async def test_scan_status_scanned_with_content(tmp_path, monkeypatch):
         reg = MagicMock(); reg.sources = [MagicMock(source_type="jellyfin")]
         with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
             status = await st.scan_status()
-        assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": False}
+        assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": False,
+                          "refresh_failed": False}
     finally:
         await database.close_db()
 
@@ -2450,7 +2457,8 @@ async def test_scan_status_scanned_but_empty(tmp_path, monkeypatch):
         with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
             status = await st.scan_status()
         # Distinct from zero-source: a finished scan that found nothing.
-        assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": True}
+        assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": True,
+                          "refresh_failed": False}
     finally:
         await database.close_db()
 
@@ -3923,3 +3931,88 @@ async def test_plexplayer_clients_source_gdm_probe_failure_is_fail_soft(caplog):
                AsyncMock(side_effect=OSError("broadcast blocked"))):
         merged = await st._plexplayer_clients_source()
     assert [p.machine_identifier for p in merged] == ["p1"]
+
+
+# ── refresh-failure surfacing (fresh-install audit F2, 2026-08-06) ───────────
+# Failures were logs-only while the rescan endpoint returned ok. Per-refresher
+# flags: exception paths AND the no-raise don't-wipe guards set them; each
+# refresher's own success clears only its own flag.
+
+async def test_browse_soft_fail_sets_flag_and_success_clears_it():
+    import app.state as st
+    st._browse_refresh_failed = False
+    err = RuntimeError("plex down")
+    libs = [_mk_lib("A:1", "ServerA")]
+    # Don't-wipe guard (no exception raised) → flag set.
+    await _run_refresh(libs, {"A:1": err}, {"A:1": err})
+    assert st._browse_refresh_failed is True
+    # Own success → cleared.
+    await _run_refresh(
+        libs,
+        {"A:1": [_mk_artist("A:1", "Radiohead")]},
+        {"A:1": [_mk_album("A:10", "Kid A", "Radiohead")]},
+    )
+    assert st._browse_refresh_failed is False
+
+
+async def test_catalog_soft_fail_sets_flag_only_with_sources():
+    import app.state as st
+    st._catalog_refresh_failed = False
+    reg = MagicMock(); reg.sources = [MagicMock()]
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)), \
+         patch("app.database.get_effective_enabled_libraries",
+               AsyncMock(return_value=[{"section_key": "A:1"}])), \
+         patch("app.catalog.scan.scan_and_replace", AsyncMock(return_value=False)):
+        await st._refresh_catalog()
+    assert st._catalog_refresh_failed is True  # sources exist, nothing replaced
+    # Same False verdict with NO sources = normal empty install, not a failure.
+    reg_empty = MagicMock(); reg_empty.sources = []
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg_empty)), \
+         patch("app.database.get_effective_enabled_libraries", AsyncMock(return_value=[])), \
+         patch("app.catalog.scan.scan_and_replace", AsyncMock(return_value=False)):
+        await st._refresh_catalog()
+    assert st._catalog_refresh_failed is False
+
+
+async def test_catalog_exception_sets_flag_and_success_clears_it():
+    import app.state as st
+    st._catalog_refresh_failed = False
+    reg = MagicMock(); reg.sources = [MagicMock()]
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)), \
+         patch("app.database.get_effective_enabled_libraries",
+               AsyncMock(return_value=[{"section_key": "A:1"}])), \
+         patch("app.catalog.scan.scan_and_replace",
+               AsyncMock(side_effect=RuntimeError("boom"))):
+        await st._refresh_catalog()
+    assert st._catalog_refresh_failed is True
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)), \
+         patch("app.database.get_effective_enabled_libraries",
+               AsyncMock(return_value=[{"section_key": "A:1"}])), \
+         patch("app.catalog.scan.scan_and_replace", AsyncMock(return_value=True)), \
+         patch.object(st, "stamp_cache", AsyncMock()), \
+         patch.object(st, "revalidate_plex_queue", AsyncMock()):
+        await st._refresh_catalog()
+    assert st._catalog_refresh_failed is False
+
+
+async def test_catalog_success_never_clears_browse_failure(tmp_path, monkeypatch):
+    # The cross-clear trap the review flagged: a standing browse failure must
+    # survive a catalog success, and scan_status must still report it.
+    st, database = await _u15_status_db(tmp_path, monkeypatch, scanning=False)
+    try:
+        monkeypatch.setattr(st, "_browse_refresh_failed", True)
+        reg = MagicMock(); reg.sources = [MagicMock()]
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)), \
+             patch("app.database.get_effective_enabled_libraries",
+                   AsyncMock(return_value=[{"section_key": "A:1"}])), \
+             patch("app.catalog.scan.scan_and_replace", AsyncMock(return_value=True)), \
+             patch.object(st, "stamp_cache", AsyncMock()), \
+             patch.object(st, "revalidate_plex_queue", AsyncMock()):
+            await st._refresh_catalog()
+        assert st._catalog_refresh_failed is False
+        assert st._browse_refresh_failed is True
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+            status = await st.scan_status()
+        assert status["refresh_failed"] is True
+    finally:
+        await database.close_db()

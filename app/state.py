@@ -2058,7 +2058,7 @@ async def _refresh_browse_index() -> None:
     single-flighted by trigger_browse_index_refresh. Clones the credit-cache
     refresh shape, including the 'all libraries failed → don't wipe a good
     index' guard."""
-    global _browse_index_refresh_running, _browse_index_gen
+    global _browse_index_refresh_running, _browse_index_gen, _browse_refresh_failed
     from app import database
     try:
         client = await get_plex_client()
@@ -2073,6 +2073,7 @@ async def _refresh_browse_index() -> None:
             await stamp_cache("browse_index_computed_at")
             _browse_index_gen += 1
             await _rebuild_artist_grouping()
+            _browse_refresh_failed = False  # intentional clear = success (audit F2)
             return
         all_libs = await client.get_libraries()
         libs = [l for l in all_libs if l.key in enabled_keys]
@@ -2095,6 +2096,9 @@ async def _refresh_browse_index() -> None:
         artists_ok = any(not isinstance(r, BaseException) for r in artist_results)
         albums_ok = any(not isinstance(r, BaseException) for r in album_results)
         if not (artists_ok and albums_ok):
+            # Soft-fail surfacing (audit F2): the don't-wipe guard bails without
+            # raising — the most common real failure (unreachable source). Flag it.
+            _browse_refresh_failed = True
             _log.warning(
                 "Browse index refresh: artists_ok=%s albums_ok=%s — index untouched",
                 artists_ok, albums_ok,
@@ -2117,7 +2121,9 @@ async def _refresh_browse_index() -> None:
             "Browse index refreshed: %d artists, %d albums",
             len(artist_rows), len(album_rows),
         )
+        _browse_refresh_failed = False  # own success clears own flag only (audit F2)
     except Exception:
+        _browse_refresh_failed = True
         _log.exception("Browse index refresh failed")
     finally:
         _browse_index_refresh_running = False
@@ -2150,9 +2156,19 @@ def browse_index_building() -> bool:
 
 _catalog_refresh_running = False
 
+# Fresh-install audit F2 (2026-08-06): refresh failures were logs-only while
+# the rescan endpoint returned {"ok": true} — silent. Per-refresher failure
+# flags, each cleared ONLY by its own refresher's success (a catalog success
+# must never clear a standing browse-index failure). The values are booleans —
+# a fixed, sanitized sentinel by construction: scan_status() reaches the
+# UNAUTHENTICATED guest endpoint, so no exception text may ever flow here
+# (raw exceptions stay in the ERROR log).
+_catalog_refresh_failed = False
+_browse_refresh_failed = False
+
 
 async def _refresh_catalog() -> None:
-    global _catalog_refresh_running
+    global _catalog_refresh_running, _catalog_refresh_failed
     from app import database
     from app.catalog import scan
     try:
@@ -2166,6 +2182,14 @@ async def _refresh_catalog() -> None:
         # (Libraries-panel U2.)
         enabled_keys = {lib["section_key"] for lib in await database.get_effective_enabled_libraries()}
         replaced = await scan.scan_and_replace(registry, enabled_keys)
+        # Soft-fail surfacing (audit F2): scan_and_replace returning False with
+        # sources connected is the don't-wipe guard — every section failed (the
+        # dead-server case, swallowed per-section by _safe). No exception ever
+        # raises on that path, so hook the verdict here. False with NO sources
+        # is a normal empty install, not a failure.
+        _catalog_refresh_failed = (
+            not replaced and bool(getattr(registry, "sources", None) or [])
+        )
         if replaced:
             await stamp_cache("catalog_computed_at")
             # R12 mid-session re-validation (2026-08-04-002 plexplayer plan
@@ -2183,6 +2207,7 @@ async def _refresh_catalog() -> None:
                 _log.warning("post-rescan queue re-validation failed",
                              exc_info=True)
     except Exception:
+        _catalog_refresh_failed = True
         _log.exception("Catalog refresh failed")
     finally:
         _catalog_refresh_running = False
@@ -2217,6 +2242,10 @@ async def scan_status() -> dict:
       - ``scanned``  at least one catalog scan has completed (the
         ``catalog_computed_at`` stamp exists)
       - ``empty``    the catalog has no tracks
+      - ``refresh_failed`` the most recent catalog OR browse-index refresh
+        failed (per-refresher flags, each cleared only by its own success;
+        boolean sentinel — never exception text, this payload is
+        guest-reachable; audit F2)
 
     ``empty``/``scanned`` describe the catalog floor; a native Plex-only install
     never populates it, so the guest browse consults this only to choose an
@@ -2231,6 +2260,7 @@ async def scan_status() -> dict:
         "scanning": _catalog_refresh_running,
         "scanned": bool(await database.get_setting("catalog_computed_at")),
         "empty": await store.is_empty(),
+        "refresh_failed": _catalog_refresh_failed or _browse_refresh_failed,
     }
 
 

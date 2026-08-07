@@ -54,45 +54,49 @@ async def replace_catalog(
     """Atomically replace the catalog content + holds in one transaction.
 
     Mirrors ``database.set_browse_index``: ``BEGIN IMMEDIATE`` → wipe → bulk
-    insert → commit (rollback on any error). The alias table is intentionally
-    untouched — its durability is the identity-stability guarantee. ``INSERT OR
-    IGNORE`` guards against a duplicate identity within a single batch.
+    insert → commit (rollback on any error), all under ``_write_tx_lock``
+    (audit F2: colliding with the browse-index refresh on the empty-enabled
+    fast path raised "cannot start a transaction within a transaction").
+    The alias table is intentionally untouched — its durability is the
+    identity-stability guarantee. ``INSERT OR IGNORE`` guards against a
+    duplicate identity within a single batch.
     """
     db = database._conn()
-    await db.execute("BEGIN IMMEDIATE")
-    try:
-        await db.execute("DELETE FROM catalog_artist")
-        await db.execute("DELETE FROM catalog_album")
-        await db.execute("DELETE FROM catalog_track")
-        await db.execute("DELETE FROM catalog_holds")
-        if artists:
-            await db.executemany(
-                f"INSERT OR IGNORE INTO catalog_artist ({_ARTIST_COLS})"
-                " VALUES (?, ?, ?, ?, ?)",
-                [_row(_ARTIST_COLS, a) for a in artists],
-            )
-        if albums:
-            await db.executemany(
-                f"INSERT OR IGNORE INTO catalog_album ({_ALBUM_COLS})"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [_row(_ALBUM_COLS, a) for a in albums],
-            )
-        if tracks:
-            await db.executemany(
-                f"INSERT OR IGNORE INTO catalog_track ({_TRACK_COLS})"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [_row(_TRACK_COLS, t) for t in tracks],
-            )
-        if holds:
-            await db.executemany(
-                f"INSERT OR IGNORE INTO catalog_holds ({_HOLD_COLS})"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                [_row(_HOLD_COLS, h) for h in holds],
-            )
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
+    async with database._write_tx_lock:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute("DELETE FROM catalog_artist")
+            await db.execute("DELETE FROM catalog_album")
+            await db.execute("DELETE FROM catalog_track")
+            await db.execute("DELETE FROM catalog_holds")
+            if artists:
+                await db.executemany(
+                    f"INSERT OR IGNORE INTO catalog_artist ({_ARTIST_COLS})"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    [_row(_ARTIST_COLS, a) for a in artists],
+                )
+            if albums:
+                await db.executemany(
+                    f"INSERT OR IGNORE INTO catalog_album ({_ALBUM_COLS})"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [_row(_ALBUM_COLS, a) for a in albums],
+                )
+            if tracks:
+                await db.executemany(
+                    f"INSERT OR IGNORE INTO catalog_track ({_TRACK_COLS})"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [_row(_TRACK_COLS, t) for t in tracks],
+                )
+            if holds:
+                await db.executemany(
+                    f"INSERT OR IGNORE INTO catalog_holds ({_HOLD_COLS})"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    [_row(_HOLD_COLS, h) for h in holds],
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
 
 # ── read: artists ────────────────────────────────────────────────────────────
@@ -249,14 +253,21 @@ async def find_identity(entity_type: str, lookup_key: str) -> str | None:
 async def register_alias(entity_type: str, lookup_key: str, identity: str) -> None:
     """Bind a lookup key to an identity, durably. ``INSERT OR IGNORE`` — an
     existing binding is never clobbered, so a key can't be re-pointed at a new
-    identity (re-minting is what U7 forbids)."""
+    identity (re-minting is what U7 forbids).
+
+    Holds ``_write_tx_lock``: under the connection's legacy isolation mode the
+    execute→commit pair is an implicit transaction held open across an await,
+    and identity resolution runs this per-entity — at crawl scale, concurrent
+    with the browse refresh — so an unlocked window here collides with locked
+    explicit writers (audit F2, 2026-08-06)."""
     db = database._conn()
-    await db.execute(
-        "INSERT OR IGNORE INTO catalog_identity_alias (entity_type, lookup_key, identity)"
-        " VALUES (?, ?, ?)",
-        (entity_type, lookup_key, identity),
-    )
-    await db.commit()
+    async with database._write_tx_lock:
+        await db.execute(
+            "INSERT OR IGNORE INTO catalog_identity_alias (entity_type, lookup_key, identity)"
+            " VALUES (?, ?, ?)",
+            (entity_type, lookup_key, identity),
+        )
+        await db.commit()
 
 
 async def repoint_alias(entity_type: str, lookup_key: str, identity: str) -> None:
@@ -264,14 +275,16 @@ async def repoint_alias(entity_type: str, lookup_key: str, identity: str) -> Non
     binding from a prior over-merge. Unlike ``register_alias`` (OR IGNORE, the
     never-re-mint guarantee), this overwrites — used only by the collision path in
     ``identity.resolve_clusters`` when two distinct clusters would otherwise share
-    an identity (ce-debug 2026-06-29)."""
+    an identity (ce-debug 2026-06-29). Holds ``_write_tx_lock`` for the same
+    implicit-transaction-window reason as ``register_alias``."""
     db = database._conn()
-    await db.execute(
-        "INSERT OR REPLACE INTO catalog_identity_alias (entity_type, lookup_key, identity)"
-        " VALUES (?, ?, ?)",
-        (entity_type, lookup_key, identity),
-    )
-    await db.commit()
+    async with database._write_tx_lock:
+        await db.execute(
+            "INSERT OR REPLACE INTO catalog_identity_alias (entity_type, lookup_key, identity)"
+            " VALUES (?, ?, ?)",
+            (entity_type, lookup_key, identity),
+        )
+        await db.commit()
 
 
 async def get_aliases_for_identity(entity_type: str, identity: str) -> list[str]:

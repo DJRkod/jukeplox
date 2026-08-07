@@ -9,8 +9,18 @@ _db: aiosqlite.Connection | None = None
 # aiosqlite serializes statements per connection, but explicit
 # BEGIN IMMEDIATE will throw "cannot start a transaction within a
 # transaction" if a previous task left a transaction open (e.g.,
-# save_queue and save_history racing on track-end). Holding one lock
-# across both keeps them strictly sequential.
+# save_queue and save_history racing on track-end — and, fresh-install
+# audit F2 2026-08-06, the browse-index and catalog refreshes colliding
+# on the empty-enabled fast path). INVARIANT: every explicit
+# BEGIN/BEGIN IMMEDIATE transaction on this connection holds this lock
+# (save_plex_servers, set_genre_cache, set_credit_cache,
+# set_browse_index, catalog/store.replace_catalog), as do the
+# crawl-scale implicit-transaction alias writers
+# (catalog/store.register_alias / repoint_alias) whose execute→commit
+# windows otherwise interleave with locked writers during identity
+# resolution. Low-frequency implicit writers (set_setting etc.) remain
+# unlocked — accepted residual risk until the isolation_level=None
+# rework.
 _write_tx_lock = asyncio.Lock()
 
 _SCHEMA = """
@@ -398,24 +408,25 @@ async def set_plex_config(server_url: str, token: str, client_id: str) -> None:
 async def save_plex_servers(servers: list[dict]) -> None:
     from app.sources import secrets
     db = _conn()
-    await db.execute("BEGIN")
-    try:
-        await db.execute("DELETE FROM plex_servers")
-        for s in servers:
-            # owned: 1/0 when discovery supplied it, NULL when absent
-            # (legacy callers) — NULL means "unknown" to the rank logic.
-            owned = s.get("owned")
-            await db.execute(
-                "INSERT OR REPLACE INTO plex_servers (machine_id, server_url, name, owner, token, client_id, owned) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (s["machine_id"], s["server_url"], s["name"], s["owner"],
-                 secrets.seal(s["token"]), s["client_id"],  # U17: sealed at rest (R24)
-                 None if owned is None else int(bool(owned))),
-            )
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
+    async with _write_tx_lock:
+        await db.execute("BEGIN")
+        try:
+            await db.execute("DELETE FROM plex_servers")
+            for s in servers:
+                # owned: 1/0 when discovery supplied it, NULL when absent
+                # (legacy callers) — NULL means "unknown" to the rank logic.
+                owned = s.get("owned")
+                await db.execute(
+                    "INSERT OR REPLACE INTO plex_servers (machine_id, server_url, name, owner, token, client_id, owned) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (s["machine_id"], s["server_url"], s["name"], s["owner"],
+                     secrets.seal(s["token"]), s["client_id"],  # U17: sealed at rest (R24)
+                     None if owned is None else int(bool(owned))),
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
 
 async def get_plex_servers() -> list[dict]:
@@ -997,18 +1008,19 @@ async def get_genre_cache() -> list[dict]:
 async def set_genre_cache(genres: list[dict]) -> None:
     """Atomically replace the genre cache with a new merged list."""
     db = _conn()
-    await db.execute("BEGIN IMMEDIATE")
-    try:
-        await db.execute("DELETE FROM genre_cache")
-        if genres:
-            await db.executemany(
-                "INSERT INTO genre_cache (name, count) VALUES (?, ?)",
-                [(g["name"], g["count"]) for g in genres],
-            )
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
+    async with _write_tx_lock:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute("DELETE FROM genre_cache")
+            if genres:
+                await db.executemany(
+                    "INSERT INTO genre_cache (name, count) VALUES (?, ?)",
+                    [(g["name"], g["count"]) for g in genres],
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
 
 # ── pattern rules + artist exclusions (2026-06-10 pattern-rules plan U1) ─────
@@ -1327,26 +1339,27 @@ async def get_credit_appearances(name_lower: str) -> list[dict]:
 async def set_credit_cache(rows: list[dict]) -> None:
     """Atomically replace the credit cache (genre_cache replace pattern)."""
     db = _conn()
-    await db.execute("BEGIN IMMEDIATE")
-    try:
-        await db.execute("DELETE FROM credit_cache")
-        if rows:
-            await db.executemany(
-                "INSERT OR IGNORE INTO credit_cache"
-                " (name, name_lower, album_id, album_title, album_artist,"
-                "  album_thumb, album_year, server_name)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (r["name"], r["name_lower"], r["album_id"], r["album_title"],
-                     r["album_artist"], r.get("album_thumb"), r.get("album_year"),
-                     r.get("server_name"))
-                    for r in rows
-                ],
-            )
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
+    async with _write_tx_lock:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute("DELETE FROM credit_cache")
+            if rows:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO credit_cache"
+                    " (name, name_lower, album_id, album_title, album_artist,"
+                    "  album_thumb, album_year, server_name)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (r["name"], r["name_lower"], r["album_id"], r["album_title"],
+                         r["album_artist"], r.get("album_thumb"), r.get("album_year"),
+                         r.get("server_name"))
+                        for r in rows
+                    ],
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
 
 # ── browse index (cross-server artist+album roster; 2026-06-21 plan U1) ──────
@@ -1431,33 +1444,34 @@ async def set_browse_index(artists: list[dict], albums: list[dict]) -> None:
     (credit_cache replace pattern). INSERT OR IGNORE guards against a duplicate
     compound id within a single crawl batch."""
     db = _conn()
-    await db.execute("BEGIN IMMEDIATE")
-    try:
-        await db.execute("DELETE FROM browse_artist_index")
-        await db.execute("DELETE FROM browse_album_index")
-        if artists:
-            await db.executemany(
-                "INSERT OR IGNORE INTO browse_artist_index"
-                f" ({_BROWSE_ARTIST_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (a["artist_id"], a["title"], a["base_key"], a.get("thumb"),
-                     a.get("release_count"), a.get("server_name"), a.get("section_key"))
-                    for a in artists
-                ],
-            )
-        if albums:
-            await db.executemany(
-                "INSERT OR IGNORE INTO browse_album_index"
-                f" ({_BROWSE_ALBUM_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (a["album_id"], a["title"], a["title_base"], a["artist"],
-                     a["artist_base_key"], a.get("year"), a.get("thumb"),
-                     a.get("subtype"), a.get("added_at"), a.get("track_count"),
-                     a.get("server_name"), a.get("section_key"))
-                    for a in albums
-                ],
-            )
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
+    async with _write_tx_lock:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute("DELETE FROM browse_artist_index")
+            await db.execute("DELETE FROM browse_album_index")
+            if artists:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO browse_artist_index"
+                    f" ({_BROWSE_ARTIST_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (a["artist_id"], a["title"], a["base_key"], a.get("thumb"),
+                         a.get("release_count"), a.get("server_name"), a.get("section_key"))
+                        for a in artists
+                    ],
+                )
+            if albums:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO browse_album_index"
+                    f" ({_BROWSE_ALBUM_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (a["album_id"], a["title"], a["title_base"], a["artist"],
+                         a["artist_base_key"], a.get("year"), a.get("thumb"),
+                         a.get("subtype"), a.get("added_at"), a.get("track_count"),
+                         a.get("server_name"), a.get("section_key"))
+                        for a in albums
+                    ],
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise

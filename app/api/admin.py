@@ -467,9 +467,16 @@ async def plex_connect_poll(pin_id: int, client_id: str):
         # so it can't come back invisible (U3). Plex has no panel Remove, so there is no
         # Plex-disconnect veto path. Best-effort — a veto-store hiccup must not fail connect.
         new_ids: set[str] = set()
+        owned_new_ids: set[str] = set()
         try:
-            after = {s["machine_id"] for s in await database.get_plex_servers()}
+            after_rows = await database.get_plex_servers()
+            after = {s["machine_id"] for s in after_rows}
             new_ids = after - before
+            # owned is 1/0/NULL; NULL (legacy rows — discovery didn't say) counts
+            # as NOT owned: never auto-crawl a library we can't prove belongs to
+            # this account (owned-only seeding policy, 2026-08-06).
+            owned_new_ids = {s["machine_id"] for s in after_rows
+                             if s["machine_id"] in new_ids and s.get("owned")}
             disabled = await database.get_disabled_sources()
             remaining = [d for d in disabled if d not in new_ids]
             if len(remaining) != len(disabled):
@@ -477,15 +484,17 @@ async def plex_connect_poll(pin_id: int, client_id: str):
                 state.invalidate_plex_client()  # veto set changed -> bump the SWR generation
         except Exception:
             _log.warning("plex-connect veto clear failed", exc_info=True)
-        # Seed a NEWLY connected server's libraries enabled-by-default, matching the
-        # non-Plex connects above. Without this, a fresh install whose server holds a
-        # single music library dead-ends: no enabled_libraries row is ever written, the
-        # panel renders no per-library control for single-library sources, and Rescan
-        # clears an already-empty catalog (fresh-install audit F1, 2026-08-06). Scoped
-        # to new_ids so a RE-auth never overwrites a remembered per-library selection.
-        for sid in new_ids:
+        # Seed a NEWLY connected OWNED server's libraries enabled-by-default, matching
+        # the non-Plex connects above. Without this, a fresh install whose server holds
+        # a single music library dead-ends: no enabled_libraries row is ever written and
+        # Rescan clears an already-empty catalog (fresh-install audit F1, 2026-08-06).
+        # Scoped to newly-added machine_ids so a RE-auth never overwrites a remembered
+        # per-library selection, and to OWNED servers so a friend's shared library is
+        # never auto-crawled into the party catalog — shared servers stay opt-in via
+        # the always-rendered Libraries drill-in.
+        for sid in owned_new_ids:
             await _enable_new_source_libraries(sid)
-        if new_ids:
+        if owned_new_ids:
             state.trigger_catalog_refresh()  # crawl the new server without a manual Rescan
     return {"resolved": resolved}
 

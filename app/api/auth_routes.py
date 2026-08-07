@@ -59,7 +59,10 @@ async def _is_setup_complete() -> bool:
 
 
 class SetupRequest(BaseModel):
-    password: str = Field(..., min_length=1)
+    # The docs promise "≥12 chars, no reset" — enforce it (audit F4). There is
+    # no reset flow, so the length floor is the only strength guard the product
+    # can offer at setup time.
+    password: str = Field(..., min_length=12)
 
 
 @router.post("/setup")
@@ -98,8 +101,11 @@ async def login_local(body: LocalLoginRequest, request: Request, response: Respo
 # ── change password ───────────────────────────────────────────────────────────
 
 class ChangePasswordRequest(BaseModel):
+    # current_password stays min 1: legacy installs may hold a shorter password
+    # and must be able to authenticate to change it. Only the NEW password is
+    # length-gated — otherwise the setup minimum is trivially bypassed (audit F4).
     current_password: str = Field(..., min_length=1)
-    new_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=12)
 
 
 @router.post("/change-password", dependencies=[Depends(require_admin)])

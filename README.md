@@ -96,8 +96,10 @@ Then choose **System Audio** in Setup → Output.
 
 ## More music sources
 
-Add sources under **Setup → Libraries**, then **Rescan** (the catalog rebuilds on connect
-or a manual rescan, not on restart).
+Add sources under **Setup → Libraries**. Your own servers' music libraries switch on and
+start indexing on connect (untick any under **Edit libraries…**); a server *shared with
+you* stays off until you tick its libraries. **Rescan** rebuilds the catalog on demand
+(the catalog rebuilds on connect or a manual rescan, not on restart).
 
 - **Jellyfin** — **Connect Jellyfin** and sign in. Nothing to mount; it's reached over the
   network like Plex, and your password is never stored (only a token).
@@ -133,7 +135,8 @@ docker rm -f jukeplox
 ```
 
 Data in the volume is kept; **run-flags are not** — re-run with the exact flags you used
-(`docker inspect jukeplox` first to recover them). Build info at `/api/version`.
+(`docker inspect jukeplox` first to recover them). Build info at `/api/version` — check
+the `git_sha` (the `image_tag` may show an internal release-train name; that's expected).
 
 ## Notes
 
