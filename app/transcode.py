@@ -8,7 +8,41 @@ module (not the HTTP layer) so the output backends don't import from `app/api/*`
 """
 from __future__ import annotations
 
+import mimetypes
+
 _OGG_EXTS = (".ogg", ".oga", ".opus")
+
+# Register audio container types missing from Python's default mimetypes map.
+# `.flac` in particular is absent by default, so /api/stream (Starlette
+# FileResponse) served a local FLAC as `application/octet-stream` and
+# guess_type-based callers fell back to `audio/mpeg` — both rejected by strict
+# Cast/DLNA renderers (2026-08-03 ce-debug: JBL Charge 5 no audio; Direct is
+# immune because GStreamer sniffs the bytes). Idempotent; runs on first import
+# of this module, which the stream proxy and both backends import at startup.
+for _ext, _mt in (
+    (".flac", "audio/flac"),
+    (".opus", "audio/opus"),
+    (".ogg", "audio/ogg"),
+    (".oga", "audio/ogg"),
+    (".m4a", "audio/mp4"),
+    (".aac", "audio/aac"),
+    (".wav", "audio/wav"),
+):
+    mimetypes.add_type(_mt, _ext)
+
+
+def container_ext(path: str) -> str:
+    """The lowercased file extension of a media part path / stream_key.
+
+    Query-safe and directory-safe: strips any ``?query`` and reads only the
+    basename, so a proxy URL like ``http://host/api/stream?key=a/b.flac`` (whose
+    real extension hides in the query) or a host with dots (``192.168.1.50``)
+    never yields a bogus extension. Returns "" when there is no extension — the
+    signal to fall back to another source. Callers prefer the part path over a
+    proxy ``stream_url`` for exactly this reason.
+    """
+    base = (path or "").split("?", 1)[0].rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[-1].lower() if "." in base else ""
 
 
 def transcodes_to_flac(part_path: str) -> bool:
