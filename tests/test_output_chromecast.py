@@ -386,6 +386,30 @@ async def test_play_calls_play_media_flac(cast_mock):
     assert args[0][1] == "audio/flac"
 
 
+async def test_play_proxied_flac_advertises_flac(cast_mock):
+    """Proxy URL (/api/stream?key=...) hides the extension in the query string,
+    so the Cast LOAD content-type must be resolved from stream_key (the real part
+    path), not the proxy URL. Regression (2026-08-03 ce-debug: JBL Charge 5 no
+    audio): _content_type did split('?')[0] on the proxy URL, lost the .flac,
+    and — since .flac is absent from Python's mimetypes — fell back to audio/mpeg,
+    so the receiver rejected the FLAC and no media session formed. A production
+    Track has no .container, so the container branch never rescued it."""
+    from app.output.chromecast import ChromecastBackend
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+    # Production-shaped Track: NO .container attribute, real .flac stream_key.
+    track = Track(id="t", title="S", artist="A", album="B", duration_ms=40000,
+                  stream_key="local-x:Test Tone Trio/Alpha Sessions/02 Mid E.flac")
+    await backend.play(
+        "http://192.168.1.50/api/stream?key=local-x%3ATest%20Tone%20Trio%2F"
+        "Alpha%20Sessions%2F02%20Mid%20E.flac",
+        track,
+    )
+    args = cc.media_controller.play_media.call_args
+    assert args[0][1] == "audio/flac"
+
+
 async def test_play_calls_play_media_mp3(cast_mock):
     from app.output.chromecast import ChromecastBackend
     cc = _make_cc()
@@ -1249,7 +1273,7 @@ async def test_sync_connect_uuid_in_degraded_mode_does_not_scan(cast_mock):
     uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
     cc = _make_cc("Living Room TV")
     cc.wait.return_value = None
-    cast_mock["pcc"].get_chromecast_from_host.return_value = cc
+    cast_mock["pcc"].Chromecast.return_value = cc
 
     backend = ChromecastBackend()
     backend._dbus_index[uuid_str] = ("Living Room TV", "192.168.1.10", 8009)
@@ -1258,9 +1282,11 @@ async def test_sync_connect_uuid_in_degraded_mode_does_not_scan(cast_mock):
         result = backend._sync_connect(uuid_str)
 
     cast_mock["pcc"].get_chromecasts.assert_not_called()
-    cast_mock["pcc"].get_chromecast_from_host.assert_called_once_with(
-        ("192.168.1.10", 8009, None, "Living Room TV", None)
-    )
+    cast_mock["pcc"].Chromecast.assert_called_once()
+    _ci = cast_mock["pcc"].models.CastInfo.call_args
+    assert _ci.args[4] == "192.168.1.10" and _ci.args[5] == 8009
+    # cast_type forced to CHROMECAST, not auto-detected 'audio' (2026-08-04 fix)
+    assert _ci.args[6] == cast_mock["pcc"].const.CAST_TYPE_CHROMECAST
     assert result is cc
 
 
@@ -1275,16 +1301,19 @@ async def test_sync_connect_uses_dbus_index(cast_mock):
     uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
     cc = _make_cc("Living Room TV")
     cc.wait.return_value = None  # pychromecast 14 success
-    cast_mock["pcc"].get_chromecast_from_host.return_value = cc
+    cast_mock["pcc"].Chromecast.return_value = cc
 
     backend = ChromecastBackend()
     backend._dbus_index[uuid_str] = ("Living Room TV", "192.168.1.10", 8009)
 
     result = backend._sync_connect(uuid_str)
 
-    cast_mock["pcc"].get_chromecast_from_host.assert_called_once_with(
-        ("192.168.1.10", 8009, None, "Living Room TV", None)
-    )
+    cast_mock["pcc"].Chromecast.assert_called_once()
+    _ci = cast_mock["pcc"].models.CastInfo.call_args
+    from uuid import UUID
+    # UUID parsed from device_id; cast_type forced to CHROMECAST (2026-08-04 fix)
+    assert _ci.args[1] == UUID(uuid_str)
+    assert _ci.args[6] == cast_mock["pcc"].const.CAST_TYPE_CHROMECAST
     assert result is cc
 
 
@@ -1299,7 +1328,7 @@ async def test_sync_connect_dbus_index_raises_on_timeout(cast_mock):
     uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
     cc = _make_cc("Living Room TV")
     cc.wait.side_effect = _FakeTimeout("timed out")
-    cast_mock["pcc"].get_chromecast_from_host.return_value = cc
+    cast_mock["pcc"].Chromecast.return_value = cc
 
     backend = ChromecastBackend()
     backend._dbus_index[uuid_str] = ("Living Room TV", "192.168.1.10", 8009)
@@ -1315,16 +1344,19 @@ async def test_sync_connect_uses_dbus_device(cast_mock):
 
     cc = _make_cc("Living Room")
     cc.wait.return_value = True
-    cast_mock["pcc"].get_chromecast_from_host.return_value = cc
+    cast_mock["pcc"].Chromecast.return_value = cc
 
     backend = ChromecastBackend()
     backend._dbus_index["192.168.1.10:8009"] = ("Living Room", "192.168.1.10", 8009)
 
     result = backend._sync_connect("192.168.1.10:8009")
 
-    cast_mock["pcc"].get_chromecast_from_host.assert_called_once_with(
-        ("192.168.1.10", 8009, None, "Living Room", None)
-    )
+    cast_mock["pcc"].Chromecast.assert_called_once()
+    _ci = cast_mock["pcc"].models.CastInfo.call_args
+    # legacy host:port device_id -> uuid None; cast_type forced to CHROMECAST
+    assert _ci.args[1] is None
+    assert _ci.args[4] == "192.168.1.10" and _ci.args[5] == 8009
+    assert _ci.args[6] == cast_mock["pcc"].const.CAST_TYPE_CHROMECAST
     assert result is cc
 
 
@@ -1339,7 +1371,7 @@ async def test_sync_connect_dbus_raises_on_timeout(cast_mock):
 
     cc = _make_cc("Living Room")
     cc.wait.side_effect = _FakeTimeout("timed out")
-    cast_mock["pcc"].get_chromecast_from_host.return_value = cc
+    cast_mock["pcc"].Chromecast.return_value = cc
 
     backend = ChromecastBackend()
     backend._dbus_index["192.168.1.10:8009"] = ("Living Room", "192.168.1.10", 8009)
@@ -1355,7 +1387,7 @@ async def test_sync_connect_dbus_succeeds_when_wait_returns_none(cast_mock):
 
     cc = _make_cc("Living Room")
     cc.wait.return_value = None  # pychromecast >= 14: None means connected OK
-    cast_mock["pcc"].get_chromecast_from_host.return_value = cc
+    cast_mock["pcc"].Chromecast.return_value = cc
 
     backend = ChromecastBackend()
     backend._dbus_index["192.168.1.10:8009"] = ("Living Room", "192.168.1.10", 8009)

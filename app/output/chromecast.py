@@ -143,22 +143,60 @@ def _log_flow_task_exc(task: Any) -> None:
 
 
 def _content_type(stream_url: str, container: str | None, part_path: str = "") -> str:
+    from app.transcode import container_ext, device_stream_content_type
     if container and container in _CONTAINER_MIME:
         native = _CONTAINER_MIME[container]
     else:
-        path = stream_url.split("?")[0]
-        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-        if ext in _CONTAINER_MIME:
-            native = _CONTAINER_MIME[ext]
-        else:
-            guessed, _ = mimetypes.guess_type(stream_url)
-            native = guessed or "audio/mpeg"
+        # part_path (the source's real file/part path, e.g. .../02 Mid E.flac) is
+        # the authoritative extension. The stream_url is often a proxy URL
+        # (/api/stream?key=...) whose extension hides in the query string, so
+        # resolving from it silently fell back to audio/mpeg for FLAC — the
+        # receiver then rejected the load (2026-08-03 ce-debug: JBL no audio).
+        # Production Tracks never set .container, so this branch is the live path.
+        ext = container_ext(part_path) or container_ext(stream_url)
+        native = (_CONTAINER_MIME.get(ext)
+                  or mimetypes.guess_type(part_path or stream_url)[0]
+                  or "audio/mpeg")
     # /api/stream transcodes OGG-family sources to FLAC, so advertise the served
     # type — not the source type — or the receiver mis-inits its decode pipeline
-    # (2026-06-17). part_path (the Plex part path, e.g. .../file.ogg) is the
-    # authoritative extension; production Tracks never set .container.
-    from app.transcode import device_stream_content_type
+    # (2026-06-17).
     return device_stream_content_type(stream_url, part_path, native)
+
+
+def _force_media_cast_type(cast_info: Any) -> Any:
+    """Return ``cast_info`` with cast_type forced to CAST_TYPE_CHROMECAST.
+
+    pychromecast auto-types some Cast speakers (e.g. the JBL Charge 5 Wi-Fi SE)
+    as ``audio``, and launching the Default Media Receiver (CC1AD845) on an
+    audio-typed connection fails with ``LAUNCH_ERROR NOT_FOUND`` —
+    intermittently, because the type comes from a flaky device setup query
+    (2026-08-04 ce-debug). The DefaultMediaReceiver is universal, so connecting
+    as a plain ``cast`` device plays reliably on audio devices too; video
+    devices are already ``cast``, so this is a no-op for them."""
+    import dataclasses
+    try:
+        target = pychromecast.const.CAST_TYPE_CHROMECAST
+        if getattr(cast_info, "cast_type", None) == target:
+            return cast_info
+        return dataclasses.replace(cast_info, cast_type=target)
+    except Exception:
+        return cast_info
+
+
+def _media_chromecast_from_host(host: str, port: int, uuid: Any, name: str | None) -> Any:
+    """Connect-by-host for media playback, forcing cast_type='cast'.
+
+    Mirrors ``pychromecast.get_chromecast_from_host`` but builds the CastInfo
+    with an explicit CAST_TYPE_CHROMECAST so pychromecast never auto-detects the
+    device as ``audio`` (see ``_force_media_cast_type``). Submodules are reached
+    through the module-level ``pychromecast`` reference so tests that patch it
+    (and hosts without pychromecast installed) behave correctly."""
+    models = pychromecast.models
+    cast_info = models.CastInfo(
+        {models.HostServiceInfo(host, port)}, uuid, name, name, host, port,
+        pychromecast.const.CAST_TYPE_CHROMECAST, None,
+    )
+    return pychromecast.Chromecast(cast_info=cast_info)
 
 
 class _AdvanceListener:
@@ -813,7 +851,12 @@ class ChromecastBackend:
         if dbus_info is not None:
             name, host, port = dbus_info
             _log.info("Chromecast: connecting to D-Bus device %r (%s:%d)", device_id, host, port)
-            cc = pychromecast.get_chromecast_from_host((host, port, None, name, None))
+            from uuid import UUID
+            try:
+                _uid = UUID(device_id)
+            except (ValueError, TypeError, AttributeError):
+                _uid = None
+            cc = _media_chromecast_from_host(host, port, _uid, name)
             try:
                 cc.wait(timeout=10)
             except _RequestTimeout:
@@ -830,7 +873,8 @@ class ChromecastBackend:
 
         if cast_info is not None and self._zconf is not None:
             _log.info("Chromecast: connecting to %r via cached CastInfo", device_id)
-            cc = pychromecast.get_chromecast_from_cast_info(cast_info, self._zconf)
+            cc = pychromecast.get_chromecast_from_cast_info(
+                _force_media_cast_type(cast_info), self._zconf)
             try:
                 cc.wait(timeout=10)
             except _RequestTimeout:
@@ -856,18 +900,25 @@ class ChromecastBackend:
         _log.warning("Chromecast: no cached info for %r — falling back to one-shot scan", device_id)
         chromecasts, browser = pychromecast.get_chromecasts(tries=1, retry_wait=0, timeout=8)
         target = next((cc for cc in chromecasts if str(cc.uuid) == device_id), None)
-        if target:
-            try:
-                target.wait(timeout=10)
-            except _RequestTimeout:
-                target = None
-        pychromecast.discovery.stop_discovery(browser)
         if not target:
+            pychromecast.discovery.stop_discovery(browser)
             raise RuntimeError(f"Chromecast device {device_id!r} not found")
-        self._resolved_name = target.name
-        self._resolved_host = target.host
-        self._resolved_port = target.port
-        return target
+        # Reconnect forcing cast_type='cast': the scanned object may be
+        # audio-typed, which breaks the media-receiver launch (see
+        # _force_media_cast_type).
+        info = target.cast_info
+        host, port = info.host, info.port
+        fname = info.friendly_name or device_id
+        pychromecast.discovery.stop_discovery(browser)
+        cc = _media_chromecast_from_host(host, port, info.uuid, fname)
+        try:
+            cc.wait(timeout=10)
+        except _RequestTimeout:
+            raise RuntimeError(f"Chromecast device {device_id!r} did not connect within 10s")
+        self._resolved_name = fname
+        self._resolved_host = host
+        self._resolved_port = port
+        return cc
 
     # ── playback ──────────────────────────────────────────────────────────────
 
