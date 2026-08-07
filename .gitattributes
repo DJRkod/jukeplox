@@ -1,0 +1,5 @@
+# Shell scripts must use LF endings — a CRLF shebang breaks execution on Linux.
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.bats  text eol=lf
+install.sh text eol=lf

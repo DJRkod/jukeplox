@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>jukeplox browse perf bench</title>
+<!-- Real render-containment CSS (the content-visibility rules under test). -->
+<link rel="stylesheet" href="../../static/browse/rail.css">
+<style>
+  /* Minimal stand-in for the production page chrome: a bounded, scrolling pane
+     so the alpha rail resolves a real scroll ancestor + host, and list rows get
+     a realistic ~64px height. The render/layout costs we measure come from the
+     REAL static/browse/index.js + rail.css, not from this. */
+  html, body { margin: 0; background: #0e0e10; color: #eee; font: 14px system-ui, sans-serif; }
+  .pane-host { position: relative; }
+  .scroll-pane { height: 800px; overflow-y: auto; border: 1px solid #222; }
+  .list-item { display: flex; align-items: center; gap: 12px; height: 64px; box-sizing: border-box;
+    padding: 0 12px; border-bottom: 1px solid #1c1c1f; }
+  .list-art { width: 48px; height: 48px; border-radius: 4px; background: #2a2a30; flex: 0 0 auto; }
+  .list-info { flex: 1 1 auto; min-width: 0; }
+  .list-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .list-sub { color: #9a9aa2; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .list-chevron { color: #555; }
+  .kebab-btn { background: none; border: 0; color: #888; font-size: 18px; cursor: pointer; }
+  .tile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; padding: 12px; }
+  .tile { } .tile-art { width: 100%; aspect-ratio: 1; background: #2a2a30; border-radius: 6px; }
+  .sort-control { padding: 8px 12px; }
+  #albums-view { display: none; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="browse-container">
+  <div id="artists-view" class="pane-host"><div id="artists-list" class="scroll-pane"></div></div>
+  <div id="albums-view" class="pane-host"><div id="albums-list" class="scroll-pane"></div></div>
+  <!-- Inert IDs the mount-time wiring (_wireSearch/_wireOverflowMenu) looks up. -->
+  <div id="genres-list"></div>
+  <div id="years-list"></div>
+  <div id="year-albums-items"></div>
+  <div id="mostplayed-list"></div>
+  <div id="recentlyadded-list"></div>
+  <div id="search-bar"><input id="search-input" type="text"></div>
+  <div id="search-results"></div>
+  <div id="overflow-menu"></div>
+  <div id="overflow-overlay"></div>
+  <button id="close-menu-btn"></button>
+</div>
+
+<script>
+// ── Synthetic catalog + mocked fetch (the ONLY non-real part) ─────────────────
+// fetch returns a real Response whose .json() performs a genuine JSON.parse, so
+// the parse cost (a suspected first-navigate stall) is measured faithfully.
+(function () {
+  let _artistsJson = '[]';
+  let _albumsJson = '[]';
+  const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const WORDS = ['Echoes','Midnight','Velvet','Paper','Neon','Hollow','Golden','Silent','Crimson',
+    'Electric','Lunar','Glass','Iron','Wild','Static','Marble','Amber','Cobalt','Saffron','Ozone'];
+  function word(n) { return WORDS[n % WORDS.length]; }
+
+  window.__bench_build = function (count, withImages) {
+    const artists = new Array(count);
+    const albums = new Array(count);
+    for (let i = 0; i < count; i++) {
+      const L = LETTERS[i % 26];                          // even A–Z spread → full rail
+      const name = L + word(i >> 1) + ' ' + word(i * 7) + ' ' + i;
+      // withImages: a UNIQUE thumb path per row → _artImg emits a real <img
+      // src="/api/art?path=…">, and each distinct URL forces its own decode (as
+      // in production with per-album art). The local bench server answers /api/art
+      // with a real bitmap. Empty thumb → placeholder glyph (no <img>, no decode).
+      const thumb = withImages ? ('art/' + i) : '';
+      artists[i] = { id: 'a' + i, title: name, thumb: thumb, release_count: (i % 12) + 1 };
+      albums[i] = {
+        id: 'b' + i, title: name, artist: word(i * 3) + ' ' + LETTERS[(i * 5) % 26],
+        thumb: thumb, year: 1960 + (i % 64), subtype: 'album', track_count: (i % 18) + 1, sources: [],
+      };
+    }
+    _artistsJson = JSON.stringify(artists);
+    _albumsJson = JSON.stringify(albums);
+  };
+
+  window.fetch = async function (url) {
+    const u = String(url);
+    let body = '{}';
+    if (u.indexOf('/api/browse/artists') === 0) body = _artistsJson;
+    else if (u.indexOf('/api/browse/albums') === 0) body = _albumsJson;
+    else if (u.indexOf('/api/pattern-rules') === 0) body = '{"rules":[]}';
+    else if (u.indexOf('/api/play-counts') === 0) body = '[]';
+    else if (u.indexOf('/api/servers') === 0) body = '[]';
+    return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+})();
+</script>
+
+<!-- Real page-shared helpers (createSortControl, _esc, …) the module depends on. -->
+<script src="../../static/shared.js"></script>
+<!-- The REAL module under test. -->
+<script src="../../static/browse/index.js"></script>
+
+<script>
+// ── Self-driving benchmark ────────────────────────────────────────────────────
+(function () {
+  const results = { count: 0, phases: {}, taps: [], longtasks: [], prof: [], notes: [], errors: [] };
+
+  window.addEventListener('error', (e) => { results.errors.push('error: ' + (e.message || '') + ' @ ' + (e.filename || '').split('/').pop() + ':' + (e.lineno || '')); });
+  window.addEventListener('unhandledrejection', (e) => { results.errors.push('rejection: ' + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason)); });
+
+  // Authoritative stall signal: main-thread long tasks (>50ms) across the run.
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) {
+        results.longtasks.push({ start: +e.startTime.toFixed(1), dur: +e.duration.toFixed(1) });
+      }
+    }).observe({ type: 'longtask', buffered: true });
+  } catch (_) { results.notes.push('longtask observer unavailable'); }
+
+  // Mirror the in-module [browse-prof] lines into the results too.
+  const _log = console.log;
+  console.log = function () {
+    try { const s = Array.prototype.join.call(arguments, ' '); if (s.indexOf('[browse-prof]') === 0) results.prof.push(s); } catch (_) {}
+    return _log.apply(console, arguments);
+  };
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
+  async function waitFor(pred, timeoutMs) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < timeoutMs) { if (pred()) return true; await raf(); }
+    return false;
+  }
+  const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none'; };
+  function listReady(itemsId, count) {
+    const col = document.querySelector('#' + itemsId + ' .alpha-items-column');
+    return !!(col && col.children.length >= count);
+  }
+
+  async function step(name, itemsId, trigger) {
+    const t0 = performance.now();
+    trigger();
+    const ok = await waitFor(() => listReady(itemsId, results.count), 8000);
+    await raf();                                  // let onComplete (rail activation) settle
+    const t1 = performance.now();
+    const col = document.querySelector('#' + itemsId + ' .alpha-items-column');
+    results.phases[name] = { wallMs: +(t1 - t0).toFixed(1), start: +t0.toFixed(1), end: +t1.toFixed(1), complete: ok };
+    if (!ok) {
+      const listEl = document.getElementById(itemsId.replace('-items', '-list'));
+      results.phases[name].diag = {
+        mountBrowser: typeof window.mountBrowser,
+        visibility: document.visibilityState,
+        itemsEl: !!document.getElementById(itemsId),
+        colChildren: col ? col.childElementCount : -1,
+        target: results.count,
+        listSnippet: listEl ? listEl.innerHTML.slice(0, 220) : '(no list el)',
+      };
+      throw new Error('phase "' + name + '" did not finish rendering');
+    }
+  }
+
+  function ltBetween(a, b) {
+    const xs = results.longtasks.filter((e) => e.start >= a - 1 && e.start <= b + 1);
+    return { count: xs.length, totalMs: +xs.reduce((s, e) => s + e.dur, 0).toFixed(1),
+             maxMs: +xs.reduce((m, e) => Math.max(m, e.dur), 0).toFixed(1) };
+  }
+
+  async function jumps(view, handle) {
+    const rail = document.querySelector('.alpha-rail.visible') || document.querySelector('.alpha-rail');
+    if (!rail || !rail.children.length) { results.notes.push('no rail for jumps'); return; }
+    const btns = Array.prototype.filter.call(rail.children, (b) => b.getAttribute('aria-disabled') !== 'true');
+    if (!btns.length) { results.notes.push('no enabled rail buttons'); return; }
+    const picks = [btns[0], btns[btns.length - 1], btns[Math.floor(btns.length / 2)], btns[0]];
+    for (const b of picks) {
+      const t0 = performance.now();
+      b.click();                                  // real tap-to-jump (smooth scroll)
+      await sleep(700);                           // let the smooth scroll + paint run
+      results.taps.push(Object.assign({ key: b.dataset.bucket, syncMs: +(performance.now() - t0).toFixed(1) }, { lt: ltBetween(t0, performance.now()) }));
+    }
+    // Drag-scrub top→bottom (exercises _railPointerMove per move).
+    const r = rail.getBoundingClientRect();
+    const cx = r.left + Math.min(5, r.width / 2);
+    const dragStart = performance.now();
+    rail.dispatchEvent(new PointerEvent('pointerdown', { clientX: cx, clientY: r.top + 2, pointerId: 1, bubbles: true, isPrimary: true }));
+    for (let f = 0; f <= 24; f++) {
+      rail.dispatchEvent(new PointerEvent('pointermove', { clientX: cx, clientY: r.top + (r.height * f / 24), pointerId: 1, bubbles: true, isPrimary: true }));
+      await raf();
+    }
+    rail.dispatchEvent(new PointerEvent('pointerup', { clientX: cx, clientY: r.bottom - 2, pointerId: 1, bubbles: true, isPrimary: true }));
+    await sleep(150);
+    results.drag = { wallMs: +(performance.now() - dragStart).toFixed(1), lt: ltBetween(dragStart, performance.now()) };
+  }
+
+  window.__bench = { done: false, results: null };
+  window.__bench.run = async function (opts) {
+    try {
+      results.count = (opts && opts.count) || 20000;
+      results.withImages = !!(opts && opts.withImages);
+
+      // rAF liveness probe: the chunked renderer advances via requestAnimationFrame;
+      // a hidden/throttled headless page would stall it. Fail fast + loud if so.
+      let rafTicks = 0; const rafT0 = performance.now();
+      await new Promise((res) => { const t = () => { rafTicks++; (rafTicks < 3 && performance.now() - rafT0 < 1000) ? requestAnimationFrame(t) : res(); }; requestAnimationFrame(t); });
+      results.rafProbe = { ticks: rafTicks, ms: +(performance.now() - rafT0).toFixed(1), visibility: document.visibilityState };
+
+      window.__bench_build(results.count, results.withImages);   // build synthetic JSON (outside measured phases)
+
+      const handle = mountBrowser('#browse-container', { authMode: 'guest' });
+
+      show('artists-view', true); show('albums-view', false);
+      await step('artists_first_navigate', 'artists-items', () => handle.activateView('artists-view'));
+
+      show('artists-view', false); show('albums-view', true);
+      await step('albums_first_navigate', 'albums-items', () => handle.activateView('albums-view'));
+
+      await jumps('albums', handle);
+
+      // Per-phase long-task rollups.
+      const p = results.phases;
+      if (p.artists_first_navigate) p.artists_first_navigate.lt = ltBetween(p.artists_first_navigate.start, p.artists_first_navigate.end);
+      if (p.albums_first_navigate) p.albums_first_navigate.lt = ltBetween(p.albums_first_navigate.start, p.albums_first_navigate.end);
+      results.longtaskTotal = { count: results.longtasks.length, totalMs: +results.longtasks.reduce((s, e) => s + e.dur, 0).toFixed(1) };
+    } catch (e) {
+      results.error = String((e && e.stack) || e);
+    }
+    window.__bench.results = results;
+    window.__bench.done = true;
+    return results;
+  };
+})();
+</script>
+</body>
+</html>

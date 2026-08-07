@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jukeplox — Admin Login</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #eee; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #1e1e1e; border-radius: 12px; padding: 2.5rem 2rem; width: 100%; max-width: 380px; box-shadow: 0 8px 40px rgba(0,0,0,.5); animation: cardIn .3s ease; }
+    @keyframes cardIn { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+    h1 { font-size: 1.5rem; margin-bottom: .25rem; letter-spacing: -.02em; }
+    .subtitle { color: #888; font-size: .85rem; margin-bottom: 2rem; }
+    input[type=password] { width: 100%; padding: .7rem 1rem; border-radius: 8px; border: 1px solid #333; background: #2a2a2a; color: #eee; font-size: 1rem; margin-bottom: .5rem; }
+    input[type=password]:focus { outline: none; border-color: #e5a00d; }
+    .btn { display: block; width: 100%; padding: .75rem 1rem; border-radius: 8px; border: none; cursor: pointer; font-size: 1rem; font-weight: 600; margin-top: .75rem; }
+    .btn-primary { background: #e5a00d; color: #111; }
+    .btn-primary:hover { background: #c98a0b; }
+    .error { color: #ff6b6b; font-size: .85rem; margin-top: .5rem; min-height: 1.2em; }
+    .spinner { display: none; font-size: .85rem; color: #888; margin-top: .5rem; }
+    .spinner.visible { display: block; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>Jukeplox</h1>
+
+{% if setup_required %}
+  <p class="subtitle">First-time setup — set an admin password.</p>
+
+  <form id="setup-form">
+    <input type="password" id="setup-password" placeholder="New password (12+ characters)" autocomplete="new-password" minlength="12" required>
+    <input type="password" id="setup-confirm" placeholder="Confirm password" autocomplete="new-password" minlength="12" required>
+    <p class="subtitle" style="font-size:.8rem">At least 12 characters — there is no reset; forgetting it means wiping app data.</p>
+    <button type="submit" class="btn btn-primary">Set password &amp; sign in</button>
+    <p class="error" id="setup-error"></p>
+  </form>
+
+{% else %}
+  <p class="subtitle">Admin access</p>
+
+  <form id="local-form">
+    <input type="password" id="password" placeholder="Password" autocomplete="current-password" required>
+    <button type="submit" class="btn btn-primary">Sign in</button>
+    <p class="error" id="local-error"></p>
+  </form>
+
+{% endif %}
+
+</div>
+
+<script>
+{% if setup_required %}
+  const setupForm = document.getElementById('setup-form');
+  const setupError = document.getElementById('setup-error');
+
+  setupForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    setupError.textContent = '';
+    const password = document.getElementById('setup-password').value;
+    const confirm = document.getElementById('setup-confirm').value;
+    if (password !== confirm) {
+      setupError.textContent = 'Passwords do not match.';
+      return;
+    }
+    const resp = await fetch('/admin/auth/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    if (resp.ok) {
+      window.location.href = '/admin';
+    } else if (resp.status === 422) {
+      // Fixed client-side message keyed on the status — not parsed from the
+      // Pydantic detail array (stable across Pydantic format changes; the
+      // rule is already declared via minlength). (audit F4)
+      setupError.textContent = 'Password must be at least 12 characters.';
+    } else {
+      setupError.textContent = 'Setup failed. Please try again.';
+    }
+  });
+
+{% else %}
+  const localForm = document.getElementById('local-form');
+  const localError = document.getElementById('local-error');
+
+  localForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    localError.textContent = '';
+    const password = document.getElementById('password').value;
+    const resp = await fetch('/admin/auth/login/local', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    if (resp.ok) {
+      window.location.href = '/admin';
+    } else {
+      localError.textContent = 'Invalid password.';
+    }
+  });
+
+{% endif %}
+</script>
+</body>
+</html>

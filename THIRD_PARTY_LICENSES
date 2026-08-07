@@ -1,0 +1,47 @@
+# Third-Party Licenses
+
+Jukeplox is licensed under GPL-2.0 (see `LICENSE`). It additionally bundles or
+builds on the third-party components listed here.
+
+## Vendored binaries (committed in this repository)
+
+Prebuilt AirPlay sender binaries ship under `vendor/airplay/` and are invoked by
+Jukeplox only as subprocesses (no library linkage) — "mere aggregation" per the
+FSF GPL FAQ. See `vendor/airplay/PROVENANCE.md` for SHA-256 hashes and rebuild
+instructions. The GPL-2.0 text that governs them is this repository's `LICENSE`.
+
+### cliap2 (`vendor/airplay/cliap2-linux-*`)
+- Role: AirPlay 2 sender
+- License: GPL-2.0 (declared upstream)
+- Built from: https://github.com/music-assistant/cliairplay (GPL-2.0)
+- Upstream origin: https://github.com/owntone/owntone-server (GPL-2.0)
+- Fetched from: https://github.com/music-assistant/server @ `d3073756d34e6ac72c0fc5027dc253c0de98346e`
+  (path `music_assistant/providers/airplay/bin/`)
+
+### cliraop (`vendor/airplay/cliraop-linux-*`)
+- Role: AirPlay 1 / RAOP sender
+- License: GPL-2.0 by OwnTone heritage (see note)
+- Built from: https://github.com/music-assistant/libraop — fork of https://github.com/philippe44/libraop
+- Upstream origin: https://github.com/owntone/owntone-server (GPL-2.0)
+- Fetched from: https://github.com/music-assistant/server @ `d3073756d34e6ac72c0fc5027dc253c0de98346e`
+- NOTE: Neither `music-assistant/libraop` nor its parent `philippe44/libraop` ships
+  an explicit LICENSE file. cliraop is treated as GPL-2.0 by its OwnTone heritage —
+  an inheritance assumption, not an upstream-declared license; clarification should
+  be requested upstream. No non-commercial or personal-use restriction exists
+  anywhere in this lineage.
+
+## System libraries (installed into the Docker image at build time)
+
+apt-installed from the Debian base image; not vendored as source here. Debian
+distributes the corresponding source via `apt-get source` / its snapshot archive.
+
+- ffmpeg — GPL-2.0-or-later (Debian build) — https://packages.debian.org/source/stable/ffmpeg
+- GStreamer (`gstreamer1.0-*`, `gir1.2-gst*`) — LGPL-2.1 — https://packages.debian.org/source/stable/gstreamer1.0-plugins-base
+- flac, libplist, libevent, libcurl, libconfuse — see their respective Debian source packages
+
+## Python dependencies (installed via pip at build time, not vendored)
+
+Runtime and dev dependencies — FastAPI, Starlette, uvicorn, httpx, pydantic,
+pydantic-settings, bcrypt, aiosqlite, jinja2, python-multipart, pychromecast,
+async-upnp-client — are permissively licensed (MIT / BSD / Apache-2.0).
+`zeroconf` is LGPL-2.1. Their source is not redistributed in this repository.

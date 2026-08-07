@@ -1,0 +1,79 @@
+# Jukeplox on TrueNAS Scale
+
+Install via the **Apps** UI. You need a dataset for app data (e.g. `/mnt/<pool>/jukeplox`)
+and at least one music source — a Plex account, a Jellyfin server, or a folder of audio
+files on the NAS. Playback goes to network speakers (Chromecast/AirPlay/DLNA).
+
+## 1. Create a Custom App
+
+Apps → **Discover Apps** → **Custom App**. Set:
+
+| Field | Value |
+|---|---|
+| Application Name | `jukeplox` |
+| Image Repository | `djrkod/jukeplox` |
+| Image Tag | `latest` |
+| Pull Policy | **Always** (so redeploys grab the newest image) |
+
+## 2. Container
+
+- **Environment Variables** → add `BIND_HOST` = your TrueNAS LAN IP (e.g. `192.168.1.50`). Lets Chromecast/DLNA fetch audio through Jukeplox. *(Skip only if you use AirPlay exclusively.)*
+- **Restart Policy** → **Unless Stopped** — so it recovers from a crash. The default ("No") leaves Jukeplox down until you restart it by hand.
+
+## 3. Network
+
+Turn on **Host Network**. Required — Jukeplox finds Cast/AirPlay over multicast (UDP 5353),
+which Docker's normal network blocks; it also binds the port directly on the host.
+
+## 4. Storage
+
+Under **Storage and Persistence**, add two **Host Path** mounts:
+
+| Host Path | Mount Path | Why |
+|---|---|---|
+| `/mnt/<pool>/jukeplox` (your dataset) | `/data` | database, settings, artwork — survives updates |
+| `/run/dbus/system_bus_socket` | `/run/dbus/system_bus_socket` | finds Cast/AirPlay devices (see below) |
+
+TrueNAS runs its own `avahi-daemon` (which owns UDP 5353), so Jukeplox asks avahi over the
+system D-Bus socket instead — that's the second mount. No host reconfiguration needed.
+
+**Using a local music folder as a source?** Add a third **Host Path** mount — your music
+dataset (e.g. `/mnt/<pool>/music`) → `/music`, set **Read Only**. Then in the app, **Connect
+Local Folder** → `/music` (the path is checked inside the container, so it must be mounted,
+not typed as a host path). Jellyfin needs no mount — it's reached over the network.
+
+## 5. Install and set up
+
+Click **Install** and wait for **Running** (~30s). Open `http://<your-truenas-ip>`, then:
+
+1. Set an admin password — **≥12 chars, no reset** (forgetting it means wiping app data).
+2. Add a music source under **Setup → Libraries** — Plex (code at plex.tv), Jellyfin
+   (sign in), or a local folder (`/music` from step 4). Your own servers' music libraries
+   switch on and start indexing automatically (untick any under **Edit libraries…**); a
+   server *shared with you* stays off until you tick its libraries. A big library indexes
+   in the background — search fills in as it runs.
+3. Pick a speaker under **Setup → Output**.
+
+**Plex is also a TrueNAS app?** It likely advertises only an internal container address,
+so Jukeplox falls back to your public address. In Plex, **Settings → Network → Custom
+server access URLs**, add `http://<plex-LAN-IP>:32400`, then reconnect Plex in Jukeplox
+to keep playback on your LAN.
+
+Share `http://<your-truenas-ip>` with guests — no app or password needed. *(Optional: add a
+**Portal** — HTTP, Use Node IP, port 80 — for a clickable link in the TrueNAS Apps UI.)*
+
+**Port 80 in use?** Add env var `PORT` = a free port (e.g. `8096`) → app at `http://<IP>:8096`.
+If you also cast, add `STREAM_BASE_URL` = `http://<IP>:8096`, or cast devices try :80 and play nothing.
+
+## Update
+
+Apps → jukeplox → ⋮ → **Edit** → **Update**. With Pull Policy = **Always** this re-pulls
+`latest`; your `/data` dataset is untouched. Confirm the build via the `git_sha` at
+`http://<IP>/api/version` (the `image_tag` field may show an internal release-train name).
+
+## Troubleshooting
+
+- **No Cast/AirPlay devices** — confirm **Host Network** (step 3) and the **D-Bus mount** (step 4). In Logs, `Cannot bind mDNS port 5353 … Falling back to avahi over D-Bus` is **expected** and means discovery works; other avahi/D-Bus errors mean the mount is wrong.
+- **Can't reach the admin page** — use `http://`, not `https://`; the app is on port 80 (`netstat -tlnp | grep ':80 '`).
+- **`docker logs jukeplox` shows nothing** — TrueNAS renames the container; use `docker logs ix-jukeplox-jukeplox-1` (or find it with `docker ps`).
+- **Security** — host networking exposes the admin port on all interfaces. Run on a trusted LAN; firewall the port if the box is internet-reachable — guest pages need no login.

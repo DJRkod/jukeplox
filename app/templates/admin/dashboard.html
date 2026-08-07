@@ -1,0 +1,1087 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jukeplox — Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/browse/rail.css?v={{ asset_v }}">
+  <link rel="stylesheet" href="/static/playback/queue.css?v={{ asset_v }}">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root { --accent: #e5a00d; --bg: #111; --surface: #1a1a1a; --surface2: #2a2a2a; --text: #eee; --muted: #888; --danger: #f87171; --accent-ui: #e5a00d; --on-accent: #111; --accent-grad: #e5a00d; --accent-strong: #c98a0b; --accent-dim: rgba(229,160,13,.13); --sax-filter: none; --border: rgba(255,255,255,.14); --divider: rgba(255,255,255,.08); }
+    /* Paint the scheme --bg ONCE as a viewport-anchored backdrop (matches guest).
+       Previously body painted it with scroll attachment, so a gradient theme
+       stretched over the full page height; on the root with `fixed` it's one
+       stable, seamless gradient. */
+    html { background: var(--bg) fixed; }
+    body { font-family: system-ui, sans-serif; color: var(--text); min-height: 100vh; background: transparent; }
+
+    /* Page header: brand + Jukebox/Setup tabs (replaces the sidebar at all sizes) */
+    #page-header { display: flex; align-items: center; gap: 1.25rem; background: var(--surface);
+                   padding: 0 1rem; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 50; }
+    #page-header h1 { font-size: 1.05rem; padding: .8rem 0; white-space: nowrap; }
+    #page-tabs { display: flex; gap: .25rem; }
+    /* Inactive tabs use the primary text colour de-emphasised by opacity, not
+       --muted: on the bright-bg gradient themes (Ladyland, Bloody Pink) --muted
+       is a dark tone tuned for the bright bottom, but this sticky header sits
+       over the dark top of the gradient where dark-on-dark vanished. Dimmed
+       --text reads wherever the active label reads, across all schemes. */
+    .ptab { padding: .95rem 1rem; font-size: .9rem; color: var(--text); opacity: .62; background: none; border: none;
+            border-bottom: 2px solid transparent; cursor: pointer; }
+    .ptab:hover { opacity: .85; }
+    /* Hairline chrome on black uses --accent-ui (lifted tone) so deep
+       anchors like A Case of Blue stay visible (U7 polish). */
+    .ptab.active { color: var(--text); opacity: 1; border-bottom-color: var(--accent-ui, var(--accent)); }
+    .ptab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+    main { padding: 1.25rem 1rem 3rem; max-width: 1100px; margin: 0 auto; }
+    .pview { display: none; }
+    .pview.active { display: block; }
+
+    /* ── Desktop two-column Jukebox (2026-06-09 rail plan U7, R12/R14) ────
+       Party state (Now Playing + transport, Queue + Recently Played) left;
+       Browse right. Pure CSS over the same shared-module-rendered DOM —
+       no JS, no re-parenting. Setup tab stays a stacked column; below the
+       breakpoint the existing stack is untouched. */
+    @media (min-width: 960px) {
+      main { max-width: 1280px; }
+      #pview-jukebox.active {
+        display: grid;
+        grid-template-columns: minmax(380px, 420px) 1fr;
+        align-items: start;
+        gap: 1.25rem;
+      }
+      /* Left column: Now Playing + Queue share one flow (the .jukebox-side
+         wrapper) so the Queue docks directly under Now Playing and STAYS there.
+         The prior grid-span ("np browse" / "queue browse") let a long Browse
+         list inflate the two auto rows and — with align-items:start — push the
+         Queue far below Now Playing (it "floated"). */
+      #pview-jukebox .jukebox-side { display: flex; flex-direction: column; gap: 1.25rem; min-width: 0; }
+      #pview-jukebox .jukebox-side > section { margin-bottom: 0; }
+      /* min-width:0 is load-bearing: #browse fills the 1fr track, and grid
+         items default to min-width:auto — one long nowrap .list-title (e.g.
+         Fiona Apple's "When the Pawn…") would otherwise force the column
+         past the viewport instead of ellipsizing. */
+      #pview-jukebox #browse { margin-bottom: 0; min-width: 0; }
+    }
+
+    section { background: var(--surface); border-radius: 10px; padding: 1.25rem; margin-bottom: 1.25rem; }
+    h2 { font-size: 1rem; color: #888; margin-bottom: 1rem; text-transform: uppercase; letter-spacing: .06em; font-size: .75rem; }
+
+    /* Now Playing (shared playback module renders into #np-panel / #np-progress) */
+    .np-row { display: flex; gap: 1rem; align-items: center; }
+    .np-placeholder { width: 80px; height: 80px; border-radius: 6px; background: var(--surface2); display: flex;
+                      align-items: center; justify-content: center; font-size: 2rem; flex-shrink: 0; }
+    .np-art { width: 80px; height: 80px; border-radius: 6px; object-fit: cover; background: var(--surface2); flex-shrink: 0; }
+    .np-art.hidden { display: none; }
+    .np-text { flex: 1; min-width: 0; }
+    .np-title { font-size: 1.1rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .np-artist { font-size: .85rem; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #np-progress { margin-top: .6rem; padding: 0 .75rem; }   /* .75rem inset = flush with the Lyrics slot (2026-06-18) */
+    /* Progress bar adopts the accent gradient (2026-06-14 scheme expansion) —
+       mirrors guest: native range kept, full var(--accent-grad) track, unplayed
+       remainder dimmed via the JS-published --np-fill, themed thumb. */
+    .np-progress-bar { --np-fill: 0%; width: 100%; max-width: none; display: block; height: 16px;
+      -webkit-appearance: none; appearance: none; background: transparent; cursor: pointer; margin: 0; }
+    .np-progress-bar::-webkit-slider-runnable-track { height: 6px; border-radius: 3px;
+      background: linear-gradient(90deg, transparent 0 var(--np-fill), rgba(0,0,0,.5) var(--np-fill) 100%), var(--accent-grad); }
+    .np-progress-bar::-moz-range-track { height: 6px; border-radius: 3px;
+      background: linear-gradient(90deg, transparent 0 var(--np-fill), rgba(0,0,0,.5) var(--np-fill) 100%), var(--accent-grad); }
+    .np-progress-bar::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px;
+      border-radius: 50%; background: var(--accent-ui, var(--accent)); border: 2px solid var(--bg); margin-top: -4px; }
+    .np-progress-bar::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%;
+      background: var(--accent-ui, var(--accent)); border: 2px solid var(--bg); }
+    .np-progress-bar:disabled { cursor: default; }
+    .np-progress-bar:disabled::-webkit-slider-thumb { opacity: 0; }
+    .np-progress-bar:disabled::-moz-range-thumb { width: 0; border: none; }
+    .np-times { display: flex; justify-content: space-between; font-size: .72rem; color: #666; margin-top: -.1rem; font-family: 'Space Mono', ui-monospace, monospace; }
+
+    .controls { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; }
+    .btn { padding: .5rem 1rem; border-radius: 6px; border: none; cursor: pointer; font-size: .9rem; font-weight: 500; }
+    .btn-sm { padding: .3rem .6rem; font-size: .8rem; border-radius: 4px; }
+    /* Transport buttons: 44px minimum touch target (phone-first host control) */
+    .btn-icon { min-width: 44px; min-height: 44px; padding: .4rem .6rem; background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+    .btn-icon:hover { background: var(--surface); }
+    .btn-icon:disabled { color: #555; cursor: default; background: var(--surface); }
+    .btn-danger { background: #7f1d1d; color: #fca5a5; }
+    .btn-danger:hover { background: #991b1b; }
+    .btn-primary { background: var(--accent); color: var(--on-accent); }
+    .btn-primary:hover { background: var(--accent-strong); }
+    /* Scoped to #volume-slider (the only range input here): a bare
+       input[type=range] selector has attribute-specificity (0,1,1) that beat
+       .np-progress-bar (0,1,0), capping the SEEK bar at 140px too. */
+    #volume-slider { flex: 1; min-width: 80px; max-width: 140px; accent-color: var(--accent); }
+    /* Volume slider — gradient fill mirroring .np-progress-bar (2026-06-18 rework):
+       the filled portion shows var(--accent-grad); the remainder is dimmed via the
+       JS-published --vol-fill. Replaces the flat native accent-color. */
+    #volume-slider { --vol-fill: 50%; -webkit-appearance: none; appearance: none;
+      background: transparent; cursor: pointer; height: 16px; margin: 0; }
+    #volume-slider::-webkit-slider-runnable-track { height: 6px; border-radius: 3px;
+      background: linear-gradient(90deg, transparent 0 var(--vol-fill), rgba(0,0,0,.5) var(--vol-fill) 100%), var(--accent-grad); }
+    #volume-slider::-moz-range-track { height: 6px; border-radius: 3px;
+      background: linear-gradient(90deg, transparent 0 var(--vol-fill), rgba(0,0,0,.5) var(--vol-fill) 100%), var(--accent-grad); }
+    #volume-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px;
+      border-radius: 50%; background: var(--accent-ui, var(--accent)); border: 2px solid var(--bg); margin-top: -4px; }
+    #volume-slider::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%;
+      background: var(--accent-ui, var(--accent)); border: 2px solid var(--bg); }
+    /* Volume nudge buttons (2026-08-04 volume rework U2): ±5% snap; transport
+       vocabulary at reduced size; disabled at the bounds (mockup pick). */
+    .vol-btn { min-width: 34px; min-height: 34px; padding: 0; background: var(--surface2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px; font-size: 1rem; line-height: 1; cursor: pointer; }
+    .vol-btn:hover { background: var(--surface); }
+    .vol-btn:disabled { opacity: .35; cursor: default; }
+    /* Volume group + orientation switch (2026-08-04 volume rework U3, mockup
+       picks: docked right rail, rotate(-90deg) technique). One render path —
+       body[data-vol-orient] flips the layout, JS never branches. */
+    .vol-group { display: flex; align-items: center; gap: .45rem; flex: 1; min-width: 0; }
+    .vol-rot-wrap { display: contents; }   /* horizontal: slider joins the group flex directly */
+    body[data-vol-orient="vertical"] #now-playing { position: relative; padding-right: 84px; min-height: 265px; }
+    body[data-vol-orient="vertical"] .vol-group { position: absolute; top: 1.25rem; bottom: 1.25rem; right: 1.25rem;
+      width: 48px; flex: none; flex-direction: column; justify-content: center; gap: .45rem;
+      border-left: 1px solid var(--divider); padding-left: .9rem; }
+    /* Rail order top→bottom: + / bar / − / label (mockup pick) */
+    body[data-vol-orient="vertical"] #vol-up { order: -1; }
+    body[data-vol-orient="vertical"] #vol-down { order: 1; }
+    body[data-vol-orient="vertical"] #vol-label { order: 2; }
+    body[data-vol-orient="vertical"] .vol-rot-wrap { display: block; width: 20px; height: 120px; position: relative; }
+    /* Rotated horizontal input: the 90deg --accent-grad runs ALONG the bar and
+       arrow keys keep their natural mapping (U1 keyboard check). */
+    body[data-vol-orient="vertical"] #volume-slider { position: absolute; top: 50%; left: 50%; width: 120px;
+      max-width: none; min-width: 0; flex: none; transform: translate(-50%, -50%) rotate(-90deg); }
+
+    /* Queue list (shared playback module rows; admin decorates with DnD + actions) */
+    .queue-item { display: flex; align-items: center; gap: .75rem; padding: .5rem; border-radius: 6px; cursor: grab; }
+    .queue-item:hover { background: var(--surface2); }
+    .queue-item.drag-over { background: var(--accent-dim); outline: 2px dashed var(--accent); }
+    .queue-item.dragging { opacity: .4; }
+    .drag-handle { color: #555; cursor: grab; user-select: none; font-size: 1.1rem; }
+    .qi-pos { color: #555; width: 1.5rem; text-align: right; font-size: .85rem; }
+    .qi-art, .qi-art-placeholder { width: 34px; height: 34px; border-radius: 4px; object-fit: cover; background: var(--surface2);
+              flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: .95rem; }
+    .qi-info { flex: 1; min-width: 0; }
+    .qi-title { font-size: .9rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .qi-artist { font-size: .8rem; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .qi-actions { display: flex; gap: .4rem; }
+    .queue-header { display: flex; align-items: center; gap: 1rem; margin-bottom: .75rem; }
+    .lock-label { display: flex; align-items: center; gap: .5rem; font-size: .85rem; color: #aaa; cursor: pointer; margin-left: auto; }
+    input[type=checkbox] { accent-color: var(--accent); width: 1rem; height: 1rem; }
+
+    /* Recently played strip (shared playback module) */
+    .pb-label { font-size: .68rem; color: var(--muted); padding: .8rem 0 .2rem; text-transform: uppercase; letter-spacing: .05em; }
+    .pb-empty { color: #555; font-size: .85rem; padding: .5rem 0; display: block; }
+    .strip { overflow-x: auto; display: flex; gap: .5rem; padding: .4rem 0 .2rem; scrollbar-width: none; }
+    .strip::-webkit-scrollbar { display: none; }
+    .qs-item { flex-shrink: 0; text-align: center; width: 56px; }
+    .qs-item.qs-history { opacity: .55; }
+    .qs-art, .qs-art-placeholder { width: 44px; height: 44px; border-radius: 4px; object-fit: cover; background: var(--surface2);
+              margin: 0 auto; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; }
+    .qs-title { font-size: .65rem; color: var(--muted); margin-top: .2rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .panel-row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-bottom: .75rem; }
+    /* International rail thresholds: always-visible dim+disabled pattern — active
+       only when the International rail mode is selected (plan 004). The popular-
+       threshold field is intentionally NOT gated (2026-06-24): it stays fully
+       enabled regardless of the selected Queue-end mode. */
+    #international-thresholds-row { transition: opacity .2s ease; }
+    #international-thresholds-row.is-inactive { opacity: .5; }
+    #international-thresholds-row .international-thresholds-hint { font-style: italic; color: var(--muted); display: none; margin-left: .15rem; }
+    #international-thresholds-row.is-inactive .international-thresholds-hint { display: inline; }
+    label { font-size: .85rem; color: #aaa; }
+    select, input[type=number] { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: .4rem .7rem; font-size: .85rem; }
+    /* Settings (2026-06-24 subtle pass): cluster rows under quiet accent subheads
+       with hairline separators, give every field one shared style, and align the
+       label column so the section reads as grouped panels, not a flat stream. */
+    #settings .settings-subhead { font-size: .7rem; letter-spacing: .14em; text-transform: uppercase;
+      color: var(--accent); font-weight: 600; opacity: .9; margin: 1.5rem 0 .85rem; padding-top: 1rem;
+      border-top: 1px solid var(--border); }
+    #settings .settings-subhead:first-of-type { margin-top: .35rem; padding-top: 0; border-top: none; }
+    #settings .panel-row { align-items: flex-start; }
+    #settings .panel-row > label:first-child { min-width: 168px; padding-top: .4rem; }
+    #settings .field-prose { font-size: .9rem; line-height: 1.7; color: var(--muted); }
+    #settings .field-note { font-style: italic; color: var(--muted); opacity: .85; }
+    /* text inputs were unstyled (raw browser default) — match number/select. */
+    #settings input[type=text] { background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: .4rem .7rem; font-size: .85rem; }
+    #settings input:focus, #settings select:focus { outline: none; border-color: var(--accent); }
+    #settings .closing-fields { display: flex; flex-direction: column; gap: .45rem; }
+    /* Sources sub-blocks reuse the Setup subhead + input treatment (multi-source U14). */
+    #libraries .settings-subhead { font-size: .7rem; letter-spacing: .14em; text-transform: uppercase;
+      color: var(--accent); font-weight: 600; opacity: .9; margin: 1.1rem 0 .6rem; }
+    #libraries .settings-subhead:first-of-type { margin-top: .25rem; }
+    #libraries input[type=text], #libraries input[type=password] {
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: .4rem .7rem; font-size: .85rem; }
+    #libraries input:focus { outline: none; border-color: var(--accent); }
+    .lib-item { display: flex; align-items: center; gap: .75rem; padding: .4rem 0; }
+    .lib-item label { cursor: pointer; font-size: .9rem; color: var(--text); }
+    /* Libraries: one source-grouped list — source switch + optional per-library
+       drill-in (Libraries-panel redesign). Built from existing tokens only. */
+    .src-block { border-bottom: 1px solid var(--divider); }
+    .src-block:last-child { border-bottom: none; }
+    .src-row { display: flex; align-items: center; gap: .6rem; padding: .5rem 0; }
+    .src-name { flex: 1; font-size: .95rem; min-width: 0; }
+    .type-tag { color: #888; font-size: .75em; text-transform: uppercase; letter-spacing: .04em; margin-right: .5rem; }
+    .src-meta { color: #666; font-size: .78rem; margin-left: .4rem; }
+    .src-controls { display: flex; gap: .35rem; align-items: center; }
+    .icbtn { background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+      min-width: 32px; padding: .3rem .5rem; font-size: .8rem; cursor: pointer; }
+    .icbtn:hover { background: var(--surface); }
+    .icbtn.rm { color: var(--danger); }
+    .drill { background: none; border: none; color: var(--accent); opacity: .85; cursor: pointer; font-size: .8rem;
+      padding: 0; text-decoration: underline; text-underline-offset: 2px; margin-left: .1rem; }
+    .drill:hover { opacity: 1; }
+    .drill:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; opacity: 1; }
+    .lib-children { margin: 0 0 .4rem 1.4rem; padding-left: .9rem; border-left: 2px solid var(--divider); }
+    .lib-children[hidden] { display: none; }
+    .lib-child { display: flex; align-items: center; gap: .6rem; padding: .3rem 0; font-size: .88rem;
+      color: var(--text); cursor: pointer; }
+    .lib-child.greyed { opacity: .45; }
+    .src-err { font-size: .8rem; color: var(--danger); padding: 0 0 .5rem .2rem; }
+    /* iOS-style whole-source switch — amber accent from the existing palette. */
+    .switch { position: relative; width: 38px; height: 22px; flex-shrink: 0; }
+    .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .switch .slider { position: absolute; inset: 0; background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 999px; transition: .15s; cursor: pointer; }
+    .switch .slider::before { content: ''; position: absolute; width: 16px; height: 16px; left: 2px; top: 2px;
+      background: #888; border-radius: 50%; transition: .15s; }
+    .switch input:checked + .slider { background: var(--accent-dim); border-color: var(--accent); }
+    .switch input:checked + .slider::before { transform: translateX(16px); background: var(--accent); }
+    .switch input:disabled + .slider { opacity: .5; cursor: default; }
+    .switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: var(--surface2); color: var(--text); padding: .75rem 1.25rem; border-radius: 8px; font-size: .9rem; box-shadow: 0 4px 20px rgba(0,0,0,.4); opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 9999; }
+    .toast.show { opacity: 1; }
+    .radio-group label { display: inline-flex; align-items: center; gap: .4rem; margin-right: 1rem; }
+    .radio-group input[type=radio] { accent-color: var(--accent); }
+    /* Info (ⓘ) hints (2026-06-24): real buttons so a click surfaces the help text
+       WITHOUT toggling the option they sit inside (and so touch users can reach it
+       at all). Native button chrome is reset to read as the old inline glyph. */
+    .info-i { appearance: none; -webkit-appearance: none; background: none; border: 0;
+      margin: 0; padding: 0 .15rem; font: inherit; line-height: 1; color: inherit;
+      opacity: .6; cursor: pointer; vertical-align: baseline; }
+    .info-i:hover { opacity: 1; color: var(--accent); }
+    .info-i:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 999px; opacity: 1; }
+    /* Click-to-show help popover (single shared node, positioned in JS). */
+    .info-pop { position: fixed; z-index: 10000; max-width: 280px; background: var(--surface2);
+      color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+      padding: .55rem .75rem; font-size: .8rem; line-height: 1.5; font-weight: 400;
+      box-shadow: 0 8px 28px rgba(0,0,0,.45); }
+    /* Most Played count badge */
+    .admin-shell .mp-count { font-family: 'Space Mono', ui-monospace, monospace; font-size: .72rem; color: var(--accent); min-width: 2.4rem; text-align: right; flex-shrink: 0; }
+
+    /* Pattern Matching / Artist Exclusion editors (plan U4) */
+    .rule-help { font-size: .8rem; color: #888; margin-bottom: .6rem; }
+    .rule-row { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; margin-bottom: .5rem; }
+    .rule-row input[type=text] { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: .4rem .6rem; font-size: .85rem; width: 130px; }
+    .rule-row .rule-inert-hint { font-size: .72rem; color: #b8860b; flex-basis: 100%; }
+    .rule-empty-state { font-size: .85rem; color: #555; padding: .4rem 0 .6rem; }
+    /* ✕ remove: full 44px tap target, visually prominent per user requirement
+       (prominence, NOT a confirmation dialog). */
+    .rule-remove { min-width: 44px; min-height: 44px; background: var(--surface2); color: var(--danger); border: 1px solid var(--border); border-radius: 6px; font-size: 1rem; cursor: pointer; }
+    .rule-remove:hover { background: #3a2525; }
+    .rule-mini-btn { min-height: 32px; background: var(--surface2); color: var(--muted); border: 1px solid var(--border); border-radius: 6px; font-size: .78rem; cursor: pointer; padding: 0 .6rem; }
+    .logout { font-size: .85rem; color: #555; padding: .25rem 0 1rem; }
+    .logout a { color: #888; text-decoration: none; }
+    .logout a:hover { color: var(--text); }
+
+    /* Browse module — shared classes scoped to .admin-shell for admin's denser layout (KTD4).
+       Base classes match the shared browse module's rendered DOM. Per KTD9: chrome helpers
+       (esc, artImg, formatDuration) stay duplicated; everything else in this block comes
+       from the unification refactor (U4 of plan 004). */
+    .admin-shell .list-item { display: flex; align-items: center; gap: .65rem; padding: .55rem .25rem; border-bottom: 1px solid #252525; cursor: pointer; transition: background .1s; }
+    .admin-shell .list-item:last-child { border-bottom: none; }
+    .admin-shell .list-item:hover { background: var(--surface2); border-radius: 4px; }
+    .admin-shell .list-art { width: 38px; height: 38px; border-radius: 4px; object-fit: cover; background: var(--surface2); flex-shrink: 0; font-size: 1.1rem; display: flex; align-items: center; justify-content: center; }
+    .admin-shell .list-info { flex: 1; min-width: 0; }
+    .admin-shell .list-title { font-size: .88rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .admin-shell .list-sub { font-size: .76rem; color: #888; }
+    .admin-shell .list-chevron { color: #555; }
+    /* kebab-btn (collected-library U4): replaces the + button; all five interaction states per DL-003 */
+    /* Theme-tinted kebabs (2026-06-11): --accent-dim chip + --accent-ui glyph;
+       hover/press escalate to the full accent fill. Mirrors guest. */
+    .admin-shell .kebab-btn { min-width: 40px; min-height: 40px; display: flex; align-items: center; justify-content: center; background: var(--accent-dim); color: var(--accent-ui, var(--accent)); border-radius: 6px; font-size: 1.15rem; border: none; cursor: pointer; flex-shrink: 0; }
+    .admin-shell .kebab-btn:hover { background: var(--accent-grad, var(--accent)); color: var(--on-accent); }
+    .admin-shell .kebab-btn:active { background: var(--accent-grad, var(--accent)); color: var(--on-accent); }
+    .admin-shell .kebab-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    /* Tile view (2026-06-15 tile-view plan U2) — shared module renders the same
+       DOM; scoped under .admin-shell for the admin's denser layout. */
+    .admin-shell .tile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 10px; padding: 10px 0; align-content: start; }
+    .admin-shell .tile { cursor: pointer; min-width: 0; }
+    .admin-shell .tile-art-wrap { position: relative; width: 100%; aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: var(--surface2); }
+    .admin-shell .tile-art { width: 100%; height: 100%; object-fit: cover; background: var(--surface2); border-radius: 6px; }
+    .admin-shell div.tile-art { filter: var(--sax-filter, none); }
+    .admin-shell .tile.is-artist .tile-art-wrap, .admin-shell .tile.is-artist .tile-art { border-radius: 50%; }
+    .admin-shell .tile-title { font-size: .8rem; font-weight: 500; margin-top: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .admin-shell .tile-sub { font-size: .72rem; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .admin-shell .tile.is-artist .tile-title, .admin-shell .tile.is-artist .tile-sub { text-align: center; }
+    .admin-shell .tile-kebab { position: absolute; top: 5px; right: 5px; width: 28px; height: 28px; min-width: 0; min-height: 0; border-radius: 6px; font-size: 1rem; background: color-mix(in srgb, var(--surface) 70%, transparent); backdrop-filter: blur(2px); }
+    /* Release drill-in album art (2026-06-15 release-art plan) — shared module
+       renders the same DOM; scoped + sized for the admin shell. */
+    .admin-shell .release-aside { display: flex; flex-direction: column; align-items: center; text-align: center; gap: .5rem; padding: .8rem .25rem .4rem; }
+    .admin-shell .ra-cover { position: relative; width: 160px; aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: var(--surface2); box-shadow: 0 4px 14px rgba(0,0,0,.35); flex-shrink: 0; }
+    .admin-shell .ra-cover-img { width: 100%; height: 100%; object-fit: cover; display: flex; align-items: center; justify-content: center; font-size: 2.2rem; }
+    .admin-shell div.ra-cover-img { filter: var(--sax-filter, none); }
+    .admin-shell .ra-htitle .t { font-size: 1.05rem; font-weight: 800; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .admin-shell .ra-htitle .s { font-size: .8rem; color: #888; margin-top: 2px; }
+    /* Release subtitle artist/year links pop in accent at rest (2026-06-20);
+       scoped so list-row name-links stay muted-until-hover. */
+    .admin-shell .ra-htitle .s .name-link { color: var(--accent-ui, var(--accent)); font-weight: 600; }
+    /* Kebab matches the cover width on mobile too (2026-06-20) — standardizing
+       the desktop full-art-width bar; desktop pins it to the aside width below. */
+    .admin-shell .release-aside .kebab-btn { width: 160px; max-width: 100%; }
+    @media (min-width: 960px) {
+      .admin-shell .release-view { display: flex; gap: 1.1rem; padding: .5rem .25rem .2rem; align-items: flex-start; }
+      .admin-shell .release-aside { flex-shrink: 0; width: 230px; position: sticky; top: 8px; align-items: stretch; text-align: left; padding: 0; }
+      .admin-shell .release-aside .ra-cover { width: 230px; }
+      .admin-shell .release-aside .kebab-btn { width: 230px; }
+      .admin-shell .release-main { flex: 1; min-width: 0; }
+    }
+    .admin-shell .overflow-menu button:disabled, .admin-shell .overflow-menu button.sheet-disabled { color: #555; cursor: default; }
+    /* Plex-player source lock (2026-08-04-002 plan U5): same body-level
+       render switch as the guest template — the shared modules stamp
+       .no-plex-hold from the U4 plex_held flag; this attribute (set by the
+       shared playback module from the output_session channel) is the ONLY
+       thing that makes it dim. No admin bypass on the visual either: the
+       admin's queue endpoints reject the same 409 output_source_lock.
+       Queue-pane rows keep their drag/remove affordances usable (dim only —
+       removing a stranded leftover is exactly what the admin wants);
+       cursor cue on browse rows, kebab navigation stays live. */
+    body[data-source-lock="plex"] .no-plex-hold { opacity: .45; }
+    body[data-source-lock="plex"] .admin-shell .list-item.no-plex-hold { cursor: not-allowed; }
+    body[data-source-lock="plex"] .admin-shell .no-plex-hold .kebab-btn { cursor: pointer; }
+    .undo-snack { position: fixed; left: 50%; transform: translateX(-50%); bottom: 18px; z-index: 200; display: flex; align-items: center; gap: 1rem; background: var(--surface2); color: var(--text); padding: .6rem .9rem; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.5); font-size: .9rem; max-width: calc(100vw - 112px); }
+    .undo-snack-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .undo-snack button { background: none; border: none; color: var(--accent); font-size: .9rem; font-weight: 600; cursor: pointer; padding: .2rem .4rem; }
+    /* Appearance gear + panel (2026-06-11 glow-up U5). The DOM is built by
+       shared.js mountAppearance (single-source component on both pages);
+       this styles it. Gear bottom-right; the undo snack's max-width cap
+       keeps the corner clear at 320px. z-order: under the overflow sheet
+       (1000), above page content. */
+    /* Gear visibility (2026-06-11 gear/rail overlap fix): browse tabs carry
+       the alphabet rail in the bottom-right corner, so the gear shows ONLY
+       on the Search tab of the Jukebox page (Setup hides it too — defaults
+       live there, the gear is the per-device override). */
+    .appearance-gear { position: fixed; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); width: 36px; height: 36px; border-radius: 50%; background: rgba(36,36,36,.8); color: #aaa; border: 1px solid var(--border); font-size: 17px; line-height: 1; display: none; align-items: center; justify-content: center; cursor: pointer; z-index: 900; }
+    .appearance-gear:hover { color: var(--text); }
+    /* A+C hybrid (gear-visibility reqs): desktop FAB on every Jukebox tab
+       (rail reserves the corner via rail.css); mobile FAB on Search only,
+       docked .appearance-tab covering the other browse tabs. Setup stays
+       gear-free in both forms — defaults live there. */
+    @media (min-width: 960px) { body:has(#pview-jukebox.active) .appearance-gear { display: flex; } }
+    @media (max-width: 959px) { body:has(#pview-jukebox.active #search-view.active) .appearance-gear { display: flex; } }
+    .appearance-panel { position: fixed; right: 12px; bottom: calc(56px + env(safe-area-inset-bottom, 0px)); width: 224px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; box-shadow: 0 8px 28px rgba(0,0,0,.6); z-index: 950; display: none; }
+    body:has(#pview-jukebox.active) .appearance-panel.open { display: block; }
+    /* Admin's strip wraps (no scroll), so the docked ⚙ is a plain pill
+       pushed to the row's end — matches the .tab pill idiom. */
+    .appearance-tab { display: none; margin-left: auto; flex-shrink: 0; background: none; border: none; border-radius: 6px; color: #888; font-size: .9rem; padding: .3rem .8rem; cursor: pointer; }
+    .appearance-tab:hover, .appearance-tab:active { color: var(--accent-ui, var(--accent)); background: var(--accent-dim); }
+    @media (max-width: 959px) {
+      body:has(#pview-jukebox.active):not(:has(#search-view.active)) .appearance-tab { display: block; }
+    }
+    .appearance-panel h4 { font-size: .62rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 0 0 8px; }
+    .ap-swatches { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
+    .ap-swatch { height: 30px; border-radius: 6px; border: 1px solid rgba(0,0,0,.33); cursor: pointer; padding: 0; }
+    .ap-rails { display: flex; gap: 7px; margin-bottom: 10px; }
+    .ap-rail-icon { flex: 1; height: 32px; border-radius: 6px; background: var(--surface2); color: #999; border: none; display: flex; align-items: center; justify-content: center; font-size: 10px; cursor: pointer; padding: 0; }
+    .ap-rail-icon.on { outline: 2px solid var(--accent-ui, var(--accent)); color: var(--accent-ui, var(--accent)); }
+    /* Tile-view U3: List/Tile view picker in the gear panel. */
+    .ap-views { display: flex; gap: 7px; margin-bottom: 10px; }
+    .ap-view-btn { flex: 1; height: 32px; border-radius: 6px; background: var(--surface2); color: #999; border: none; display: flex; align-items: center; justify-content: center; gap: 4px; font-size: .72rem; cursor: pointer; padding: 0; }
+    .ap-view-btn.on { outline: 2px solid var(--accent-ui, var(--accent)); color: var(--accent-ui, var(--accent)); }
+    .ap-hostdef { display: block; width: 100%; background: none; border: none; color: var(--accent-ui, var(--accent)); font-size: .68rem; text-align: center; cursor: pointer; padding: 4px 0 0; }
+    .ap-hostdef:disabled { color: #555; cursor: default; }
+    /* U6: Setup's default-scheme picker reuses .ap-swatch; the selected
+       default carries the ring (the gear panel hides the active instead). */
+    .ap-swatch.on { outline: 2px solid var(--accent-ui, var(--accent)); outline-offset: 1px; }
+    /* Scheme-switch crossfade (mockup variant B, 1.2s): the shared engine
+       wraps live scheme changes in document.startViewTransition; this
+       stretches the default ~0.25s crossfade. Browsers without View
+       Transitions never enter this path (instant switch). */
+    ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 1.2s; }
+    /* padding-right matches .list-item's .25rem so the header kebab's right
+       edge lines up with the row kebabs below it (2026-06-11 align fix). */
+    .admin-shell .section-header { display: flex; align-items: center; justify-content: space-between; padding: 0 .25rem 0 0; }
+    .admin-shell .section-header h3 { font-size: .72rem; color: #666; text-transform: uppercase; letter-spacing: .06em; padding: .5rem .25rem .2rem; margin: 0; }
+    /* Search result category labels accented to match the "More matches"
+       divider; scoped to .cat-head so drill-in headers stay muted. */
+    .admin-shell .section-header.cat-head h3 { color: var(--accent); }
+    /* Tiered search (plan 2026-06-14-005): "More matches" divider + scroll
+       sentinel for the broad literal title-substring tier (shared module
+       renders the same DOM on both pages). */
+    .admin-shell .more-head { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; padding: .7rem .25rem .35rem; margin-top: .35rem; border-top: 1px solid var(--border); }
+    .admin-shell .more-head h3 { font-size: .72rem; color: var(--accent); text-transform: uppercase; letter-spacing: .06em; margin: 0; }
+    .admin-shell .more-head .hint { font-size: .7rem; color: var(--muted); }
+    .admin-shell .search-sentinel { height: 1px; }
+    .admin-shell .search-sentinel.loading { height: 2.5rem; display: flex; align-items: center; justify-content: center; }
+    .admin-shell .search-sentinel.loading::after { content: ''; width: 1rem; height: 1rem; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: sentSpin .7s linear infinite; }
+    @keyframes sentSpin { to { transform: rotate(360deg); } }
+    .admin-shell .back-btn { font-size: .85rem; color: var(--accent); cursor: pointer; padding: .4rem .25rem .6rem; }
+    /* Wayfinding bar (2026-06-10 nav plan U3; locked mockup variant B):
+       sticky origin link + tappable trail, replaces per-view back-btn rows
+       in drilled views. Rules identical in both templates. */
+    /* Non-sticky: the drill-in wayfinder scrolls away with the content like the
+       top-level sort headers, so the transparent bar never overlays album rows
+       (it has no opaque backing on the 72%-translucent .browse-surface). */
+    .wayfind-bar { display: flex; align-items: center; gap: .5rem; padding: .55rem .75rem; background: var(--bg); border-bottom: 1px solid var(--divider); white-space: nowrap; overflow: hidden; }
+    .wf-origin { color: var(--accent); font-size: .85rem; cursor: pointer; flex-shrink: 0; }
+    .wf-div { color: #444; flex-shrink: 0; }
+    .wf-trail { flex: 1; font-size: .78rem; color: var(--muted); display: flex; align-items: center; gap: .3rem; min-width: 0; overflow: hidden; }
+    .wf-sep { color: #555; flex-shrink: 0; }
+    .wf-crumb { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .wf-crumb.wf-here { color: var(--text); cursor: default; }
+    /* Name links (2026-06-10 nav plan U4): artist/release text in rows is
+       tappable with its own hit zone; affordance on press/hover only. */
+    .name-link { cursor: pointer; }
+    .name-link:hover, .name-link:active { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+    .name-link-self { opacity: .45; cursor: default; }
+    .admin-shell .loading { padding: 1.5rem; text-align: center; color: #555; font-size: .85rem; }
+    /* Legacy admin loading rule kept for any chrome elements (libraries, plex-connect) still using .a-loading */
+    .a-loading { padding: 1.5rem; text-align: center; color: #555; font-size: .85rem; }
+    /* Browse mode tabs (unprefixed; replaces .a-mode-tab) */
+    .admin-shell #tabs { display: flex; gap: .3rem; margin-bottom: .75rem; flex-wrap: wrap; border-bottom: 1px solid var(--border); padding-bottom: .5rem; }
+    .admin-shell .tab { padding: .3rem .8rem; border-radius: 6px; background: none; font-size: .82rem; cursor: pointer; color: #888; border: none; }
+    .admin-shell .tab.active { background: var(--accent-dim); color: var(--accent); }
+    .admin-shell .view { display: none; }
+    .admin-shell .view.active { display: block; }
+    /* Search input + filter tabs + results pane (admin denser variant) */
+    .admin-shell #search-input { width: 100%; padding: .55rem .8rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; font-size: .9rem; }
+    .admin-shell #search-input:focus { outline: none; border-color: var(--accent); }
+    /* Clear-× affordance (treatment C) — scheme-following via accent vars */
+    .admin-shell .search-field { position: relative; display: flex; align-items: center; }
+    .admin-shell .search-field #search-input { padding-right: 2.4rem; }
+    .admin-shell #search-input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+    .admin-shell .search-clear { appearance: none; -webkit-appearance: none; position: absolute; right: .4rem; top: 50%;
+      transform: translateY(-50%) scale(.6); width: 1.45rem; height: 1.45rem; display: grid; place-items: center;
+      border: none; border-radius: 50%; background: var(--accent-dim); color: var(--accent-ui);
+      font-size: .85rem; line-height: 1; cursor: pointer; opacity: 0; pointer-events: none;
+      transition: opacity .16s ease, transform .16s cubic-bezier(.34,1.56,.64,1); }
+    .admin-shell .search-field.has-text .search-clear { opacity: 1; pointer-events: auto; transform: translateY(-50%) scale(1); }
+    .admin-shell .search-clear:hover, .admin-shell .search-clear:focus-visible { background: var(--accent); color: var(--on-accent); outline: none; }
+    .admin-shell .search-clear:active { transform: translateY(-50%) scale(.82) rotate(90deg); }
+    /* #search-bar (sticky docked bar) + #search-filter-tabs + .filter-tab now live
+       single-source in static/browse/rail.css (2026-07-02 ce-debug). */
+    /* div.list-art = the 🎷 placeholder only — img.list-art is real artwork
+       and must never be tinted (U7 sweep fix; there is no -placeholder
+       suffix variant of list-art). */
+    .np-placeholder, .qi-art-placeholder, .qs-art-placeholder, div.list-art { filter: var(--sax-filter, none); }
+    /* Viewport-relative caps (2026-06-10 debug): fixed 480/700px ignored the
+       window — panes overflowed short desktop windows and forced page-scroll
+       rail traversal on phones. The px floors keep the lists usable when the
+       window is very short. Offsets ≈ chrome above the list (header + tabs +
+       sort row) plus a small bottom margin. */
+    .admin-shell #search-results,
+    .admin-shell #years-list,
+    .admin-shell #genres-list { max-height: max(280px, calc(100vh - 320px)); overflow-y: auto; margin-top: .5rem; }
+    .admin-shell #artists-list,
+    .admin-shell #albums-list { max-height: max(320px, calc(100vh - 185px)); overflow-y: auto; margin-top: .5rem; }
+    /* Multi-source badge + inline source picker (rendered by the shared module) */
+    /* (Alpha index bar rules removed in U3; replaced by shared static/browse/rail.css) */
+    /* Genre/year chips + Show More now live in the shared static/browse/rail.css
+       (single source for guest + admin; gradient-gloss treatment 2026-06-17).
+       The admin fork that hovered only to --surface — no accent — is gone. */
+    /* Overflow menu (KTD10): position:fixed on both pages; admin centers it as a modal
+       rather than guest's bottom-sheet so it doesn't underlap admin's desktop chrome. */
+    .overflow-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 999; display: none; }
+    .overflow-overlay.visible { display: block; }
+    .overflow-menu { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); max-width: 480px; width: 90%; background: var(--surface); border-radius: 8px; padding: 1rem; z-index: 1000; display: none; box-shadow: 0 4px 24px rgba(0,0,0,.6); max-height: 85vh; overflow-y: auto; }
+    .overflow-menu.visible { display: block; }
+    .overflow-menu button { display: block; width: 100%; padding: .75rem; font-size: .95rem; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; border-bottom: 1px solid var(--border); border-radius: 4px; }
+    .overflow-menu button:hover:not(:disabled) { background: var(--surface2); }
+    .overflow-menu button:last-child { border-bottom: none; color: var(--muted); }
+    .overflow-menu button:disabled { color: #555; cursor: not-allowed; }
+    /* Stranded-tracks switch confirm (plexplayer plan U6): admin-only chrome
+       dialog for the structured 409 on POST /admin/output/active. The card
+       carries its own Confirm/Cancel ON TOP of the backdrop (blocking-overlay
+       lesson: a blocking overlay must never cover its own dismiss control);
+       sits under the toast (z 9999) so the outcome toast stays visible. */
+    .switch-confirm-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 1200; display: flex; align-items: center; justify-content: center; }
+    .switch-confirm-card { background: var(--surface2); color: var(--text); border-radius: 10px; padding: 1.25rem 1.5rem; max-width: 380px; margin: 1rem; box-shadow: 0 8px 32px rgba(0,0,0,.5); }
+    .switch-confirm-card p { margin: 0; }
+    .switch-confirm-actions { display: flex; gap: .75rem; justify-content: flex-end; margin-top: 1rem; }
+    .overflow-menu button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    /* ── Recent Plays curation panel (2026-07-03 plan; Direction A) ──────────
+       Admin-only Setup chrome, collapsed by default. Compact rows + page pager
+       over the ~50-entry live history the /admin/queue payload already carries. */
+    #recent-plays .rp-head { display: flex; align-items: center; gap: .6rem; width: 100%;
+      background: none; border: none; padding: 0; margin: 0; cursor: pointer; text-align: left;
+      font-size: .75rem; color: #888; text-transform: uppercase; letter-spacing: .06em; font-family: inherit; }
+    #recent-plays .rp-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    #recent-plays .rp-chev { transition: transform .15s ease; }
+    #recent-plays.rp-collapsed .rp-chev { transform: rotate(-90deg); }
+    #recent-plays .rp-count { margin-left: auto; font-size: .7rem; color: var(--muted);
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 999px;
+      padding: .1rem .5rem; text-transform: none; letter-spacing: 0; }
+    /* No max-height/overflow: the panel paginates at 10 rows, so the body fits
+       its page (10 rows + pager) without an internal scrollbar — the Setup page
+       scrolls instead. */
+    #recent-plays .rp-body { margin-top: 1rem; }
+    #recent-plays.rp-collapsed .rp-body { display: none; }
+    #recent-plays .rp-row { display: flex; align-items: center; gap: .7rem; padding: .5rem .1rem;
+      border-bottom: 1px solid var(--divider); min-width: 0; }
+    #recent-plays .rp-row:last-child { border-bottom: none; }
+    #recent-plays .rp-art { width: 30px; height: 30px; border-radius: 4px; flex: none;
+      background: var(--surface2); object-fit: cover; }
+    #recent-plays .rp-meta { min-width: 0; flex: 1; }
+    #recent-plays .rp-t { font-size: .9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #recent-plays .rp-s { font-size: .78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #recent-plays .rp-when { font-size: .75rem; color: var(--muted); white-space: nowrap; flex: none; }
+    #recent-plays .rp-x { min-width: 44px; height: 44px; display: grid; place-items: center; flex: none;
+      background: transparent; border: 1px solid transparent; border-radius: 8px; color: var(--muted);
+      cursor: pointer; font-size: 1rem; }
+    #recent-plays .rp-x:hover, #recent-plays .rp-x:focus-visible { background: #7f1d1d; color: #fca5a5;
+      border-color: #7f1d1d; outline: none; }
+    #recent-plays .rp-empty { color: var(--muted); font-size: .85rem; padding: .5rem .1rem; }
+    #recent-plays .rp-pager { display: flex; align-items: center; justify-content: center; gap: .75rem; margin-top: .9rem; }
+    #recent-plays .rp-pager .rp-nav { min-width: 44px; min-height: 44px; background: var(--surface2);
+      color: var(--text); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: .8rem; padding: 0 .7rem; }
+    #recent-plays .rp-pager .rp-nav:disabled { opacity: .35; cursor: default; }
+    #recent-plays .rp-pager .rp-lbl { font-size: .78rem; color: var(--muted); min-width: 9ch; text-align: center; }
+  </style>
+</head>
+<body>
+
+<header id="page-header">
+  <h1>🎷 Jukeplox</h1>
+  <div id="page-tabs">
+    <button class="ptab active" data-ptab="jukebox">Jukebox</button>
+    <button class="ptab" data-ptab="setup">Setup</button>
+  </div>
+</header>
+
+<main>
+  <!-- ── Jukebox tab: live party controls ─────────────────────────────── -->
+  <div id="pview-jukebox" class="pview active">
+
+    <!-- Party state (Now Playing + Queue) shares one column flow so the Queue
+         stays docked under Now Playing on long pages — see .jukebox-side CSS. -->
+    <div class="jukebox-side">
+    <!-- Now Playing -->
+    <section id="now-playing">
+      <h2>Now Playing</h2>
+      <!-- Output-session outage banner (supervisor plan U4): admin-rich detail
+           over the shared lean note — rendered by renderOutputSessionBanner
+           from the output_session WS event / /admin/queue snapshot field. -->
+      <div id="output-outage-banner" style="display:none;background:#3b1c1c;border:1px solid #7f3b3b;border-radius:6px;padding:.6rem .9rem;margin-bottom:.75rem;font-size:.85rem;line-height:1.5;color:#e8c4a8;align-items:center;gap:.75rem">
+        <span id="output-outage-msg" style="flex:1"></span>
+        <button class="btn btn-sm" id="btn-outage-resume" style="flex-shrink:0;background:var(--surface2);color:var(--text);border:1px solid var(--border)">Resume</button>
+      </div>
+      <div id="np-panel"></div>
+      <div id="np-progress"></div>
+      <div class="controls" style="margin-top:.75rem">
+        <button class="btn btn-icon" id="btn-prev" title="Skip Back" disabled>⏮</button>
+        <button class="btn btn-icon" id="btn-pause" title="Pause/Resume">⏸</button>
+        <button class="btn btn-icon" id="btn-skip" title="Skip">⏭</button>
+        <!-- Volume group (2026-08-04 volume rework U3): one wrapper so the
+             vertical orientation can dock the whole unit as a right rail via
+             CSS only. .vol-rot-wrap is display:contents horizontally and the
+             sized box for the rotate(-90deg) technique vertically. -->
+        <div class="vol-group">
+          <button class="vol-btn" id="vol-down" title="Volume down" aria-label="Volume down">−</button>
+          <div class="vol-rot-wrap"><input type="range" id="volume-slider" min="0" max="1" step="0.01" value="0.5"></div>
+          <button class="vol-btn" id="vol-up" title="Volume up" aria-label="Volume up">+</button>
+          <span id="vol-label" style="font-size:.8rem;color:#888">50%</span>
+        </div>
+        <span id="protocol-label" style="display:none;font-size:.75rem;color:#888;margin-left:.5rem"></span>
+        <button class="btn btn-sm" id="btn-no-audio" style="display:none;margin-left:auto;background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:.8rem" title="Click if no audio is coming out of the AirPlay speaker — falls back to AirPlay 1 for this device">No audio?</button>
+      </div>
+    </section>
+
+    <!-- Queue -->
+    <section id="queue">
+      <div class="queue-header">
+        <h2 style="margin:0">Queue</h2>
+        <button class="btn btn-danger btn-sm" id="btn-clear">Clear Queue</button>
+        <label class="lock-label">
+          <input type="checkbox" id="lock-toggle"> Lock guest queuing
+        </label>
+        <label class="lock-label" title="Block guests from re-queueing a track that's already playing or queued">
+          <input type="checkbox" id="flood-toggle"> Flood Control
+        </label>
+      </div>
+      <div id="queue-list"></div>
+      <div class="pb-label">Recently played</div>
+      <div id="history-strip" class="strip"></div>
+    </section>
+    </div><!-- /.jukebox-side -->
+
+    <!-- Browse & Queue -->
+    <section id="browse" class="browse-surface admin-shell">
+      <h2>Browse &amp; Queue</h2>
+      <div id="tabs">
+        <button class="tab active" data-view="search-view">Search</button>
+        <button class="tab" data-view="artists-view">Artists</button>
+        <button class="tab" data-view="albums-view">Albums</button>
+        <button class="tab" data-view="genres-view">Genres</button>
+        <button class="tab" data-view="years-view">Years</button>
+        <button class="tab" data-view="mostplayed-view">Most Played</button>
+        <button class="tab" data-view="recentlyadded-view">Recently Added</button>
+        <button class="tab" data-view="highestrated-view">Highest Rated</button>
+      </div>
+      <div id="browse-container" role="region" aria-label="Browse music">
+        <!-- Search pane -->
+        <div id="search-view" class="view active">
+          <div id="search-bar">
+            <div class="search-field">
+              <input type="search" id="search-input" placeholder="Search tracks, albums, artists, genres…">
+              <button class="search-clear" type="button" aria-label="Clear search">✕</button>
+            </div>
+            <div id="search-filter-tabs">
+              <button class="filter-tab active" data-filter="all">All</button>
+              <button class="filter-tab" data-filter="artists">Artists</button>
+              <button class="filter-tab" data-filter="tracks">Tracks</button>
+              <button class="filter-tab" data-filter="albums">Albums</button>
+              <button class="filter-tab" data-filter="genres">Genres</button>
+            </div>
+          </div>
+          <div id="search-results"><p class="a-loading">Type to search your Plex library.</p></div>
+        </div>
+        <!-- Artists pane -->
+        <div id="artists-view" class="view">
+          <div id="artists-list"><p class="a-loading">Loading…</p></div>
+        </div>
+        <!-- Albums pane -->
+        <div id="albums-view" class="view">
+          <div id="albums-list"><p class="a-loading">Loading…</p></div>
+        </div>
+        <!-- Genres pane -->
+        <div id="genres-view" class="view">
+          <div id="genres-list"><p class="a-loading">Loading…</p></div>
+        </div>
+        <!-- Years pane -->
+        <div id="years-view" class="view">
+          <div id="years-list"><p class="a-loading">Loading…</p></div>
+        </div>
+        <!-- Most Played pane (2026-06-10 most-played plan U2) -->
+        <div id="mostplayed-view" class="view">
+          <div id="mostplayed-list"><p class="a-loading">Loading…</p></div>
+        </div>
+        <!-- Recently Added pane (plan 006) -->
+        <div id="recentlyadded-view" class="view">
+          <div id="recentlyadded-list"><p class="a-loading">Loading…</p></div>
+        </div>
+        <!-- Highest Rated pane (2026-06-26 ratings-and-tags plan U7) -->
+        <div id="highestrated-view" class="view">
+          <div id="highestrated-list"><p class="a-loading">Loading…</p></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ── Setup tab: output / libraries / settings ─────────────────────── -->
+  <div id="pview-setup" class="pview">
+
+    <!-- Output -->
+    <section id="output">
+      <h2>Output</h2>
+      <!-- Discovery-health banner (passive-discovery plan U6). The message is
+           set by admin/app.js::_updateBackendBanner from the devices payload's
+           mdns_status — the host-networking guidance when in-process mDNS can't
+           bind 5353, or a per-backend "scan unavailable" note. Buttons live
+           outside the JS-set message span so they survive re-renders. -->
+      <div id="mdns-unavailable-banner" style="display:none;background:#3b1c1c;border:1px solid #7f3b3b;border-radius:6px;padding:.75rem 1rem;margin-bottom:.75rem;font-size:.85rem;line-height:1.5">
+        <span id="mdns-banner-msg" style="color:#f3c0c0"></span>
+        <div style="margin-top:.5rem;display:flex;gap:.5rem;align-items:center">
+          <button class="btn btn-sm" id="btn-retry-discovery" style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Retry Discovery</button>
+          <button class="btn btn-sm" id="btn-dismiss-mdns-banner" style="background:transparent;color:var(--muted);border:1px solid var(--border)">Dismiss</button>
+        </div>
+      </div>
+      <!-- Offline-device warning (discovery plan U6, R3/D5): active output
+           or picker selection appears offline — mark, never auto-switch. -->
+      <div id="device-offline-banner" style="display:none;background:#3b2f1c;border:1px solid #7f6b3b;border-radius:6px;padding:.6rem .9rem;margin-bottom:.75rem;font-size:.85rem;line-height:1.5;color:#e8d8a8"></div>
+      <div class="panel-row">
+        <label>Device:</label>
+        <select id="device-select"></select>
+        <label>via:</label>
+        <select id="connection-select"></select>
+        <button class="btn btn-primary btn-sm" id="btn-apply-output">Apply</button>
+        <button class="btn btn-sm" id="btn-scan-output">Scan</button>
+        <button class="btn btn-sm" id="btn-retest-ap2" style="display:none;background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:.85rem" title="Re-run the AirPlay 2 probe for this device (use after a speaker firmware update)">↻ Re-test AP2</button>
+      </div>
+      <div id="output-device-hint" style="display:none; margin-top:.5rem; color:#bbb; font-size:.9rem;"></div>
+    </section>
+
+    <!-- Libraries -->
+    <!-- ── Libraries: connected sources (connect/remove/rescan/priority) +
+         Plex library selection, unified into one panel (multi-source U14) ──── -->
+    <section id="libraries">
+      <h2>Libraries</h2>
+
+      <p class="muted" style="font-size:.85rem;color:#888;margin:.25rem 0 .6rem">
+        Connected media sources, highest playback priority first. Toggle a source on or
+        off; expand one to choose which of its libraries are in the jukebox.</p>
+      <div id="sources-list"><p style="color:#555;font-size:.85rem">Loading…</p></div>
+      <div id="sources-scan-status" class="muted" style="font-size:.82rem;margin-top:.4rem;display:none"></div>
+      <div style="margin-top:.75rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
+        <button class="btn btn-primary btn-sm" id="btn-connect-plex">Connect Plex</button>
+        <button class="btn btn-primary btn-sm" id="btn-connect-jellyfin-toggle">Connect Jellyfin</button>
+        <button class="btn btn-primary btn-sm" id="btn-connect-local-toggle">Connect Local Folder</button>
+        <button class="btn btn-sm" id="btn-rescan-sources"
+                style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Rescan</button>
+        <span id="plex-connect-spinner" style="display:none;font-size:.85rem;color:#888">Waiting for Plex authorization…</span>
+        <span id="plex-connect-error" style="display:none;font-size:.85rem;color:#f87171"></span>
+        <span id="index-status" class="muted" style="font-size:.8rem;color:#888"></span>
+      </div>
+
+      <!-- Jellyfin connect: revealed by the "Connect Jellyfin" button, mirroring
+           the Plex connect affordance (a button, not an always-open form). -->
+      <div id="jf-connect-form" style="display:none;margin-top:.6rem;padding:.7rem;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
+        <div class="panel-row" style="flex-wrap:wrap;gap:.5rem;align-items:center;margin:0">
+          <input id="jf-url" type="text" placeholder="http://jellyfin.local:8096"
+                 style="flex:1;min-width:220px">
+          <input id="jf-user" type="text" placeholder="Username" autocomplete="username"
+                 style="width:140px">
+          <input id="jf-pass" type="password" placeholder="Password"
+                 autocomplete="current-password" style="width:140px">
+          <input id="jf-name" type="text" placeholder="Name (optional)" style="width:140px">
+          <button class="btn btn-primary btn-sm" id="btn-connect-jellyfin">Connect</button>
+          <button class="btn btn-sm" id="btn-cancel-jellyfin"
+                  style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+        <span id="jf-connect-error" style="display:none;font-size:.85rem;color:#f87171;margin-top:.4rem"></span>
+      </div>
+
+      <!-- Local folder connect: revealed by the "Connect Local Folder" button,
+           mirroring the Jellyfin connect affordance. A directory path (read-only;
+           no credential) — the server scans tagged audio under it. -->
+      <div id="local-connect-form" style="display:none;margin-top:.6rem;padding:.7rem;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
+        <div class="panel-row" style="flex-wrap:wrap;gap:.5rem;align-items:center;margin:0">
+          <input id="local-dir" type="text" placeholder="/music (a folder of tagged audio files)"
+                 style="flex:1;min-width:260px">
+          <input id="local-name" type="text" placeholder="Name (optional)" style="width:140px">
+          <button class="btn btn-primary btn-sm" id="btn-connect-local">Connect</button>
+          <button class="btn btn-sm" id="btn-cancel-local"
+                  style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+        <span id="local-connect-error" style="display:none;font-size:.85rem;color:#f87171;margin-top:.4rem"></span>
+      </div>
+
+    </section>
+
+    <!-- Settings -->
+    <section id="settings">
+      <h2>Settings</h2>
+
+      <div class="settings-subhead">Queue &amp; playback</div>
+      <div class="panel-row">
+        <label>Queue end:</label>
+        <div class="radio-group">
+          <label><input type="radio" name="end-behavior" value="stop" checked> Stop</label>
+          <label><input type="radio" name="end-behavior" value="popular_random"> Popular Random
+            <button type="button" class="info-i" title="When the queue runs dry, keep the music going by playing a random track from your most-played songs — tracks played at least the threshold number of times on this jukebox.">&#9432;</button>
+          </label>
+          <label><input type="radio" name="end-behavior" value="full_random"> Full Random
+            <button type="button" class="info-i" title="When the queue runs dry, keep the music going by playing any random track from your enabled libraries.">&#9432;</button>
+          </label>
+        </div>
+      </div>
+      <div class="panel-row" id="popular-threshold-row">
+        <label>Popular threshold:</label>
+        <div class="field-prose">
+          Count a track as popular after
+          <input type="number" id="popular-random-threshold" min="1" style="width:64px" placeholder="2">
+          plays on this jukebox.
+          <span class="field-note">(applies to Popular Random)</span>
+        </div>
+      </div>
+      <!-- Gapless playback + auto-resume window (2026-07-11 supervisor plan
+           U5). Toggle default OFF; resume window >= 1 minute (server rejects
+           0/negative), default 60. Both save via the batched Save Settings
+           POST. Minimal treatment — the deliberate visual pass is deferred to
+           a mockups round per the project standard. -->
+      <div class="panel-row">
+        <label>Gapless playback:</label>
+        <div class="radio-group">
+          <label><input type="checkbox" id="gapless-enabled"> Chain tracks without a gap on outputs that support it</label>
+          <button type="button" class="info-i" title="Off by default. When on, the next track is prepared before the current one ends so supported outputs transition without silence. The output picker's via list shows each protocol's gapless capability.">&#9432;</button>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Auto-resume window:</label>
+        <div class="field-prose">
+          If the output device drops, keep trying and auto-resume within
+          <input type="number" id="resume-window-minutes" min="1" style="width:64px" placeholder="60">
+          minutes.
+          <span class="field-note">(after that, resume manually)</span>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Volume bar:</label>
+        <div class="radio-group">
+          <label><input type="radio" name="volume-orientation" value="horizontal" checked> Horizontal</label>
+          <label><input type="radio" name="volume-orientation" value="vertical"> Vertical</label>
+          <button type="button" class="info-i" title="Render the Jukebox tab's volume control as a vertical bar docked at the right edge of the Now Playing card. Applies to all admin devices: this device switches when you save; others on their next load.">&#9432;</button>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Closing Time:</label>
+        <div class="field-prose closing-fields">
+          <label><input type="checkbox" id="closing-time-enabled"> After a chosen song plays, freeze the queue and show a send-off message</label>
+          <div>
+            Song
+            <input type="text" id="closing-time-title" style="width:150px" placeholder="Closing Time">
+            by
+            <input type="text" id="closing-time-artist" style="width:130px" placeholder="Semisonic">
+          </div>
+          <div>
+            Message
+            <input type="text" id="closing-time-message" style="width:340px;max-width:100%" placeholder="You don't have to go home, but you can't stay here.">
+          </div>
+          <span class="field-note">(the song plays out in full, then the queue freezes until you resume)</span>
+        </div>
+      </div>
+
+      <div class="settings-subhead">Surprise Me</div>
+      <div class="panel-row">
+        <label>Surprise Me button:</label>
+        <div class="radio-group">
+          <label><input type="checkbox" id="surprise-enabled"> Show the "Surprise Me" button</label>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Surprise source:</label>
+        <select id="surprise-source-mode">
+          <option value="auto">Auto — Plex similar → heuristic → random</option>
+          <option value="plex">Plex similarity only</option>
+          <option value="heuristic">Genre/artist heuristic only</option>
+          <option value="random">Random only</option>
+        </select>
+      </div>
+      <div class="panel-row" id="surprise-source-note" style="display:none">
+        <label></label>
+        <div class="field-prose muted" style="font-size:.82rem">
+          A non-Plex source is connected, so Surprise Me uses whole-library random
+          across all your sources. The Plex similarity options above only apply to
+          a Plex-only library.
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Surprise variety:</label>
+        <select id="surprise-diversity">
+          <option value="artist">No repeat artist (most variety)</option>
+          <option value="album">No repeat album</option>
+          <option value="off">Off (allow repeats)</option>
+        </select>
+      </div>
+      <div class="panel-row">
+        <label>Random length filter:</label>
+        <div class="field-prose">
+          Exclude tracks shorter than
+          <input type="number" id="random-min-seconds" min="0" style="width:64px" placeholder="0">
+          or longer than
+          <input type="number" id="random-max-seconds" min="0" style="width:64px" placeholder="0">
+          seconds from random choices.
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Limit random length:</label>
+        <div class="radio-group">
+          <label><input type="checkbox" id="queue-end-length-limit"> Also apply this filter to Popular &amp; Full Random queue-end picks</label>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Recent suggestions:</label>
+        <span id="surprise-recent" class="muted" style="font-size:.82rem">—</span>
+      </div>
+
+      <div class="settings-subhead">Browse &amp; appearance</div>
+      <div class="panel-row">
+        <label>Alphabet rail style:</label>
+        <div class="radio-group">
+          <label><input type="radio" name="rail-mode" value="vanilla" checked> Vanilla</label>
+          <label><input type="radio" name="rail-mode" value="magnetic"> Magnetic</label>
+          <label><input type="radio" name="rail-mode" value="waveform"> Waveform</label>
+          <label><input type="radio" name="rail-mode" value="loupe"> Loupe</label>
+          <label><input type="radio" name="rail-mode" value="vu"> VU Meter</label>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Alphabet rail mode:</label>
+        <div class="radio-group">
+          <label><input type="radio" name="rail-alpha-mode" value="english" checked> English-friendly
+            <button type="button" class="info-i" title="The shipped rail: a fixed A–Z index plus catch-alls for symbols and non-Latin scripts. Best when your library is mostly English.">&#9432;</button>
+          </label>
+          <label><input type="radio" name="rail-alpha-mode" value="international"> International
+            <button type="button" class="info-i" title="Builds the rail from the first characters that actually appear in your library (any script) instead of assuming A–Z. Best for libraries with many non-Latin artists or albums.">&#9432;</button>
+          </label>
+        </div>
+      </div>
+      <div class="panel-row" id="international-thresholds-row">
+        <label>International thresholds:</label>
+        <div class="field-prose">
+          Give a character its own artists-rail entry after
+          <input type="number" id="rail-artist-threshold" min="1" style="width:64px" placeholder="2">
+          <button type="button" class="info-i" title="Minimum number of artists sharing a first character before that character gets its own entry on the artists rail. Higher values keep very large non-Latin libraries from producing hundreds of rail entries.">&#9432;</button>
+          artists share it, and its own albums-rail entry after
+          <input type="number" id="rail-album-threshold" min="1" style="width:64px" placeholder="2">
+          <button type="button" class="info-i" title="Minimum number of albums sharing a first character before that character gets its own entry on the albums rail.">&#9432;</button>
+          albums share it.
+          <span class="international-thresholds-hint">(applies to International)</span>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Default browse/search view:</label>
+        <div class="radio-group">
+          <label><input type="radio" name="default-view" value="list" checked> List</label>
+          <label><input type="radio" name="default-view" value="tile"> Tiles</label>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Default color scheme:</label>
+        <!-- Swatch grid rendered by admin/app.js via the shared appearance
+             schemes table (glow-up U6) — markup here is the shell only. -->
+        <div id="default-scheme-picker" class="ap-swatches" style="grid-template-columns: repeat(5, 34px); margin-bottom: 0;"></div>
+      </div>
+      <!-- Rating display style (2026-06-27 plan U2). Global look for the 0–5
+           rating (you + guests), NOT a guest gate — so it sits with the other
+           appearance defaults, above "Guest experience". -->
+      <div class="panel-row">
+        <label>Rating style:</label>
+        <div class="radio-group">
+          <label><input type="radio" name="rating-style" value="stars" checked> Stars</label>
+          <label><input type="radio" name="rating-style" value="dots"> Dots</label>
+          <label><input type="radio" name="rating-style" value="bars"> Bars</label>
+          <button type="button" class="info-i" title="How track ratings are drawn everywhere — for you and for guests. A global look, not a guest visibility toggle.">&#9432;</button>
+        </div>
+      </div>
+
+      <div class="settings-subhead">Guest experience</div>
+      <div class="panel-row">
+        <label>Lyrics contribute prompt:</label>
+        <div class="radio-group">
+          <label><input type="checkbox" id="lyrics-contribute-enabled"> Show "No lyrics found — contribute some?" on a confirmed miss</label>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Upcoming tracks:</label>
+        <div class="field-prose">
+          Show
+          <input type="number" id="guest-n" min="0" max="999" style="width:64px" placeholder="∞">
+          upcoming tracks to guests.
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>History tracks:</label>
+        <div class="field-prose">
+          Show
+          <input type="number" id="guest-m" min="0" max="999" style="width:64px" placeholder="∞">
+          history tracks to guests.
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Most Played shows:</label>
+        <div class="field-prose">
+          Top
+          <input type="number" id="most-played-display-limit" min="1" style="width:64px" placeholder="100">
+          tracks on the Most Played leaderboard.
+          <span class="field-note">(display only — doesn't change Popular Random)</span>
+        </div>
+      </div>
+      <!-- Track ratings + tags (2026-06-26 ratings-and-tags plan U9). Visibility
+           defaults OFF; facet toggles default ON. -->
+      <div class="panel-row">
+        <label>Show to guests:</label>
+        <div class="radio-group">
+          <label><input type="checkbox" id="ratings-visible-to-guests"> Track ratings</label>
+          <label><input type="checkbox" id="tags-visible-to-guests"> Track tags</label>
+          <button type="button" class="info-i" title="Off by default. You always see ratings and tags; guests see them only when checked here.">&#9432;</button>
+        </div>
+      </div>
+      <div class="panel-row">
+        <label>Browse tabs for guests:</label>
+        <div class="radio-group">
+          <label><input type="checkbox" id="facet-genre"> Genres</label>
+          <label><input type="checkbox" id="facet-years"> Years</label>
+          <label><input type="checkbox" id="facet-mostplayed"> Most Played</label>
+          <label><input type="checkbox" id="facet-recentlyadded"> Recently Added</label>
+          <label><input type="checkbox" id="facet-highestrated"> Highest Rated</label>
+          <button type="button" class="info-i" title="On by default. Unchecking hides a tab from guests only — you keep every tab and the data is preserved.">&#9432;</button>
+        </div>
+      </div>
+      <button class="btn btn-primary btn-sm" id="btn-save-settings">Save Settings</button>
+    </section>
+
+    <!-- Pattern Matching (2026-06-10 pattern-rules plan U4). Rows are
+         rendered by admin/app.js; markup here is the shell only. -->
+    <section id="pattern-matching">
+      <h2>Pattern Matching</h2>
+      <p class="rule-help">Strings in a rule are treated as identical by Browse and Search. Displayed names never change.</p>
+      <div id="pattern-rule-list"></div>
+      <div class="panel-row">
+        <button class="btn btn-sm" id="btn-add-pattern-rule">Add Rule</button>
+        <button class="btn btn-primary btn-sm" id="btn-save-pattern-rules">Save Rules</button>
+      </div>
+    </section>
+
+    <!-- Artist Exclusion (plan U4): exact-name drops from Browse by Artist
+         only — Search, drill-ins, and playback are unaffected. -->
+    <section id="artist-exclusion">
+      <h2>Artist Exclusion</h2>
+      <p class="rule-help">Artists whose name exactly matches an entry are hidden from Browse by Artist only.</p>
+      <div id="exclusion-list"></div>
+      <div class="panel-row">
+        <button class="btn btn-sm" id="btn-add-exclusion">Add Rule</button>
+        <button class="btn btn-primary btn-sm" id="btn-save-exclusions">Save Exclusions</button>
+      </div>
+    </section>
+
+    <!-- Recent Plays curation (2026-07-03 plan): admin-only panel to prune recent
+         plays. Collapsed by default; the ✕ that used to sit on the shared history
+         strip lives here now. Rendered by renderRecentPlays in static/admin/app.js
+         (admin Setup chrome — no shared-module fork). -->
+    <section id="recent-plays" class="rp-collapsed">
+      <button type="button" class="rp-head" id="recent-plays-head"
+              aria-expanded="false" aria-controls="recent-plays-list">
+        <span class="rp-chev" aria-hidden="true">▾</span>
+        <span class="rp-title">Recent Plays</span>
+        <span class="rp-count" id="recent-plays-count">0 plays</span>
+      </button>
+      <div class="rp-body">
+        <p class="rule-help">Remove an accidental or test play — it drops from history and its
+          play is un-counted (track, album, and artist each −1).</p>
+        <div id="recent-plays-list"></div>
+        <div class="rp-pager" id="recent-plays-pager"></div>
+      </div>
+    </section>
+
+    <div class="logout"><a href="#" id="logout-link">Sign out</a></div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+<div class="overflow-overlay" id="overflow-overlay"></div>
+<div class="overflow-menu" id="overflow-menu">
+  <div id="queue-album-area"></div>
+  <button id="close-menu-btn">Cancel</button>
+</div>
+
+<div id="build-info-badge" style="position:fixed;bottom:6px;right:8px;font-size:10px;font-family:monospace;color:#666;opacity:0.55;cursor:default;z-index:9999" title="Click to copy">
+  loading...
+</div>
+
+<script src="/static/shared.js?v={{ asset_v }}"></script>
+<script src="/static/browse/index.js?v={{ asset_v }}"></script>
+<script src="/static/playback/index.js?v={{ asset_v }}"></script>
+<script src="/static/admin/app.js?v={{ asset_v }}"></script>
+<script>
+  // Footer badge showing build info from /api/version. Confirms which
+  // image the running container actually is — answers "did my deploy
+  // update?" at a glance, no curl needed. Click to copy the full triplet.
+  (async function() {
+    try {
+      const r = await fetch('/api/version');
+      if (!r.ok) return;
+      const v = await r.json();
+      const el = document.getElementById('build-info-badge');
+      if (!el) return;
+      el.textContent = `build ${v.git_sha} · ${v.build_time}`;
+      el.addEventListener('click', () => {
+        navigator.clipboard.writeText(`git_sha=${v.git_sha} build_time=${v.build_time} image_tag=${v.image_tag}`);
+      });
+    } catch (e) { /* badge is best-effort */ }
+  })();
+</script>
+</body>
+</html>

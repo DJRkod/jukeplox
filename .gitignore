@@ -1,0 +1,46 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.env
+data/
+.venv/
+venv/
+# Scratch / local-only artifacts (harness screenshots + Chrome profiles,
+# build logs, code-review JSON output) — never part of the source tree.
+tmp/
+*.log
+correctness.json
+maintainability.json
+testing.json
+# Design mockups — kept locally for reference, not shipped to the release repo
+docs/mockups/
+
+# Internal engineering docs — kept locally, not part of the public/deployable repo.
+# Deployment docs that DO ship: README.md, INSTALL.md, TrueNAS-README.md,
+# docs/screenshots/. (Tracked-in-master internal paths like docs/reports/ stay
+# tracked locally; ignoring them keeps the go-public orphan rebuild from
+# re-adding them — seed-scrub run 2026-08-07.)
+docs/plans/
+docs/brainstorms/
+docs/solutions/
+docs/reports/
+docs/residual-review-findings/
+docs/jukeplox-bug-report.md
+docs/install-wizard.md
+
+# Local agent / tooling state
+.claude/
+.compound-engineering/
+CLAUDE.md
+AGENTS.md
+
+# Local runtime state / secrets (belt-and-suspenders — should never be tracked)
+secret.key
+*.db
+*.sqlite
+*.sqlite3

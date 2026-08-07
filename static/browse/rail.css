@@ -1,0 +1,715 @@
+/* static/browse/rail.css
+ *
+ * Shared stylesheet for the alphabet index rail. Linked from both
+ * app/templates/guest/index.html and app/templates/admin/dashboard.html.
+ *
+ * All rail-specific CSS lives here per KTD 1 + KTD 2 of
+ * docs/plans/2026-06-06-001-feat-alphabet-index-rail-plan.md. The
+ * discipline pytest (tests/test_static_discipline.py) enforces this
+ * residence via STYLESHEET_LINK_ALLOWED and a rail-class inline-style scan.
+ */
+
+/* U4: structural wrappers — pure positioning context for the rail (added in U5).
+   The rail lives inside .alpha-items-column as a last-child sibling of rows so
+   position:sticky resolves to the correct scroll context (#content on guest,
+   #artists-list / #albums-list on admin). No flex/grid layout at this level. */
+.list-with-rail { position: relative; }
+.alpha-items-column { position: relative; }
+
+/* 2026-06-09 rail plan U2: pane-anchored. The rail lives inside a
+   .rail-host (the PARENT of the pane's scroll container — never inside the
+   scroller itself, where absolute children scroll away with content) and
+   spans the host's box. Replaces plan 002's viewport-fixed placement; the
+   short-pane clipping that motivated fixed is handled by condensation
+   (.condensed/.elide below) instead of overflow. */
+.rail-host { position: relative; }
+/* 2026-06-10 gutter fix (2026-06-24 perf rework): the rail's right-hand lane on
+   the items column is now reserved as direct inline padding-right set by
+   _railLaneRefresh on the column (incl. the wider +14px tile-grid gutter), NOT a
+   --rail-lane custom property on the host — an inherited host custom property
+   restyled every cell (O(N)) on the cold render. The rail's own --rail-inset
+   (below) is likewise set on the rail element, not the host. */
+.alpha-rail {
+  position: absolute;
+  right: var(--rail-inset, 4px);
+  top: 8px;
+  bottom: 8px;
+  width: 22px;
+  display: none;
+  flex-direction: column;
+  z-index: 50;
+  /* Theme-aware scrim: a translucent tint of the scheme surface, not a
+     hardcoded near-black. The Vanilla rail always shows this background, so on
+     light themes a black strip made the dark var(--text) letters unreadable.
+     color-mix keeps the floating-overlay feel while following the theme. */
+  background: color-mix(in srgb, var(--surface) 86%, transparent);
+  border-radius: 3px;
+  padding: 3px 0;
+  /* Unified type across all three modes (2026-06-09 rail plan R6) — matches
+     the density labels/counts and the vanilla mockup. font-size on the nav
+     gives `inherit` in the condensed-active rule below a sane resolution
+     target (otherwise it climbs to the page's 16px and the active letter
+     blows out exactly in the geometry-constrained state). */
+  font-family: 'Space Mono', ui-monospace, monospace;
+  font-size: 0.66rem;
+}
+.alpha-rail.visible { display: flex; }
+/* Reserved gear corner (2026-06-11 gear-visibility reqs, option A): at
+   desktop widths the appearance FAB shows on every tab, so the rail
+   yields its bottom 52px and the two can never collide. Condensation
+   absorbs the lost height; .no-host's bottom:auto still wins below. */
+@media (min-width: 960px) {
+  .alpha-rail { bottom: 52px; }
+}
+/* Defensive fallback when no host resolves (unexpected DOM): park on the
+   viewport edge as before. */
+.alpha-rail.no-host {
+  position: fixed;
+  right: 8px;
+  top: 50%;
+  bottom: auto;
+  transform: translateY(-50%);
+  max-height: calc(100vh - 80px);
+}
+
+/* U2: condensation. Below ~13px per letter the module marks alternating
+   letters .elide — they render as mid-dots while keeping their flex slot,
+   so drag-scrub geometry stays continuous across all 27 buckets. The
+   active letter never stays elided (CSS un-elides it). The single
+   !important is deliberate: .elide must beat every mode's own font-size. */
+.alpha-rail.condensed button.elide { font-size: 0 !important; }
+.alpha-rail.condensed button.elide::after {
+  content: '·';
+  font-size: 0.5rem;
+  color: #555;
+  line-height: 1;
+}
+.alpha-rail.condensed button.elide[aria-current="true"] { font-size: inherit !important; }
+.alpha-rail.condensed button.elide[aria-current="true"]::after { content: none; }
+.alpha-rail.mode-density.condensed button.elide .bar,
+.alpha-rail.mode-density.condensed button.elide .count { display: none; }
+/* Unified base button skeleton — every mode's 27 children are <button
+   data-letter> on this reset; mode classes layer their own deltas. */
+.alpha-rail button {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: center;
+  font-family: inherit;
+}
+/* 2026-06-11 glow-up U2: rail accents use --accent-ui (the scheme's lifted
+   "readable on dark" tone) with the raw anchor as fallback. For gold both
+   are #e5a00d (zero visual change); for dark anchors like A Case of Blue
+   the lifted tone keeps letters/bars/glows legible on the dark rail. */
+.alpha-rail button:focus-visible {
+  outline: 1px solid var(--accent-ui, var(--accent));
+  outline-offset: -1px;
+}
+
+/* 2026-06-09 rail plan U1: vanilla mode — the bare base. Plain letters, no
+   bars/counts/scaling; active letter takes the accent plus a left tick.
+   Mirrors docs/mockups/2026-06-09-vanilla-rail/vanilla.html. */
+.alpha-rail.mode-vanilla button {
+  flex: 1;
+  min-height: 0;
+  font-size: 0.66rem;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text);
+  opacity: 0.55;
+  position: relative;
+}
+.alpha-rail.mode-vanilla button:hover { opacity: 0.9; }
+.alpha-rail.mode-vanilla button[aria-disabled="true"] {
+  color: #444;
+  opacity: 0.5;
+  cursor: default;
+}
+.alpha-rail.mode-vanilla button[aria-current="true"] {
+  color: var(--accent-ui, var(--accent));
+  opacity: 1;
+  font-weight: 800;
+}
+.alpha-rail.mode-vanilla button[aria-current="true"]::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 15%;
+  bottom: 15%;
+  width: 2px;
+  background: var(--accent-ui, var(--accent));
+  border-radius: 1px;
+}
+
+/* Plan 003 U4: density mode — each rail row is a horizontal accent-gold
+   bar whose width encodes the bucket's artist count. Reading the rail =
+   reading the library's shape (heavy in M/S, sparse in Q/X/Z). Mirrors
+   docs/mockups/2026-06-06-rail-redesigns/density.html. The mode-density
+   class on the rail flips layout from the base button-based shape to a
+   row-based shape with bars and labels. */
+.alpha-rail.mode-density {
+  width: 56px;
+  background: transparent;
+  padding: 8px 4px 8px 0;
+  gap: 2px;
+}
+.alpha-rail.mode-density .density-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  /* Flex-fill like the vanilla base (review fix, corroborated): the U2 rail
+     box spans the pane, so fixed-height rows would cluster at the top —
+     misaligning drag-scrub's height/27 buckets, leaving a dead tap zone
+     below the letters on tall panes, and overflowing short panes that
+     condensation is supposed to handle. Even slots keep scrub geometry
+     exact in every pane height. */
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  cursor: pointer;
+}
+.alpha-rail.mode-density .density-row .label {
+  font-size: 0.62rem;
+  font-weight: 700;
+  color: var(--muted);
+  width: 12px;
+  text-align: right;
+  font-family: 'Space Mono', ui-monospace, monospace;
+}
+.alpha-rail.mode-density .density-row.empty .label { color: #333; }
+.alpha-rail.mode-density .density-row[aria-current="true"] .label { color: var(--accent-ui, var(--accent)); }
+.alpha-rail.mode-density .density-row .bar {
+  display: inline-block;  /* span since U1's unified <button> base — buttons permit phrasing content only */
+  height: 8px;
+  background: var(--accent-ui, var(--accent));
+  margin-right: 6px;
+  border-radius: 2px 0 0 2px;
+  transition: opacity 150ms, box-shadow 150ms, height 150ms;
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+.alpha-rail.mode-density .density-row.empty .bar { opacity: 0; }
+.alpha-rail.mode-density .density-row:hover:not(.empty) .bar { opacity: 0.75; }
+.alpha-rail.mode-density .density-row[aria-current="true"] .bar {
+  opacity: 1;
+  height: 12px;
+  box-shadow: 0 0 6px var(--accent-ui, var(--accent));
+}
+.alpha-rail.mode-density .density-row .count {
+  position: absolute;
+  right: 100%;
+  margin-right: 4px;
+  font-size: 0.6rem;
+  color: var(--muted);
+  font-family: 'Space Mono', ui-monospace, monospace;
+  opacity: 0;
+  transition: opacity 120ms;
+  white-space: nowrap;
+  background: var(--surface);
+  padding: 1px 4px;
+  border-radius: 2px;
+  pointer-events: none;
+}
+.alpha-rail.mode-density .density-row:hover:not(.empty) .count { opacity: 1; }
+.alpha-rail.mode-density .density-row[aria-disabled="true"] { cursor: default; }
+
+/* Plan 003 U5: magnetic mode — 27 letter buttons that scale on proximity
+   to the pointer (Mac Dock metaphor). Active letter glows independently
+   of cursor via aria-current=true. Background is transparent at rest and
+   fades in only while .engaged. Mirrors
+   docs/mockups/2026-06-06-rail-redesigns/magnetic.html. */
+.alpha-rail.mode-magnetic {
+  width: auto;
+  background: transparent;
+  padding: 10px 4px;
+  border-radius: 12px;
+  gap: 1px;
+  transition: background 200ms, box-shadow 200ms;
+}
+.alpha-rail.mode-magnetic.engaged {
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+.alpha-rail.mode-magnetic .magnetic-letter {
+  /* Flex-fill like the vanilla base (review fix, corroborated) — see the
+     .density-row comment: fixed 16px slots misaligned scrub buckets and
+     defeated condensation once the U2 rail box spans the pane. */
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text);
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: transform 80ms ease-out, opacity 80ms, color 80ms;
+  transform-origin: right center;
+  padding: 0;
+  font-family: inherit;
+  /* 2026-06-09 rail plan U4: proximity styling is driven by a custom
+     property the JS writes (--falloff in [0,1]) instead of inline
+     transform/opacity. Inline styles outranked the [aria-current] rules
+     below, which is exactly why the accent highlight never showed while
+     the flare was engaged. 1.2 = (max scale 2.2) - 1. */
+  --falloff: 0;
+  transform: scale(calc(1 + 1.2 * var(--falloff)));
+  opacity: calc(0.5 + 0.5 * var(--falloff));
+}
+.alpha-rail.mode-magnetic .magnetic-letter[aria-disabled="true"] {
+  color: var(--muted);
+  opacity: 0.25;
+  cursor: default;
+}
+.alpha-rail.mode-magnetic .magnetic-letter[aria-current="true"] {
+  color: var(--accent-ui, var(--accent));
+  opacity: 1;
+  font-weight: 800;
+}
+
+/* Glow-up U4 (2026-06-11 plan): three new decoration layers over the same
+   27-button skeleton. Visual contracts are the locked mockups in
+   docs/mockups/2026-06-11-glowup/ (rails-interactive.html for waveform/vu,
+   glowup.html for loupe). All accent uses go through --accent-ui /
+   --accent-grad so scheme switches re-color live with no DOM rebuild. */
+
+/* Waveform: the library's shape as mirrored count-scaled bars; sparse
+   anchor labels (every 3rd letter), the active bar flares + shows its
+   label. Bar width/height set inline by _waveformRefresh. */
+.alpha-rail.mode-waveform {
+  width: 44px;
+  background: transparent;
+  padding: 8px 4px 8px 0;
+}
+.alpha-rail.mode-waveform button {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  position: relative;
+  font-size: 0;  /* hide the base letter text; the .label span carries it */
+}
+.alpha-rail.mode-waveform button .label {
+  font-size: 0.55rem;
+  font-weight: 700;
+  color: var(--muted);
+  width: 10px;
+  text-align: right;
+  font-family: 'Space Mono', ui-monospace, monospace;
+  visibility: hidden;
+}
+.alpha-rail.mode-waveform button.anchor .label,
+.alpha-rail.mode-waveform button[aria-current="true"] .label { visibility: visible; }
+.alpha-rail.mode-waveform button[aria-current="true"] .label {
+  color: var(--accent-ui, var(--accent));
+  font-weight: 800;
+}
+.alpha-rail.mode-waveform button .bar {
+  display: inline-block;
+  border-radius: 2px;
+  /* --accent-grad is a color for most schemes and a gradient image for
+     Silver Mountains — the background shorthand accepts both. */
+  background: var(--accent-grad, var(--accent));
+  opacity: 0.7;
+  transition: opacity 120ms, box-shadow 120ms, transform 120ms;
+  transform-origin: right center;
+  flex-shrink: 0;
+}
+.alpha-rail.mode-waveform button.empty .bar { opacity: 0.15; }
+.alpha-rail.mode-waveform button[aria-current="true"] .bar {
+  opacity: 1;
+  box-shadow: 0 0 7px var(--accent-ui, var(--accent));
+  transform: scaleX(1.35);
+}
+.alpha-rail.mode-waveform button[aria-disabled="true"] { cursor: default; }
+/* Condensation: elided rows fall back to the shared mid-dot; hide their
+   bar/label like density does so the dot reads cleanly. */
+.alpha-rail.mode-waveform.condensed button.elide .bar,
+.alpha-rail.mode-waveform.condensed button.elide .label { display: none; }
+
+/* Loupe: the invisible rail. A hairline track + per-letter ticks at rest;
+   the active letter is an accent dot. The floating lens during scrub is
+   the shared .alpha-overlay restyled via .lens (below). */
+.alpha-rail.mode-loupe {
+  width: 14px;
+  background: transparent;
+  padding: 6px 0;
+}
+.alpha-rail.mode-loupe::before {
+  content: '';
+  position: absolute;
+  right: 6px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: #2a2a2a;
+  border-radius: 1px;
+}
+.alpha-rail.mode-loupe button {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  font-size: 0;  /* letters live in the DOM for a11y, ticks render instead */
+}
+.alpha-rail.mode-loupe button::after {
+  content: '';
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 6px;
+  height: 1px;
+  background: #3a3a3a;
+}
+.alpha-rail.mode-loupe button[aria-disabled="true"]::after { background: #262626; }
+.alpha-rail.mode-loupe button[aria-current="true"]::after {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  right: 2px;
+  background: var(--accent-ui, var(--accent));
+  box-shadow: 0 0 8px var(--accent-ui, var(--accent));
+}
+
+/* VU meter: uniform LED segments; the ladder lights A→active in the scheme
+   gradient, the active segment is the glowing peak lamp. Pure CSS off
+   aria-current — :has(~ [aria-current]) selects every segment above the
+   peak, nothing lights when no letter is active yet. */
+.alpha-rail.mode-vu {
+  width: 40px;
+  background: transparent;
+  padding: 8px 2px;
+  gap: 2px;
+}
+.alpha-rail.mode-vu button {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  position: relative;
+  font-size: 0;
+}
+.alpha-rail.mode-vu button .label {
+  font-size: 0.5rem;
+  font-weight: 700;
+  color: var(--muted);
+  width: 9px;
+  text-align: right;
+  font-family: 'Space Mono', ui-monospace, monospace;
+}
+.alpha-rail.mode-vu button[aria-disabled="true"] .label { color: #333; }
+.alpha-rail.mode-vu button .seg {
+  display: inline-block;
+  width: 16px;
+  height: 60%;
+  min-height: 2px;
+  max-height: 14px;
+  border-radius: 2px;
+  background: var(--surface2, #242424);
+  transition: background 80ms, box-shadow 80ms;
+  flex-shrink: 0;
+}
+.alpha-rail.mode-vu button:has(~ button[aria-current="true"]) .seg {
+  background: var(--accent-grad, var(--accent));
+  opacity: 0.85;
+}
+.alpha-rail.mode-vu button[aria-current="true"] .seg {
+  background: var(--accent-ui, var(--accent));
+  box-shadow: 0 0 9px var(--accent-ui, var(--accent));
+  opacity: 1;
+}
+.alpha-rail.mode-vu button[aria-current="true"] .label {
+  color: var(--accent-ui, var(--accent));
+  font-weight: 800;
+}
+/* Condensation: segments keep the ladder continuous (they shrink with the
+   flex slots); only the elided labels and the shared mid-dot are dropped. */
+.alpha-rail.mode-vu.condensed button.elide .label { display: none; }
+.alpha-rail.mode-vu.condensed button.elide::after { content: none; }
+
+/* (No .admin-shell .alpha-rail overrides needed — the rail spans its
+   .rail-host box uniformly on both pages per the U2 pane-anchoring.) */
+
+/* U7: center letter overlay shown during pointer drag-scrub.
+   - position:fixed + viewport-centered translate keeps the overlay anchored
+     to the screen center while the list scrolls underneath.
+   - 140px font is readable mid-drag on a 375px viewport without occluding
+     the entire screen; translucent dark backing pill provides contrast
+     against varied list content.
+   - z-index 1500: above overflow-menu (1000) so it remains visible even if
+     a menu somehow re-opens mid-drag; below toast (9999) per KTD 4.
+   - opacity transition is the fade in/out; pointer-events:none keeps the
+     overlay non-interactive so it can't intercept the drag's own events. */
+.alpha-overlay {
+  /* U2: anchored to the pane (re-parented into .rail-host alongside the
+     rail); centers on the pane the user is scrubbing, not the viewport. */
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 140px;
+  font-weight: bold;
+  color: var(--accent-ui, var(--accent));
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 20px;
+  padding: 24px 40px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 150ms ease;
+  z-index: 1500;
+  font-family: system-ui, sans-serif;
+  min-width: 1.5em;
+  text-align: center;
+}
+.alpha-overlay.no-host { position: fixed; }
+/* Glow-up U4: loupe lens — the SAME overlay element restyled. left:auto
+   !important overrides the activation-time inline left (scroller-center);
+   top is written inline per pointer move so the lens rides the thumb. */
+.alpha-overlay.lens {
+  left: auto !important;
+  right: 34px;
+  transform: translateY(-50%);
+  width: 64px;
+  height: 64px;
+  min-width: 0;
+  padding: 0;
+  border-radius: 50%;
+  background: #1a1a1a;
+  border: 2px solid var(--accent-ui, var(--accent));
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.6), 0 0 12px color-mix(in srgb, var(--accent-ui, var(--accent)) 40%, transparent);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  font-size: 0;
+  font-family: system-ui, sans-serif;
+}
+.alpha-overlay.lens .big {
+  font-size: 26px;
+  font-weight: 800;
+  color: var(--accent-ui, var(--accent));
+}
+.alpha-overlay.lens .ghost {
+  font-size: 10px;
+  font-weight: 600;
+  color: #666;
+}
+
+/* ── Browse chips + "Show More" (genres / years) ──────────────────────────────
+   Shared by guest + admin (both link this file) — the chips are browse-view
+   content rendered by the shared createGenreBrowser (static/shared.js) and the
+   year-chip renderer (static/browse/index.js). Co-located here as the browse
+   shared stylesheet to replace the forked per-template rules: guest hovered to a
+   flat --accent, admin hovered only to --surface (no accent at all), and "Show
+   More" had no CSS at all (a raw browser button). One themed treatment now
+   (Variant B "gradient gloss", 2026-06-17): hover lights the accent, :active
+   (click) fills with the scheme gradient + glow, and Show More is a gradient
+   pill with a sheen. All accent uses route through --accent-ui / --accent-grad /
+   --accent-dim so a scheme switch re-colors live (same contract as the rail). */
+.genre-chip, .year-chip {
+  display: inline-block; margin: .3rem; font-size: .85rem; cursor: pointer;
+  background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+  transition: background .14s ease, color .14s ease, border-color .14s ease, box-shadow .14s ease;
+  animation: chipAppear .22s ease;
+}
+.genre-chip { padding: .4rem .85rem; border-radius: 999px; }
+.year-chip  { padding: .4rem .7rem;  border-radius: 7px; }
+@keyframes chipAppear { from { opacity: 0; transform: scale(.93); } to { opacity: 1; transform: scale(1); } }
+
+/* Hover (moused-over): border + label in --accent-ui over a faint --accent-dim wash. */
+.genre-chip:hover, .year-chip:hover {
+  background: var(--accent-dim); color: var(--accent-ui); border-color: var(--accent-ui);
+}
+/* Active (clicked): fill with the scheme's gradient + soft glow. On solid
+   schemes --accent-grad is the solid anchor, so it degrades cleanly. */
+.genre-chip:active, .year-chip:active {
+  background: var(--accent-grad, var(--accent)); color: var(--on-accent);
+  border-color: transparent;
+  box-shadow: 0 2px 10px var(--accent-dim), 0 0 0 1px color-mix(in srgb, var(--accent-ui) 45%, transparent);
+}
+.genre-chip:focus-visible, .year-chip:focus-visible {
+  outline: 2px solid var(--accent-ui, var(--accent)); outline-offset: 2px;
+}
+
+/* "Show More" — a quiet GHOST button (2026-06-18 rework): a surface chip with an
+   accent border + accent text, lifting to a faint --accent-dim wash on hover. The
+   prior full --accent-grad fill + glow + sheen read too loud next to the chips.
+   The chevron is a ::after glyph because createGenreBrowser sets the button's
+   textContent (a child span would be wiped). All accent uses route through
+   --accent-ui / --surface2 / --accent-dim so a scheme switch re-colors live. */
+.show-more-btn {
+  display: inline-flex; align-items: center; gap: .4rem;
+  margin: .55rem .3rem .2rem; padding: .52rem 1.2rem;
+  border: 1px solid var(--accent-ui, var(--accent)); border-radius: 999px;
+  background: var(--surface2); color: var(--accent-ui, var(--accent));
+  font: inherit; font-size: .84rem; font-weight: 700; cursor: pointer;
+  transition: background .14s ease, color .14s ease, transform .12s ease, box-shadow .14s ease;
+}
+.show-more-btn::after { content: '⌄'; font-size: .9em; line-height: 1; }
+.show-more-btn:hover { background: var(--accent-dim); transform: translateY(-1px); box-shadow: 0 2px 10px var(--accent-dim); }
+.show-more-btn:focus-visible { outline: 2px solid var(--accent-ui, var(--accent)); outline-offset: 2px; }
+
+/* ── Browse surface (Option B — 2026-06-19 admin/user gradient unification) ──────
+   The browse content area is a frosted, theme-tinted panel that lets the scheme
+   gradient glow softly through — now IDENTICAL on guest (#browse-container) and
+   admin (section#browse) via the shared .browse-surface class. Replaces the prior
+   fork: guest rendered text straight on the bare gradient, admin used an opaque
+   --surface card that hid the gradient entirely (the "dark background"). color-mix
+   keeps the panel translucent so the fixed gradient backdrop reads through; the
+   blur calms busy gradient regions behind text. --surface/--border route through
+   the scheme so a switch re-colors live. Per-page padding/margins stay in each
+   template (guest is a phone-first column, admin a dashboard section).
+   Opacity note: tests/test_frontend_regressions.py::test_translucent_schemes_opaque_and_readable
+   locks Bloody Pink + Ladyland *surface tokens* opaque because translucent
+   surfaces over those vivid gradients hurt text legibility. The panel here is
+   only mildly translucent (72%) — enough to glow the gradient through, opaque
+   enough that body text stays legible over the brightest gradient stops. Lower
+   it for a punchier gradient only after checking legibility on BP/Ladyland. */
+.browse-surface {
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+/* The drill-in .wayfind-bar is NON-sticky (it scrolls away with the content, so
+   nothing ever passes behind it) and sits on the frosted .browse-surface — so it
+   must NOT paint a background of its own: a surface tint reads darker (a "darker
+   box") and a backdrop blur paints its own frosted rectangle (a "second
+   semitransparent box" on gradient themes). Transparent matches the panel exactly
+   = no box, in parity with admin. Shared rule (both pages link rail.css).
+   NOTE (2026-07-02 ce-debug): #search-bar is NOT in this transparent rule — it is
+   position:sticky, so scrolled results pass BEHIND it and a transparent backing
+   let them bleed through the docked bar (guest only, since only guest's
+   #browse-container carries .browse-surface — admin was already opaque via the
+   base #search-bar rule). A docked bar over scrolling content must be opaque, so
+   #search-bar backs with the opaque --elev-base (+ --surface tint) in its base
+   rule below. */
+.browse-surface .wayfind-bar {
+  background: transparent;
+}
+
+/* ── Time-dimension labels (2026-06-20 sort-aware rail) ───────────────────────
+   On Album year sorts the rail buckets are decades ("60s"), 5-year bins, or
+   individual years (2-digit) — wider than the single letters the waveform / VU /
+   density label widths above were sized for. Scoped to .dim-time so the letter
+   rail stays pixel-identical. */
+.alpha-rail.dim-time.mode-waveform button .label,
+.alpha-rail.dim-time.mode-vu button .label,
+.alpha-rail.dim-time.mode-density .density-row .label {
+  width: auto;
+  min-width: 1.6em;
+  white-space: nowrap;
+}
+
+/* ── Render containment for large grids/lists (2026-06-21 browse-index plan U7) ──
+   At public scale the Artists / Albums views render thousands of cells. Without
+   containment the engine lays out and paints every off-screen cell up front —
+   the source of the all-at-once render jank on big collections.
+   `content-visibility: auto` lets the browser SKIP layout/paint for cells
+   outside the viewport while KEEPING their DOM node, so the alpha rail's
+   per-cell `data-bucket-start` anchors, the cross-server dedup, and scroll
+   geometry all keep working over the full ordered set. This is render
+   containment, NOT JS windowing that removes nodes (plan R12/R13 — full DOM
+   kept, single-source: both pages link this file).
+   `contain-intrinsic-size: auto <len>` makes each cell remember its last
+   rendered size after first paint; the length is the pre-paint estimate that
+   keeps the scrollbar roughly sized. Covers tile mode (.tile in .tile-grid,
+   incl. the artist drill-in release grid) and list mode (.list-item rows). */
+.tile-grid > .tile {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 210px;
+}
+.alpha-items-column > .list-item {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 64px;
+}
+
+/* ── Track ratings + tags (2026-06-26 ratings-and-tags plan U5/U6) ──────────
+   Shared by guest + admin (both load this sheet). Pips sit trailing-right on a
+   track row; outline tag chips wrap on a line under the subtitle. Empty pip
+   uses the mode-aware --star-empty (applyScheme sets it; the CSS fallback
+   covers the no-scheme default); the fill uses --accent-ui so deep-anchor
+   schemes (King Crimson, Rainy Purple) stay legible — verified across all 16
+   schemes in docs/brainstorms/mockups/ratings-tags-allschemes.html. */
+.trk-rating { display: inline-flex; align-items: center; gap: 3px; flex-shrink: 0; margin-right: .15rem; }
+/* Switchable mark shape (2026-06-27 plan U3): the bare .trk-pip is STARS — the
+   install default AND the pre-JS paint. :root[data-rating-style] (set by the
+   shared appearance engine from /api/appearance) swaps to dots or bars. Fill
+   keeps the two-token model (empty --star-empty / on --accent-ui) so every
+   shape stays legible across all 16 schemes + light mode. */
+.trk-pip {
+  width: 16px; height: 16px; background: var(--star-empty, rgba(255,255,255,.18));
+  -webkit-clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+  clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+}
+.trk-pip.on { background: var(--accent-ui, var(--accent)); }
+:root[data-rating-style="dots"] .trk-pip {
+  width: 14px; height: 14px; border-radius: 50%; -webkit-clip-path: none; clip-path: none;
+}
+:root[data-rating-style="bars"] .trk-pip {
+  width: 18px; height: 9px; border-radius: 2px; -webkit-clip-path: none; clip-path: none;
+}
+.trk-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.trk-tag { display: inline-flex; align-items: center; gap: .3rem; border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: .1rem .5rem; font-size: .72rem; line-height: 1.3; }
+
+/* Admin authoring (U6): editable pips clickable, faint until set; tag ✕ delete
+   + "＋ tag" affordance. All authoring controls stopPropagation in JS so the
+   row's click-to-queue never fires. */
+.trk-rating.is-editable .trk-pip { cursor: pointer; }
+.trk-rating.is-editable:hover .trk-pip.hov { background: var(--accent-strong, var(--accent-ui)); }
+.trk-rating .trk-clear { background: none; border: none; color: var(--muted); cursor: pointer; font-size: .72rem; line-height: 1; padding: 0 0 0 .15rem; }
+.trk-rating .trk-clear:hover { color: var(--danger); }
+/* Reflow fix (2026-06-27 plan U4/R9): the clear button is always in the DOM so
+   its slot is reserved; is-hidden makes it invisible + non-interactive while a
+   row is unrated, keeping width constant so rating/clearing never shifts it. */
+.trk-rating .trk-clear.is-hidden { visibility: hidden; pointer-events: none; }
+.trk-tag .trk-tag-del { background: none; border: none; color: inherit; opacity: .55; cursor: pointer; font-size: .8rem; line-height: 1; padding: 0; }
+.trk-tag .trk-tag-del:hover { opacity: 1; color: var(--danger); }
+.trk-tags .trk-tag-add { font-size: .72rem; color: var(--muted); background: none; border: 1px dashed var(--border); border-radius: 999px; padding: .08rem .5rem; cursor: pointer; }
+.trk-tags .trk-tag-add:hover { color: var(--accent-ui, var(--accent)); border-color: var(--accent-ui, var(--accent)); }
+.trk-tags .trk-tag-input { font-size: .72rem; background: var(--surface); color: var(--text); border: 1px solid var(--accent-ui, var(--accent)); border-radius: 999px; padding: .06rem .5rem; width: 110px; outline: none; }
+
+/* ── Search: docked filter-tab bar (2026-07-02 ce-debug) ──────────────────────
+   Single source for guest + admin (was forked in both templates with divergent
+   structure — guest wrapped input+tabs in a sticky #search-bar backed by
+   var(--bg); admin had NO wrapper and NO sticky). The bar docks to the top of
+   the search scroll area and follows scroll. It backs with the OPAQUE
+   --elev-base (not var(--bg)) so scrolled results never bleed through it on the
+   translucent / gradient schemes (Tubular Blue, Ladyland, Bloody Pink) — the
+   same opaque-base treatment the sort popover uses. Both templates mount the
+   identical #search-bar > (.search-field + #search-filter-tabs) markup. */
+#search-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  padding: .75rem .75rem .5rem;
+  /* Opaque base + surface tint so scrolled results never bleed through the
+     docked bar, and it still reads as the panel's surface tone on translucent /
+     gradient schemes (mirrors the sort popover's opaque-base treatment). This
+     OUTRANKS nothing by itself, so it must not be re-forced transparent by a
+     .browse-surface rule — see the .wayfind-bar note above. */
+  background-color: var(--elev-base, #16161b);
+  background-image: linear-gradient(var(--surface), var(--surface));
+  border-bottom: 1px solid var(--divider);
+}
+#search-filter-tabs { display: flex; gap: .4rem; padding: .5rem 0 0; flex-wrap: wrap; }
+.filter-tab {
+  padding: .28rem .75rem;
+  border: none;
+  border-radius: 999px;
+  background: var(--surface2);
+  color: var(--accent-ui, var(--accent));
+  font-size: .78rem;
+  cursor: pointer;
+}
+.filter-tab.active { background: var(--accent-grad, var(--accent)); color: var(--on-accent); }
