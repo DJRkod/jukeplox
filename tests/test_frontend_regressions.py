@@ -2217,6 +2217,39 @@ def test_rail_geometry_is_containment_safe_structural():
     )
 
 
+def test_rail_jump_tap_is_swallowed_wrong_artist_guard():
+    """A tap that interrupts an in-flight rail jump must NOT drill in
+    (2026-08-08 wrong-artist debug).
+
+    Tapping a letter starts _settleJump, which converges the landing across
+    frames as content-visibility cells realize their true size — content is
+    still MOVING under the finger. A fast follow-up artist tap during that
+    window lands on whatever row is at that pixel mid-motion (R.E.M. instead of
+    the aimed-at Rachel Goswell) and, without a guard, drills into it. The
+    guard: _settleJump's abort stamps _settleAbortedAt on a tap interrupt, and
+    every browse nav entry point (list delegation + artist/release tiles)
+    swallows a drill while _tapInterruptedJump() holds; the user's next tap, on
+    settled content, opens the right item. Behavioral proof: the guard-verify
+    harness (jump→immediate tap = no drill; jump→settle→tap = drill)."""
+    browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    assert "function _tapInterruptedJump(" in browse and "_settleAbortedAt" in browse, (
+        "the wrong-artist guard must exist: _settleJump stamps _settleAbortedAt on "
+        "a tap interrupt and _tapInterruptedJump() gates the nav entry points."
+    )
+    # Only a TAP (pointerdown/touchstart) arms the guard — a wheel/key interrupt
+    # means the user took over scrolling, not selecting a row.
+    m = re.search(r"const abort = \(e\) => \{(.*?)\};", browse, re.S)
+    assert m and "pointerdown" in m.group(1) and "touchstart" in m.group(1), (
+        "_settleJump's abort must stamp _settleAbortedAt only for pointerdown/touchstart."
+    )
+    # Guard must gate every drill entry point: the delegated list handler and
+    # both tile builders. Any new queue-into-view/drill path must add it too.
+    assert browse.count("_tapInterruptedJump()") >= 3, (
+        "the guard must gate the list delegation handler AND the artist + release "
+        f"tile click handlers; found {browse.count('_tapInterruptedJump()')} guarded site(s)."
+    )
+
+
 def test_browse_top_level_rows_use_event_delegation_structural():
     browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
     assert "function _wireListDelegation(" in browse, (
