@@ -2197,9 +2197,10 @@ async def _flow_play(sup, backend, track, url="http://x/api/stream?key=k",
 
 async def test_flow_load_once_stream_type_and_no_watchdog(flow_env, fresh_supervisor):
     """Gapless on → ONE LOAD of the flow URL (base composed like per-track
-    dispatch), BUFFERED-without-duration stream type (the documented knob),
-    and NO per-track duration watchdog (flow liveness = stream consumption +
-    connection status)."""
+    dispatch), BUFFERED-without-duration stream type (the documented knob;
+    hardware-confirmed 2026-08-08 — real Linkplay receivers play the open-ended
+    chunked FLAC cleanly under BUFFERED), and NO per-track duration watchdog
+    (flow liveness = stream consumption + connection status)."""
     from app.output.chromecast import ChromecastBackend
     sup, timers, rec = fresh_supervisor
     cc = _make_cc()
@@ -2823,7 +2824,9 @@ async def test_flow_receiver_idle_routes_outage_not_advance(
         flow_env, fresh_supervisor, monkeypatch, idle_reason):
     """Per-track terminal states are SUPPRESSED as advance authority in flow
     mode (no track boundaries exist device-side): a terminal IDLE mid-flow is
-    a receiver hiccup → outage-suspected, never advance."""
+    a receiver hiccup → outage-suspected, never advance. The classifier then
+    RECOVERS it (hold + auto-resume at position) rather than skipping — see
+    test_classify_flow_receiver_transient_recovers_not_skips in test_output_session."""
     import app.state as st
     from app.output.chromecast import ChromecastBackend
     sup, timers, rec = fresh_supervisor

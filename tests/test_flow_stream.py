@@ -855,6 +855,82 @@ def test_flow_decode_args_http_source_keeps_credentials_off_argv():
     assert seek[seek.index("-i") + 1] == "pipe:0"
 
 
+async def test_flow_source_fetch_uses_bounded_read_timeout(monkeypatch):
+    """The source→ffmpeg feed must NOT use read=None: an unbounded read let a
+    half-open / stalled Plex connection block the feeder and starve the encoder
+    forever. It is bounded ABOVE the decode-stall watchdog so the watchdog still
+    owns the skip decision and this is a pure connection-leak backstop."""
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            captured["timeout"] = kw.get("timeout")
+
+        def build_request(self, *a, **kw):
+            return object()
+
+        async def send(self, *a, **kw):
+            raise httpx.ReadError("stalled")   # end the feed immediately
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(flow.httpx, "AsyncClient", _FakeClient)
+
+    dec = flow.FFmpegPCMDecoder(
+        "http://plex:32400/library/parts/1/file.flac?X-Plex-Token=SECRET", None)
+    proc = SimpleNamespace(stdin=SimpleNamespace())
+    await dec._feed_source(proc)            # returns cleanly (ReadError caught)
+
+    timeout = captured["timeout"]
+    assert timeout is not None
+    assert timeout.read is not None                       # never unbounded
+    assert timeout.read == flow.FLOW_SOURCE_READ_TIMEOUT_S
+    assert timeout.connect == 10.0                        # connect bound unchanged
+    # Backstop, not skip authority: must sit strictly above the stall watchdog.
+    assert flow.FLOW_SOURCE_READ_TIMEOUT_S > flow.FLOW_DECODE_STALL_S
+
+
+async def test_flow_source_midstream_failure_surfaces_as_decode_error(monkeypatch):
+    """A mid-stream source failure (read timeout / transport error) must NOT
+    look like a clean end-of-track. _feed_source flags it, and read() converts
+    the flag into a FlowDecodeError (→ server-side _flow_skip) instead of a
+    clean EOF that would silently truncate the song."""
+    async def _noop():
+        return None
+
+    # Part 1: a mid-stream failure sets the source-failed flag.
+    class _FailClient:
+        def __init__(self, *a, **k): pass
+        def build_request(self, *a, **k): return object()
+        async def send(self, *a, **k):
+            raise httpx.ReadTimeout("stalled mid-stream")
+        async def aclose(self): pass
+    monkeypatch.setattr(flow.httpx, "AsyncClient", _FailClient)
+    dec = flow.FFmpegPCMDecoder("http://plex:32400/x.flac", None)
+    proc = SimpleNamespace(stdin=SimpleNamespace(close=lambda: None,
+                                                 wait_closed=_noop))
+    await dec._feed_source(proc)
+    assert dec._source_failed is True
+
+    # Part 2: read() turns the flag into FlowDecodeError on a clean ffmpeg exit.
+    class _EmptyStdout:
+        async def read(self, n): return b""
+    class _CleanProc:
+        stdout = _EmptyStdout()
+        async def wait(self): return 0
+    failed = flow.FFmpegPCMDecoder("http://plex:32400/x.flac", None)
+    failed._source_failed = True
+    failed._proc = _CleanProc()
+    with pytest.raises(flow.FlowDecodeError):
+        await failed.read(4096)
+
+    # Contrast: a genuine clean end (no source failure) is a normal EOF.
+    clean = flow.FFmpegPCMDecoder("http://plex:32400/x.flac", None)
+    clean._proc = _CleanProc()
+    assert await clean.read(4096) == b""
+
+
 def test_redact_scrubs_url_query_strings():
     assert flow._redact("open http://h:32400/p.flac?X-Plex-Token=abc&x=1 "
                         "failed") == "open http://h:32400/p.flac?<redacted> failed"
