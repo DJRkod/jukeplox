@@ -751,10 +751,16 @@ window.mountPlayback = function mountPlayback(config) {
       // Anti-repeat (plan 005): send the browser's recently-surprised ids so the
       // server won't re-suggest them (remove + re-press won't repeat).
       const exclude = (typeof getRecentSurprised === 'function') ? getRecentSurprised() : [];
+      // Durable ownership (remove-own-surprise-after-screen-off): reserve + persist
+      // an owner token BEFORE the request so the server can stamp it on the queued
+      // row and this browser can still remove its own track even if THIS response
+      // is lost (phone sleeps during a slow resolve). Null on admin (removes all).
+      const ownerToken = (typeof cfg.reserveSurpriseToken === 'function')
+        ? cfg.reserveSurpriseToken() : null;
       const resp = await fetch('/api/queue/surprise', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ picks: seed, exclude }),
+        body: JSON.stringify({ picks: seed, exclude, owner_token: ownerToken }),
       });
       if (resp.status === 423) { _toast('Queuing is paused by the host'); return; }
       if (resp.ok) {
@@ -766,9 +772,10 @@ window.mountPlayback = function mountPlayback(config) {
           if (data.entry && data.entry.track_id && typeof recordSurprised === 'function') {
             recordSurprised(data.entry.track_id);
           }
-          // Hand the append receipt to the page so the surprise track gets a
-          // remove (✕) in the queue, same as a manual add. cfg.onQueued saves
-          // the receipt and refreshes (also closes the paint-before-save race).
+          // Hand the entry to the page. Callers decide what to persist: the guest
+          // proves surprise ownership via the pre-stored owner_token (durable,
+          // survives a lost response), so its onQueued only refreshes — it does NOT
+          // save a receipt. cfg.onQueued also closes the paint-before-render race.
           if (data.entry && cfg.onQueued) cfg.onQueued(data.entry);
         }
         // ok:false (no library content) → stay silent; never surface a failure.

@@ -663,6 +663,33 @@ def test_queue_item_play_recorded_survives_round_trip():
     assert QueueItem.from_dict(legacy).play_recorded is False
 
 
+def test_queue_item_owner_token_survives_round_trip():
+    """Durable surprise ownership: the client-generated owner_token must survive
+    the persistence round-trip (to_dict → from_dict), riding metadata_json like
+    play_recorded, and default None for legacy rows without the key."""
+    import json
+    from app.queue.models import QueueItem
+    item = QueueItem(track=make_track("t1"), owner_token="tok-abc123")
+    restored = QueueItem.from_dict(item.to_dict())
+    assert restored.owner_token == "tok-abc123"
+    assert restored.track_id == "t1"
+    # Legacy row (metadata blob without the key) → None (no owner).
+    legacy = item.to_dict()
+    meta = json.loads(legacy["metadata_json"])
+    del meta["owner_token"]
+    legacy["metadata_json"] = json.dumps(meta)
+    assert QueueItem.from_dict(legacy).owner_token is None
+
+
+async def test_append_stamps_owner_token(engine):
+    """engine.append threads a caller-supplied owner_token onto the queue item;
+    default None keeps back-compat for host/browse appends."""
+    stamped = await engine.append(make_track("t1"), owner_token="tok-xyz")
+    plain = await engine.append(make_track("t2"))
+    assert stamped.owner_token == "tok-xyz"
+    assert plain.owner_token is None
+
+
 async def test_restart_after_hold_lands_idle_with_held_item_front(tmp_path, monkeypatch):
     """Integration (R18): hold → real DB persist → fresh engine restart. The
     held item survives as queue front with its play_recorded mark; the fresh

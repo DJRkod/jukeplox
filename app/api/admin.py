@@ -982,6 +982,11 @@ def _queue_item_dict(item) -> dict:
         # both; this aligns the admin GET path.
         "album_id": t.album_id,
         "added_at": item.added_at,
+        # owner_token: align the admin GET shape with the guest GET / queue_changed
+        # rows (which carry it for durable guest ownership). Always None on admin
+        # appends — admin removal is not ownership-scoped — but keeping the field
+        # present (null) makes the two queue-row shapes a consistent superset.
+        "owner_token": getattr(item, "owner_token", None),
         "thumb": t.thumb,
         "duration_ms": t.duration_ms,
         "server_name": t.server_name,

@@ -118,13 +118,14 @@ class QueueEngine:
             return True
         return any(item.track_id == track_id for item in self._queue)
 
-    async def append(self, track: Track, *, bypass_lock: bool = False) -> QueueItem:
+    async def append(self, track: Track, *, bypass_lock: bool = False,
+                     owner_token: str | None = None) -> QueueItem:
         async with self._lock:
             if self._locked and not bypass_lock:
                 raise QueueLockError("Guest queuing is currently locked")
             if len(self._queue) >= _MAX_QUEUE_DEPTH:
                 raise QueueLockError("Queue is full")
-            item = QueueItem(track=track)
+            item = QueueItem(track=track, owner_token=owner_token)
             self._queue.append(item)
             await self._persist()
         await self._emit("queue_changed")
