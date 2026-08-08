@@ -97,13 +97,14 @@ WATCHDOG_GRACE_S = 30
 NEAR_END_GRACE_MS = 12_000
 
 # Cast stream_type for the flow-mode LOAD (2026-07-11 supervisor plan U10).
-# BUFFERED-without-duration is the deliberate default: LIVE tells receivers to
-# drop their timeline entirely, while BUFFERED with an unknown duration (the
-# streamed-FLAC pipe never carries one) keeps transport behavior closest to
-# per-track playback on the JBL strict-baseline receiver. The LIVE-vs-BUFFERED
-# call is a DEFERRED HARDWARE DECISION (plan deferred-to-implementation) —
-# this knob is the one place to flip if validation on the real receiver shows
-# unknown-duration BUFFERED streams stalling.
+# BUFFERED (unknown-duration) is correct and HARDWARE-CONFIRMED: a 3-hour soak
+# on real Linkplay receivers (JBL Charge 5, WiiM Pro, 2026-08-08) played the
+# open-ended non-seekable chunked FLAC cleanly under BUFFERED — it is NOT
+# rejected, and it buffers further ahead than LIVE. (An earlier hypothesis that
+# BUFFERED caused the mid-flow IDLE(ERROR) skip was DISPROVEN on that hardware;
+# the real cause was transient Linkplay hiccups mishandled as track-level skips
+# — fixed in session.py FLOW_RECOVERABLE_REASONS, not here.) LIVE would also
+# drop the receiver-side timeline. Leave this BUFFERED.
 FLOW_STREAM_TYPE = "BUFFERED"
 
 # Flow-mode status-poll cadence (seconds). pychromecast 14 has no built-in

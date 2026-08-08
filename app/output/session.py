@@ -117,6 +117,36 @@ DEVICE_LEVEL_REASONS = frozenset({
     "sink_error",
 })
 
+# Flow-mode receiver transients that are RECOVERABLE, not track-level failures.
+# A Cast flow receiver can report IDLE(ERROR) or stop pulling the stream
+# (consumer-gone) mid-flow while its control socket stays UP — so the R15
+# reachability probe reads "reachable" and the old code SKIPPED the (playing)
+# track. A 3-hour hardware soak (2026-08-08) showed these are transient Linkplay
+# hiccups (the same family as connection_lost, which the socket-drop path
+# already recovers by hold + auto-resume-at-position), NOT bad tracks — a bad
+# track fails at DECODE (FlowDecodeError → server-side _flow_skip), never here.
+# So route these through the SAME hold + auto-resume path connection_lost uses;
+# the R19 flap guard bounds a persistently-flapping receiver (holds for manual
+# after FLAP_GUARD_N short-lived resumes) instead of skipping a live track.
+FLOW_RECOVERABLE_REASONS = frozenset({
+    "flow_receiver_idle",
+    "flow_consumer_gone",
+})
+
+# Stuck-track backstop for the flow recovery path. Hold + auto-resume recovers a
+# transient, but a receiver that keeps erroring at ~the SAME position (content
+# the server decodes yet the receiver rejects, or a wedged media pipeline that
+# won't consume the re-LOAD) would otherwise recover-loop forever — strictly
+# worse than the old skip. So: after FLOW_RECOVER_STUCK_LIMIT recoveries on the
+# same track without at least FLOW_RECOVER_PROGRESS_MS of forward progress, fall
+# back to a track-level skip (the pre-fix backstop). A track whose held position
+# ADVANCES between hiccups is a genuine transient and keeps recovering
+# unbounded. NOTE: the R19 flap guard is adjacency-gated (only counts resumes
+# that re-fail within FLAP_SHORT_LIVED_S), so it does NOT bound a slow-cadence
+# receiver; this progress-aware cap is what actually bounds the flow path.
+FLOW_RECOVER_STUCK_LIMIT = 3
+FLOW_RECOVER_PROGRESS_MS = 10_000
+
 # ── reconnect / auto-resume tuning (U3) ───────────────────────────────────────
 # Backoff schedule for the direct-address retry loop: short fixed start,
 # exponential growth, LAN-sender-norm cap (~300s). Discovery arrival and the
@@ -321,6 +351,32 @@ class OutputSessionSupervisor:
         self._outage: _Outage | None = None
         self._flap_stamps: list[float] = []
         self._last_auto_resume_at: float | None = None
+        # Flow-recovery stuck-track guard (see FLOW_RECOVER_STUCK_LIMIT): tracks
+        # consecutive flow recoveries on the same track WITHOUT forward progress.
+        self._flow_recover_track_id: Any = None
+        self._flow_recover_pos_ms: int = 0
+        self._flow_recover_count: int = 0
+
+    def flow_recovery_allowed(self, track_id: Any, pos_ms: int) -> bool:
+        """Stuck-track backstop for the flow recovery path (FLOW_RECOVERABLE_
+        REASONS). Return True to recover (hold + auto-resume), False to fall
+        back to a track-level skip. A track that keeps hiccuping WITHOUT forward
+        progress (same track, position not advanced by >= FLOW_RECOVER_
+        PROGRESS_MS) is capped at FLOW_RECOVER_STUCK_LIMIT recoveries, then
+        skipped. Forward progress (or a new track) refreshes the budget, so a
+        genuine transient on a normally-advancing track recovers unbounded.
+        Degrades safely: if position is unavailable (reads ~0 each time) this
+        collapses to a plain 3-strikes-then-skip on the same track."""
+        if (track_id != self._flow_recover_track_id
+                or pos_ms - self._flow_recover_pos_ms >= FLOW_RECOVER_PROGRESS_MS):
+            self._flow_recover_track_id = track_id
+            self._flow_recover_pos_ms = pos_ms
+            self._flow_recover_count = 1
+            return True
+        self._flow_recover_count += 1
+        if pos_ms > self._flow_recover_pos_ms:
+            self._flow_recover_pos_ms = pos_ms
+        return self._flow_recover_count <= FLOW_RECOVER_STUCK_LIMIT
 
     # ── outage-suspected emission hook (consumed by U2) ────────────────────
 
@@ -1524,6 +1580,30 @@ async def _classify_outage(token: int, track: Any, reason: str) -> None:
     if reason in DEVICE_LEVEL_REASONS:
         await hold.enter_output_hold(
             reason, play_recorded=get_supervisor().dispatch_play_recorded(token))
+        return
+    if reason in FLOW_RECOVERABLE_REASONS:
+        # A reachable flow receiver hiccup is usually a transient (hardware-
+        # evidenced), not a bad track — recover it like connection_lost (hold +
+        # auto-resume at position), NOT a track-level skip. BUT a track that
+        # keeps failing at the same position (receiver-rejected content, wedged
+        # media pipeline) must not recover-loop forever — the progress-aware
+        # cap falls back to the old skip after FLOW_RECOVER_STUCK_LIMIT
+        # no-progress recoveries. (The R19 flap guard alone does NOT bound this
+        # — it only counts sub-FLAP_SHORT_LIVED_S re-fails; see the cap comment.)
+        pos_ms = await hold._capture_position_ms(state.output_router.active)
+        track_id = getattr(track, "id", None)
+        if get_supervisor().flow_recovery_allowed(track_id, pos_ms):
+            await hold.enter_output_hold(
+                reason,
+                play_recorded=get_supervisor().dispatch_play_recorded(token))
+            return
+        _log.warning(
+            "Output session: %s recovered %d× for %r without progress "
+            "(~%dms) — treating the track as the failure and skipping",
+            reason, FLOW_RECOVER_STUCK_LIMIT,
+            _title(track) if track is not None else "?", pos_ms,
+        )
+        await _track_level_skip(track, reason)
         return
     # Ambiguous reason → reachability probe is the R15 tie-breaker. A probe
     # that raises counts as unreachable (matches the U1 deadline-extension

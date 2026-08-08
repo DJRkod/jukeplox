@@ -111,6 +111,18 @@ FLOW_CONSUMER_GRACE_S = 5.0
 # so without this bound a stalled source froze the stream forever.
 FLOW_DECODE_STALL_S = 30.0
 
+# httpx per-read timeout on the SOURCE fetch that feeds ffmpeg's stdin. A bare
+# read=None let a half-open / stalled Plex connection block the feeder — and so
+# starve the encoder — indefinitely. The decode-stall watchdog above remains
+# the PRIMARY skip authority (it raises FlowDecodeError → server-side skip when
+# no PCM arrives for FLOW_DECODE_STALL_S), so this is deliberately set ABOVE it
+# as a connection-level backstop: it never preempts the watchdog's proper skip,
+# it only guarantees a genuinely wedged source self-terminates (httpx.ReadError)
+# instead of leaking a socket + ffmpeg + feeder task if teardown cancellation is
+# ever missed. It must stay > FLOW_DECODE_STALL_S so a slow-but-alive source is
+# judged by the watchdog, not severed here.
+FLOW_SOURCE_READ_TIMEOUT_S = FLOW_DECODE_STALL_S + 15.0
+
 # The encode-format knob (see module docstring). "flac" | "wav".
 FLOW_ENCODE_FORMAT_DEFAULT = "flac"
 
@@ -364,6 +376,11 @@ class FFmpegPCMDecoder:
         self._stderr_task: asyncio.Task | None = None
         self._feeder_task: asyncio.Task | None = None
         self._closed = False
+        # Set when the source fetch fails MID-STREAM (read timeout / transport
+        # error) rather than ending cleanly — so read() raises FlowDecodeError
+        # (→ server-side skip) instead of letting the clean stdin close look
+        # like a normal end-of-track and silently truncate the song.
+        self._source_failed = False
 
     async def read(self, n: int) -> bytes:
         if self._closed:
@@ -388,6 +405,11 @@ class FFmpegPCMDecoder:
         rc = await self._proc.wait()
         if rc != 0 and not self._closed:
             raise FlowDecodeError(f"ffmpeg decode exited {rc}")
+        if self._source_failed and not self._closed:
+            # ffmpeg drained cleanly (rc 0) only because the feeder closed stdin
+            # after a mid-stream source failure — surface it as a decode failure
+            # (→ _flow_skip) instead of a silent truncated end-of-track.
+            raise FlowDecodeError("source fetch failed mid-stream")
         return b""
 
     async def _feed_source(self, proc: Any) -> None:
@@ -396,8 +418,9 @@ class FFmpegPCMDecoder:
         ffmpeg drains and exits; ffmpeg dying early (BrokenPipe) just ends
         the feed — its exit code surfaces through ``read``."""
         client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=None, write=None,
-                                  pool=None),
+            timeout=httpx.Timeout(connect=10.0,
+                                  read=FLOW_SOURCE_READ_TIMEOUT_S,
+                                  write=None, pool=None),
             follow_redirects=True,
         )
         try:
@@ -416,6 +439,10 @@ class FFmpegPCMDecoder:
         except (BrokenPipeError, ConnectionResetError):
             pass  # ffmpeg exited early; its non-zero rc is handled by read()
         except Exception:
+            # A real source failure mid-stream (httpx read timeout / transport
+            # error), NOT a clean end — flag it so read() raises FlowDecodeError
+            # rather than returning a clean EOF that truncates the track.
+            self._source_failed = True
             _log.warning("Flow decode: source fetch failed for %s",
                          _redact(self._source), exc_info=True)
         finally:

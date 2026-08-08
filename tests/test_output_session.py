@@ -8,6 +8,7 @@ injected timer factory) — no real sleeps, per the repo's pytest-hang policy
 
 import asyncio
 import logging
+import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 # The hold flag's home since the session decomposition — tests patch the
@@ -513,6 +514,74 @@ async def test_confirm_timeout_reachable_is_track_level_skip(monkeypatch):
         skipped.assert_awaited_once()
         assert skipped.await_args.args[0] is item.track
         advance.assert_awaited_once()
+
+
+@pytest.mark.parametrize("reason", ["flow_receiver_idle", "flow_consumer_gone"])
+async def test_classify_flow_receiver_transient_recovers_not_skips(
+        monkeypatch, reason):
+    """A flow receiver hiccup (IDLE(ERROR) / consumer-gone) with the control
+    socket still UP is a transient Linkplay blip, NOT a bad track — it must
+    HOLD + auto-resume the playing track (like connection_lost), never a
+    track-level skip. This holds even though the reachability probe would say
+    'reachable': FLOW_RECOVERABLE_REASONS is classified before the probe runs.
+    (2026-08-08 hardware fix — a 3h soak proved these are transients the
+    connection_lost recovery path already handles.)"""
+    from app.output import session
+    sup, timers, rec = _fresh(monkeypatch)
+    sup.add_outage_listener(session.classify_outage)
+    probe = AsyncMock(return_value=(True, "IDLE"))   # socket up / reachable
+    with contextlib.ExitStack() as stack:
+        qe, skipped, advance = _wire_state(stack, probe=probe)
+        item = await _start_playing(qe, make_track("t1"))
+        await qe.append(make_track("t2"))
+        token = sup.on_dispatched(item.track)
+        sup.on_playback_confirmed(token)              # playing + counted
+        rec.assert_called_once()
+
+        sup.on_outage_reported(reason)
+        await _drain()
+
+        assert session.output_hold_active() is True
+        assert session.output_hold_reason() == reason
+        assert [i.track_id for i in qe.queue] == ["t1", "t2"]  # nothing skipped
+        assert qe.queue[0].play_recorded is True   # resume won't double-count
+        skipped.assert_not_called()                 # NOT a track-level skip
+        advance.assert_not_called()
+        probe.assert_not_awaited()                  # recovered before the probe
+        rec.assert_called_once()
+
+
+async def test_flow_recovery_cap_stuck_track_skips_progressing_recovers(monkeypatch):
+    """Progress-aware flow-recovery cap (the real bound on the recovery path,
+    since the R19 flap guard is adjacency-gated). A track stuck at ~the same
+    position recovers FLOW_RECOVER_STUCK_LIMIT times then falls back to skip
+    (allowed=False); a track whose held position advances by >=
+    FLOW_RECOVER_PROGRESS_MS refreshes the budget and recovers unbounded."""
+    from app.output import session
+    sup, timers, rec = _fresh(monkeypatch)
+    N = session.FLOW_RECOVER_STUCK_LIMIT
+    P = session.FLOW_RECOVER_PROGRESS_MS
+
+    # Stuck at the same position: N recoveries allowed, then skip.
+    for _ in range(N):
+        assert sup.flow_recovery_allowed("A", 5000) is True
+    assert sup.flow_recovery_allowed("A", 5000) is False      # capped → skip
+
+    # A different track refreshes the budget.
+    assert sup.flow_recovery_allowed("B", 1000) is True
+
+    # Forward progress on the same track refreshes the budget every time →
+    # a genuine transient on a normally-advancing track never gets skipped.
+    pos = 1000
+    for _ in range(N + 3):
+        pos += P
+        assert sup.flow_recovery_allowed("B", pos) is True
+
+    # Sub-threshold drift (< P) does NOT count as progress → still capped.
+    sup2, _t2, _r2 = _fresh(monkeypatch)
+    for _ in range(N):
+        assert sup2.flow_recovery_allowed("C", 0) is True
+    assert sup2.flow_recovery_allowed("C", P - 1) is False     # drift < P → skip
 
 
 async def test_no_probe_available_defaults_track_level(monkeypatch):
@@ -2503,22 +2572,28 @@ async def test_defer_confirmation_cancels_deadline_then_confirm_counts():
     sup.defer_confirmation(999)        # stale → no-op
 
 
-async def test_flow_outage_reasons_are_classifier_ambiguous():
-    """Consumer-gone / receiver-IDLE mid-flow have NOT established the device
-    is gone (the Cast socket may still be CONNECTED) — they must route
-    through the classifier's reachability probe, never the device-level
-    fast path (advance-authority table: outage-SUSPECTED → classifier)."""
-    from app.output.session import DEVICE_LEVEL_REASONS
+async def test_flow_transient_reasons_are_recoverable_not_device_level():
+    """Consumer-gone / receiver-IDLE mid-flow are RECOVERABLE transients: they
+    are classified in FLOW_RECOVERABLE_REASONS (hold + auto-resume, bypassing
+    the reachability probe — a socket-up receiver hiccup is not a bad track),
+    and are NOT in DEVICE_LEVEL_REASONS (they are not a hard device-gone
+    signal). Neither set may contain the other's members."""
+    from app.output.session import DEVICE_LEVEL_REASONS, FLOW_RECOVERABLE_REASONS
+    assert "flow_consumer_gone" in FLOW_RECOVERABLE_REASONS
+    assert "flow_receiver_idle" in FLOW_RECOVERABLE_REASONS
     assert "flow_consumer_gone" not in DEVICE_LEVEL_REASONS
     assert "flow_receiver_idle" not in DEVICE_LEVEL_REASONS
+    assert FLOW_RECOVERABLE_REASONS.isdisjoint(DEVICE_LEVEL_REASONS)
 
 
-async def test_flow_consumer_gone_unreachable_holds_reachable_skips(monkeypatch):
-    """The classifier verdicts for the flow's ambiguous reasons: unreachable
-    device means outage hold; reachable device means the stream/track is the
-    failure — today's skip behavior."""
+async def test_flow_transients_hold_reachable_and_unreachable(monkeypatch):
+    """Classifier verdict for the flow receiver transients: HOLD (recover) in
+    BOTH cases. Unreachable is an obvious outage hold; reachable is ALSO a hold
+    now (2026-08-08 hardware fix) — a flow receiver hiccup with the socket up is
+    a transient Linkplay blip, not a bad track, so it recovers via hold +
+    auto-resume like connection_lost instead of the old track-level skip."""
     from app.output import session
-    # Unreachable → hold.
+    # Unreachable flow_consumer_gone → hold.
     sup, timers, rec = _fresh(monkeypatch)
     sup.add_outage_listener(session.classify_outage)
     probe = AsyncMock(return_value=(False, None))
@@ -2532,7 +2607,7 @@ async def test_flow_consumer_gone_unreachable_holds_reachable_skips(monkeypatch)
         skipped.assert_not_called()
         advance.assert_not_called()
 
-    # Reachable → track-level skip (fresh supervisor + hold flag).
+    # Reachable flow_receiver_idle → HOLD too (recover, not skip).
     sup, timers, rec = _fresh(monkeypatch)
     sup.add_outage_listener(session.classify_outage)
     probe = AsyncMock(return_value=(True, "PLAYING"))
@@ -2542,9 +2617,10 @@ async def test_flow_consumer_gone_unreachable_holds_reachable_skips(monkeypatch)
         sup.on_dispatched(item.track)
         sup.on_outage_reported("flow_receiver_idle")
         await _drain()
-        assert session.output_hold_active() is False
-        skipped.assert_awaited_once()
-        advance.assert_awaited_once()
+        assert session.output_hold_active() is True
+        skipped.assert_not_called()
+        advance.assert_not_called()
+        probe.assert_not_awaited()   # recovered before the probe even runs
 
 
 async def test_capture_position_hook_overrides_snapshot():
