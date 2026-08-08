@@ -122,7 +122,11 @@ async def get_queue():
     # show a remove (✕) on the entries this browser queued. Upcoming only
     # — history/now-playing are not guest-removable. (mirrors admin's
     # per-item `position` merge in app/api/admin.py get_queue)
-    queue_rows = [{**_track_dict(i.track), "added_at": i.added_at} for i in queue]
+    # owner_token: the durable half of guest ownership (added_at is the receipt
+    # half). Echoed so a reconnecting guest can match its pre-stored token and
+    # restore the remove (✕) even when it never saw the append response.
+    queue_rows = [{**_track_dict(i.track), "added_at": i.added_at,
+                   "owner_token": i.owner_token} for i in queue]
     history_rows = [_track_dict(i.track) for i in history]
     # plex_held: identity-mode annotate (queue rows carry enqueue-time hold
     # SNAPSHOTS — the flag must resolve live; plan U4). One combined pass so
@@ -2010,6 +2014,12 @@ class SurpriseRequest(BaseModel):
     # Anti-repeat (plan 005): the browser's recently-surprised track ids, excluded
     # from the smart sources so remove + re-press won't return the same track.
     exclude: list[str] = Field(default_factory=list, max_length=50)
+    # Durable ownership token (remove-own-surprise-after-screen-off): the browser
+    # generates + persists this BEFORE the press and sends it here; the server
+    # stamps it on the queued item so the guest can still remove its own track
+    # when this response is lost (phone slept during a slow resolve). Opaque;
+    # optional for back-compat with older clients.
+    owner_token: str | None = Field(default=None, max_length=128)
 
 
 @router.post("/api/queue/surprise")
@@ -2074,7 +2084,7 @@ async def surprise_me(body: SurpriseRequest):
         return {"ok": False}
 
     try:
-        item = await state.queue_engine.append(track)
+        item = await state.queue_engine.append(track, owner_token=body.owner_token)
     except QueueLockError:
         raise HTTPException(status_code=423, detail="queue_locked")
 

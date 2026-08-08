@@ -43,6 +43,15 @@ class QueueItem:
     # twice. Persisted inside metadata_json (no schema change) so the mark
     # survives a restart with the held item at the queue front (R18).
     play_recorded: bool = False
+    # Durable guest ownership (remove-own-surprise-after-screen-off): a client-
+    # generated opaque token the browser persists BEFORE it issues the queue
+    # request and that the server echoes back on this row. The guest UI matches
+    # it to show a remove (✕) on its own entries — unlike the (track_id,
+    # added_at) receipt, this survives a lost POST response (phone slept during a
+    # slow Surprise Me), because ownership is proven by durable server state, not
+    # by receiving the response body. Rides metadata_json like play_recorded (no
+    # queue_state schema migration); None for host/browse appends.
+    owner_token: str | None = None
 
     @property
     def track_id(self) -> str:
@@ -68,6 +77,9 @@ class QueueItem:
                 # Supervisor plan U2 (R19): item-level held-play mark; rides
                 # the metadata blob to avoid a queue_state schema migration.
                 "play_recorded": self.play_recorded,
+                # Durable guest ownership token; rides the blob for the same
+                # no-migration reason. None for host/browse appends.
+                "owner_token": self.owner_token,
             }),
             "added_at": self.added_at,
         }
@@ -89,7 +101,8 @@ class QueueItem:
             holds=meta.get("holds", []) or [],
         )
         return cls(track=track, added_at=data["added_at"],
-                   play_recorded=bool(meta.get("play_recorded", False)))
+                   play_recorded=bool(meta.get("play_recorded", False)),
+                   owner_token=meta.get("owner_token"))
 
 
 @dataclass

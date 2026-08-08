@@ -394,6 +394,52 @@ def test_surprise_pick_is_retractable_via_receipt():
     )
 
 
+def test_surprise_ownership_survives_lost_response_via_token():
+    """remove-own-surprise-after-screen-off: ownership of a surprise pick must be
+    durable — proven by an owner_token reserved+persisted BEFORE the request and
+    echoed by the server — so a phone that sleeps during a slow resolve (missing
+    the response) can still remove its track. A receipt learned only from the
+    response cannot survive that; the token can."""
+    pb = PLAYBACK_JS.read_text(encoding="utf-8")
+    # _doSurprise reserves a token via config and sends it in the POST body.
+    assert "reserveSurpriseToken" in pb and "owner_token" in pb, (
+        "static/playback/index.js _doSurprise must reserve an owner token "
+        "(cfg.reserveSurpriseToken) and send it as owner_token in the surprise POST."
+    )
+    guest = GUEST_APP.read_text(encoding="utf-8")
+    # The guest owns the store, reserves BEFORE the request, matches by the
+    # server-echoed token, and prunes it alongside receipts.
+    assert "surpriseTokens" in guest and "reserveSurpriseToken:" in guest, (
+        "static/guest/app.js must define the surpriseTokens store and wire "
+        "reserveSurpriseToken into mountPlayback."
+    )
+    assert "surpriseTokens.has(" in guest and "surpriseTokens.prune(" in guest, (
+        "guestRemovePlan must match rows by the echoed owner_token, and both "
+        "resync paths must prune stale tokens."
+    )
+    # Insecure-context safety: plain-http LAN installs have no crypto.randomUUID.
+    assert "getRandomValues" in guest and "randomUUID(" not in guest, (
+        "Token generation must use crypto.getRandomValues (works on http LAN "
+        "installs); crypto.randomUUID() is secure-context-only and must not be called."
+    )
+
+
+def test_surprise_token_prune_has_grace_window():
+    """Regression guard for the prune-before-land race (4-reviewer finding): a
+    freshly reserved token must NOT be pruned before its server row lands, or the
+    feature re-breaks in its exact target window. The store stamps a reserve
+    timestamp and prune keeps a token when its row is present OR it is still young."""
+    guest = GUEST_APP.read_text(encoding="utf-8")
+    assert "GRACE_MS" in guest, (
+        "surpriseTokens must keep reserved-but-not-yet-echoed tokens for a grace "
+        "window so a queue_changed/refresh during the resolve can't prune them."
+    )
+    assert re.search(r"present\.has\([^\n]*\|\|[^\n]*GRACE_MS", guest), (
+        "surpriseTokens.prune must keep a token when its row is present OR younger "
+        "than GRACE_MS (present-or-young filter)."
+    )
+
+
 def test_surprise_button_has_inflight_working_state():
     """The shared control defines a distinct in-flight working state — spinner +
     a SELF-CONTAINED spin keyframe (so it animates on the admin dock too, where

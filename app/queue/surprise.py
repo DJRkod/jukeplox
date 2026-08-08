@@ -29,6 +29,12 @@ _log = logging.getLogger(__name__)
 # resolve gives up (see the CONSCIOUS INVERSION note at the floor call site).
 _PLEX_LOCK_FLOOR_TRIES = 8
 
+# Never-dead-end floor resilience (2026-08-08 latency pass): a transient error on
+# a single floor draw (e.g. a Plex ReadTimeout, or the shared httpx pool briefly
+# degraded after a slow smart source) must NOT abandon the floor and queue nothing
+# while the catalog has content — retry a few draws before giving up.
+_FLOOR_ERROR_RETRIES = 3
+
 SOURCE_PLEX_SONIC = "plex_sonic"
 SOURCE_PLEX_SIMILAR = "plex_similar_artist"
 SOURCE_HEURISTIC = "heuristic"
@@ -155,9 +161,10 @@ async def resolve_surprise(
     get_exclusions=None,
     get_enabled_libraries=None,
     sonic_seed_tries: int = 2,
-    similar_name_tries: int = 12,
+    similar_name_tries: int = 6,
     get_plex_lock_ids=None,
     notify_lock_giveup=None,
+    resolve_budget_s: float = 8.0,
 ):
     """Return ``(track, source_label)`` for one Surprise pick.
 
@@ -182,6 +189,18 @@ async def resolve_surprise(
         from app.state import plex_lock_enabled_ids as get_plex_lock_ids  # noqa: F811
     if notify_lock_giveup is None:
         from app.state import notify_plex_lock_giveup as notify_lock_giveup  # noqa: F811
+
+    # Wall-clock budget clock — started HERE, before the first await, so the
+    # pre-resolve prefetches (get_exclusions, get_plex_lock_ids) count against the
+    # budget too. Under DB contention those reads can stall; starting the clock at
+    # entry keeps the total press latency honestly bounded rather than letting an
+    # unbudgeted prefetch erode the smart-source window silently. See the chain
+    # loop below for how the budget gates the smart sources.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, resolve_budget_s)
+
+    def _remaining() -> float:
+        return deadline - loop.time()
 
     # Anti-repeat (plan 005): the browser's recently-surprised track ids, excluded
     # from the smart sources so remove + re-press won't repeat. The floor ignores
@@ -363,25 +382,54 @@ async def resolve_surprise(
     # 500 the public endpoint. The intra-source guards above already keep partial
     # slowness from killing a source; this loop is the comprehensive safety net so
     # any unanticipated failure still falls through to heuristic → random.
+    #
+    # Wall-clock budget (latency guard): the smart sources issue many Plex round
+    # trips through a bounded per-server semaphore, and a stalled read can burn the
+    # full 15s httpx timeout — the field-reported 15-30s press. The budget gates
+    # STARTING a smart source: once the deadline has passed we skip the remaining
+    # smart/heuristic sources (all Plex-bound) and fall to the random floor.
+    #
+    # We deliberately do NOT wait_for/cancel a source mid-flight. Cancelling an
+    # in-flight httpx request interrupts it at an arbitrary await and leaves the
+    # shared Plex connection pool degraded, so the very next consumer — the random
+    # floor — then stalls on a poisoned connection for the full 15s and could even
+    # fail (hardware-observed: an 8s cancel followed by a 15s floor ReadTimeout →
+    # a ~23s press that queued NOTHING). Bounding by starting-gate + trimmed
+    # fan-out (see similar_name_tries / albums_sample) keeps the common case fast
+    # without that failure mode; a single started source is bounded by its own
+    # trimmed work and the per-call 15s httpx ceiling. The floor is NEVER budgeted
+    # (R4) and now tolerates a transient draw error (see below). The budget clock
+    # (loop/deadline/_remaining) starts at function entry above, so these smart
+    # sources see whatever budget the pre-resolve prefetches left.
+    _SMART_SOURCES = {"sonic", "similar", "heuristic"}
+    _SMART_FNS = {"sonic": try_sonic, "similar": try_similar, "heuristic": try_heuristic}
+    _SMART_LABELS = {"sonic": SOURCE_PLEX_SONIC, "similar": SOURCE_PLEX_SIMILAR,
+                     "heuristic": SOURCE_HEURISTIC}
     for source in chain:
         try:
-            if source == "sonic":
-                t = await try_sonic()
+            if source in _SMART_SOURCES:
+                if _remaining() <= 0:
+                    _log.info("surprise: resolve budget (%.1fs) spent — skipping "
+                              "%r, degrading toward the random floor",
+                              resolve_budget_s, source)
+                    continue
+                t = await _SMART_FNS[source]()
                 if t is not None:
-                    return t, SOURCE_PLEX_SONIC
-            elif source == "similar":
-                t = await try_similar()
-                if t is not None:
-                    return t, SOURCE_PLEX_SIMILAR
-            elif source == "heuristic":
-                t = await try_heuristic()
-                if t is not None:
-                    return t, SOURCE_HEURISTIC
+                    return t, _SMART_LABELS[source]
             elif source == "random":
                 if lock_ids is None:
-                    t = await shuffle_provider()
-                    if t is not None:
-                        return t, SOURCE_RANDOM
+                    # Never-dead-end floor: retry a few draws so one transient
+                    # error doesn't abandon the floor and queue nothing.
+                    for _ in range(_FLOOR_ERROR_RETRIES):
+                        try:
+                            t = await shuffle_provider()
+                        except Exception as e:
+                            _log.warning("surprise floor draw failed, retrying: %r", e)
+                            continue
+                        if t is not None:
+                            return t, SOURCE_RANDOM
+                        break  # provider returned None → library genuinely empty
+                    return None, None
                 else:
                     # CONSCIOUS INVERSION of the never-dead-end floor rule
                     # (2026-08-04-002 plan U8, R11). docs/solutions/design-
@@ -397,7 +445,13 @@ async def resolve_surprise(
                     # debounced admin notice, the queue simply doesn't refill.
                     saw_candidate = False
                     for _ in range(_PLEX_LOCK_FLOOR_TRIES):
-                        t = await shuffle_provider()
+                        try:
+                            t = await shuffle_provider()
+                        except Exception as e:
+                            # A transient draw error is not a dead library — try
+                            # the next re-roll rather than abandoning the floor.
+                            _log.warning("surprise floor draw failed, retrying: %r", e)
+                            continue
                         if t is None:
                             break  # library genuinely empty — the pre-existing
                             #        no-pick condition, not a lock give-up
@@ -414,7 +468,7 @@ async def resolve_surprise(
     return None, None
 
 
-async def _artist_random_track(client, sk, artist, acceptable, albums_sample: int = 2):
+async def _artist_random_track(client, sk, artist, acceptable, albums_sample: int = 1):
     """Resolve an already-matched local artist to a RANDOM acceptable track,
     cheaply: sample a couple of the artist's albums and fetch their tracks in
     parallel (speedup A/E), instead of scanning every album sequentially. Picking

@@ -113,6 +113,74 @@ const queueReceipts = {
   },
 };
 
+// ── Durable surprise ownership tokens (remove-own-surprise-after-screen-off) ──
+//
+// Unlike the (track_id, added_at) receipt above — which is only learned from the
+// append RESPONSE and is therefore lost when a phone sleeps during a slow
+// Surprise Me — an ownership token is generated and persisted HERE, BEFORE the
+// request goes out. The server stamps it on the queued row and echoes it on
+// every queue payload (GET + queue_changed), so this browser can match its own
+// row and keep the remove (✕) even if it never saw the response. A row is owned
+// when its `owner_token` is one we reserved.
+function _genOwnerToken() {
+  // crypto.randomUUID is secure-context-only (absent on plain-http LAN installs,
+  // e.g. http://<nas>:80); crypto.getRandomValues works everywhere. Fall back to
+  // a time+random string only if crypto is entirely unavailable.
+  try {
+    const a = new Uint8Array(16);
+    crypto.getRandomValues(a);
+    return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    return 'r' + Date.now().toString(16) + Math.random().toString(16).slice(2);
+  }
+}
+const surpriseTokens = {
+  KEY: 'jukeplox.surpriseTokens',
+  // Grace window: keep a reserved-but-not-yet-echoed token this long so a
+  // queue_changed / refresh that fires DURING the resolve (another guest's add,
+  // a track advance, or the screen-on resync) can't prune it before its row
+  // lands. Must exceed the resolve budget (~8s) plus wake slack — otherwise the
+  // feature re-breaks in exactly its target window (the prune-before-land race).
+  GRACE_MS: 30000,
+  // Bound growth from presses that never produce a row (ok:false / 423 / a lost
+  // request the server never processed): keep only the most-recent CAP tokens.
+  CAP: 100,
+  _raw() {
+    try { return JSON.parse(localStorage.getItem(this.KEY)) || []; }
+    catch { return []; }
+  },
+  // Normalize to [{t, ts}]; tolerate the legacy plain-string format (ts=0 → old,
+  // so it survives while its row is present and is reaped once the row is gone).
+  load() {
+    return this._raw()
+      .map((e) => (typeof e === 'string' ? { t: e, ts: 0 } : e))
+      .filter((e) => e && e.t);
+  },
+  _write(list) {
+    try { localStorage.setItem(this.KEY, JSON.stringify(list.slice(-this.CAP))); }
+    catch { /* private mode / quota — ownership silently degrades, no crash */ }
+  },
+  // Reserve a new token, persist it (with a reserve timestamp) BEFORE the request.
+  reserve() {
+    const token = _genOwnerToken();
+    const list = this.load();
+    list.push({ t: token, ts: Date.now() });
+    this._write(list);
+    return token;
+  },
+  has(token) { return !!token && this.load().some((e) => e.t === token); },
+  forget(token) { this._write(this.load().filter((e) => e.t !== token)); },
+  // Hygiene: drop a token only when its row is absent AND it is older than the
+  // grace window. A freshly reserved token whose row hasn't landed yet is within
+  // grace → KEPT (fixes the prune-before-land race); a played/removed row's token
+  // is absent + eventually old → reaped. Called on every queue render.
+  prune(queueItems) {
+    const present = new Set((queueItems || []).map((i) => i.owner_token).filter(Boolean));
+    const now = Date.now();
+    this._write(this.load().filter((e) => present.has(e.t) || (now - e.ts) < this.GRACE_MS));
+  },
+};
+
 // Guest remove plan (unify-queue-remove U3): returns { singles, albums } for the
 // shared playback renderer (static/playback/index.js _renderRemovePlan), which
 // draws the ✕ chip + full-height album bar. Guest scope = the browser's OWN
@@ -121,15 +189,29 @@ const queueReceipts = {
 // remove() redeems the receipt via /api/queue/undo, drops it locally, and toasts;
 // the server's queue_changed broadcast re-renders for every client.
 function guestRemovePlan(items) {
-  const remove = async (body, msg) => {
+  const remove = async (body, msg, token) => {
     const [status] = await api('POST', '/api/queue/undo', body);
-    if (status === 200) { queueReceipts.forget(body); showToast(msg); }
-    else showToast('Could not remove');
+    if (status === 200) {
+      queueReceipts.forget(body);
+      if (token) surpriseTokens.forget(token);
+      showToast(msg);
+    } else showToast('Could not remove');
   };
   const singles = [];
   const albums = [];
   let i = 0;
   while (i < items.length) {
+    // Token-owned (surprise) rows first: ownership is proven by a pre-stored
+    // owner_token the server echoes on the row, so it survives a lost response.
+    // The removal body (track_id, added_at) is read straight off the queue row.
+    const item = items[i];
+    if (surpriseTokens.has(item.owner_token)) {
+      const body = { track_id: item.track_id, added_at: item.added_at };
+      const token = item.owner_token;
+      singles.push({ idx: i, remove: () => remove(body, 'Removed from queue', token) });
+      i++;
+      continue;
+    }
     const owned = queueReceipts.ownedFor(items[i]);
     if (!owned) { i++; continue; }
     if (owned.kind === 'single') {
@@ -228,10 +310,12 @@ const playbackHandle = mountPlayback({
   queue: { el: '#queue-list', removePlan: guestRemovePlan },
   history: { el: '#history-strip' },
   toast: showToast,
-  // Surprise picks queue from the playback dock, not the browse add flow — wire
-  // the same receipt persistence so a guest can remove a track their own
-  // Surprise press queued (mirrors the mountBrowser onQueued below).
-  onQueued: (receipt) => { queueReceipts.save(receipt); refreshQueueState(); },
+  // Surprise ownership is proven by a durable owner_token reserved BEFORE the
+  // press (see reserveSurpriseToken) — not by the response receipt, which is
+  // lost when the phone sleeps mid-resolve. So the happy path here just needs to
+  // re-render; the token (already persisted) makes the row removable regardless.
+  reserveSurpriseToken: () => surpriseTokens.reserve(),
+  onQueued: () => { refreshQueueState(); },
   // Nav plan U5 wiring: name taps route to the shared browse module's
   // navigation API; the origin link returns here via the tab strip.
   onNameTap: (t) => {
@@ -260,6 +344,7 @@ async function refreshQueueState() {
   const [, queue] = await api('GET', '/api/queue');
   if (queue) {
     queueReceipts.prune(queue.queue);  // bound storage; drop receipts for gone entries
+    surpriseTokens.prune(queue.queue); // and the durable ownership tokens
     playbackHandle.applyQueue(queue.queue, queue.history);
     setLocked(queue.is_locked);
   }
@@ -299,6 +384,7 @@ function connectWS() {
     else if (msg.type === 'track_skipped') playbackHandle.showSkipped(msg);
     else if (msg.type === 'queue_changed') {
       queueReceipts.prune(msg.queue);
+      surpriseTokens.prune(msg.queue);
       playbackHandle.applyQueue(msg.queue, msg.history);
       setLocked(msg.is_locked);
     } else if (msg.type === 'lock_changed') {

@@ -72,6 +72,10 @@ GUEST_ALLOWED = {
     # Own-track receipt store (remove-own-queued-tracks U4): browser-local
     # ownership for the in-queue remove (✕); onQueued is inline config.
     "queueReceipts",
+    # Durable surprise-ownership token store + generator (remove-own-surprise-
+    # after-screen-off): ownership that survives a lost append response, matched
+    # against the server-echoed owner_token on each queue row.
+    "surpriseTokens", "_genOwnerToken",
     # Queue remove plan (unify-queue-remove): builds {singles, albums} for the
     # shared playback remove renderer (receipt-scoped; album-as-unit).
     "guestRemovePlan",

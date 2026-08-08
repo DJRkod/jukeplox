@@ -517,6 +517,69 @@ def test_surprise_enqueues_and_returns_source(client, mock_deps):
     assert [i.track_id for i in qe.queue] == ["c1"]
 
 
+def test_surprise_stamps_owner_token_on_queue_item(client, mock_deps):
+    """Durable ownership: the browser sends a pre-generated owner_token with the
+    press; the server stamps it onto the appended queue item so ownership is
+    recoverable from durable queue state even if the POST response is lost (phone
+    slept during a slow resolve)."""
+    qe, _ = mock_deps
+    with patch("app.queue.surprise.resolve_surprise",
+               AsyncMock(return_value=(_surprise_track("c1"), "random"))):
+        resp = client.post(
+            "/api/queue/surprise",
+            json={"picks": [], "owner_token": "tok-abc123"},
+        )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    assert qe.queue[0].owner_token == "tok-abc123"
+
+
+def test_surprise_without_owner_token_leaves_none(client, mock_deps):
+    """Back-compat: an older client that omits owner_token still queues; the
+    item simply carries no owner (None), never a crash."""
+    qe, _ = mock_deps
+    with patch("app.queue.surprise.resolve_surprise",
+               AsyncMock(return_value=(_surprise_track("c1"), "random"))):
+        resp = client.post("/api/queue/surprise", json={"picks": []})
+    assert resp.status_code == 200
+    assert qe.queue[0].owner_token is None
+
+
+async def test_get_queue_echoes_owner_token(client, mock_deps):
+    """The GET /api/queue rows carry owner_token so a reconnecting guest can
+    match its stored token against the (possibly-missed) queued row and restore
+    the remove (✕). None for host/browse appends."""
+    qe, _ = mock_deps
+    await qe.append(make_track("t1"), bypass_lock=True, owner_token="tok-1")
+    await qe.append(make_track("t2"), bypass_lock=True)
+    rows = client.get("/api/queue").json()["queue"]
+    assert rows[0]["owner_token"] == "tok-1"
+    assert rows[1]["owner_token"] is None
+
+
+async def test_undo_removes_by_receipt_ignoring_owner_token(client, mock_deps):
+    """Security invariant: /api/queue/undo matches only (track_id, added_at) and
+    never requires or consults owner_token — the token is a client-side UI hint,
+    not an auth credential. A token-owned row is removable by its receipt alone,
+    with no token presented. Pins the token as non-load-bearing server-side."""
+    qe, _ = mock_deps
+    item = await qe.append(make_track("t1"), bypass_lock=True, owner_token="secret-tok")
+    resp = client.post("/api/queue/undo",
+                       json={"track_id": item.track_id, "added_at": item.added_at})
+    assert resp.status_code == 200 and resp.json().get("removed", 0) >= 1
+    assert qe.queue == []
+
+
+def test_queue_event_item_carries_owner_token():
+    """The queue_changed WS payload (which the queue re-renders paint straight
+    from, no refetch) must carry owner_token exactly as the GET does — else a
+    push-driven re-render would strip a token-owned row's ✕."""
+    from app.state import _queue_event_item
+    from app.queue.models import QueueItem
+    item = QueueItem(track=make_track("t1"), owner_token="tok-9")
+    ev_item = _queue_event_item(item)
+    assert ev_item.owner_token == "tok-9"
+
+
 def test_surprise_disabled_returns_403(client):
     """Covers AE5 (server side). Master off → endpoint refuses, nothing queued."""
     async def fake_get(key, *a):

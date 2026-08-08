@@ -185,6 +185,77 @@ async def test_heuristic_failsoft_when_library_raises():
     assert track.id == "rand"
 
 
+# ── Resolution latency budget ───────────────────────────────────────────────────
+
+async def test_resolve_budget_skips_later_sources_after_overrun():
+    """Between-source deadline: a source that OVERRUNS the budget without a hit
+    causes the remaining smart sources to be skipped (via the _remaining()<=0
+    pre-check) — the chain falls to the fast random floor instead of piling on
+    more slow Plex work. Note: the budget gates STARTING a source; it does not
+    cancel one mid-flight (see the no-cancellation test below)."""
+    import asyncio
+    class SlowEmptySonic(FakeClient):
+        async def get_sonic_nearest(self, track_id, **kw):
+            self.calls.append(("sonic", track_id))
+            await asyncio.sleep(0.3)   # slow, but no candidates → consumes budget
+            return []
+    fc = SlowEmptySonic(
+        similar_names={"s1": ["Sim"]}, artists={"1": [FakeArtist("a1", "Sim")]},
+        albums={"a1": [FakeAlbum("al1")]}, album_tracks={"al1": [mk_track("c2")]},
+        genre_tracks={"Rock": [mk_track("c3")]},
+    )
+    floor = mk_track("rand", artist="Floor")
+    track, source = await resolve_surprise(
+        SEED, "auto", **_kw(client=fc, shuffle_provider=make_shuffle(floor)),
+        resolve_budget_s=0.1)
+    assert source == SOURCE_RANDOM and track.id == "rand"
+    # similar + heuristic skipped once the budget was spent — never attempted.
+    assert not _has(fc.calls, "similar_names")
+    assert not _has(fc.calls, "get_artists")
+    assert not _has(fc.calls, "get_tracks")
+
+
+async def test_resolve_no_midsource_cancellation_started_source_completes():
+    """A smart source that has STARTED within budget runs to completion and its
+    hit is used — the resolver no longer cancels mid-flight. (Mid-source
+    cancellation poisoned the shared Plex httpx pool and broke the subsequent
+    floor on real hardware — a ~23s press that queued nothing.)"""
+    import asyncio
+    class SlowHitSonic(FakeClient):
+        async def get_sonic_nearest(self, track_id, **kw):
+            await asyncio.sleep(0.3)
+            return [mk_track("c1", artist="X")]
+    track, source = await resolve_surprise(
+        SEED, "auto", **_kw(client=SlowHitSonic()), resolve_budget_s=0.1)
+    # Not cancelled at the 0.1s budget — sonic completed and its hit is used.
+    assert source == SOURCE_PLEX_SONIC and track.id == "c1"
+
+
+async def test_floor_tolerates_transient_draw_error():
+    """Never-dead-end: a transient error on one floor draw (e.g. a Plex
+    ReadTimeout, or the shared pool briefly degraded) must not abandon the floor
+    and queue nothing — it retries and still returns a track when content exists."""
+    calls = {"n": 0}
+    async def flaky_floor():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient plex read timeout")
+        return mk_track("rand", artist="Floor")
+    track, source = await resolve_surprise(
+        [], "random", **_kw(shuffle_provider=flaky_floor))
+    assert source == SOURCE_RANDOM and track.id == "rand"
+    assert calls["n"] == 2   # retried after the transient error
+
+
+async def test_resolve_budget_generous_still_uses_smart_source():
+    """The budget only bites on a stall: a fast smart source under budget still
+    wins (no behavior change on a healthy server)."""
+    fc = FakeClient(sonic={"s1": [mk_track("c1", artist="X")]})
+    track, source = await resolve_surprise(
+        SEED, "auto", **_kw(client=fc), resolve_budget_s=8.0)
+    assert source == SOURCE_PLEX_SONIC and track.id == "c1"
+
+
 # ── No-seed rule (R4) ──────────────────────────────────────────────────────────
 
 async def test_no_seed_goes_random_and_skips_smart_sources():
@@ -366,22 +437,24 @@ async def test_album_mode_candidate_without_album_id_not_gated():
 
 async def test_similar_artist_picks_random_track_not_first():
     """Covers AE1. The similar-artist path picks a RANDOM track from the chosen
-    artist across albums, not deterministically the first."""
+    artist (patched random → last), not deterministically the first. The album
+    sample is 1 (latency trim 2026-08-08), so this exercises random-pick WITHIN
+    the sampled album rather than across albums."""
     from unittest.mock import patch
     fc = FakeClient(
         sonic={"s1": []},
         similar_names={"s1": ["Sim Act"]},
         artists={"1": [FakeArtist("a1", "Sim Act")]},
-        albums={"a1": [FakeAlbum("al1"), FakeAlbum("al2")]},
+        albums={"a1": [FakeAlbum("al1")]},
         album_tracks={
-            "al1": [mk_track("t1", artist="Sim Act"), mk_track("t2", artist="Sim Act")],
-            "al2": [mk_track("t3", artist="Sim Act")],
+            "al1": [mk_track("t1", artist="Sim Act"), mk_track("t2", artist="Sim Act"),
+                    mk_track("t3", artist="Sim Act")],
         },
     )
     with patch("app.queue.surprise.random.choice", lambda seq: seq[-1]):
         track, source = await resolve_surprise(SEED, "auto", **_kw(client=fc))
     assert source == SOURCE_PLEX_SIMILAR
-    # last of [t1,t2,t3] proves it gathered across albums + random-picked, not first
+    # random.choice patched to last → t3, proving it is not pinned to the first track
     assert track.id == "t3"
 
 

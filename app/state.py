@@ -750,6 +750,7 @@ def _queue_event_item(item):
         duration_ms=t.duration_ms,
         album_id=t.album_id,
         added_at=item.added_at,
+        owner_token=getattr(item, "owner_token", None),
     )
 
 

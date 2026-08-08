@@ -43,6 +43,11 @@ class QueueItem:
     # broadcast; defaults True (fail-open — the server enqueue gate, not the
     # client dim, is the enforcement).
     plex_held: bool = True
+    # Durable guest-ownership token (remove-own-surprise-after-screen-off): rides
+    # the push exactly as added_at/plex_held do, so a queue_changed re-render
+    # (which paints from this payload, not a refetch) keeps a token-owned row's
+    # remove (✕). None for host/browse appends and all history rows.
+    owner_token: str | None = None
 
 
 @dataclass
