@@ -167,12 +167,48 @@ async def get_track(identity: str) -> dict | None:
 
 
 async def get_all_tracks() -> list[dict]:
-    """Every track row — the candidate pool for whole-library random and the
-    multi-source search floor (U8/U13)."""
+    """Every track row — the candidate pool for the multi-source search floor
+    (U8/U13). NOTE: this streams the WHOLE table; for a single random pick use
+    ``get_random_track`` instead (loading 100k+ rows per Surprise/shuffle press
+    cost seconds — 2026-08-09 latency fix)."""
     async with database._conn().execute(
         f"SELECT {_TRACK_COLS} FROM catalog_track"
     ) as cur:
         return [dict(row) async for row in cur]
+
+
+async def get_random_track(
+    min_ms: int | None = None, max_ms: int | None = None
+) -> dict | None:
+    """ONE random track row via an indexed pick — the whole-library random floor's
+    candidate, WITHOUT loading the whole table (2026-08-09 latency fix; the old
+    floor streamed every row and, for Plex, traversed artist→album→track live at
+    ~2.4s per draw). Source-neutral: the catalog spans every connected source.
+
+    With a length band the SQL keeps only in-band rows so a match is GUARANTEED
+    when one exists; bounds are INCLUSIVE and a NULL/zero duration always passes,
+    mirroring ``surprise._within_length``. Returns None when nothing qualifies
+    (a band excludes every row, or the catalog is empty) — the caller owns the
+    never-dead-end unfiltered retry."""
+    sql = f"SELECT {_TRACK_COLS} FROM catalog_track"
+    params: list = []
+    if min_ms is not None or max_ms is not None:
+        band = []
+        if min_ms is not None:
+            band.append("duration_ms >= ?")
+            params.append(min_ms)
+        if max_ms is not None:
+            band.append("duration_ms <= ?")
+            params.append(max_ms)
+        # NULL/zero durations pass (never drop a track whose length we can't read).
+        sql += (
+            " WHERE duration_ms IS NULL OR duration_ms = 0 OR ("
+            + " AND ".join(band) + ")"
+        )
+    sql += " ORDER BY RANDOM() LIMIT 1"
+    async with database._conn().execute(sql, params) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
 
 
 async def is_empty() -> bool:

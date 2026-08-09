@@ -780,58 +780,50 @@ async def _broadcast_queue_changed() -> None:
         await manager.broadcast_to_all(ev)
 
 
-def _row_within_band(row, min_ms, max_ms) -> bool:
-    """Inclusive [min_ms, max_ms] band test on a catalog track row's
-    ``duration_ms``, mirroring ``surprise._within_length``: a missing/zero
-    duration always passes (we never silently drop a track whose length we
-    can't read). Both bounds None → always True."""
-    dur = row.get("duration_ms") or 0
-    if not dur:
-        return True
-    if min_ms is not None and dur < min_ms:
-        return False
-    if max_ms is not None and dur > max_ms:
-        return False
-    return True
-
-
 async def _catalog_shuffle(min_ms, max_ms):
     """Whole-library random off the unified catalog — the source-neutral floor
-    (plan U13).
+    (plan U13), now an INDEXED single-row pick (2026-08-09 latency fix) rather
+    than loading every catalog row per press.
 
-    The Plex artist→album→track traversal below can't reach Jellyfin/local
-    content, so once a non-Plex source is connected the random floor draws from
-    the catalog's track rows instead. Band handling mirrors ``_shuffle_provider``:
-    when a min/max is in effect, filter rows to the band and pick one at random;
-    if none qualify, fall back to an unfiltered pick so the floor never
-    dead-ends. Returns a fully-built ``Track`` (carrying its priority-ordered
-    holds for play-time fallback) or None when the catalog is empty."""
+    The catalog spans EVERY connected source, so this is the fast floor for
+    all-Plex installs too — the old Plex artist→album→track traversal cost ~2.4s
+    per draw and was re-rolled up to ``_PLEX_LOCK_FLOOR_TRIES`` (8×) under the
+    plexplayer source-lock and ``_SHUFFLE_BAND_TRIES`` (25×) under a length band
+    (the field-reported 15-25s Surprise "Random" press). Band handling mirrors
+    ``_within_length`` (inclusive bounds; a missing/zero duration passes) and is
+    pushed into SQL, so a match is guaranteed when one exists; when a band
+    excludes every row a final UNFILTERED pick keeps the floor from dead-ending.
+    Returns a fully-built ``Track`` (carrying its priority-ordered holds for
+    play-time fallback and the plexplayer source-lock check) or None when the
+    catalog is empty."""
     from app.catalog import store, views
-    rows = await store.get_all_tracks()
-    if not rows:
-        return None
     if min_ms is not None or max_ms is not None:
-        in_band = [r for r in rows if _row_within_band(r, min_ms, max_ms)]
-        if in_band:
-            rows = in_band
-    return await views._track(random.choice(rows))
+        row = await store.get_random_track(min_ms=min_ms, max_ms=max_ms)
+        if row is not None:
+            return await views._track(row)
+        # band excluded every row → never-dead-end unfiltered pick below
+    row = await store.get_random_track()
+    return await views._track(row) if row else None
 
 
 async def _shuffle_provider(bounds=_UNSET):
-    """Return a random track from enabled libraries (artist→album→track traversal).
+    """Return a random track from enabled libraries — the whole-library random
+    floor shared by the guest Surprise Me button and the Full Random queue-end
+    mode (2026-06-21).
 
-    This is the whole-library random floor, shared by the guest Surprise Me
-    button and the Full Random queue-end mode (2026-06-21).
+    Draws from the unified, enabled catalog via a single INDEXED pick
+    (``_catalog_shuffle``) — source-neutral (works for mixed Plex/Jellyfin/local
+    libraries) and instant, with NO per-draw round trips (2026-08-09 latency fix;
+    the old Plex artist→album→track traversal cost ~2.4s per draw and was
+    re-rolled up to 8× under the plexplayer source-lock and 25× under a length
+    band — the 15-25s Surprise "Random" press). The live Plex traversal below is
+    kept ONLY as a fail-soft fallback for an all-Plex install whose catalog has
+    not been crawled yet (fresh setup) or if the catalog is momentarily
+    unreadable, so a press never dead-ends.
 
-    Random-pick length band: when a min/max is in effect, each traversal's album
-    tracks are filtered to the band and a random in-band track is returned.
-    Because a random album may hold no in-band track, the traversal is retried up
-    to ``_SHUFFLE_BAND_TRIES`` times; if none is found, one final UNFILTERED
-    traversal returns a track anyway so the floor never dead-ends. With no band
-    in effect this is a single unfiltered traversal — identical to the
-    pre-feature behavior.
-
-    ``bounds`` selects where the band comes from:
+    Random-pick length band: applied inside ``_catalog_shuffle`` (in SQL) and,
+    on the traversal fallback, per album. ``bounds`` selects where the band
+    comes from:
       - ``_UNSET`` (the no-arg Surprise Me call): fetch and apply the admin band
         (``get_random_length_bounds``) — unchanged 2026-06-20 behavior.
       - an explicit ``(min_ms, max_ms)`` (the queue-end caller): use it directly.
@@ -844,10 +836,26 @@ async def _shuffle_provider(bounds=_UNSET):
     else:
         min_ms, max_ms = bounds
 
-    # Source-neutral floor (plan U13): with a non-Plex source connected, the Plex
-    # traversal below can't see Jellyfin/local tracks — draw from the catalog.
-    if await catalog_active():
-        return await _catalog_shuffle(min_ms, max_ms)
+    # Source-neutral catalog floor first. Fail-soft: an empty catalog (fresh
+    # install pre-crawl) or a momentarily unreadable one degrades to the live
+    # Plex traversal below so a press never dead-ends.
+    catalog_empty = False
+    try:
+        track = await _catalog_shuffle(min_ms, max_ms)
+        if track is not None:
+            return track
+        catalog_empty = True  # _catalog_shuffle returns None only when empty
+    except Exception as e:
+        # Defensive DB-read resilience: a momentarily unreadable catalog degrades
+        # to the live traversal rather than dead-ending the press.
+        _log.debug("shuffle floor: catalog pick unavailable (%r); "
+                   "falling back to live traversal", e)
+
+    # With a non-Plex source connected the catalog is the ONLY floor (the Plex
+    # traversal can't see Jellyfin/local tracks), so an empty catalog there means
+    # genuinely nothing to play — don't fall through to a partial Plex traversal.
+    if catalog_empty and await catalog_active():
+        return None
 
     # Band-invariant fetches are hoisted out of the retry loop — the client and
     # the enabled-library list don't change between attempts, so re-fetching them

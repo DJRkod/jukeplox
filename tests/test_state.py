@@ -692,7 +692,11 @@ def _shuf_client(tracks_return):
 def _shuf_ctx(client, bounds):
     import app.state as st
     import app.database as db
+    # The floor now draws from the unified catalog first; these traversal tests
+    # exercise the fail-soft fallback, so force an empty catalog pick (2026-08-09
+    # latency fix). Catalog-first behavior has its own tests below.
     with patch.object(st, "get_plex_client", AsyncMock(return_value=client)), \
+         patch.object(st, "_catalog_shuffle", AsyncMock(return_value=None)), \
          patch.object(db, "get_enabled_libraries",
                       AsyncMock(return_value=[{"section_key": "1"}])), \
          patch.object(db, "get_random_length_bounds", AsyncMock(return_value=bounds)):
@@ -757,6 +761,49 @@ async def test_shuffle_provider_empty_library_returns_none_with_band():
     assert track is None
 
 
+async def test_shuffle_provider_prefers_catalog_no_live_traversal():
+    """The floor draws from the unified catalog via one indexed pick and does NOT
+    perform the live Plex artist→album→track traversal when the catalog has
+    content (2026-08-09 latency fix: ~2.4s/draw traversal → indexed pick)."""
+    import app.state as st
+    client = _shuf_client([_shuf_track("t1", 5000)])
+    cat_track = _shuf_track("cat1", 200000)
+    with _shuf_ctx(client, (None, None)):
+        # Override the ctx's empty-catalog default: the catalog serves a track.
+        with patch.object(st, "_catalog_shuffle", AsyncMock(return_value=cat_track)):
+            track = await st._shuffle_provider()
+    assert track is not None and track.id == "cat1"
+    assert client.get_artists.await_count == 0   # no live traversal
+    assert client.get_albums.await_count == 0
+    assert client.get_tracks.await_count == 0
+
+
+async def test_shuffle_provider_mixed_empty_catalog_returns_none():
+    """With a non-Plex source connected (catalog_active) and an empty catalog,
+    the floor returns None rather than a partial Plex-only traversal — the
+    catalog is the ONLY source-neutral floor for mixed libraries."""
+    import app.state as st
+    client = _shuf_client([_shuf_track("t1", 5000)])
+    with _shuf_ctx(client, (None, None)):          # _catalog_shuffle → None (empty)
+        with patch.object(st, "catalog_active", AsyncMock(return_value=True)):
+            track = await st._shuffle_provider()
+    assert track is None
+    assert client.get_artists.await_count == 0   # no traversal for mixed
+
+
+async def test_shuffle_provider_catalog_error_falls_back_to_traversal():
+    """A catalog read error degrades to the live traversal (never dead-end),
+    for an all-Plex install."""
+    import app.state as st
+    client = _shuf_client([_shuf_track("t1", 5000)])
+    with _shuf_ctx(client, (None, None)):
+        with patch.object(st, "_catalog_shuffle",
+                          AsyncMock(side_effect=RuntimeError("db hiccup"))):
+            track = await st._shuffle_provider()
+    assert track is not None and track.id == "t1"
+    assert client.get_artists.await_count == 1   # traversal fallback ran
+
+
 # ── Auto-fill provider (queue-end modes; 2026-06-21 plan U3) ─────────────────
 
 @contextlib.contextmanager
@@ -765,7 +812,10 @@ def _auto_ctx(client, *, length_limit, bounds=(30000, 600000)):
     length-limit checkbox state, and the stored band (applied only when on)."""
     import app.state as st
     import app.database as db
+    # Catalog-first floor: force an empty catalog pick so these queue-end tests
+    # exercise the live-traversal fallback (2026-08-09 latency fix).
     with patch.object(st, "get_plex_client", AsyncMock(return_value=client)), \
+         patch.object(st, "_catalog_shuffle", AsyncMock(return_value=None)), \
          patch.object(db, "get_enabled_libraries",
                       AsyncMock(return_value=[{"section_key": "1"}])), \
          patch.object(db, "get_random_length_bounds", AsyncMock(return_value=bounds)), \

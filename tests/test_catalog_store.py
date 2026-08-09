@@ -109,6 +109,70 @@ async def test_empty_catalog_reads_are_empty(db):
     assert await store.is_empty() is True
 
 
+# ── random floor pick (2026-08-09 latency fix) ───────────────────────────────
+
+async def test_get_random_track_returns_a_catalog_row(db):
+    await store.replace_catalog(
+        artists=[_artist("ar1")], albums=[_album("al1")],
+        tracks=[_track("t1", "al1"), _track("t2", "al1")], holds=[],
+    )
+    picks = {(await store.get_random_track())["identity"] for _ in range(30)}
+    assert picks and picks <= {"t1", "t2"}  # only catalog rows, non-None
+
+
+async def test_get_random_track_empty_catalog_returns_none(db):
+    assert await store.get_random_track() is None
+    assert await store.get_random_track(min_ms=1000, max_ms=2000) is None
+
+
+async def test_get_random_track_band_keeps_only_in_band(db):
+    await store.replace_catalog(
+        artists=[], albums=[_album("al1")],
+        tracks=[
+            _track("short", "al1", duration_ms=3000),
+            _track("good", "al1", duration_ms=200000),
+            _track("long", "al1", duration_ms=2_000_000),
+        ], holds=[],
+    )
+    for _ in range(30):
+        row = await store.get_random_track(min_ms=30000, max_ms=600000)
+        assert row["identity"] == "good"
+
+
+async def test_get_random_track_band_boundaries_inclusive(db):
+    await store.replace_catalog(
+        artists=[], albums=[_album("al1")],
+        tracks=[
+            _track("atmin", "al1", duration_ms=30000),
+            _track("atmax", "al1", duration_ms=600000),
+        ], holds=[],
+    )
+    ids = {(await store.get_random_track(min_ms=30000, max_ms=600000))["identity"]
+           for _ in range(30)}
+    assert ids == {"atmin", "atmax"}  # both endpoints kept (inclusive)
+
+
+async def test_get_random_track_band_zero_or_null_duration_passes(db):
+    """A track whose length we can't read (0/NULL) is never dropped by the band,
+    mirroring surprise._within_length."""
+    await store.replace_catalog(
+        artists=[], albums=[_album("al1")],
+        tracks=[_track("nodur", "al1", duration_ms=0)], holds=[],
+    )
+    row = await store.get_random_track(min_ms=30000, max_ms=600000)
+    assert row is not None and row["identity"] == "nodur"
+
+
+async def test_get_random_track_band_excludes_all_returns_none(db):
+    """When the band matches nothing, return None — the caller owns the
+    never-dead-end unfiltered retry."""
+    await store.replace_catalog(
+        artists=[], albums=[_album("al1")],
+        tracks=[_track("toolong", "al1", duration_ms=9_000_000)], holds=[],
+    )
+    assert await store.get_random_track(min_ms=30000, max_ms=600000) is None
+
+
 async def test_is_empty_false_once_tracks_present(db):
     await store.replace_catalog([], [_album("al1")], [_track("t1", "al1")], [])
     assert await store.is_empty() is False
