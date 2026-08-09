@@ -2227,26 +2227,54 @@ def test_rail_jump_tap_is_swallowed_wrong_artist_guard():
     window lands on whatever row is at that pixel mid-motion (R.E.M. instead of
     the aimed-at Rachel Goswell) and, without a guard, drills into it. The
     guard: _settleJump's abort stamps _settleAbortedAt on a tap interrupt, and
-    every browse nav entry point (list delegation + artist/release tiles)
-    swallows a drill while _tapInterruptedJump() holds; the user's next tap, on
-    settled content, opens the right item. Behavioral proof: the guard-verify
-    harness (jump→immediate tap = no drill; jump→settle→tap = drill)."""
+    every browse nav entry point (list delegation + artist/release tiles +
+    name-links + the year-albums row builder) swallows a drill while
+    _tapInterruptedJump() holds; the user's next tap, on settled content, opens
+    the right item. Behavioral proof: the guard-verify harness (jump→immediate
+    tap = no drill; jump→settle→tap = drill). Hardened 2026-08-08 after code
+    review caught the year-albums rail-bearing view as an un-guarded 4th surface."""
     browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
     assert "function _tapInterruptedJump(" in browse and "_settleAbortedAt" in browse, (
         "the wrong-artist guard must exist: _settleJump stamps _settleAbortedAt on "
         "a tap interrupt and _tapInterruptedJump() gates the nav entry points."
     )
     # Only a TAP (pointerdown/touchstart) arms the guard — a wheel/key interrupt
-    # means the user took over scrolling, not selecting a row.
-    m = re.search(r"const abort = \(e\) => \{(.*?)\};", browse, re.S)
-    assert m and "pointerdown" in m.group(1) and "touchstart" in m.group(1), (
-        "_settleJump's abort must stamp _settleAbortedAt only for pointerdown/touchstart."
+    # means the user took over scrolling, not selecting a row. Assert the code
+    # form directly (robust to arrow-fn reformatting; the closure-body regex was
+    # brittle and could match the explanatory comment instead of the conditional).
+    assert re.search(r"t === 'pointerdown' \|\| t === 'touchstart'", browse), (
+        "_settleJump's abort must gate the _settleAbortedAt stamp on pointerdown/touchstart only."
     )
-    # Guard must gate every drill entry point: the delegated list handler and
-    # both tile builders. Any new queue-into-view/drill path must add it too.
-    assert browse.count("_tapInterruptedJump()") >= 3, (
-        "the guard must gate the list delegation handler AND the artist + release "
-        f"tile click handlers; found {browse.count('_tapInterruptedJump()')} guarded site(s)."
+    assert re.search(r"_settleAbortedAt = _nowMs\(\)", browse), (
+        "the abort must stamp _settleAbortedAt = _nowMs() (the guard's arming write)."
+    )
+    # Init must be -Infinity, not 0: a 0 init arms the guard for the first
+    # _JUMP_TAP_GUARD_MS of page load (performance.now() starts near 0).
+    assert re.search(r"_settleAbortedAt = -Infinity", browse), (
+        "_settleAbortedAt must init to -Infinity so the guard is inert before the first jump."
+    )
+    # Pin the behavioral constants — reducing either silently guts the fix.
+    assert re.search(r"_JUMP_TAP_GUARD_MS\s*=\s*250\b", browse), (
+        "the tap-guard window must be 250ms; a smaller value evaporates the guard."
+    )
+    assert re.search(r"_STABLE_FRAMES\s*=\s*3\b", browse) and "++stable >= _STABLE_FRAMES" in browse, (
+        "_settleJump must early-exit after 3 consecutive flush frames (reset on any shift)."
+    )
+    # Guard POLARITY: the gate must bail on true (if (...) return), not the
+    # inverted sense. Count the guarded-bail form — it must cover every drill
+    # entry point: delegated list handler, artist tile, release tile, BOTH
+    # name-link handlers, and the year-albums row (the surface review caught).
+    bail_sites = len(re.findall(r"if \(_tapInterruptedJump\(\)\) return", browse))
+    assert bail_sites >= 6, (
+        "the guard-and-bail (`if (_tapInterruptedJump()) return`) must gate every "
+        "rail-bearing drill path (list delegation, artist tile, release tile, both "
+        f"name-links, year-albums row); found {bail_sites}."
+    )
+    # The year-albums view activates a rail (_activateRail) AND builds its own
+    # per-row click handler — it must carry the guard (regression: it didn't).
+    m = re.search(r"function _renderYearAlbumsItems\(.*?\n  \}", browse, re.S)
+    assert m and "_tapInterruptedJump()" in m.group(0), (
+        "the year-albums row builder activates a rail, so its row click must be guarded."
     )
 
 

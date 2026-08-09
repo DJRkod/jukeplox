@@ -66,8 +66,14 @@
   // aimed-at Rachel Goswell — 2026-08-08 debug). _tapInterruptedJump() lets the
   // nav entry points swallow that one drill; the user's next tap, on now-settled
   // content, opens the right item.
-  let _settleAbortedAt = 0;
+  // Init to -Infinity, NOT 0: with 0, `_nowMs() - 0` is below the guard window
+  // for the first _JUMP_TAP_GUARD_MS of page load (performance.now() starts near
+  // 0), which would wrongly swallow a drill before any jump has ever run.
+  let _settleAbortedAt = -Infinity;
   const _JUMP_TAP_GUARD_MS = 250;
+  // Consecutive flush frames _settleJump must see before it trusts the landing
+  // and stops (a tuning knob for the same behavior group as the guard window).
+  const _STABLE_FRAMES = 3;
   const _nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
   function _tapInterruptedJump() {
     return (_nowMs() - _settleAbortedAt) < _JUMP_TAP_GUARD_MS;
@@ -1222,7 +1228,6 @@
     // scroller top), exact in any offsetParent arrangement.
     let tries = 20;
     let stable = 0;
-    const _STABLE_FRAMES = 3;
     const tick = () => {
       if (aborted || gen !== _settleJumpGen || !target.isConnected) { cleanup(); return; }
       const delta = target.getBoundingClientRect().top - scrollRoot.getBoundingClientRect().top;
@@ -2370,6 +2375,7 @@
       if (selfArtist) grey(a);
       else a.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (_tapInterruptedJump()) return;   // tap landed mid-jump: don't jump to a moving name-link
         browseToArtist(info.artist, { pane: _paneFor(row) });
       });
     }
@@ -2379,6 +2385,7 @@
       if (selfAlbum) grey(al);
       else al.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (_tapInterruptedJump()) return;   // tap landed mid-jump: don't jump to a moving name-link
         browseToAlbum(info.albumId, info.album, { pane: _paneFor(row) });
       });
     }
@@ -2403,16 +2410,15 @@
   function _renderCellsChunked(column, count, buildCell, isStale, onComplete) {
     return new Promise((resolve) => {
       let i = 0;
-      const _now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
       const pump = () => {
-        const start = _now();
+        const start = _nowMs();
         const frag = document.createDocumentFragment();
         while (i < count) {
           frag.appendChild(buildCell(i));
           i++;
           // One cell is always built before the clock is read, so a slow single
           // build can never stall progress (and the loop can't spin doing zero).
-          if (_now() - start >= _RENDER_FRAME_BUDGET_MS) break;
+          if (_nowMs() - start >= _RENDER_FRAME_BUDGET_MS) break;
         }
         column.appendChild(frag);
       };
@@ -3489,7 +3495,10 @@
       row.className = 'list-item';
       // Single-year view: year omitted from the subtitle (it is constant).
       row.innerHTML = `${_artImg(album.thumb, 'list-art')}<div class="list-info"><div class="list-title">${_esc(album.title)}</div><div class="list-sub"><span class="name-link nl-artist">${_esc(album.artist)}</span></div></div>`;
-      row.addEventListener('click', () => showAlbumTracks(album.id, album.title, null, nav));
+      row.addEventListener('click', () => {
+        if (_tapInterruptedJump()) return;   // Year-Albums has a live rail: guard the mid-jump mis-tap too
+        showAlbumTracks(album.id, album.title, null, nav);
+      });
       _wireNameLinks(row, { artist: album.artist });
       row.appendChild(_albumKebabBtn(album));
       if (bucketData) _setBucketStart(row, bucketData.keyForItem, idx);
