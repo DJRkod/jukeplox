@@ -59,6 +59,25 @@
   // a newer jump starts (two loops must never fight over the scroller).
   let _railScrubTarget = null;
   let _settleJumpGen = 0;
+  // Timestamp a user gesture interrupted an IN-FLIGHT rail jump settle. A tap
+  // that lands while the jump is still converging hits a row that is still
+  // moving under the finger — drilling in would open whatever happened to be at
+  // that pixel mid-motion (the "wrong artist" — e.g. R.E.M. instead of the
+  // aimed-at Rachel Goswell — 2026-08-08 debug). _tapInterruptedJump() lets the
+  // nav entry points swallow that one drill; the user's next tap, on now-settled
+  // content, opens the right item.
+  // Init to -Infinity, NOT 0: with 0, `_nowMs() - 0` is below the guard window
+  // for the first _JUMP_TAP_GUARD_MS of page load (performance.now() starts near
+  // 0), which would wrongly swallow a drill before any jump has ever run.
+  let _settleAbortedAt = -Infinity;
+  const _JUMP_TAP_GUARD_MS = 250;
+  // Consecutive flush frames _settleJump must see before it trusts the landing
+  // and stops (a tuning knob for the same behavior group as the guard window).
+  const _STABLE_FRAMES = 3;
+  const _nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  function _tapInterruptedJump() {
+    return (_nowMs() - _settleAbortedAt) < _JUMP_TAP_GUARD_MS;
+  }
   // Plan 002 U2: singleton rail on document.body. Replaces per-column build.
   // _activeColumn is the .alpha-items-column the rail currently points at;
   // pointer handlers and the highlight observer read it at event time.
@@ -139,7 +158,10 @@
     const sub = (typeof rc === 'number' && rc > 0) ? `${rc} release${rc === 1 ? '' : 's'}` : '';
     tile.innerHTML = `<div class="tile-art-wrap">${_artImg(artist.thumb, 'tile-art')}</div>`
       + `<div class="tile-title">${_esc(artist.title)}</div><div class="tile-sub">${sub}</div>`;
-    tile.addEventListener('click', () => showArtistAlbums(artist.id, artist.title, returnView || 'artists'));
+    tile.addEventListener('click', () => {
+      if (_tapInterruptedJump()) return;   // tap landed mid-jump: don't open a moving tile
+      showArtistAlbums(artist.id, artist.title, returnView || 'artists');
+    });
     return tile;
   }
 
@@ -155,7 +177,10 @@
     const sub = album.artist ? `<span class="name-link nl-artist">${_esc(album.artist)}</span>` : '';
     tile.innerHTML = `<div class="tile-art-wrap">${_artImg(album.thumb, 'tile-art')}</div>`
       + `<div class="tile-title">${_esc(album.title)}</div><div class="tile-sub">${sub}</div>`;
-    if (!noClick) tile.addEventListener('click', () => showAlbumTracks(album.id, album.title, ctx.returnView, ctx.parentNav || null));
+    if (!noClick) tile.addEventListener('click', () => {
+      if (_tapInterruptedJump()) return;   // tap landed mid-jump: don't open a moving tile
+      showAlbumTracks(album.id, album.title, ctx.returnView, ctx.parentNav || null);
+    });
     if (album.artist) _wireNameLinks(tile, { artist: album.artist, currentArtistNorm: ctx.currentArtistNorm });
     const k = _albumKebabBtn(album, ctx.currentArtistNorm);
     k.classList.add('tile-kebab');
@@ -1178,20 +1203,36 @@
     // scroller, and keydown never fires on an unfocused pane div.
     const evs = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
     let aborted = false;
-    const abort = () => { aborted = true; };
+    const abort = (e) => {
+      aborted = true;
+      // Only a TAP (pointerdown/touchstart) arms the wrong-artist guard — a wheel
+      // or key interrupt means the user took over scrolling, not selecting a row.
+      const t = e && e.type;
+      if (t === 'pointerdown' || t === 'touchstart') _settleAbortedAt = _nowMs();
+    };
     evs.forEach(e => window.addEventListener(e, abort, { passive: true, once: true }));
     const cleanup = () => evs.forEach(e => window.removeEventListener(e, abort));
-    // Hold the watch for the FULL window — no early exit on an agreeing read.
-    // rAF callbacks run before the frame's render step, so the realization
-    // shift lands AFTER a tick that still saw estimate-consistent (matching)
-    // geometry; exiting on first agreement misses it. Corrections are
-    // viewport-rect-based (target top vs scroller top), which is exact in any
-    // offsetParent arrangement and self-corrects late realization trickle.
+    // Watch up to a bounded window, but STOP once the landing has held flush for
+    // a few consecutive frames. Exiting on a SINGLE agreeing read is unsafe: rAF
+    // callbacks run before the frame's render step, so a late content-visibility
+    // realization shift can land AFTER one tick that saw estimate-consistent
+    // (matching) geometry. Requiring _STABLE_FRAMES consecutive flush frames
+    // keeps that safety (any shift resets the counter) while ending the loop as
+    // soon as content genuinely settles — instead of always running the full 20.
+    // Each tick forces a synchronous getBoundingClientRect layout on the
+    // content-visibility list (~15ms on a large library); holding for the full
+    // window tripled the jump's main-thread cost (~160ms raw → ~500ms) and left
+    // content micro-adjusting for ~333ms+ — the "chug", and the window in which a
+    // fast follow-up tap lands on a row that has shifted (wrong-artist drill,
+    // 2026-08-08 debug). Corrections are viewport-rect-based (target top vs
+    // scroller top), exact in any offsetParent arrangement.
     let tries = 20;
+    let stable = 0;
     const tick = () => {
       if (aborted || gen !== _settleJumpGen || !target.isConnected) { cleanup(); return; }
       const delta = target.getBoundingClientRect().top - scrollRoot.getBoundingClientRect().top;
-      if (Math.abs(delta) > 1) scrollRoot.scrollTop += delta;
+      if (Math.abs(delta) > 1) { scrollRoot.scrollTop += delta; stable = 0; }
+      else if (++stable >= _STABLE_FRAMES) { cleanup(); return; }
       if (--tries < 0) { cleanup(); return; }
       requestAnimationFrame(tick);
     };
@@ -2334,6 +2375,7 @@
       if (selfArtist) grey(a);
       else a.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (_tapInterruptedJump()) return;   // tap landed mid-jump: don't jump to a moving name-link
         browseToArtist(info.artist, { pane: _paneFor(row) });
       });
     }
@@ -2343,6 +2385,7 @@
       if (selfAlbum) grey(al);
       else al.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (_tapInterruptedJump()) return;   // tap landed mid-jump: don't jump to a moving name-link
         browseToAlbum(info.albumId, info.album, { pane: _paneFor(row) });
       });
     }
@@ -2367,16 +2410,15 @@
   function _renderCellsChunked(column, count, buildCell, isStale, onComplete) {
     return new Promise((resolve) => {
       let i = 0;
-      const _now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
       const pump = () => {
-        const start = _now();
+        const start = _nowMs();
         const frag = document.createDocumentFragment();
         while (i < count) {
           frag.appendChild(buildCell(i));
           i++;
           // One cell is always built before the clock is read, so a slow single
           // build can never stall progress (and the loop can't spin doing zero).
-          if (_now() - start >= _RENDER_FRAME_BUDGET_MS) break;
+          if (_nowMs() - start >= _RENDER_FRAME_BUDGET_MS) break;
         }
         column.appendChild(frag);
       };
@@ -2409,6 +2451,10 @@
       if (!row || !column.contains(row)) return;
       const item = row._jpItem;
       if (!item) return;
+      // A tap that interrupted an in-flight rail jump lands on a row still moving
+      // under the finger — every affordance on it (open, kebab, name-link) would
+      // act on the wrong item. Swallow this tap; the next one hits settled content.
+      if (_tapInterruptedJump()) return;
       const kebab = e.target.closest('.kebab-btn');
       if (kebab) { _openSheet(_albumKebabItems(item, kebab, null), kebab); return; }
       const nameLink = e.target.closest('.nl-artist');
@@ -3449,7 +3495,10 @@
       row.className = 'list-item';
       // Single-year view: year omitted from the subtitle (it is constant).
       row.innerHTML = `${_artImg(album.thumb, 'list-art')}<div class="list-info"><div class="list-title">${_esc(album.title)}</div><div class="list-sub"><span class="name-link nl-artist">${_esc(album.artist)}</span></div></div>`;
-      row.addEventListener('click', () => showAlbumTracks(album.id, album.title, null, nav));
+      row.addEventListener('click', () => {
+        if (_tapInterruptedJump()) return;   // Year-Albums has a live rail: guard the mid-jump mis-tap too
+        showAlbumTracks(album.id, album.title, null, nav);
+      });
       _wireNameLinks(row, { artist: album.artist });
       row.appendChild(_albumKebabBtn(album));
       if (bucketData) _setBucketStart(row, bucketData.keyForItem, idx);
