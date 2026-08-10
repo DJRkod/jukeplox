@@ -3,7 +3,9 @@
 import os
 import shutil
 import subprocess
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
 
@@ -484,3 +486,179 @@ def test_proxy_rejects_uncontained_local_key_with_404():
          patch("app.state.get_plex_client", AsyncMock(return_value=reg)):
         r = TestClient(app).get("/api/stream", params={"key": "loc:../escape"})
     assert r.status_code == 404
+
+
+# ── passthrough resume on upstream mid-body truncation (2026-08-09 ce-debug) ──
+# A constrained Cast/DLNA receiver buffers ahead, stops reading, then re-requests
+# every ~90s; with read=None we stop draining Plex, Plex idle-closes the socket,
+# and the next read raises RemoteProtocolError mid-body. The client then gets a
+# body short of Content-Length, the receiver reports idle_reason=ERROR, and the
+# per-track EOS matrix SKIPS the track. The proxy must transparently resume the
+# upstream from the last delivered byte so the client always gets a complete body.
+
+
+class _ByteResp:
+    """httpx streaming-response stand-in: yields the given chunks, optionally
+    raising RemoteProtocolError afterward (models a mid-body upstream drop)."""
+
+    def __init__(self, chunks, headers, raise_after=False):
+        self._chunks = list(chunks)
+        self.headers = headers
+        self.status_code = 206 if "content-range" in headers else 200
+        self.raise_after = raise_after
+        self.closed = False
+
+    async def aiter_bytes(self, chunk_size=65536):
+        for c in self._chunks:
+            yield c
+        if self.raise_after:
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body")
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _ResumeClient:
+    """httpx.AsyncClient stand-in that hands out queued responses to successive
+    send() calls and records the request headers (so the resume Range can be
+    asserted)."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.requests = []
+        self.closed = False
+
+    def build_request(self, method, url, headers=None):
+        return SimpleNamespace(method=method, url=url, headers=dict(headers or {}))
+
+    async def send(self, req, stream=True):
+        self.requests.append((req.url, dict(req.headers)))
+        return self._responses.pop(0)
+
+    async def aclose(self):
+        self.closed = True
+
+
+async def _drain(streaming_response) -> bytes:
+    return b"".join([chunk async for chunk in streaming_response.body_iterator])
+
+
+async def test_passthrough_resumes_on_upstream_truncation():
+    """The core fix: when Plex closes the connection mid-body, the proxy re-opens
+    the upstream with a Range from the last delivered byte and delivers the FULL
+    Content-Length worth of bytes — so the receiver never sees a short body (and
+    never skips)."""
+    from app.api import stream as s
+
+    full = bytes(range(256)) * 40          # 10240 bytes
+    total = len(full)
+    split = 4096
+    first = _ByteResp(
+        [full[:split]],
+        {"content-length": str(total), "content-type": "audio/flac"},
+        raise_after=True,                  # drops mid-body after 4096 bytes
+    )
+    second = _ByteResp(
+        [full[split:]],
+        {"content-length": str(total - split),
+         "content-range": f"bytes {split}-{total - 1}/{total}",
+         "content-type": "audio/flac"},
+    )
+    client = _ResumeClient([second])
+
+    resp = s._stream_passthrough(
+        first, client, "http://plex/file.flac", {"X-Plex-Token": "t"})
+    body = await _drain(resp)
+
+    assert body == full                    # complete body delivered despite the drop
+    assert len(client.requests) == 1       # exactly one resume
+    _url, hdrs = client.requests[0]
+    assert hdrs["Range"] == f"bytes={split}-"   # resumed from the truncation offset
+    assert hdrs["X-Plex-Token"] == "t"     # base auth headers carried onto the resume
+    assert first.closed and second.closed and client.closed
+
+
+async def test_passthrough_resume_offset_accounts_for_client_range():
+    """When the client's own request was a Range (206), the resume offset is
+    ABSOLUTE — base (from Content-Range) plus bytes already sent — not relative."""
+    from app.api import stream as s
+
+    # Upstream 206 for client Range bytes=1000-: serves bytes 1000..1999.
+    tail = bytes(range(256)) * 4           # 1024 bytes of range body
+    base, total_size = 1000, 2024
+    length = len(tail)
+    first = _ByteResp(
+        [tail[:400]],
+        {"content-length": str(length),
+         "content-range": f"bytes {base}-{base + length - 1}/{total_size}",
+         "content-type": "audio/flac"},
+        raise_after=True,
+    )
+    second = _ByteResp(
+        [tail[400:]],
+        {"content-length": str(length - 400),
+         "content-range": f"bytes {base + 400}-{base + length - 1}/{total_size}",
+         "content-type": "audio/flac"},
+    )
+    client = _ResumeClient([second])
+
+    resp = s._stream_passthrough(first, client, "http://plex/f.flac", {})
+    body = await _drain(resp)
+
+    assert body == tail
+    _url, hdrs = client.requests[0]
+    assert hdrs["Range"] == f"bytes={base + 400}-"   # 1000 + 400 delivered
+
+
+async def test_passthrough_gives_up_after_max_resume_attempts(monkeypatch):
+    """A persistently failing upstream must NOT loop forever or raise into the
+    ASGI layer — it resumes up to the bounded budget, then ends quietly with
+    whatever was delivered."""
+    from app.api import stream as s
+
+    monkeypatch.setattr(s, "_STREAM_RESUME_MAX", 2)
+    total = 10000
+    first = _ByteResp(
+        [b"x" * 100],
+        {"content-length": str(total), "content-type": "audio/flac"},
+        raise_after=True,
+    )
+    # Every resume immediately drops again (no progress).
+    resumes = [
+        _ByteResp(
+            [],
+            {"content-length": str(total - 100),
+             "content-range": f"bytes 100-{total - 1}/{total}"},
+            raise_after=True,
+        )
+        for _ in range(5)
+    ]
+    client = _ResumeClient(resumes)
+
+    resp = s._stream_passthrough(first, client, "http://plex/f", {})
+    body = await _drain(resp)              # must not raise
+
+    assert body == b"x" * 100             # only what actually arrived
+    assert len(client.requests) == 2      # bounded by _STREAM_RESUME_MAX
+    assert client.closed
+
+
+async def test_passthrough_clean_stream_yields_all_and_closes():
+    """A healthy upstream streams straight through, opens no resume request, and
+    closes both the response and the client."""
+    from app.api import stream as s
+
+    full = b"abcdef" * 1000
+    up = _ByteResp(
+        [full[i:i + 4096] for i in range(0, len(full), 4096)],
+        {"content-length": str(len(full)), "content-type": "audio/flac"},
+    )
+    client = _ResumeClient([])
+
+    resp = s._stream_passthrough(up, client, "http://plex/f", {})
+    body = await _drain(resp)
+
+    assert body == full
+    assert client.requests == []          # no resume needed
+    assert up.closed and client.closed

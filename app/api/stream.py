@@ -116,10 +116,30 @@ async def proxy_plex_stream(key: str, request: Request):
         await http_client.aclose()
         return await _serve_transcoded_flac(key, source_url, extra_headers)
 
-    return _stream_passthrough(upstream_resp, http_client)
+    return _stream_passthrough(upstream_resp, http_client, source_url, extra_headers)
 
 
-def _stream_passthrough(plex_resp, http_client: httpx.AsyncClient) -> StreamingResponse:
+# Bounded upstream reconnects per client stream on a mid-body truncation
+# (2026-08-09 ce-debug). Reset to zero on any progress, so a stream that keeps
+# advancing can survive far more than this many total drops.
+_STREAM_RESUME_MAX = 3
+
+
+def _content_range_start(value: str) -> int:
+    """Absolute start byte from a ``Content-Range: bytes START-END/TOTAL`` header
+    (0 when absent/unparseable — i.e. a plain 200 full-body response)."""
+    try:
+        return int(value.split()[1].split("-", 1)[0])
+    except (IndexError, ValueError, AttributeError):
+        return 0
+
+
+def _stream_passthrough(
+    plex_resp,
+    http_client: httpx.AsyncClient,
+    source_url: str,
+    base_headers: dict,
+) -> StreamingResponse:
     resp_headers: dict[str, str] = {
         "Content-Type": plex_resp.headers.get("content-type", "application/octet-stream"),
         "Accept-Ranges": "bytes",
@@ -128,12 +148,99 @@ def _stream_passthrough(plex_resp, http_client: httpx.AsyncClient) -> StreamingR
         if h in plex_resp.headers:
             resp_headers[h.title()] = plex_resp.headers[h]
 
-    async def _stream():
+    # Resume-on-truncation (2026-08-09 ce-debug). A constrained Cast/DLNA
+    # receiver buffers ahead then stops reading; with read=None we stop draining
+    # the source, which idle-closes the socket ~90s later. The receiver's next
+    # re-request then reads a half-open upstream and httpx raises
+    # RemoteProtocolError mid-body — the client gets a body short of
+    # Content-Length, the receiver reports idle_reason=ERROR, and the per-track
+    # EOS matrix SKIPS the track (the "plays partway then skips" bug). Resuming
+    # the upstream from the last delivered byte (the source honors Range — the
+    # receiver already gets 206s on this file) hands the client a complete body,
+    # so no ERROR and no skip. It also keeps the RemoteProtocolError from
+    # propagating as a raw ASGI traceback.
+    total: int | None = None
+    cl = plex_resp.headers.get("content-length")
+    if cl is not None:
         try:
-            async for chunk in plex_resp.aiter_bytes(chunk_size=65536):
-                yield chunk
+            total = int(cl)
+        except ValueError:
+            total = None
+    base_off = _content_range_start(plex_resp.headers.get("content-range", ""))
+
+    async def _stream():
+        resp = plex_resp
+        sent = 0
+        attempts = 0
+
+        async def _reopen() -> bool:
+            """Re-open the upstream from the next needed byte. Returns False if
+            the reconnect request itself fails (caller ends the stream)."""
+            nonlocal resp, attempts
+            attempts += 1
+            resume_at = base_off + sent
+            _log.info(
+                "stream proxy: resuming upstream from byte %d (attempt %d/%d)",
+                resume_at, attempts, _STREAM_RESUME_MAX)
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            hdrs = dict(base_headers)
+            hdrs["Range"] = f"bytes={resume_at}-"
+            try:
+                req = http_client.build_request("GET", source_url, headers=hdrs)
+                resp = await http_client.send(req, stream=True)
+                return True
+            except Exception as exc:
+                _log.warning("stream proxy: resume request failed at byte %d: %r",
+                             resume_at, exc)
+                return False
+
+        try:
+            while True:
+                dropped = False
+                try:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        if total is not None:
+                            room = total - sent
+                            if room <= 0:
+                                return          # promised body fully delivered
+                            if len(chunk) > room:
+                                chunk = chunk[:room]
+                        yield chunk
+                        sent += len(chunk)
+                        attempts = 0            # progress resets the budget
+                except httpx.TransportError as exc:
+                    dropped = True
+                    _log.info("stream proxy: upstream dropped at %d/%s bytes: %r",
+                              sent, total, exc)
+                # Delivered the full promised length → done.
+                if total is not None and sent >= total:
+                    return
+                # Unknown length: completeness is unverifiable and a byte-offset
+                # resume has no reliable meaning — end best-effort (prior behavior).
+                if total is None:
+                    if dropped:
+                        _log.warning("stream proxy: upstream dropped on an "
+                                     "unknown-length stream; ending")
+                    return
+                # Known length but short (dropped, or a clean-but-early close):
+                # resume from where we stopped, subject to the reconnect budget.
+                if attempts >= _STREAM_RESUME_MAX:
+                    _log.warning(
+                        "stream proxy: upstream truncated at %d/%d bytes; giving "
+                        "up after %d resume attempt(s)", sent, total, attempts)
+                    return
+                if not await _reopen():
+                    return
         finally:
-            await plex_resp.aclose()
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
             await http_client.aclose()
 
     return StreamingResponse(_stream(), status_code=plex_resp.status_code, headers=resp_headers)
