@@ -150,15 +150,28 @@ def album_coarse(it: dict):
 
 
 def album_same(a: dict, b: dict) -> bool:
-    """Same release: track counts both-known-and-equal OR both-unknown (None).
+    """Same release: same subtype AND (track counts both-known-and-equal OR
+    both-unknown None).
 
     Mirrors the native browse-index fold exactly (parity plan U1/R5): native
-    ``_group_albums`` buckets albums by ``track_count``, with ``None`` bucketing
-    together — so two copies whose counts are both unknown FOLD, and a known
-    count paired with an unknown one STAYS SEPARATE (can't confirm same release),
-    as do two known-but-different counts (distinct editions). Loosening the
-    prior both-known-only rule stops a connected non-Plex source from splitting
-    albums the native pipeline previously folded (R6)."""
+    ``_group_albums`` buckets albums by ``(track_count, subtype)``, with ``None``
+    bucketing together — so two copies whose counts are both unknown FOLD, and a
+    known count paired with an unknown one STAYS SEPARATE (can't confirm same
+    release), as do two known-but-different counts (distinct editions). Loosening
+    the prior both-known-only rule stops a connected non-Plex source from
+    splitting albums the native pipeline previously folded (R6).
+
+    The subtype gate keys on the same content signal the native fold uses: a
+    Single/EP and an Album sharing a title with an UNKNOWN count on DIFFERENT
+    sources are distinct releases the same-source guard can't separate — without
+    it they fold and the single vanishes (ce-debug 2026-08-10, Van She "Idea of
+    Happiness"). ``None`` subtype normalizes to ``'album'`` (matching
+    ``guest._group_albums`` and the frontend) so an inconsistent tag on one source
+    never splits one genuine release."""
+    sa = (a.get("subtype") or "album").strip().lower()
+    sb = (b.get("subtype") or "album").strip().lower()
+    if sa != sb:
+        return False
     ta, tb = a.get("track_count"), b.get("track_count")
     if ta is None and tb is None:
         return True

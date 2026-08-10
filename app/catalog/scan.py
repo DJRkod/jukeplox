@@ -58,6 +58,17 @@ def _shape_items(sources: list[dict]) -> tuple[list[dict], list[dict], list[dict
                 "local_key": a.id, "title": a.title, "base_key": browse_base_key(a.title),
                 "thumb": a.thumb, "release_count": a.release_count,
             })
+        # Per-album track counts from actual track membership. Plex's newer music
+        # agent omits leafCount from the bulk album listing, so alb.track_count is
+        # None and the same-title album/single dedup (merge.album_same) can't tell
+        # distinct releases apart — collapsing them across sources (ce-debug
+        # 2026-08-10). Fall back to any leafCount a source DOES supply (e.g.
+        # Jellyfin). Keyed by the track's album_id, which equals the album's
+        # local_key within one source.
+        alb_counts: dict = {}
+        for t in src.get("tracks") or []:
+            if t.album_id is not None:
+                alb_counts[t.album_id] = alb_counts.get(t.album_id, 0) + 1
         for alb in src.get("albums") or []:
             album_items.append({
                 "match_ids": getattr(alb, "match_ids", {}) or {},
@@ -66,7 +77,8 @@ def _shape_items(sources: list[dict]) -> tuple[list[dict], list[dict], list[dict
                 "title_base": browse_base_key(alb.title), "artist": alb.artist,
                 "artist_base_key": browse_base_key(alb.artist), "year": alb.year,
                 "thumb": alb.thumb, "subtype": alb.subtype, "added_at": alb.added_at,
-                "track_count": alb.track_count,
+                "track_count": (alb.track_count if alb.track_count is not None
+                                else alb_counts.get(alb.id)),
             })
         for t in src.get("tracks") or []:
             track_items.append({

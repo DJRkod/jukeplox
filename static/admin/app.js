@@ -1355,24 +1355,26 @@ async function loadSources() {
   } catch {
     sourcesList.innerHTML = '<p style="color:#f87171;font-size:.85rem">Could not load sources.</p>';
   }
+  // Scan-status badge + browse-index freshness line. Both are driven by
+  // renderSourceScanStatus (which self-polls while a scan/index build is in
+  // flight), so an in-progress scan on load animates to its final state without
+  // a page reload.
   renderSourceScanStatus();
-  // Browse-index freshness line next to Rescan (moved here from the old loadLibraries;
-  // 503s on a non-Plex install, which is fine — the line just stays blank).
-  try {
-    const s = await api('GET', '/admin/plex/index-status');
-    const el = document.getElementById('index-status');
-    if (el) el.textContent = s.building ? 'Indexing…'
-      : (s.computed_at ? 'Indexed ' + new Date(s.computed_at).toLocaleString() : 'Not yet indexed');
-  } catch {}
 }
 
 // U15 admin scan-status badge: surfaces the catalog scan state under the Sources
 // list — "Scanning…" while a crawl runs, and a distinct "no music found" when a
 // finished scan returned nothing (vs the zero-source "No sources connected"
 // which the sources list itself shows). Hidden when the library is populated.
+// Live-poll timer id for the scan-status / index readouts (admin-only Setup
+// chrome). Set while a scan or index build is in flight, cleared when idle.
+let _jpScanPoll = null;
+
 async function renderSourceScanStatus() {
   const el = document.getElementById('sources-scan-status');
   if (!el) return;
+  // Supersede any pending live-poll tick — this call refreshes the readouts now.
+  if (_jpScanPoll) { clearTimeout(_jpScanPoll); _jpScanPoll = null; }
   let s;
   try { s = await api('GET', '/admin/scan-status'); } catch { el.style.display = 'none'; return; }
   let msg = '';
@@ -1387,6 +1389,24 @@ async function renderSourceScanStatus() {
   }
   el.textContent = msg;
   el.style.display = msg ? '' : 'none';
+  // Browse-index freshness line ("Indexing…" → "Indexed <time>"). 503s on a
+  // non-Plex install, which is fine — the line just stays blank. `building`
+  // catches the NATIVE browse-index rebuild that scan-status.scanning (catalog
+  // only) doesn't, so the live poll below covers both install types.
+  let building = false;
+  try {
+    const idx = await api('GET', '/admin/plex/index-status');
+    const iel = document.getElementById('index-status');
+    if (iel) iel.textContent = idx.building ? 'Indexing…'
+      : (idx.computed_at ? 'Indexed ' + new Date(idx.computed_at).toLocaleString() : 'Not yet indexed');
+    building = !!idx.building;
+  } catch {}
+  // Live update: while a scan or index build is in flight, re-check shortly so
+  // the readouts settle to their final state on a live page (no reload). Stops
+  // polling once idle — never a perpetual timer.
+  if (s.scanning || building) {
+    _jpScanPoll = setTimeout(renderSourceScanStatus, 2500);
+  }
 }
 
 async function connectJellyfin() {
@@ -1476,7 +1496,10 @@ async function removeSource(type, sourceId) {
 async function rescanSources() {
   const btn = document.getElementById('btn-rescan-sources');
   if (btn) { btn.disabled = true; btn.textContent = 'Rescanning…'; }
-  try { await api('POST', '/admin/sources/rescan'); showToast('Rescanning all sources…'); }
+  try {
+    await api('POST', '/admin/sources/rescan'); showToast('Rescanning all sources…');
+    renderSourceScanStatus();  // reflect "Scanning…" now + start the live poll
+  }
   catch { showToast('Rescan failed'); }
   finally { if (btn) { btn.disabled = false; btn.textContent = 'Rescan Sources'; } }
 }

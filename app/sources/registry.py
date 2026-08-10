@@ -135,6 +135,9 @@ class SourceRegistry:
     async def get_years(self, section_key: str) -> list[int]:
         return await self._route(section_key).get_years(section_key)
 
+    async def get_album_track_counts(self, section_key: str) -> dict[str, int]:
+        return await self._route(section_key).get_album_track_counts(section_key)
+
     async def get_sonic_nearest(
         self, track_id: str, limit: int = 10, max_distance: float = 0.35,
     ) -> list[Track]:
@@ -176,6 +179,7 @@ class _NoopSource:
     async def get_genres(self, *a, **kw): return []
     async def get_styles_with_counts(self, *a, **kw): return []
     async def get_years(self, *a, **kw): return []
+    async def get_album_track_counts(self, *a, **kw): return {}
     async def get_sonic_nearest(self, *a, **kw): return []
     async def get_artist_similar_names(self, *a, **kw): return []
     async def get_artist_popular_tracks(self, *a, **kw): return []

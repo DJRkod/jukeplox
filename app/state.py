@@ -2031,7 +2031,7 @@ def _build_browse_index_rows(libs_data: list) -> tuple[list[dict], list[dict]]:
     from app.plex.client import browse_base_key
     artist_rows: list[dict] = []
     album_rows: list[dict] = []
-    for server_name, section_key, artists, albums in libs_data:
+    for server_name, section_key, artists, albums, album_counts in libs_data:
         for a in artists:
             artist_rows.append({
                 "artist_id": a.id,
@@ -2053,7 +2053,15 @@ def _build_browse_index_rows(libs_data: list) -> tuple[list[dict], list[dict]]:
                 "thumb": alb.thumb,
                 "subtype": alb.subtype,
                 "added_at": alb.added_at,
-                "track_count": alb.track_count,
+                # Fill track_count from actual track membership only when the
+                # source left it None: Plex's newer music agent omits leafCount
+                # from the bulk album listing, so alb.track_count is None
+                # library-wide and same-title album/single releases can no longer
+                # be told apart, collapsing in _group_albums (ce-debug
+                # 2026-08-10). A real leafCount (older agent) or a source that
+                # supplies its own count is left untouched.
+                "track_count": (alb.track_count if alb.track_count is not None
+                                else (album_counts or {}).get(alb.id)),
                 "server_name": server_name,
                 "section_key": section_key,
             })
@@ -2094,6 +2102,24 @@ async def _refresh_browse_index() -> None:
         album_results = await asyncio.gather(
             *[client.get_albums(l.key) for l in libs], return_exceptions=True
         )
+        # Per-album track counts derived from the track listing — Plex's newer
+        # music agent no longer returns leafCount on the bulk album listing, so
+        # this restores the content signal same-title album/single grouping needs
+        # (ce-debug 2026-08-10). Genuinely best-effort: each leg is wrapped so ANY
+        # failure — including a source that doesn't implement it (which raises
+        # synchronously in a bare comprehension and would bypass gather's
+        # return_exceptions, failing the WHOLE refresh) — degrades to {} and never
+        # blocks the index replace. It is NOT part of the don't-wipe gate below.
+        async def _safe_album_counts(key):
+            try:
+                return await client.get_album_track_counts(key)
+            except Exception:
+                _log.warning(
+                    "album track-count crawl failed for %s — same-title grouping "
+                    "degrades to title-only until the next scan", key, exc_info=True,
+                )
+                return {}
+        count_results = await asyncio.gather(*[_safe_album_counts(l.key) for l in libs])
         # Require BOTH an artist call AND an album call to have succeeded before
         # the atomic replace — never install a PARTIAL index. An asymmetric
         # failure (e.g. every section-wide album query times out while the artist
@@ -2114,10 +2140,10 @@ async def _refresh_browse_index() -> None:
             )
             return
         libs_data = []
-        for lib, ar, br in zip(libs, artist_results, album_results):
+        for lib, ar, br, cr in zip(libs, artist_results, album_results, count_results):
             artists = ar if not isinstance(ar, BaseException) else []
             albums = br if not isinstance(br, BaseException) else []
-            libs_data.append((lib.server_name, lib.key, artists, albums))
+            libs_data.append((lib.server_name, lib.key, artists, albums, cr))
         artist_rows, album_rows = _build_browse_index_rows(libs_data)
         await database.set_browse_index(artist_rows, album_rows)
         await stamp_cache("browse_index_computed_at")

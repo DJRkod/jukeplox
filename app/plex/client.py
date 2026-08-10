@@ -454,6 +454,43 @@ class PlexClient:
         self._store(cache_key, tracks)
         return tracks
 
+    def _count_album_leaves(self, raw: bytes) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        data = json.loads(raw)
+        for item in data.get("MediaContainer", {}).get("Metadata", []):
+            prk = item.get("parentRatingKey")
+            if prk is None:
+                continue
+            aid = self._make_id(prk)
+            counts[aid] = counts.get(aid, 0) + 1
+        return counts
+
+    async def get_album_track_counts(self, section_key: str) -> dict[str, int]:
+        """{album compound id -> track count} for a whole section, derived by
+        counting tracks per ``parentRatingKey``.
+
+        Plex's newer music agent (``tv.plex.agents.music``) omits ``leafCount``
+        from the bulk album listing (``/all?type=9``) — it survives only in
+        per-item ``/library/metadata/{id}``, too costly to fetch per album
+        (ce-debug 2026-08-10, Van She "Idea of Happiness"). The track listing
+        (``type=10``) still carries ``parentRatingKey`` per track, so one bulk
+        pass yields every album's real length — the content signal the same-title
+        album/single fold needs. Counting is lightweight (no Track objects) and
+        runs off-loop like the other whole-library parsers (U3)."""
+        bare_key = self._strip(section_key) or section_key
+        cache_key = f"albumleaves:{bare_key}"
+        cached = self._cached(cache_key)
+        if cached is not None:
+            return cached
+        raw = await self._get_raw(
+            f"/library/sections/{bare_key}/all", params={"type": TYPE_TRACK}
+        )
+        counts = await asyncio.get_running_loop().run_in_executor(
+            None, self._count_album_leaves, raw
+        )
+        self._store(cache_key, counts)
+        return counts
+
     async def get_track(self, track_id: str) -> Track:
         bare_id = self._strip(track_id) or track_id
         data = await self._get(f"/library/metadata/{bare_id}")
@@ -873,6 +910,10 @@ class MultiPlexClient:
         _, client = self._route(section_key)
         return await client.get_tracks(section_key, album_id=album_id, genre=genre, year=year)
 
+    async def get_album_track_counts(self, section_key: str) -> dict[str, int]:
+        _, client = self._route(section_key)
+        return await client.get_album_track_counts(section_key)
+
     async def get_track(self, track_id: str) -> Track:
         _, client = self._route(track_id)
         return await client.get_track(track_id)
@@ -936,6 +977,7 @@ class _NoopClient:
     async def get_artists(self, *a, **kw): self._raise()
     async def get_albums(self, *a, **kw): self._raise()
     async def get_tracks(self, *a, **kw): self._raise()
+    async def get_album_track_counts(self, *a, **kw): self._raise()
     async def search(self, *a, **kw): self._raise()
     async def search_titles(self, *a, **kw): self._raise()
     async def fetch_art(self, *a, **kw): self._raise()

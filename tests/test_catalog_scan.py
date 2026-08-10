@@ -160,6 +160,27 @@ def test_build_catalog_drops_album_orphaned_by_track_dedup():
     assert all(h["identity"] == kept for h in album_holds)  # no holds for a dropped album
 
 
+def test_build_catalog_same_title_album_and_single_kept_apart_by_derived_count():
+    # ce-debug 2026-08-10: Plex's newer music agent omits leafCount, so album
+    # items arrive with track_count=None; a same-title album (2 trk) and single
+    # (1 trk) on different sources would merge (album_same treats both-None as the
+    # same release, and the same-source guard can't help across sources). Deriving
+    # each album's count from its track membership (2 vs 1) keeps them distinct.
+    built = scan.build_catalog([
+        {"source_id": "m1", "priority": 0, "server_name": "S1", "artists": [],
+         "albums": [_album("m1:al", title="Idea of Happiness", artist="Van She", tc=None)],
+         "tracks": [_track("m1:t1", "m1:al", title="Cold Hearted", artist="Van She",
+                           album="Idea of Happiness", num=1),
+                    _track("m1:t2", "m1:al", title="So Excited", artist="Van She",
+                           album="Idea of Happiness", num=2)]},
+        {"source_id": "jelly", "priority": 1, "server_name": "S2", "artists": [],
+         "albums": [_album("jelly:s", title="Idea of Happiness", artist="Van She", tc=None)],
+         "tracks": [_track("jelly:s1", "jelly:s", title="Idea of Happiness (Remix)",
+                           artist="Van She", album="Idea of Happiness", num=1)]},
+    ])
+    assert len(built["albums"]) == 2, [a["title"] for a in built["albums"]]
+
+
 # ── scan_and_replace (I/O + guard) ───────────────────────────────────────────
 
 async def test_scan_and_replace_writes_catalog(db):

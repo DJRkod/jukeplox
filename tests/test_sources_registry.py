@@ -32,6 +32,21 @@ async def test_routes_by_source_id_prefix():
     a.get_track.assert_awaited_once()
 
 
+async def test_get_album_track_counts_routes_to_owning_source():
+    # Regression (ce-debug 2026-08-10): _refresh_browse_index calls
+    # registry.get_album_track_counts to derive album lengths (Plex's newer agent
+    # drops leafCount). The registry MUST expose it and route to the owning source
+    # — it was added only to the legacy MultiPlexClient at first, so the real
+    # SourceRegistry raised AttributeError mid-refresh and failed every scan.
+    a, b = _fake_source("A"), _fake_source("B")
+    a.get_album_track_counts = AsyncMock(return_value={"A:10": 11})
+    b.get_album_track_counts = AsyncMock(return_value={})
+    reg = SourceRegistry([a, b])
+    assert await reg.get_album_track_counts("A:section") == {"A:10": 11}
+    a.get_album_track_counts.assert_awaited_once()
+    b.get_album_track_counts.assert_not_awaited()
+
+
 async def test_unknown_or_prefixless_key_falls_back_to_first_source():
     a, b = _fake_source("A"), _fake_source("B")
     reg = SourceRegistry([a, b])

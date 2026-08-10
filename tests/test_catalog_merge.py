@@ -60,6 +60,35 @@ def test_albums_sharing_only_release_group_do_not_merge():
     assert len(_albums([us, jp])) == 2
 
 
+def test_albums_same_title_single_vs_album_unknown_count_cross_source_no_merge():
+    # ce-debug 2026-08-10 (Van She "Idea of Happiness"): a Single/EP and an Album
+    # sharing a title with UNKNOWN track_count on DIFFERENT sources must not merge.
+    # The same-source guard can't separate them (distinct sources) and track_count
+    # is None on both, so subtype is the only content signal — album_same keys on
+    # it. Without this the album (one source) and single (another) fold into one
+    # release and the single vanishes.
+    album = {"match_ids": {}, "source_id": "S1", "local_key": "S1:album",
+             "title_base": "idea of happiness", "artist_base_key": "van she",
+             "track_count": None, "subtype": "album"}
+    single = {"match_ids": {}, "source_id": "S2", "local_key": "S2:single",
+              "title_base": "idea of happiness", "artist_base_key": "van she",
+              "track_count": None, "subtype": "single"}
+    assert len(_albums([album, single])) == 2
+
+
+def test_albums_same_release_subtype_none_and_album_still_merge():
+    # No-regression: a genuine shared release whose subtype is None on one source
+    # and "album" on the other must still fold (None normalizes to "album"), so an
+    # inconsistent subtype tag never splits one release into two rows.
+    a = {"match_ids": {}, "source_id": "S1", "local_key": "S1:a",
+         "title_base": "ok computer", "artist_base_key": "radiohead",
+         "track_count": None, "subtype": None}
+    b = {"match_ids": {}, "source_id": "S2", "local_key": "S2:b",
+         "title_base": "ok computer", "artist_base_key": "radiohead",
+         "track_count": None, "subtype": "album"}
+    assert len(_albums([a, b])) == 1
+
+
 def test_albums_sharing_release_id_still_merge():
     # The release id (edition-specific) stays authoritative: the SAME release in two
     # sources still folds to one, even while sharing the release-group id.
