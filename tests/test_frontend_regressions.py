@@ -2910,3 +2910,143 @@ def test_search_indexing_hint_is_single_source_shared_module():
             f"{rel} must not fork the search indexing hint — it lives in "
             "static/browse/index.js (shared-module discipline)"
         )
+
+
+# ── Added-to-queue: in-place sweep + persistent ♪ ember ──────────────────────
+# 2026-08-10 plan (docs/plans/2026-08-10-002): tapping a track row confirms the
+# queue-add ON the row (scheme-colored Spark Sweep) and leaves a persistent ♪
+# ember while the track is queued, live for every client via queue_changed and
+# auto-clearing when the track plays. All rendering lives in the shared browse
+# module. These pins lock the load-bearing invariants a text scan can see.
+
+QUEUE_BROWSE_JS = ROOT / "static/browse/index.js"
+
+
+def test_queue_ember_decoration_mirrors_ratings_pattern():
+    """Membership-driven ember: an idempotent per-row applier + a full-list sweep
+    over the same selector the ratings decoration uses, applied at build in
+    makeTrackRow, and an applyQueue handle that rebuilds the set (so a played/
+    removed track drops out → auto-clear)."""
+    browse = QUEUE_BROWSE_JS.read_text(encoding="utf-8")
+    assert "function _applyQueuedEmber(row)" in browse
+    assert "function _redecorateQueued()" in browse
+    assert ".list-item.track-row[data-track-id]" in browse
+    # rebuilt wholesale (not merged) so clearing happens by set-rebuild
+    assert "applyQueue: (queueItems) =>" in browse
+    assert "_queuedIds = next" in browse
+    # applied at build time so fresh renders (navigation/search) self-correct
+    m = re.search(r"function makeTrackRow\b.*?\n  \}", browse, re.S)
+    assert m and "_applyQueuedEmber(row)" in m.group(0), (
+        "makeTrackRow must decorate the row with the queued ember at build time."
+    )
+
+
+def test_queue_ember_is_at_visible_element_with_accessible_name():
+    """The ember must be a real, AT-visible element with an accessible name
+    (aria-label 'in queue'), never a pseudo-element (invisible to AT)."""
+    browse = QUEUE_BROWSE_JS.read_text(encoding="utf-8")
+    assert "createElement('span')" in browse and "'jp-qember" in browse
+    assert "setAttribute('aria-label', 'in queue')" in browse, (
+        "the ♪ ember must carry aria-label='in queue' (the glyph is decorative to AT)."
+    )
+
+
+def test_queue_add_inplace_replaces_success_toast():
+    """On a 200 single-track add the in-place sweep + AT announcement fire on the
+    tapped row; the corner success toast is only the no-visible-row fallback.
+    Error/lock/source-lock toasts remain (a bare _config.toast scan can't tell
+    success from error — they share the call form — so pin the specific success
+    string's position instead)."""
+    browse = QUEUE_BROWSE_JS.read_text(encoding="utf-8")
+    fn = browse[browse.index("async function addTrack"):browse.index("async function addAlbum")]
+    assert "_playQueueMorph(" in fn and "_announceQueue(" in fn
+    assert "_queuedIds.add(trackId)" in fn, "the add path must optimistically mark membership."
+    # in-place fires before the corner success toast (which is the fallback branch)
+    assert fn.index("_playQueueMorph(") < fn.index("_config.toast('Added to queue!')"), (
+        "the in-place morph must be the primary success path; the success toast is the fallback."
+    )
+    # error/lock paths keep their toasts
+    assert "'Queuing is paused by the host'" in fn
+    assert "_SOURCE_LOCK_MSG" in fn
+    # makeTrackRow hands the tapped row to addTrack so the correct row animates
+    assert "addTrack(track.track_id || track.id, track.title, track, null, null, row)" in browse
+
+
+def test_queue_retap_shortcircuits_duplicate_without_toast():
+    """Re-tapping an already-queued row is a client-side no-op: skip the POST and
+    the duplicate toast, pulse the ember. Only for a plain add — a source-
+    specified 'Play From Source…' reorder still POSTs."""
+    browse = QUEUE_BROWSE_JS.read_text(encoding="utf-8")
+    fn = browse[browse.index("async function addTrack"):browse.index("async function addAlbum")]
+    assert "!sourceServerName && trackId && _queuedIds.has(trackId)" in fn
+    assert "_emberPulse(" in fn
+    # the short-circuit returns before the POST
+    assert fn.index("_queuedIds.has(trackId)") < fn.index("_api('POST'"), (
+        "the re-tap no-op must return before the enqueue POST."
+    )
+
+
+def test_queue_morph_reduced_motion_and_timer_hygiene():
+    """The morph is dual-gated for reduced motion (JS guard skips the sweep; the
+    ember/announcement still fire) and uses a cancelable per-row timer cleared
+    before start (no stacked sweeps on re-tap / re-render)."""
+    browse = QUEUE_BROWSE_JS.read_text(encoding="utf-8")
+    assert "function _prefersReducedMotion()" in browse
+    assert "prefers-reduced-motion: reduce" in browse
+    morph = browse[browse.index("function _playQueueMorph"):browse.index("function _emberPulse")]
+    assert "_prefersReducedMotion()" in morph, "the morph must skip animating under reduced motion."
+    assert "_queueMorphTimers" in morph and "clearTimeout(prev)" in morph, (
+        "the per-row morph timer must be cancelable and cleared before start."
+    )
+
+
+def test_queue_indicator_css_scheme_following_and_single_source():
+    """Sweep/ember CSS is injected once from the shared browse module (no new
+    <link>) and re-colors with the active scheme (accent-grad / on-accent /
+    accent-ui), with a reduced-motion CSS fallback."""
+    browse = QUEUE_BROWSE_JS.read_text(encoding="utf-8")
+    assert "id = 'jp-queue-styles'" in browse or "jp-queue-styles" in browse
+    assert "var(--accent-grad" in browse, "the sweep must ride the scheme accent gradient."
+    assert "var(--on-accent" in browse, "the confirm text must use --on-accent."
+    assert "var(--accent-ui" in browse, "the ember must use --accent-ui."
+    assert "@media (prefers-reduced-motion: reduce)" in browse
+    # no new stylesheet <link> introduced in either template
+    for tmpl in (GUEST_TEMPLATE, ADMIN_TEMPLATE):
+        src = tmpl.read_text(encoding="utf-8")
+        assert "jp-queue-styles" not in src, (
+            f"{tmpl.name}: queue-indicator CSS ships from the browse module, not the template."
+        )
+    # the indicator lives in the shared module, not forked into per-page files
+    for rel in ("static/guest/app.js", "static/admin/app.js"):
+        src = (ROOT / rel).read_text(encoding="utf-8")
+        assert "_applyQueuedEmber" not in src and "jp-qember" not in src, (
+            f"{rel} must not fork the queue ember — it lives in static/browse/index.js."
+        )
+
+
+def test_queue_membership_fed_from_pages_live_and_snapshot():
+    """Both pages push membership into browse from the queue_changed branch AND
+    refreshQueueState (load / ws.onopen / visibilitychange) — four call sites —
+    so live updates, fresh-nav hydration, and reconnect resync all converge.
+    No new top-level symbol is added (edits inside existing handlers)."""
+    guest = GUEST_APP.read_text(encoding="utf-8")
+    admin = ADMIN_APP.read_text(encoding="utf-8")
+    assert guest.count("browseHandle.applyQueue(") >= 2, (
+        "guest must feed browse from both queue_changed and refreshQueueState."
+    )
+    assert admin.count("browseHandle.applyQueue(") >= 2, (
+        "admin must feed browse from both queue_changed and refreshQueueState."
+    )
+    # null-guarded (browse mounts in an IIFE; a broadcast can race first paint)
+    assert "if (browseHandle) browseHandle.applyQueue" in guest
+    assert "if (browseHandle) browseHandle.applyQueue" in admin
+
+
+def test_queue_live_region_is_polite_status():
+    """A visually-hidden polite live region carries the AT confirmation — the sole
+    confirmation on the reduced-motion path (sweep skipped, toast suppressed)."""
+    browse = QUEUE_BROWSE_JS.read_text(encoding="utf-8")
+    assert "function _announceQueue" in browse
+    assert "setAttribute('role', 'status')" in browse
+    assert "setAttribute('aria-live', 'polite')" in browse
+    assert "jp-sr-only" in browse

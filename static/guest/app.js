@@ -346,6 +346,10 @@ async function refreshQueueState() {
     queueReceipts.prune(queue.queue);  // bound storage; drop receipts for gone entries
     surpriseTokens.prune(queue.queue); // and the durable ownership tokens
     playbackHandle.applyQueue(queue.queue, queue.history);
+    // Hydrate/resync browse embers from the snapshot (load / ws.onopen /
+    // visibilitychange), so a fresh navigator and a dropped-frame client both
+    // converge (added-to-queue plan).
+    if (browseHandle) browseHandle.applyQueue(queue.queue);
     setLocked(queue.is_locked);
   }
 }
@@ -386,6 +390,10 @@ function connectWS() {
       queueReceipts.prune(msg.queue);
       surpriseTokens.prune(msg.queue);
       playbackHandle.applyQueue(msg.queue, msg.history);
+      // Feed browse queue membership so track-row embers update live for every
+      // client (added-to-queue plan). Null-guard: browse mounts in an IIFE and a
+      // broadcast can race first paint (the appearanceHandle guard precedent).
+      if (browseHandle) browseHandle.applyQueue(msg.queue);
       setLocked(msg.is_locked);
     } else if (msg.type === 'lock_changed') {
       setLocked(msg.is_locked);

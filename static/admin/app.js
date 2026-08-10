@@ -245,6 +245,10 @@ async function refreshQueueState() {
   try {
     const state = await api('GET', '/admin/queue');
     playbackHandle.applyQueue(state.queue, state.history);
+    // Hydrate/resync browse embers from the snapshot (load / ws.onopen /
+    // visibilitychange) — fresh navigator + dropped-frame client both converge
+    // (added-to-queue plan).
+    if (browseHandle) browseHandle.applyQueue(state.queue);
     setRecentPlaysData(state.history);
     syncLock(state.is_locked);
     _historyEmpty = !(state.history && state.history.length);
@@ -511,6 +515,10 @@ function connectWS() {
     else if (msg.type === 'track_skipped') playbackHandle.showSkipped(msg);
     else if (msg.type === 'queue_changed') {
       playbackHandle.applyQueue(msg.queue, msg.history);
+      // Feed browse queue membership so track-row embers update live (added-to-
+      // queue plan). Null-guard: browse mounts in an IIFE; a broadcast can race
+      // first paint.
+      if (browseHandle) browseHandle.applyQueue(msg.queue);
       setRecentPlaysData(msg.history);
       syncLock(msg.is_locked);
       _historyEmpty = !(msg.history && msg.history.length);
