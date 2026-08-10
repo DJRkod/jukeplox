@@ -1510,9 +1510,15 @@
   // album), which already carries it. Album rows / header / breadcrumb keep
   // their name-links (different renderers). See
   // docs/plans/2026-06-14-004-feat-track-row-suppress-inline-links-plan.md.
-  function _trackSubHtml(t, dur) {
+  function _trackSubHtml(t, dur, ctx) {
+    // Omit the album inside its own drill-in (2026-08-10): ctx.currentAlbumId
+    // means the row is already in this album, so "— {album}" is redundant — and
+    // for a very long album title (e.g. Fiona Apple's "When the Pawn…") it walls
+    // the list under every row. Keep the album in flat/search/All-Songs views,
+    // where it disambiguates. .list-sub also clamps to one line as a backstop.
+    const showAlbum = t.album && !(ctx && ctx.currentAlbumId);
     return _esc(t.artist)
-      + (t.album ? ' — ' + _esc(t.album) : '')
+      + (showAlbum ? ' — ' + _esc(t.album) : '')
       + (dur ? ' · ' + dur : '');
   }
 
@@ -1531,7 +1537,7 @@
     // payload shapes) means no class — fail open, the server gate enforces.
     if (track.plex_held === false) row.classList.add('no-plex-hold');
     const dur = track.duration_ms ? _formatDuration(track.duration_ms) : '';
-    row.innerHTML = `<div class="list-info"><div class="list-title">${_esc(track.title)}</div><div class="list-sub">${_trackSubHtml(track, dur)}</div></div><button class="kebab-btn" title="Track options" aria-haspopup="true">⋮</button>`;
+    row.innerHTML = `<div class="list-info"><div class="list-title">${_esc(track.title)}</div><div class="list-sub">${_trackSubHtml(track, dur, ctx)}</div></div><button class="kebab-btn" title="Track options" aria-haspopup="true">⋮</button>`;
     row.querySelector('.kebab-btn').addEventListener('click', (e) => {
       e.stopPropagation();
       _openSheet(_trackKebabItems(track, sources, ctx, row), e.currentTarget);
@@ -1984,7 +1990,11 @@
             ? addAlbum(sources[0].album_id, sources[0].server_name)
             : addAlbum(album.id, null))),
     }];
-    if (album.artist) {
+    // Omit "Go to artist" for a Various Artists comp (2026-08-10 VA plan U3):
+    // album.artist is "Various Artists" there, which is not a navigable artist
+    // (matches the roster drop and the drill-in header's non-navigable label) —
+    // offering it would fire browseToArtist("Various Artists"), a dead nav.
+    if (album.artist && album.artist.trim().toLowerCase() !== 'various artists') {
       items.push({
         label: 'Go to artist',
         // U6: disabled inside that artist's own drill (same test as the
@@ -2923,10 +2933,17 @@
           // (drills in place inside search, switches to Artists otherwise); the
           // year drills that year's releases. The "·" separator stays muted.
           const bits = [];
-          if (a0.artist) bits.push(`<span class="name-link nl-artist">${_esc(a0.artist)}</span>`);
+          // Header artist is the album's OWN artist (2026-08-10 VA plan U2),
+          // not tracks[0]'s performer. A Various Artists comp is a non-navigable
+          // label: dimmed via .name-link-self (opacity/cursor), NOT an accent
+          // .nl-artist link — mirrors the roster's VA drop at _distinctPerformers.
+          const headerArtist = a0.album_artist || a0.artist;
+          const isVA = !!headerArtist && headerArtist.trim().toLowerCase() === 'various artists';
+          if (headerArtist && !isVA) bits.push(`<span class="name-link nl-artist">${_esc(headerArtist)}</span>`);
+          else if (isVA)             bits.push(`<span class="name-link-self">${_esc(headerArtist)}</span>`);
           if (a0.year)   bits.push(`<span class="name-link nl-year">${a0.year}</span>`);
           sub.innerHTML = bits.join(' · ');
-          if (a0.artist) _wireNameLinks(sub, { artist: a0.artist });
+          if (headerArtist && !isVA) _wireNameLinks(sub, { artist: headerArtist });
           const yEl = sub.querySelector('.nl-year');
           if (yEl) yEl.addEventListener('click', (e) => { e.stopPropagation(); browseToYear(a0.year); });
         }

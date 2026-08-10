@@ -79,6 +79,15 @@
     .np-art.hidden { display: none; }
     .np-text { flex: 1; min-width: 0; }
     .np-title { font-size: 1.1rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* Now Playing marquee (2026-08-10 long-titles plan U6) — parity with guest;
+       JS-driven, motion-gated, reduced-motion falls back to full wrap. */
+    .np-title .np-title-tt { display: inline-block; will-change: transform; }
+    .np-title.overflowing .np-title-tt { animation: npMarquee 9s ease-in-out infinite alternate; }
+    @keyframes npMarquee { from { transform: translateX(0); } to { transform: translateX(var(--mq-shift, 0px)); } }
+    @media (prefers-reduced-motion: reduce) {
+      .np-title { white-space: normal; }
+      .np-title.overflowing .np-title-tt { animation: none; }
+    }
     .np-artist { font-size: .85rem; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #np-progress { margin-top: .6rem; padding: 0 .75rem; }   /* .75rem inset = flush with the Lyrics slot (2026-06-18) */
     /* Progress bar adopts the accent gradient (2026-06-14 scheme expansion) —
@@ -162,7 +171,7 @@
     .qi-art, .qi-art-placeholder { width: 34px; height: 34px; border-radius: 4px; object-fit: cover; background: var(--surface2);
               flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: .95rem; }
     .qi-info { flex: 1; min-width: 0; }
-    .qi-title { font-size: .9rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .qi-title { font-size: .9rem; font-weight: 500; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
     .qi-artist { font-size: .8rem; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .qi-actions { display: flex; gap: .4rem; }
     .queue-header { display: flex; align-items: center; gap: 1rem; margin-bottom: .75rem; }
@@ -295,8 +304,11 @@
     .admin-shell .list-item:hover { background: var(--surface2); border-radius: 4px; }
     .admin-shell .list-art { width: 38px; height: 38px; border-radius: 4px; object-fit: cover; background: var(--surface2); flex-shrink: 0; font-size: 1.1rem; display: flex; align-items: center; justify-content: center; }
     .admin-shell .list-info { flex: 1; min-width: 0; }
-    .admin-shell .list-title { font-size: .88rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .admin-shell .list-sub { font-size: .76rem; color: #888; }
+    /* 2-line clamp on dense titles (2026-08-10 long-titles plan U4) — parity
+       with guest; track rows reuse .list-title so they clamp too. */
+    .admin-shell .list-title { font-size: .88rem; font-weight: 500; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    /* Subtitle clamps to one line (2026-08-10) — parity with guest. */
+    .admin-shell .list-sub { font-size: .76rem; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .admin-shell .list-chevron { color: #555; }
     /* kebab-btn (collected-library U4): replaces the + button; all five interaction states per DL-003 */
     /* Theme-tinted kebabs (2026-06-11): --accent-dim chip + --accent-ui glyph;
@@ -313,7 +325,7 @@
     .admin-shell .tile-art { width: 100%; height: 100%; object-fit: cover; background: var(--surface2); border-radius: 6px; }
     .admin-shell div.tile-art { filter: var(--sax-filter, none); }
     .admin-shell .tile.is-artist .tile-art-wrap, .admin-shell .tile.is-artist .tile-art { border-radius: 50%; }
-    .admin-shell .tile-title { font-size: .8rem; font-weight: 500; margin-top: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .admin-shell .tile-title { font-size: .8rem; font-weight: 500; margin-top: 5px; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
     .admin-shell .tile-sub { font-size: .72rem; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .admin-shell .tile.is-artist .tile-title, .admin-shell .tile.is-artist .tile-sub { text-align: center; }
     .admin-shell .tile-kebab { position: absolute; top: 5px; right: 5px; width: 28px; height: 28px; min-width: 0; min-height: 0; border-radius: 6px; font-size: 1rem; background: color-mix(in srgb, var(--surface) 70%, transparent); backdrop-filter: blur(2px); }
@@ -323,7 +335,8 @@
     .admin-shell .ra-cover { position: relative; width: 160px; aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: var(--surface2); box-shadow: 0 4px 14px rgba(0,0,0,.35); flex-shrink: 0; }
     .admin-shell .ra-cover-img { width: 100%; height: 100%; object-fit: cover; display: flex; align-items: center; justify-content: center; font-size: 2.2rem; }
     .admin-shell div.ra-cover-img { filter: var(--sax-filter, none); }
-    .admin-shell .ra-htitle .t { font-size: 1.05rem; font-weight: 800; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* Drill-in header wraps in full (2026-08-10 long-titles plan U5) — parity. */
+    .admin-shell .ra-htitle .t { font-size: 1.05rem; font-weight: 800; letter-spacing: -.01em; white-space: normal; overflow: visible; }
     .admin-shell .ra-htitle .s { font-size: .8rem; color: #888; margin-top: 2px; }
     /* Release subtitle artist/year links pop in accent at rest (2026-06-20);
        scoped so list-row name-links stay muted-until-hover. */

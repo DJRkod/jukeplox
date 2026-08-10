@@ -1949,6 +1949,25 @@ def test_track_dict_year_none_serializes_null():
     assert _track_dict(t)["year"] is None
 
 
+def test_track_dict_includes_album_artist():
+    """Long-titles/VA plan U1: the track serializer surfaces the album's own
+    artist so the release drill-in header can attribute it correctly (a VA
+    comp must read 'Various Artists', not the first track's performer)."""
+    from app.api.guest import _track_dict
+    t = Track(id="t1", title="Dirty Water", artist="The Standells", album="Nuggets",
+              duration_ms=1000, stream_key="/p", server_name="X",
+              album_artist="Various Artists")
+    assert _track_dict(t)["album_artist"] == "Various Artists"
+
+
+def test_track_dict_album_artist_none_serializes_null():
+    """A track with no album_artist serializes album_artist: null (no crash)."""
+    from app.api.guest import _track_dict
+    t = Track(id="t1", title="Song", artist="A", album="B", duration_ms=1000,
+              stream_key="/p", server_name="X")
+    assert _track_dict(t)["album_artist"] is None
+
+
 def test_browse_album_tracks_no_matching_artist_returns_empty(mock_deps):
     """get_album succeeds but no library has an artist with that name."""
     _, plex = mock_deps

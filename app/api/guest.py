@@ -154,6 +154,11 @@ def _track_dict(t) -> dict:
         "track_id": t.id,
         "title": t.title,
         "artist": t.artist,
+        # Album-level artist (2026-08-10 long-titles/VA plan U1): lets the
+        # release drill-in header attribute the album correctly — a Various
+        # Artists comp reads "Various Artists" instead of tracks[0]'s performer.
+        # Additive; existing consumers ignore it. None for albumless/legacy rows.
+        "album_artist": getattr(t, "album_artist", None),
         "album": t.album,
         # Album drill target for clickable names (2026-06-10 nav plan U1).
         # None for albumless tracks; absent in pre-change play_track_meta
