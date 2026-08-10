@@ -67,6 +67,9 @@ async def test_enrichment_defaults_degrade_to_empty():
     assert await s.get_sonic_nearest("min1:42") == []
     assert await s.get_artist_similar_names("min1:42") == []
     assert await s.get_artist_popular_tracks("min1:7") == []
+    # A source that reports its own album track_count (Jellyfin, local) needs no
+    # derivation, so the default is an empty map (ce-debug 2026-08-10).
+    assert await s.get_album_track_counts("min1:L") == {}
     empty = await s.search_titles("min1:L", "q")
     assert empty.tracks == [] and empty.albums == [] and empty.artists == []
 

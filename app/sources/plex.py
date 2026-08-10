@@ -121,6 +121,9 @@ class PlexSource(MusicSource):
     async def get_years(self, section_key: str) -> list[int]:
         return await self._client.get_years(section_key)
 
+    async def get_album_track_counts(self, section_key: str) -> dict[str, int]:
+        return await self._client.get_album_track_counts(section_key)
+
     async def get_sonic_nearest(
         self, track_id: str, limit: int = 10, max_distance: float = 0.35,
     ) -> list[Track]:

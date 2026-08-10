@@ -1142,6 +1142,32 @@ def test_group_albums_genuine_shared_album_still_folds(mock_deps):
     assert {s["server_name"] for s in okc[0]["sources"]} == {"ServerA", "ServerB"}
 
 
+def test_group_albums_same_title_single_and_album_unknown_count_not_folded(mock_deps):
+    """ce-debug 2026-08-10 (Van She "Idea of Happiness"): a Single/EP and an Album
+    that share a title with an UNKNOWN track_count must stay separate rows.
+
+    Plex reports no leafCount for singles, so the single and the album both carry
+    track_count=None and land in one count bucket. With the album ALSO on a
+    higher-ranked server, `_group_albums`' per-bucket "emit only the top server's
+    copies" rule silently dropped the single, which lived only on the lower-ranked
+    server. Bucketing by subtype (Single vs Album) keeps them apart while the
+    album still folds across servers."""
+    rows = [_album_idx_row("A:album", "Idea of Happiness", "Van She",
+                           server="ServerA", subtype="album", track_count=None),
+            _album_idx_row("B:album", "Idea of Happiness", "Van She",
+                           server="ServerB", subtype="album", track_count=None),
+            _album_idx_row("B:single", "Idea of Happiness", "Van She",
+                           server="ServerB", subtype="single", track_count=None)]
+    with patch("app.database.get_browse_albums", AsyncMock(return_value=rows)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums")
+    ioh = [d for d in resp.json() if d["title"] == "Idea of Happiness"]
+    all_source_ids = {s["album_id"] for d in ioh for s in d["sources"]}
+    assert "B:single" in all_source_ids, "the single was silently dropped"
+    assert len(ioh) == 2  # the folded album row + the single's own row
+
+
 # ── U5: per-release track resolution (index path) ────────────────────────────
 
 def _idx_arow(aid, server="ServerA", count=11, **kw):

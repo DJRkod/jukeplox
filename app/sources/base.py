@@ -147,6 +147,14 @@ class MusicSource(ABC):
     async def get_years(self, section_key: str) -> list[int]:
         return []
 
+    async def get_album_track_counts(self, section_key: str) -> dict[str, int]:
+        """``{album id -> track count}`` for a section. Default empty: a source
+        that already reports each album's track_count (Jellyfin, local) needs no
+        derivation. Plex overrides — its newer music agent drops leafCount from
+        the bulk album listing, so counts are derived from track membership
+        (ce-debug 2026-08-10)."""
+        return {}
+
     async def get_sonic_nearest(
         self, track_id: str, limit: int = 10, max_distance: float = 0.35,
     ) -> list[Track]:

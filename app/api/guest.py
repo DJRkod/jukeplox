@@ -568,7 +568,16 @@ def _group_albums(tagged: list, compiled=(), order: dict | None = None) -> list:
     for album, srv in tagged:
         key = _norm(album.title, compiled) + '|' + _norm(album.artist, compiled)
         releases = groups.setdefault(key, {})
-        servers = releases.setdefault(album.track_count, {})
+        # Bucket by (track_count, subtype): track_count alone can't separate a
+        # Single/EP from an Album that merely shares its title, because Plex
+        # reports NO leafCount for singles — both bucket under None, and the
+        # per-bucket "emit only the top server's copies" rule below then drops the
+        # single when the album outranks it on another server (ce-debug 2026-08-10,
+        # Van She "Idea of Happiness"). subtype is the content signal that keeps
+        # them apart; None normalizes to 'album' (matching the frontend's
+        # `a.subtype || 'album'`) so an inconsistent tag never splits one release.
+        bucket = (album.track_count, (album.subtype or 'album').lower())
+        servers = releases.setdefault(bucket, {})
         servers.setdefault(srv or "", []).append(album)
     out = []
     for releases in groups.values():

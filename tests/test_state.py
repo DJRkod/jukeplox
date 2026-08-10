@@ -1841,7 +1841,8 @@ def test_build_browse_index_rows_happy():
     libs_data = [
         ("ServerA", "A:1",
          [_mk_artist("A:1", "Radiohead", release_count=9)],
-         [_mk_album("A:10", "Kid A", "Radiohead", year=2000)]),
+         [_mk_album("A:10", "Kid A", "Radiohead", year=2000)],
+         {}),
     ]
     arts, albs = _build_browse_index_rows(libs_data)
     assert arts[0] == {
@@ -1861,7 +1862,8 @@ def test_build_browse_index_rows_carries_added_at():
     libs_data = [
         ("S", "S:1", [],
          [_mk_album("S:9", "Kid A", "Radiohead", added_at=1700000000),
-          _mk_album("S:10", "No Date", "Radiohead")]),
+          _mk_album("S:10", "No Date", "Radiohead")],
+         {}),
     ]
     _, albs = _build_browse_index_rows(libs_data)
     by_id = {a["album_id"]: a for a in albs}
@@ -1876,12 +1878,33 @@ def test_build_browse_index_rows_carries_track_count():
     libs_data = [
         ("S", "S:1", [],
          [_mk_album("S:9", "Loveless", "My Bloody Valentine", track_count=11),
-          _mk_album("S:10", "No Count", "X")]),
+          _mk_album("S:10", "No Count", "X")],
+         {}),
     ]
     _, albs = _build_browse_index_rows(libs_data)
     by_id = {a["album_id"]: a for a in albs}
     assert by_id["S:9"]["track_count"] == 11
     assert by_id["S:10"]["track_count"] is None
+
+
+def test_build_browse_index_rows_derives_track_count_from_counts():
+    """ce-debug 2026-08-10: Plex's newer music agent omits leafCount from the bulk
+    album listing (alb.track_count is None), so the builder must fill track_count
+    from the derived per-album counts. A real leafCount still wins when present;
+    an album absent from the counts map falls back to its own value."""
+    from app.state import _build_browse_index_rows
+    libs_data = [
+        ("S", "S:1", [],
+         [_mk_album("S:album", "Idea of Happiness", "Van She"),   # leafCount None
+          _mk_album("S:single", "Idea of Happiness", "Van She"),  # leafCount None
+          _mk_album("S:leaf", "Has Leaf", "X", track_count=7)],   # agent DID supply it
+         {"S:album": 11, "S:single": 5}),
+    ]
+    _, albs = _build_browse_index_rows(libs_data)
+    by_id = {a["album_id"]: a for a in albs}
+    assert by_id["S:album"]["track_count"] == 11
+    assert by_id["S:single"]["track_count"] == 5   # single now distinguishable
+    assert by_id["S:leaf"]["track_count"] == 7     # real leafCount preserved
 
 
 def test_build_browse_index_rows_artist_album_keys_align():
@@ -1891,15 +1914,17 @@ def test_build_browse_index_rows_artist_album_keys_align():
     from app.state import _build_browse_index_rows
     libs_data = [
         ("S", "S:1", [_mk_artist("S:1", "  Sigur Rós ")],
-         [_mk_album("S:9", "( )", "  Sigur Rós ")]),
+         [_mk_album("S:9", "( )", "  Sigur Rós ")],
+         {}),
     ]
     arts, albs = _build_browse_index_rows(libs_data)
     assert arts[0]["base_key"] == albs[0]["artist_base_key"]
 
 
-async def _run_refresh(libs, artists_by_key, albums_by_key):
+async def _run_refresh(libs, artists_by_key, albums_by_key, counts_by_key=None):
     """Drive _refresh_browse_index against a fake client; return (set_idx, stamp)."""
     import app.state as st
+    counts_by_key = counts_by_key or {}
     client = MagicMock()
     client.get_libraries = AsyncMock(return_value=libs)
 
@@ -1915,8 +1940,15 @@ async def _run_refresh(libs, artists_by_key, albums_by_key):
             raise v
         return v
 
+    async def _gc(key):
+        v = counts_by_key.get(key, {})
+        if isinstance(v, Exception):
+            raise v
+        return v
+
     client.get_artists = AsyncMock(side_effect=_ga)
     client.get_albums = AsyncMock(side_effect=_gal)
+    client.get_album_track_counts = AsyncMock(side_effect=_gc)
     set_idx = AsyncMock()
     stamp = AsyncMock()
     enabled = [{"section_key": l.key} for l in libs]
@@ -1943,6 +1975,41 @@ async def test_refresh_browse_index_happy_bulk_crawl():
     assert {r["album_id"] for r in album_rows} == {"A:10", "B:20"}
     assert {r["server_name"] for r in album_rows} == {"ServerA", "ServerB"}
     stamp.assert_awaited_once_with("browse_index_computed_at")
+
+
+async def test_refresh_browse_index_fills_track_count_from_derived_counts():
+    """ce-debug 2026-08-10: the refresh crawls per-album track counts and stamps
+    them onto album rows, restoring the content signal Plex's newer agent drops
+    from the bulk album listing. A failed counts leg degrades to no counts (never
+    blocks the index replace)."""
+    libs = [_mk_lib("A:1", "ServerA")]
+    set_idx, stamp = await _run_refresh(
+        libs,
+        {"A:1": [_mk_artist("A:1", "Van She")]},
+        {"A:1": [_mk_album("A:album", "Idea of Happiness", "Van She"),
+                 _mk_album("A:single", "Idea of Happiness", "Van She")]},
+        counts_by_key={"A:1": {"A:album": 11, "A:single": 5}},
+    )
+    set_idx.assert_awaited_once()
+    _, album_rows = set_idx.await_args.args
+    by_id = {r["album_id"]: r for r in album_rows}
+    assert by_id["A:album"]["track_count"] == 11
+    assert by_id["A:single"]["track_count"] == 5
+
+
+async def test_refresh_browse_index_counts_failure_degrades_gracefully():
+    """A failed per-album-count leg must not block the index replace — album rows
+    just keep their own (possibly None) track_count."""
+    libs = [_mk_lib("A:1", "ServerA")]
+    set_idx, stamp = await _run_refresh(
+        libs,
+        {"A:1": [_mk_artist("A:1", "Van She")]},
+        {"A:1": [_mk_album("A:album", "Idea of Happiness", "Van She")]},
+        counts_by_key={"A:1": RuntimeError("count query timeout")},
+    )
+    set_idx.assert_awaited_once()   # index still installed
+    _, album_rows = set_idx.await_args.args
+    assert album_rows[0]["track_count"] is None
 
 
 async def test_refresh_browse_index_all_failed_does_not_wipe():
@@ -2124,6 +2191,7 @@ async def test_refresh_browse_index_rebuilds_grouping_and_bumps_gen():
     client.get_libraries = AsyncMock(return_value=libs)
     client.get_artists = AsyncMock(return_value=[_mk_artist("A:1", "Radiohead")])
     client.get_albums = AsyncMock(return_value=[_mk_album("A:10", "Kid A", "Radiohead")])
+    client.get_album_track_counts = AsyncMock(return_value={})
     roster = [{"title": "Radiohead", "base_key": "radiohead"}]
     try:
         with patch("app.state.get_plex_client", AsyncMock(return_value=client)), \

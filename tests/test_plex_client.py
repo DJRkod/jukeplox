@@ -458,6 +458,40 @@ async def test_get_albums_returns_album_objects(respx_mock):
     assert albums[0].year == 1969
 
 
+async def test_get_albums_track_count_none_when_agent_drops_leafcount(respx_mock):
+    """Regression pin (ce-debug 2026-08-10): Plex's newer music agent returns no
+    leafCount/childCount in the bulk album listing, so Album.track_count is None.
+    The browse-index/catalog crawl must derive it from tracks instead of trusting
+    the album item."""
+    import httpx
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(
+        return_value=httpx.Response(200, json=_metadata_response(
+            {"ratingKey": "85390", "title": "Idea of Happiness", "parentTitle": "Van She"},
+        ))
+    )
+    client = make_client()
+    albums = await client.get_albums("1")
+    assert albums[0].track_count is None
+
+
+async def test_get_album_track_counts_counts_tracks_by_parent(respx_mock):
+    """The derived content signal: count tracks per parentRatingKey from the track
+    listing, since the album listing no longer carries leafCount. Tracks with no
+    parent are ignored (ce-debug 2026-08-10)."""
+    import httpx
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(
+        return_value=httpx.Response(200, json={"MediaContainer": {"Metadata": [
+            {"ratingKey": "101", "title": "t1", "parentRatingKey": "10"},
+            {"ratingKey": "102", "title": "t2", "parentRatingKey": "10"},
+            {"ratingKey": "201", "title": "s1", "parentRatingKey": "20"},
+            {"ratingKey": "999", "title": "no-parent"},
+        ]}})
+    )
+    client = make_client()
+    counts = await client.get_album_track_counts("1")
+    assert counts == {"10": 2, "20": 1}
+
+
 async def test_get_albums_for_artist_returns_all_release_types(respx_mock):
     """section-all with parentRatingKey returns all release types; client-side filter applied."""
     import httpx

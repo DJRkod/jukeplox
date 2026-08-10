@@ -165,6 +165,9 @@ ADMIN_ALLOWED = {
     "syncSurpriseSourceNote",
     # Admin Sources scan-status badge (plan U15): scanning / scanned-empty.
     "renderSourceScanStatus",
+    # Live-poll timer id for the scan-status + index readouts so they settle to
+    # their final state on a live page without a reload (ce-debug 2026-08-10).
+    "_jpScanPoll",
     "loadSettings",
     # Surprise "Recent suggestions" readout — shared render path for the GET fetch
     # + the live surprise_recorded WS event (admin-only Setup chrome).
