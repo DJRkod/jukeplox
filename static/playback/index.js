@@ -72,6 +72,7 @@ window.mountPlayback = function mountPlayback(config) {
   let _trackId = null;    // last applied track — position resets on change
   let _tickTimer = null;
   let _syncTimer = null;
+  let _npMqRaf = null;    // Now Playing marquee rAF handle — module-scoped, cleared on every title change (U6 timer hygiene)
   let _seeking = false;   // suppresses repaints while the user drags
   // ── lyrics state (2026-06-17 plan 008) ───────────────────────────────
   let _lyrics = null;         // last fetched result {available, instrumental, synced, plain}
@@ -288,7 +289,7 @@ window.mountPlayback = function mountPlayback(config) {
     if (_npEls) {
       _npEls.placeholder.style.display = '';
       _npEls.art.classList.add('hidden');
-      _npEls.title.textContent = 'Jukeplox';
+      _applyNpTitle(_npEls.title, 'Jukeplox');
       _npEls.artist.textContent = 'Nothing playing';
     }
     if (_mbEls) {
@@ -332,6 +333,46 @@ window.mountPlayback = function mountPlayback(config) {
     });
   }
 
+  // Now Playing marquee (2026-08-10 long-titles plan U6): a title too long for
+  // the focal NP line scrolls to reveal its end. The scrolling text lives in an
+  // aria-hidden inner span while .np-title carries the aria-label, so assistive
+  // tech reads the full title once rather than animated mutations. Motion is
+  // gated by prefers-reduced-motion (skip here; the CSS @media makes the static
+  // fallback wrap in full). The rAF handle is module-scoped and cancelled on
+  // every title change, so a stale measurement from a superseded track can't
+  // fire. Micro-bar title is intentionally left as a plain ellipsis (no marquee).
+  function _applyNpTitle(el, text) {
+    if (!el) return;
+    text = text || '';
+    let tt = el.querySelector('.np-title-tt');
+    // No-op when the title is unchanged: applyNowPlaying can re-fire for the
+    // same track (e.g. pause/resume), and re-measuring would restart the
+    // marquee mid-scroll. Only rebuild + re-measure on an actual title change.
+    if (tt && tt.textContent === text) return;
+    el.setAttribute('aria-label', text);
+    if (!tt) {
+      el.textContent = '';
+      tt = document.createElement('span');
+      tt.className = 'np-title-tt';
+      tt.setAttribute('aria-hidden', 'true');
+      el.appendChild(tt);
+    }
+    tt.textContent = text;
+    el.classList.remove('overflowing');
+    el.style.removeProperty('--mq-shift');
+    if (_npMqRaf) { cancelAnimationFrame(_npMqRaf); _npMqRaf = null; }
+    const reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce) return;   // static full-wrap fallback handled by the CSS @media
+    _npMqRaf = requestAnimationFrame(() => {
+      _npMqRaf = null;
+      const shift = el.clientWidth - tt.scrollWidth;
+      if (shift < -4) {
+        el.style.setProperty('--mq-shift', shift + 'px');
+        el.classList.add('overflowing');
+      }
+    });
+  }
+
   function applyNowPlaying(data) {
     if (!data || !data.title) { _setIdle(); return; }
     _hasTrack = true;
@@ -341,7 +382,7 @@ window.mountPlayback = function mountPlayback(config) {
       data.album ? { kind: 'album', text: data.album, albumId: data.album_id } : null,
     ];
     if (_npEls) {
-      _npEls.title.textContent = data.title;
+      _applyNpTitle(_npEls.title, data.title);
       _setNameLine(_npEls.artist, subParts, 'now');
       if (data.thumb) {
         _npEls.art.src = _art(data.thumb);

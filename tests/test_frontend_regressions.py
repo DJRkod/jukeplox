@@ -1190,6 +1190,113 @@ def test_release_subtitle_links_and_kebab_parity():
         )
 
 
+def test_release_header_uses_album_artist_and_va_is_non_navigable():
+    """2026-08-10 long-titles/VA plan U2: the release drill-in header attributes
+    the album by its OWN artist (album_artist), not the first track's performer,
+    and renders a Various Artists comp as a non-navigable .name-link-self label
+    (dimmed), never an accent .nl-artist link. One shared code path = guest +
+    admin parity; both templates already define .name-link-self."""
+    browse = BROWSE_JS.read_text(encoding="utf-8")
+    assert "a0.album_artist" in browse, (
+        "showAlbumTracks must source the header artist from a0.album_artist "
+        "(the U1 serializer field), not the first track's performer."
+    )
+    assert re.search(r"===\s*['\"]various artists['\"]", browse), (
+        "showAlbumTracks must detect Various Artists (case-normalized) to gate "
+        "the non-navigable header treatment."
+    )
+    assert "name-link-self" in browse, (
+        "the VA header branch must render 'Various Artists' as a non-navigable "
+        ".name-link-self label, not an accent .nl-artist link."
+    )
+    for tmpl in (GUEST_TEMPLATE, ADMIN_TEMPLATE):
+        src = tmpl.read_text(encoding="utf-8")
+        assert ".name-link-self" in src, (
+            f"{tmpl.name}: must define .name-link-self (non-navigable label style)."
+        )
+
+
+def test_album_row_kebab_omits_go_to_artist_for_va():
+    """2026-08-10 long-titles/VA plan U3: the album-row kebab (_albumKebabItems)
+    must not offer 'Go to artist' for a Various Artists comp — album.artist is
+    'Various Artists' there, a non-navigable label; the entry would otherwise
+    fire a dead browseToArtist('Various Artists')."""
+    browse = BROWSE_JS.read_text(encoding="utf-8")
+    m = re.search(r"function _albumKebabItems\b.*?\n  \}", browse, re.S)
+    assert m, "static/browse/index.js must define _albumKebabItems."
+    body = m.group(0)
+    assert re.search(r"album\.artist[^\n]*various artists", body, re.I), (
+        "_albumKebabItems must gate the 'Go to artist' entry behind a Various "
+        "Artists check so VA rows omit it (no dead browseToArtist nav)."
+    )
+
+
+def test_dense_titles_clamp_two_lines_and_drill_header_wraps():
+    """2026-08-10 long-titles plan U4/U5: dense title surfaces (.list-title,
+    .tile-title, .qi-title) clamp to 2 lines instead of a 1-line ellipsis
+    dead-end, and the focal drill-in header (.ra-htitle .t) wraps in full. Both
+    templates must carry the treatment — shared renderers, one behavior on both
+    pages. Track rows reuse .list-title, so they clamp via the same rule."""
+    for tmpl in (GUEST_TEMPLATE, ADMIN_TEMPLATE):
+        src = tmpl.read_text(encoding="utf-8")
+        for cls in ("list-title", "tile-title", "qi-title"):
+            m = re.search(rf"\.{cls} \{{[^}}]*\}}", src)
+            assert m, f"{tmpl.name}: no rule found for .{cls}"
+            block = m.group(0)
+            assert "-webkit-line-clamp: 2" in block and "nowrap" not in block, (
+                f"{tmpl.name}: .{cls} must 2-line-clamp (no nowrap) for long titles."
+            )
+        rah = re.search(r"\.ra-htitle \.t \{[^}]*\}", src)
+        assert rah and "white-space: normal" in rah.group(0) and "nowrap" not in rah.group(0), (
+            f"{tmpl.name}: .ra-htitle .t must wrap in full (white-space:normal, no clamp)."
+        )
+
+
+def test_now_playing_title_marquee_motion_gated():
+    """2026-08-10 long-titles plan U6: the Now Playing title marquees a long
+    title (JS-measured overflow → --mq-shift + .overflowing). The scrolling text
+    lives in an aria-hidden inner span while .np-title carries the aria-label; the
+    rAF handle is module-scoped and cancelled on every title change (timer
+    hygiene); motion is gated by prefers-reduced-motion in both JS and CSS, with a
+    full-wrap static fallback. Both templates carry the CSS (parity)."""
+    pb = PLAYBACK_JS.read_text(encoding="utf-8")
+    assert "_applyNpTitle" in pb, "the playback module must route the NP title through _applyNpTitle."
+    assert "np-title-tt" in pb and "aria-hidden" in pb and "aria-label" in pb, (
+        "the scrolling inner span must be aria-hidden and .np-title must carry the full title as aria-label."
+    )
+    assert "_npMqRaf" in pb and "cancelAnimationFrame(_npMqRaf)" in pb, (
+        "the marquee rAF handle must be module-scoped and cancelled on every title change."
+    )
+    assert "prefers-reduced-motion" in pb, "the JS must skip animating under prefers-reduced-motion."
+    for tmpl in (GUEST_TEMPLATE, ADMIN_TEMPLATE):
+        src = tmpl.read_text(encoding="utf-8")
+        assert "@keyframes npMarquee" in src, f"{tmpl.name}: must define the npMarquee keyframe."
+        assert re.search(r"reduce\)\s*\{\s*\.np-title \{ white-space: normal", src), (
+            f"{tmpl.name}: reduced-motion must fall back to a full-wrap .np-title (white-space:normal)."
+        )
+
+
+def test_track_subtitle_omits_redundant_album_and_clamps():
+    """2026-08-10 tracklist-subtitle overflow: a track row inside its own album
+    drill-in must NOT repeat the album in its subtitle (redundant, and a very
+    long title like Fiona Apple's "When the Pawn…" walls the list), and .list-sub
+    must clamp to one line so no long artist/album ever wraps unbounded. The
+    album stays in flat/search/All-Songs views where it is meaningful."""
+    browse = BROWSE_JS.read_text(encoding="utf-8")
+    m = re.search(r"function _trackSubHtml\b.*?\n  \}", browse, re.S)
+    assert m, "static/browse/index.js must define _trackSubHtml."
+    assert "currentAlbumId" in m.group(0), (
+        "_trackSubHtml must omit the album when ctx.currentAlbumId is set "
+        "(the row is already inside that album's drill-in)."
+    )
+    for tmpl in (GUEST_TEMPLATE, ADMIN_TEMPLATE):
+        src = tmpl.read_text(encoding="utf-8")
+        m2 = re.search(r"\.list-sub \{[^}]*\}", src)
+        assert m2 and "nowrap" in m2.group(0) and "text-overflow: ellipsis" in m2.group(0), (
+            f"{tmpl.name}: .list-sub must clamp to one line (nowrap + ellipsis)."
+        )
+
+
 def test_release_kebab_navigation():
     """2026-06-20 release-kebab-nav: the detail-view header kebab gains Go to
     artist(s) + Go to year. Single artist = one entry; a compilation (>1 distinct
