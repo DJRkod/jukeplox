@@ -49,8 +49,9 @@ async def test_registry_none_when_no_sources_at_all():
 
 async def test_registry_includes_subsonic_source_when_configured():
     """U4: a stored Subsonic source builds a SubsonicSource into the registry
-    (additive wiring mirroring the Jellyfin/local paths). token = the opened API
-    key; user maps to the adapter's username."""
+    (additive wiring mirroring the Jellyfin/local paths). token = the opened
+    secret; user maps to the adapter's username. A row without auth_mode (pre-
+    fallback shape) builds as apiKey (2026-08-11-003 U3)."""
     import app.state as st
     import app.database as db
     st.invalidate_plex_client()
@@ -71,6 +72,33 @@ async def test_registry_includes_subsonic_source_when_configured():
     assert sub.server_name == "Navidrome"
     assert sub.username == "dj"
     assert sub.url_borne_auth is True
+    # No auth_mode in the row → apiKey (back-compat): _common_params carries apiKey.
+    assert "apiKey" in sub._common_params()
+
+
+async def test_registry_builds_token_mode_subsonic_source():
+    """U3 (2026-08-11-003): a stored auth_mode='token' source builds a token+salt
+    auther — the secret (password) drives u/s/t, not apiKey — read from the DB
+    with NO network probe."""
+    import app.state as st
+    import app.database as db
+    st.invalidate_plex_client()
+    with patch.object(db, "get_plex_servers", AsyncMock(return_value=[])), \
+         patch.object(db, "get_plex_config", AsyncMock(return_value=None)), \
+         patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_subsonic_sources", AsyncMock(return_value=[
+             {"source_id": "subsonic-2", "name": "gonic",
+              "server_url": "http://gonic.local:4747", "token": "the-password",
+              "user": "dj", "client": "Jukeplox", "auth_mode": "token"}])), \
+         patch.object(db, "get_emby_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_local_sources", AsyncMock(return_value=[])):
+        reg = await st.get_plex_client()
+    st.invalidate_plex_client()
+    sub = next(s for s in reg.sources if s.source_type == "subsonic")
+    params = sub._common_params()
+    assert "apiKey" not in params
+    assert params["s"] and params["t"]     # token+salt auth
+    assert "p" not in params               # never the cleartext password
 
 
 async def test_registry_includes_emby_source_when_configured():

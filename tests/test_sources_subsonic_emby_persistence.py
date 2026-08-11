@@ -65,6 +65,7 @@ async def test_subsonic_save_get_round_trip_sealed_at_rest(db):
     await database.save_subsonic_source(
         source_id="sub1", server_url="http://navidrome.lan:4533", name="Navidrome",
         token="subsonic-api-key-xyz", user="dj", client="jukeplox",
+        auth_mode="apikey",
     )
     # Raw stored value is sealed (not plaintext).
     raw = await _raw_token(db.db_path, "subsonic_sources", "sub1")
@@ -80,16 +81,77 @@ async def test_subsonic_save_get_round_trip_sealed_at_rest(db):
     assert r["token"] == "subsonic-api-key-xyz"
     assert r["user"] == "dj"
     assert r["client"] == "jukeplox"
+    assert r["auth_mode"] == "apikey"
+
+
+async def test_subsonic_token_mode_round_trip_seals_password(db):
+    # token+salt fallback (2026-08-11-003 U2): the stored secret is the account
+    # PASSWORD, sealed at rest, and auth_mode round-trips as 'token'.
+    from app.sources import secrets
+    await database.save_subsonic_source(
+        source_id="subT", server_url="http://gonic.lan:4747", name="gonic",
+        token="my-account-password", user="dj", client="jukeplox",
+        auth_mode="token",
+    )
+    raw = await _raw_token(db.db_path, "subsonic_sources", "subT")
+    assert raw.startswith(secrets.SEALED_PREFIX)
+    assert "my-account-password" not in raw  # never plaintext at rest (AE3)
+    rows = {r["source_id"]: r for r in await database.get_subsonic_sources()}
+    assert rows["subT"]["auth_mode"] == "token"
+    assert rows["subT"]["token"] == "my-account-password"
+
+
+async def test_subsonic_preexisting_row_defaults_to_apikey(db):
+    # R6/AE6: a row written without auth_mode (pre-fallback shape) reads back as
+    # 'apikey' via the column DEFAULT — existing apiKey sources are unchanged.
+    await database._conn().execute(
+        "INSERT INTO subsonic_sources (source_id, server_url, name, token, user, client) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("subOld", "http://old.lan", "Old", "some-key", "u", "c"),
+    )
+    await database._conn().commit()
+    rows = {r["source_id"]: r for r in await database.get_subsonic_sources()}
+    assert rows["subOld"]["auth_mode"] == "apikey"
+
+
+async def test_migrate_columns_adds_auth_mode_to_legacy_table(db):
+    # Exercises the ALTER TABLE path (not just the CREATE-TABLE DEFAULT): a
+    # pre-fallback subsonic_sources table without auth_mode gains the column and
+    # existing rows read back as 'apikey' after _migrate_columns (R6/AE6).
+    conn = database._conn()
+    await conn.execute("DROP TABLE subsonic_sources")
+    await conn.execute(
+        "CREATE TABLE subsonic_sources (source_id TEXT PRIMARY KEY, "
+        "server_url TEXT NOT NULL, name TEXT NOT NULL, token TEXT NOT NULL, "
+        "user TEXT NOT NULL, client TEXT NOT NULL)")
+    await conn.execute(
+        "INSERT INTO subsonic_sources (source_id, server_url, name, token, user, client) "
+        "VALUES ('legacy', 'http://a.lan', 'A', 'k', 'u', 'c')")
+    await conn.commit()
+    async with conn.execute("PRAGMA table_info(subsonic_sources)") as cur:
+        assert "auth_mode" not in {r["name"] async for r in cur}
+
+    await database._migrate_columns()
+    await conn.commit()
+
+    async with conn.execute("PRAGMA table_info(subsonic_sources)") as cur:
+        assert "auth_mode" in {r["name"] async for r in cur}
+    rows = {r["source_id"]: r for r in await database.get_subsonic_sources()}
+    assert rows["legacy"]["auth_mode"] == "apikey"
+    # Idempotent: a second run does not error or duplicate the column.
+    await database._migrate_columns()
+    await conn.commit()
 
 
 async def test_subsonic_upsert_updates_in_place(db):
     await database.save_subsonic_source(
         source_id="sub1", server_url="http://a.lan", name="A",
-        token="k1", user="u1", client="c1",
+        token="k1", user="u1", client="c1", auth_mode="apikey",
     )
+    # A reconnect can flip mode: apikey → token, secret+mode overwrite together.
     await database.save_subsonic_source(
         source_id="sub1", server_url="http://b.lan", name="B",
-        token="k2", user="u2", client="c2",
+        token="k2", user="u2", client="c2", auth_mode="token",
     )
     rows = await database.get_subsonic_sources()
     assert len(rows) == 1
@@ -97,12 +159,13 @@ async def test_subsonic_upsert_updates_in_place(db):
     assert rows[0]["name"] == "B"
     assert rows[0]["token"] == "k2"
     assert rows[0]["user"] == "u2"
+    assert rows[0]["auth_mode"] == "token"
 
 
 async def test_subsonic_delete_removes_row(db):
     await database.save_subsonic_source(
         source_id="sub1", server_url="http://a.lan", name="A",
-        token="k1", user="u1", client="c1",
+        token="k1", user="u1", client="c1", auth_mode="apikey",
     )
     await database.delete_subsonic_source("sub1")
     assert await database.get_subsonic_sources() == []
@@ -112,6 +175,7 @@ async def test_subsonic_server_url_never_contains_credential(db):
     await database.save_subsonic_source(
         source_id="sub1", server_url="http://navidrome.lan:4533", name="Navidrome",
         token="subsonic-api-key-xyz", user="dj", client="jukeplox",
+        auth_mode="apikey",
     )
     row = await _raw_row(db.db_path, "subsonic_sources", "sub1")
     assert "subsonic-api-key-xyz" not in row["server_url"]
@@ -234,7 +298,7 @@ async def test_get_degrades_on_legacy_plaintext_and_lost_key(db):
     # Sealed row whose key is then lost/rotated — get_* degrades to "", no raise.
     await database.save_subsonic_source(
         source_id="sealed", server_url="http://b.lan", name="B",
-        token="will-be-lost", user="u", client="c",
+        token="will-be-lost", user="u", client="c", auth_mode="apikey",
     )
     secrets._key_path().write_bytes(Fernet.generate_key())  # rotate → decrypt fails
     rows = {r["source_id"]: r for r in await database.get_subsonic_sources()}

@@ -19,6 +19,7 @@ Covers the plan's U2 scenarios:
 - a fetch_art/resolve_stream failure never emits the api key into logs.
 """
 
+import hashlib
 import re
 
 import httpx
@@ -31,6 +32,7 @@ from app.sources.subsonic import SubsonicSource, SubsonicAuthError
 SERVER = "http://navidrome.local:4533"
 USER = "party"
 API_KEY = "key-abc-secret"
+PASSWORD = "s3cr3t-pw"  # token+salt mode account password (never transmitted)
 
 # The registry accepts ids matching this shape after the {source_id}: prefix.
 _ID_AFTER_PREFIX = re.compile(r"^[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)?$")
@@ -43,6 +45,14 @@ def _sr(payload):
     )
 
 
+def _sr_failed(code, message):
+    """A Subsonic ``failed`` envelope (HTTP 200, error code) — code 40 = wrong
+    creds, which the adapter maps to SubsonicAuthError."""
+    return httpx.Response(200, json={"subsonic-response": {
+        "status": "failed", "version": "1.16.1",
+        "error": {"code": code, "message": message}}})
+
+
 class FakeSubsonic:
     """A minimal in-memory Subsonic REST surface for httpx.MockTransport.
 
@@ -50,9 +60,19 @@ class FakeSubsonic:
     lets a second (gonic-style) fixture reshape response fields.
     """
 
-    def __init__(self, *, has_api_key_ext=True, unsafe_ids=False):
+    def __init__(self, *, has_api_key_ext=True, unsafe_ids=False,
+                 known_apikey=None, known_password=None):
         self.has_api_key_ext = has_api_key_ext
         self.unsafe_ids = unsafe_ids
+        # When a known credential is set, the fake ENFORCES it on every
+        # authenticated request (wrong secret → failed code 40), instead of
+        # accepting anything. This is the fix for the original ship's blind spot:
+        # a credential-blind mock passes CI while a real wrong secret is rejected.
+        # apiKey mode checks apiKey==known_apikey; token mode recomputes
+        # md5(known_password + s) and compares t, proving the adapter's token
+        # derivation is wire-correct. Both None → accept (back-compat).
+        self.known_apikey = known_apikey
+        self.known_password = known_password
         self.last_url = None  # full URL of the most recent request (for leak checks)
 
         aid = "ar:1" if unsafe_ids else "ar1"
@@ -83,6 +103,20 @@ class FakeSubsonic:
              "year": 2001},  # no MBID → empty match_ids
         ]
 
+    def _auth_ok(self, params) -> bool:
+        """Enforce the configured credential (if any) — apiKey exact match, or
+        token+salt md5 recomputation. No known credential → accept."""
+        if self.known_apikey is not None:
+            return params.get("apiKey") == self.known_apikey
+        if self.known_password is not None:
+            s, t = params.get("s"), params.get("t")
+            if not s or not t:
+                return False
+            import hashlib
+            return t == hashlib.md5(
+                (self.known_password + s).encode("utf-8")).hexdigest()
+        return True
+
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.last_url = str(request.url)
         path = request.url.path
@@ -90,11 +124,16 @@ class FakeSubsonic:
         name = path.rsplit("/", 1)[-1].replace(".view", "")
 
         if name == "getOpenSubsonicExtensions":
+            # The unauthenticated capability endpoint — never credential-gated.
             exts = []
             if self.has_api_key_ext:
                 exts = [{"name": "apiKeyAuthentication", "versions": [1]},
                         {"name": "transcodeOffset", "versions": [1]}]
             return _sr({"openSubsonicExtensions": exts})
+
+        # Every other endpoint is authenticated: reject a wrong secret.
+        if not self._auth_ok(params):
+            return _sr_failed(40, "Wrong username or password.")
 
         if name == "ping":
             return _sr({})
@@ -176,6 +215,14 @@ def _source(fake, **kw):
                           source_id="navi", server_name="Navi", http=http, **kw)
 
 
+def _token_source(fake, **kw):
+    """A token+salt-mode source: the secret is the account password."""
+    http = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
+    return SubsonicSource(server_url=SERVER, api_key=PASSWORD, username=USER,
+                          source_id="navi", server_name="Navi", http=http,
+                          auth_mode="token", **kw)
+
+
 @pytest.fixture
 def fake():
     return FakeSubsonic()
@@ -201,19 +248,18 @@ def test_url_borne_auth_flag(fake):
 
 # ── extension detection / auth ───────────────────────────────────────────────
 
-async def test_api_key_extension_detected(fake):
-    s = _source(fake)
-    assert await s.supports_api_key() is True
+def test_invalid_auth_mode_rejected_at_construction():
+    # A typo'd mode must fail loudly, not silently emit the wrong auth params.
+    http = httpx.AsyncClient(transport=httpx.MockTransport(FakeSubsonic().handler))
+    with pytest.raises(ValueError):
+        SubsonicSource(server_url=SERVER, api_key="k", username=USER, http=http,
+                       auth_mode="Token")  # wrong case
 
 
-async def test_missing_api_key_extension_surfaces_clear_error():
-    fake = FakeSubsonic(has_api_key_ext=False)
+def test_invalid_auth_mode_rejected_in_set_auth(fake):
     s = _source(fake)
-    assert await s.supports_api_key() is False
-    with pytest.raises(SubsonicAuthError) as ei:
-        await s.require_api_key_support()
-    # a message the connect handler can reject on
-    assert "api" in str(ei.value).lower() and "key" in str(ei.value).lower()
+    with pytest.raises(ValueError):
+        s.set_auth("password")  # not a valid mode
 
 
 async def test_requests_carry_api_key_not_password(fake):
@@ -223,6 +269,163 @@ async def test_requests_carry_api_key_not_password(fake):
     assert "apiKey=key-abc-secret" in fake.last_url
     assert "&p=" not in fake.last_url and "?p=" not in fake.last_url
     assert "&t=" not in fake.last_url and "&s=" not in fake.last_url
+
+
+# ── token+salt fallback (2026-08-11-003 U1) ──────────────────────────────────
+
+def test_apikey_mode_common_params_unchanged(fake):
+    # Regression (R6): apiKey mode emits apiKey and NONE of s/t/p.
+    s = _source(fake)
+    p = s._common_params()
+    assert p["apiKey"] == API_KEY
+    assert p["u"] == USER and p["f"] == "json"
+    assert "s" not in p and "t" not in p and "p" not in p
+
+
+def test_token_mode_common_params_shape_and_md5(fake):
+    # R2: token mode emits u/s/t with t=md5(password+salt); no apiKey, no p.
+    s = _token_source(fake)
+    p = s._common_params()
+    assert p["u"] == USER and p["f"] == "json"
+    assert "apiKey" not in p and "p" not in p
+    assert p["s"] and p["t"]
+    expected = hashlib.md5((PASSWORD + p["s"]).encode("utf-8"),
+                           usedforsecurity=False).hexdigest()
+    assert p["t"] == expected
+
+
+def test_token_mode_fresh_salt_per_call(fake):
+    # R2: each request gets a fresh salt (and therefore a fresh token).
+    s = _token_source(fake)
+    a = s._common_params()
+    b = s._common_params()
+    assert a["s"] != b["s"]
+    assert a["t"] != b["t"]
+
+
+async def test_token_mode_requests_carry_token_salt_not_password(fake):
+    s = _token_source(fake)
+    await s.get_genres("navi:lib")
+    assert "&t=" in fake.last_url and "&s=" in fake.last_url
+    assert f"u={USER}" in fake.last_url
+    assert "apiKey=" not in fake.last_url
+    assert "&p=" not in fake.last_url and "?p=" not in fake.last_url
+    # the cleartext password must never appear anywhere in the URL
+    assert PASSWORD not in fake.last_url
+
+
+def test_url_borne_auth_true_in_token_mode(fake):
+    # AE4/R5: force-proxy applies to token+salt too (the URL carries u/t/s).
+    assert _token_source(fake).url_borne_auth is True
+
+
+async def test_resolve_stream_token_mode_no_cleartext_password(fake):
+    s = _token_source(fake)
+    tgt = s.resolve_stream("navi:tr1")
+    assert isinstance(tgt, StreamTarget)
+    assert "t=" in tgt.url and "s=" in tgt.url
+    assert "apiKey=" not in tgt.url and "&p=" not in tgt.url
+    assert PASSWORD not in tgt.url
+
+
+async def test_set_auth_reconfigures_mode(fake):
+    # U4 relies on flipping one source's mode without a second httpx client.
+    s = _source(fake)  # starts apikey
+    assert "apiKey" in s._common_params()
+    s.set_auth("token", secret=PASSWORD)
+    p = s._common_params()
+    assert "apiKey" not in p and p["s"] and p["t"]
+    assert p["t"] == hashlib.md5((PASSWORD + p["s"]).encode("utf-8"),
+                                 usedforsecurity=False).hexdigest()
+
+
+async def test_probe_extensions_unauth_carries_no_credentials(fake):
+    # security-lens/adversarial P1: the detection probe must not transmit the
+    # unvalidated secret — only v/c/f on the wire.
+    s = _source(fake)
+    present = await s._probe_extensions_unauth()
+    assert present is True
+    assert "apiKey=" not in fake.last_url
+    assert f"u={USER}" not in fake.last_url
+    assert "&t=" not in fake.last_url and "&s=" not in fake.last_url
+    assert "&p=" not in fake.last_url and "?p=" not in fake.last_url
+
+
+async def test_probe_extensions_unauth_absent_returns_false():
+    fake = FakeSubsonic(has_api_key_ext=False)
+    s = _source(fake)
+    assert await s._probe_extensions_unauth() is False
+
+
+async def test_probe_extensions_unauth_raises_on_failed_status():
+    def handler(request):
+        return httpx.Response(200, json={"subsonic-response": {
+            "status": "failed", "error": {"code": 0, "message": "nope"}}})
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    s = SubsonicSource(server_url=SERVER, api_key=API_KEY, username=USER,
+                       source_id="navi", http=http)
+    with pytest.raises(RuntimeError):
+        await s._probe_extensions_unauth()
+
+
+async def test_validate_credentials_ok(fake):
+    # ping succeeds → no raise, in both modes.
+    await _source(fake).validate_credentials()
+    await _token_source(fake).validate_credentials()
+
+
+async def test_validate_credentials_raises_on_auth_failure():
+    # A server that rejects the secret returns a Subsonic failed code 40 →
+    # SubsonicAuthError (the real connect-time secret check; get_libraries would
+    # not have caught this).
+    def handler(request):
+        if request.url.path.endswith("ping.view"):
+            return httpx.Response(200, json={"subsonic-response": {
+                "status": "failed", "error": {"code": 40, "message": "wrong"}}})
+        return _sr({})
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    s = SubsonicSource(server_url=SERVER, api_key="badpw", username=USER,
+                       source_id="navi", http=http, auth_mode="token")
+    with pytest.raises(SubsonicAuthError):
+        await s.validate_credentials()
+
+
+# ── U6: both-mode credential ENFORCEMENT (closes the original mock-blind gap) ──
+# The prior FakeSubsonic accepted any credential, so a green suite proved nothing
+# about wire-correctness. These use a credential-enforcing fake in BOTH modes.
+
+async def test_apikey_mode_correct_key_accepted_by_enforcing_server():
+    fake = FakeSubsonic(known_apikey=API_KEY)
+    s = _source(fake)  # apikey mode, api_key == API_KEY
+    await s.validate_credentials()                 # correct key → no raise
+    assert "Rock" in await s.get_genres("navi:lib")
+
+
+async def test_apikey_mode_wrong_key_rejected_by_enforcing_server():
+    fake = FakeSubsonic(known_apikey="the-right-key")
+    http = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
+    s = SubsonicSource(server_url=SERVER, api_key="WRONG-key", username=USER,
+                       source_id="navi", http=http)  # apikey (default)
+    with pytest.raises(SubsonicAuthError):
+        await s.validate_credentials()
+
+
+async def test_token_mode_correct_password_accepted_by_enforcing_server():
+    # Proves t=md5(password+salt) is WIRE-correct: the fake recomputes it
+    # server-side from the known password and only accepts a matching token.
+    fake = FakeSubsonic(has_api_key_ext=False, known_password=PASSWORD)
+    s = _token_source(fake)  # password == PASSWORD
+    await s.validate_credentials()                 # correct password → no raise
+    assert "Rock" in await s.get_genres("navi:lib")
+
+
+async def test_token_mode_wrong_password_rejected_by_enforcing_server():
+    fake = FakeSubsonic(has_api_key_ext=False, known_password="correct-pw")
+    http = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
+    s = SubsonicSource(server_url=SERVER, api_key="WRONG-pw", username=USER,
+                       source_id="navi", http=http, auth_mode="token")
+    with pytest.raises(SubsonicAuthError):
+        await s.validate_credentials()
 
 
 # ── browse parse ─────────────────────────────────────────────────────────────

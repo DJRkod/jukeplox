@@ -765,17 +765,18 @@
         <span id="jf-connect-error" style="display:none;font-size:.85rem;color:#f87171;margin-top:.4rem"></span>
       </div>
 
-      <!-- OpenSubsonic connect (2026-08-10-003 U7): revealed by "Connect Subsonic",
-           mirroring the Jellyfin affordance. R5 — an API KEY is stored, never a
-           password; the help hint tells the admin where to generate one. After a
+      <!-- OpenSubsonic connect (2026-08-11-003, token+salt fallback): revealed by
+           "Connect Subsonic". ONE credential field auto-routed by the server's
+           capability — an API key where the server advertises apiKeyAuthentication,
+           else the account password (token+salt, sealed at rest). After a
            successful connect the resolved proxy base (U5) is surfaced so a wrong
            LAN-IP auto-detection is visible before a silent no-audio cast. -->
       <div id="subsonic-connect-form" style="display:none;margin-top:.6rem;padding:.7rem;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
         <div class="panel-row" style="flex-wrap:wrap;gap:.5rem;align-items:center;margin:0">
           <input id="subsonic-url" type="text" placeholder="http://navidrome.local:4533"
                  style="flex:1;min-width:220px">
-          <input id="subsonic-key" type="password" placeholder="API key"
-                 autocomplete="off" style="width:160px">
+          <input id="subsonic-key" type="password" placeholder="API key or password"
+                 autocomplete="off" style="width:180px">
           <input id="subsonic-user" type="text" placeholder="Username" autocomplete="username"
                  style="width:140px">
           <input id="subsonic-name" type="text" placeholder="Name (optional)" style="width:140px">
@@ -784,8 +785,10 @@
                   style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Cancel</button>
         </div>
         <p class="muted" style="font-size:.8rem;color:#888;margin:.45rem 0 0">
-          Generate an API key in your server's settings — Navidrome: Settings → Users →
-          your user → API key.</p>
+          Enter your server's <strong>API key</strong> if it supports one (Navidrome:
+          Settings → Users → your user → API key), otherwise your account
+          <strong>password</strong> — Jukeplox detects which and never stores a plaintext
+          password.</p>
         <span id="subsonic-connect-error" style="display:none;font-size:.85rem;color:#f87171;margin-top:.4rem"></span>
         <span id="subsonic-connect-note" style="display:none;font-size:.82rem;color:#888;margin-top:.4rem"></span>
       </div>

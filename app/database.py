@@ -66,10 +66,17 @@ CREATE TABLE IF NOT EXISTS subsonic_sources (
     server_url  TEXT NOT NULL,      -- CREDENTIAL-FREE base URL (the API key rides
                                     -- query params only in server-side fetches, U5)
     name        TEXT NOT NULL,      -- friendly display name for the source picker
-    token       TEXT NOT NULL,      -- OpenSubsonic API key — named `token` so the
+    token       TEXT NOT NULL,      -- sealed secret: the OpenSubsonic API key
+                                    -- (auth_mode='apikey') OR the account password
+                                    -- (auth_mode='token'); named `token` so the
                                     -- _reseal helper (hardcoded on `token`) is reused
     user        TEXT NOT NULL,      -- Subsonic username (u= common param)
-    client      TEXT NOT NULL       -- client id sent as c= common param
+    client      TEXT NOT NULL,      -- client id sent as c= common param
+    auth_mode   TEXT NOT NULL DEFAULT 'apikey'  -- 'apikey' | 'token' (token+salt)
+                                    -- fallback, 2026-08-11-003). DEFAULT is a
+                                    -- migration fallback for pre-existing rows
+                                    -- (all apiKey pre-fallback); every new write
+                                    -- passes auth_mode explicitly.
 );
 
 CREATE TABLE IF NOT EXISTS emby_sources (
@@ -327,6 +334,16 @@ async def _migrate_columns() -> None:
         # treated conservatively (no fold). The next crawl populates it.
         await _db.execute("ALTER TABLE browse_album_index ADD COLUMN track_count INTEGER")
 
+    async with _db.execute("PRAGMA table_info(subsonic_sources)") as cur:
+        sub_cols = {row["name"] async for row in cur}
+    if "auth_mode" not in sub_cols:
+        # token+salt fallback (2026-08-11-003 U2): pre-existing Subsonic sources
+        # were all apiKey, so the DEFAULT correctly stamps them 'apikey'. A
+        # constant DEFAULT keeps the NOT NULL ADD COLUMN legal on SQLite.
+        await _db.execute(
+            "ALTER TABLE subsonic_sources ADD COLUMN auth_mode TEXT NOT NULL "
+            "DEFAULT 'apikey'")
+
 
 async def _migrate_seal_credentials() -> None:
     """One-time upgrade: re-seal any plaintext credential rows at rest (U17/R24).
@@ -514,19 +531,25 @@ async def get_subsonic_sources() -> list[dict]:
 
 async def save_subsonic_source(
     source_id: str, server_url: str, name: str, token: str, user: str, client: str,
+    auth_mode: str,
 ) -> None:
-    """Upsert one OpenSubsonic source. Stores the API key only (never a password,
-    R5); the server_url is credential-free (the key rides query params only in
-    server-side fetches, U5). The token is sealed at rest via app.sources.secrets."""
+    """Upsert one OpenSubsonic source. ``auth_mode`` ('apikey' | 'token') is a
+    REQUIRED argument (no Python default) so a forgotten mode fails loudly rather
+    than silently mis-authing a token server as apiKey (the column's DEFAULT is a
+    migration-only fallback for pre-existing rows). ``token`` is the mode's secret
+    — the API key or the account password — sealed at rest via app.sources.secrets;
+    the server_url stays credential-free (the secret rides query params only in
+    server-side fetches, U5)."""
     from app.sources import secrets
     db = _conn()
     await db.execute(
-        "INSERT INTO subsonic_sources (source_id, server_url, name, token, user, client) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
+        "INSERT INTO subsonic_sources "
+        "(source_id, server_url, name, token, user, client, auth_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(source_id) DO UPDATE SET "
         "server_url = excluded.server_url, name = excluded.name, token = excluded.token, "
-        "user = excluded.user, client = excluded.client",
-        (source_id, server_url, name, secrets.seal(token), user, client),  # U3 (R5a)
+        "user = excluded.user, client = excluded.client, auth_mode = excluded.auth_mode",
+        (source_id, server_url, name, secrets.seal(token), user, client, auth_mode),
     )
     await db.commit()
 

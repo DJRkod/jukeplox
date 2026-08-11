@@ -184,11 +184,13 @@ class LocalConnectRequest(BaseModel):
 
 
 class SubsonicConnectRequest(BaseModel):
-    # OpenSubsonic connect (U4/R5): an API key (never a password) plus the
-    # username the key belongs to (Subsonic's ``u`` param) and an optional client
-    # name (``c``, defaulted in the adapter). server_url is stored credential-free.
+    # OpenSubsonic connect (2026-08-11-003, token+salt fallback): ONE secret,
+    # auto-routed by the server's detected capability — an API key for servers
+    # advertising the apiKeyAuthentication extension, else the account password
+    # (standard token+salt). Plus the username (Subsonic's ``u`` param). server_url
+    # is stored credential-free.
     server_url: str = Field(min_length=1, max_length=512)
-    api_key: str = Field(min_length=1, max_length=512)
+    secret: str = Field(min_length=1, max_length=512)
     username: str = Field(min_length=1, max_length=256)
     name: str = Field(default="", max_length=128)
 
@@ -342,11 +344,14 @@ def _normalize_source_url(url: str) -> str:
         return raw.rstrip("/").lower()
 
 
-async def _reject_duplicate_source(server_url: str) -> None:
-    """Raise a ``duplicate`` source error if any configured source already lives at
-    the same normalized URL (U4/R10). Reads the credential-free stored server_url
-    of every non-local source type. Best-effort read: a store hiccup does not block
-    a connect (worst case an admin sees two rows for one server)."""
+async def _reject_duplicate_source(server_url: str, *, allow_source_id: str | None = None) -> None:
+    """Raise a ``duplicate`` source error if a DIFFERENT configured source already
+    lives at the same normalized URL (U4/R10). Reads the credential-free stored
+    server_url of every non-local source type. ``allow_source_id`` exempts one
+    Subsonic source so an admin can RE-connect it (rotate a key/password, flip the
+    auth mode) — a same-source reconnect is an upsert, not a duplicate. Best-effort
+    read: a store hiccup does not block a connect (worst case an admin sees two
+    rows for one server)."""
     target = _normalize_source_url(server_url)
     try:
         existing: list[str] = []
@@ -355,6 +360,8 @@ async def _reject_duplicate_source(server_url: str) -> None:
         for j in await database.get_jellyfin_sources():
             existing.append(j.get("server_url") or "")
         for sub in await database.get_subsonic_sources():
+            if allow_source_id and sub.get("source_id") == allow_source_id:
+                continue  # the same source re-connecting — not a duplicate
             existing.append(sub.get("server_url") or "")
         for e in await database.get_emby_sources():
             existing.append(e.get("server_url") or "")
@@ -547,43 +554,96 @@ async def _finish_source_connect(source_id: str) -> None:
     state.trigger_catalog_refresh()  # crawl it into the unified catalog
 
 
+def _subsonic_auth_msg(mode: str) -> str:
+    """A mode-specific, actionable auth-rejection message (AE5)."""
+    if mode == "apikey":
+        return ("The server advertises API-key auth but rejected this secret — "
+                "check you pasted a valid API key (not a password).")
+    return ("The server rejected the username/password — check the account "
+            "credentials (this server uses password auth, not an API key).")
+
+
 @router.post("/sources/subsonic")
 async def connect_subsonic(body: SubsonicConnectRequest):
-    """Connect an OpenSubsonic source by API key (R5 — a password is never stored).
+    """Connect an OpenSubsonic source, auto-routing one secret by capability
+    (2026-08-11-003, token+salt fallback).
 
-    Validated live: the server MUST advertise the OpenSubsonic API-Key extension
-    (rejected otherwise, never falling back to password/token+salt) and a
-    ``get_libraries()`` probe must succeed. On success the API key is saved sealed
-    and a catalog scan kicks off. A duplicate URL, unreachable server, bad key, or
-    missing extension surfaces an inline-categorized error and the source is NOT
-    saved. ``no_music_libraries`` is a warning that still saves the source.
-    Admin-gated by the router-level require_admin (R26)."""
+    A credential-free probe (``_probe_extensions_unauth``) detects the server's
+    apiKey support: present → the secret is an **API key** (unchanged path);
+    absent → the secret is the account **password**, authenticated via standard
+    token+salt. The secret is proven by a real authenticated ``validate_credentials``
+    ping (NOT the no-network ``get_libraries``), then sealed at rest with the
+    negotiated ``auth_mode``. A duplicate URL, unreachable server, or wrong secret
+    surfaces an inline-categorized error and the source is NOT saved.
+    ``no_music_libraries`` is a warning that still saves. On a probe hard-error a
+    NEW url falls back to token, but a source already stored as apiKey is NEVER
+    silently downgraded. Admin-gated by the router-level require_admin (R26)."""
     from app.sources.subsonic import CLIENT_NAME, SubsonicAuthError, SubsonicSource
-    await _reject_duplicate_source(body.server_url)
     server_url = body.server_url.rstrip("/")
-    # Validate FIRST, before allocating a SubsonicSource (which opens an httpx
-    # client) — a rejection must not leave a client unclosed / waste an alloc.
-    # Mirrors connect_emby's validate → construct → try/finally-probe order.
+    # Stable id across reconnects: derive from the normalized URL (upsert).
+    import hashlib
+    source_id = "subsonic-" + hashlib.sha1(
+        _normalize_source_url(server_url).encode("utf-8")).hexdigest()[:12]
+    # Allow RE-connecting this same source (rotate a key/password, flip auth mode)
+    # — only a DIFFERENT source at the same URL is a duplicate.
+    await _reject_duplicate_source(body.server_url, allow_source_id=source_id)
+    # Validate before allocating a SubsonicSource (which opens an httpx client) —
+    # a rejection must not leave a client unclosed / waste an alloc.
     await _validate_source_url(body.server_url)  # reject loopback/link-local/private-per-flag pre-probe
+
+    # Prior auth mode for THIS source (reconnect). An apiKey source must never be
+    # silently downgraded to password storage by a single failed capability probe.
+    # ``prior_lookup_ok`` tracks whether the read itself succeeded: if it failed
+    # AND the probe later fails, we cannot rule out an existing apiKey source, so
+    # we refuse rather than blindly fall back to token (fail-safe).
+    prior_mode: str | None = None
+    prior_lookup_ok = True
+    try:
+        for s in await database.get_subsonic_sources():
+            if s.get("source_id") == source_id:
+                prior_mode = s.get("auth_mode")
+                break
+    except Exception:
+        prior_lookup_ok = False
+        _log.warning("subsonic connect: prior-source lookup failed", exc_info=True)
+
     source = SubsonicSource(
-        server_url=server_url, api_key=body.api_key, username=body.username,
+        server_url=server_url, api_key=body.secret, username=body.username,
+        source_id=source_id,
         server_name=body.name.strip() or _hostname(body.server_url) or "Subsonic",
     )
-    # ── outbound probe ──
+    # ── outbound probe + authenticated validate (one httpx client, closed below) ──
     try:
-        # API-Key extension gate FIRST: a no-extension server is rejected before
-        # anything is saved (R5). Then a live get_libraries() validates the key +
-        # reachability and yields the music-section count.
-        await source.require_api_key_support()
+        # 1) credential-free capability probe → negotiate the mode.
+        try:
+            has_apikey = await source._probe_extensions_unauth()
+            mode = "apikey" if has_apikey else "token"
+        except Exception:
+            if prior_mode == "apikey" or not prior_lookup_ok:
+                # Either a known apiKey source, or we couldn't read the prior mode
+                # (so an apiKey source can't be ruled out) — refuse to downgrade.
+                raise _source_error(
+                    "unreachable",
+                    "Could not confirm the server's API-key capability; not "
+                    "downgrading to password auth. Try again.")
+            mode = "token"  # new source: fall back to the universally-supported scheme
+        # 2) route THIS one source into the detected mode, then AUTHENTICATE the
+        #    secret (get_libraries is a no-network synthetic and validates nothing).
+        source.set_auth(mode, secret=body.secret)
+        try:
+            await source.validate_credentials()
+        except SubsonicAuthError:
+            raise _source_error("auth_rejected", _subsonic_auth_msg(mode))
+        # 3) library probe — a UX warning signal only, after auth has passed.
         libraries = await source.get_libraries()
-    except SubsonicAuthError as e:
-        raise _source_error("auth_rejected", str(e) or "Subsonic rejected the API key")
+    except HTTPException:
+        raise  # a categorized _source_error — do not re-wrap as unreachable
     except Exception:
         raise _source_error("unreachable", "Could not reach the Subsonic server")
     finally:
         with contextlib.suppress(Exception):
             await source._http.aclose()
-    # ── end outbound probe ──
+    # ── end probe ──
     no_music = not _has_music_libraries(libraries)
     warning: str | None = None
     if no_music:
@@ -591,26 +651,24 @@ async def connect_subsonic(body: SubsonicConnectRequest):
                      _hostname(body.server_url))
         warning = ("Source saved, but no music libraries were found — check that "
                    "the server exposes a Music library and the account has access.")
-    # Stable id across reconnects: derive from the normalized URL.
-    import hashlib
-    source_id = "subsonic-" + hashlib.sha1(
-        _normalize_source_url(server_url).encode("utf-8")).hexdigest()[:12]
     name = body.name.strip() or _hostname(body.server_url) or "Subsonic"
+    # Persist the just-validated secret and the negotiated mode together (atomic —
+    # a reconnect never pairs a new mode with a previously stored secret).
     await database.save_subsonic_source(
         source_id=source_id, server_url=server_url, name=name,
-        token=body.api_key, user=body.username, client=CLIENT_NAME)
+        token=body.secret, user=body.username, client=CLIENT_NAME, auth_mode=mode)
     await _finish_source_connect(source_id)
     # Surface the device-facing proxy base a URL-auth (Subsonic) source will
     # stream through so a wrong LAN-IP auto-detection is visible in the UI (U7)
     # BEFORE a silent no-audio cast. Best-effort: base detection must never fail
-    # the connect — on RuntimeError (no device-reachable base) report null so the
-    # UI shows the actionable "set STREAM_BASE_URL" guidance instead.
+    # the connect — on RuntimeError (no device-reachable base) report null.
     resolved_stream_base: str | None
     try:
         resolved_stream_base = state.resolved_proxy_base_for_url_auth()
     except Exception:
         resolved_stream_base = None
     return {"ok": True, "source_id": source_id, "name": name, "type": "subsonic",
+            "auth_mode": mode,
             "resolved_stream_base": resolved_stream_base, "warning": warning}
 
 
