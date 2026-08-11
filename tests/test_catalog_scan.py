@@ -224,6 +224,52 @@ async def test_scan_and_replace_partial_failure_catalogs_good_source(db):
     assert len(tracks) == 1  # the good source is catalogued; the failed one contributes nothing
 
 
+async def test_scan_and_replace_emby_401_warns_and_other_sources_ingest(db):
+    """2026-08-10-003 U4: an Emby 401 during scan (EmbyAuthError from get_libraries)
+    surfaces as a WARNING (scan._safe swallows it) and does NOT crash the crawl —
+    the healthy source still ingests. Mirrors the generic partial-failure guard for
+    the new source type."""
+    from app.sources.emby import EmbyAuthError
+
+    class _EmbyAuthFailSource:
+        source_id = "emby-1"
+        source_type = "emby"
+        async def get_libraries(self):
+            raise EmbyAuthError("Emby token rejected (401)")
+
+    good = _FakeSource(
+        "m1", libs=[Library(key="m1:1", title="M", type="artist", server_name="Plex")],
+        artists=[_artist("m1:ar")], albums=[_album("m1:al")], tracks=[_track("m1:t1", "m1:al")],
+    )
+    ok = await scan.scan_and_replace(_FakeRegistry([good, _EmbyAuthFailSource()]))
+    assert ok is True
+    tracks = await store.get_all_tracks()
+    assert len(tracks) == 1  # the 401 source contributes nothing; the crawl survived
+
+
+async def test_scan_and_replace_subsonic_auth_error_warns_and_other_sources_ingest(db):
+    """A SubsonicAuthError during scan (bad/expired API key from get_libraries)
+    surfaces as a WARNING (scan._safe swallows it) and does NOT crash the crawl —
+    the healthy source still ingests. Mirrors the Emby-401 partial-failure guard for
+    the Subsonic source type (the provider-agnostic _safe wrapper)."""
+    from app.sources.subsonic import SubsonicAuthError
+
+    class _SubsonicAuthFailSource:
+        source_id = "subsonic-1"
+        source_type = "subsonic"
+        async def get_libraries(self):
+            raise SubsonicAuthError("Subsonic rejected the API key (401)")
+
+    good = _FakeSource(
+        "m1", libs=[Library(key="m1:1", title="M", type="artist", server_name="Plex")],
+        artists=[_artist("m1:ar")], albums=[_album("m1:al")], tracks=[_track("m1:t1", "m1:al")],
+    )
+    ok = await scan.scan_and_replace(_FakeRegistry([good, _SubsonicAuthFailSource()]))
+    assert ok is True
+    tracks = await store.get_all_tracks()
+    assert len(tracks) == 1  # the auth-failed source contributes nothing; crawl survived
+
+
 async def test_scan_and_replace_priority_follows_source_order(db):
     # Same track held by both sources; the holds carry each source's order as priority.
     t_plex = _track("m1:t", "m1:al", stream_key="m1:p")

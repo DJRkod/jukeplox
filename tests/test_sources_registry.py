@@ -19,6 +19,9 @@ def _fake_source(source_id, lib_title="L"):
     s.fetch_art = AsyncMock(return_value=(b"", "image/jpeg"))
     s.resolve_stream = MagicMock(return_value=StreamTarget(url=f"http://{source_id}/stream"))
     s.invalidate_cache = MagicMock()
+    # U5: default header-auth (no credential in URL). A MagicMock would otherwise
+    # auto-create a truthy url_borne_auth, wrongly flagging every fake as URL-auth.
+    s.url_borne_auth = False
     return s
 
 
@@ -86,6 +89,42 @@ def test_stream_url_returns_routed_source_url():
     reg = SourceRegistry([a, b])
     assert reg.stream_url("B:part") == "http://B/stream"
     b.resolve_stream.assert_called_once_with("B:part")
+
+
+# ── U5: url_borne_auth routing + stream_url() refuses URL-auth sources ─────────
+
+def test_url_borne_auth_for_reads_owning_source_flag():
+    a, b = _fake_source("A"), _fake_source("B")
+    b.url_borne_auth = True          # B is a URL-auth (Subsonic-shaped) source
+    reg = SourceRegistry([a, b])
+    assert reg.url_borne_auth_for("B:part") is True
+    assert reg.url_borne_auth_for("A:part") is False
+
+
+def test_url_borne_auth_for_defaults_false_and_handles_fallback():
+    # Prefixless / unknown-id keys route to the first source; its flag is read.
+    a = _fake_source("A")
+    reg = SourceRegistry([a])
+    assert reg.url_borne_auth_for("bareid") is False
+    assert reg.url_borne_auth_for("ZZ:unknown") is False
+
+
+def test_stream_url_refuses_url_auth_source_p0():
+    # P0: a raw credentialed upstream URL must never escape via stream_url() for a
+    # URL-auth source — it returns "" so _make_stream_url force-proxies instead.
+    a, b = _fake_source("A"), _fake_source("B")
+    b.url_borne_auth = True
+    b.resolve_stream = MagicMock(
+        return_value=StreamTarget(url="http://B/rest/stream.view?id=x&apiKey=LEAKED"))
+    reg = SourceRegistry([a, b])
+    assert reg.stream_url("B:part") == ""
+    # Header-auth source is unaffected — still returns its raw URL.
+    assert reg.stream_url("A:part") == "http://A/stream"
+
+
+def test_noop_source_has_url_borne_auth_false():
+    from app.sources.registry import _NoopSource
+    assert _NoopSource().url_borne_auth is False
 
 
 def test_invalidate_cache_fans_out():

@@ -18,6 +18,8 @@ async def test_registry_includes_local_source_when_configured():
     with patch.object(db, "get_plex_servers", AsyncMock(return_value=[])), \
          patch.object(db, "get_plex_config", AsyncMock(return_value=None)), \
          patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_subsonic_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_emby_sources", AsyncMock(return_value=[])), \
          patch.object(db, "get_local_sources", AsyncMock(return_value=[
              {"source_id": "local-1", "name": "Vinyl", "root_dir": "/music"}])):
         reg = await st.get_plex_client()
@@ -29,18 +31,93 @@ async def test_registry_includes_local_source_when_configured():
 
 
 async def test_registry_none_when_no_sources_at_all():
-    """AE6 additivity: the local loop is empty-safe — a zero-source install still
-    returns None (no registry), exactly as before U11."""
+    """AE6 additivity: every source loop is empty-safe — a zero-source install still
+    returns None (no registry), exactly as before U11/U4."""
     import app.state as st
     import app.database as db
     st.invalidate_plex_client()
     with patch.object(db, "get_plex_servers", AsyncMock(return_value=[])), \
          patch.object(db, "get_plex_config", AsyncMock(return_value=None)), \
          patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_subsonic_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_emby_sources", AsyncMock(return_value=[])), \
          patch.object(db, "get_local_sources", AsyncMock(return_value=[])):
         reg = await st.get_plex_client()
     st.invalidate_plex_client()
     assert reg is None
+
+
+async def test_registry_includes_subsonic_source_when_configured():
+    """U4: a stored Subsonic source builds a SubsonicSource into the registry
+    (additive wiring mirroring the Jellyfin/local paths). token = the opened API
+    key; user maps to the adapter's username."""
+    import app.state as st
+    import app.database as db
+    st.invalidate_plex_client()
+    with patch.object(db, "get_plex_servers", AsyncMock(return_value=[])), \
+         patch.object(db, "get_plex_config", AsyncMock(return_value=None)), \
+         patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_subsonic_sources", AsyncMock(return_value=[
+             {"source_id": "subsonic-1", "name": "Navidrome",
+              "server_url": "http://nav.local:4533", "token": "APIKEY",
+              "user": "dj", "client": "Jukeplox"}])), \
+         patch.object(db, "get_emby_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_local_sources", AsyncMock(return_value=[])):
+        reg = await st.get_plex_client()
+    st.invalidate_plex_client()
+    assert reg is not None
+    sub = next(s for s in reg.sources if s.source_type == "subsonic")
+    assert sub.source_id == "subsonic-1"
+    assert sub.server_name == "Navidrome"
+    assert sub.username == "dj"
+    assert sub.url_borne_auth is True
+
+
+async def test_registry_includes_emby_source_when_configured():
+    """U4: a stored Emby source builds an EmbySource into the registry."""
+    import app.state as st
+    import app.database as db
+    st.invalidate_plex_client()
+    with patch.object(db, "get_plex_servers", AsyncMock(return_value=[])), \
+         patch.object(db, "get_plex_config", AsyncMock(return_value=None)), \
+         patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_subsonic_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_emby_sources", AsyncMock(return_value=[
+             {"source_id": "emby-1", "name": "Living Room",
+              "server_url": "http://emby.local:8096", "token": "etok",
+              "user_id": "eu1", "device_id": "dev-1"}])), \
+         patch.object(db, "get_local_sources", AsyncMock(return_value=[])):
+        reg = await st.get_plex_client()
+    st.invalidate_plex_client()
+    assert reg is not None
+    emby = next(s for s in reg.sources if s.source_type == "emby")
+    assert emby.source_id == "emby-1"
+    assert emby.server_name == "Living Room"
+
+
+async def test_registry_plex_only_is_byte_identical_with_empty_new_loops(monkeypatch):
+    """AE6 hard invariant: with no Subsonic/Emby configured, the registry is exactly
+    the Plex-only registry — the new loops append nothing and the source list is
+    unchanged."""
+    import app.state as st
+    import app.database as db
+    from app.plex.client import PlexClient
+    st.invalidate_plex_client()
+    server = {"machine_id": "m1", "server_url": "http://plex.local:32400",
+              "name": "Home", "owner": "me", "token": "t", "client_id": "c",
+              "owned": 1}
+    with patch.object(db, "get_plex_servers", AsyncMock(return_value=[server])), \
+         patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_subsonic_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_emby_sources", AsyncMock(return_value=[])), \
+         patch.object(db, "get_local_sources", AsyncMock(return_value=[])), \
+         patch.object(PlexClient, "__init__",
+                      lambda self, **kw: setattr(self, "machine_id", kw.get("machine_id", ""))):
+        reg = await st.get_plex_client()
+    st.invalidate_plex_client()
+    assert reg is not None
+    assert len(reg.sources) == 1
+    assert reg.sources[0].source_type == "plex"
 
 
 async def test_startup_reconnect_calls_discover_then_set_device():
@@ -1750,6 +1827,9 @@ def _warm_client(target):
     c = MagicMock()
     c.stream_url = lambda k: f"plex:{k}"
     c.resolve_stream = MagicMock(return_value=target)
+    # U5: a bare MagicMock auto-creates a truthy url_borne_auth_for, which would
+    # wrongly force the URL-auth proxy branch — these are header-auth (Plex) warms.
+    c.url_borne_auth_for = MagicMock(return_value=False)
     return c
 
 
@@ -2718,6 +2798,7 @@ def _u1_track(tid="x"):
 def _u1_client():
     c = MagicMock()
     c.stream_url = lambda k: f"url:{k}"
+    c.url_borne_auth_for = MagicMock(return_value=False)  # U5: header-auth
     return c
 
 
@@ -3776,6 +3857,7 @@ async def test_play_with_fallback_dispatches_plex_holder_under_plexplayer(
     router.effective_backend.return_value = router.active
     client = MagicMock()
     client.stream_url = lambda k: f"url:{k}"
+    client.url_borne_auth_for = MagicMock(return_value=False)  # U5: header-auth
     with patch.object(st, "output_router", router), \
          patch.object(st, "record_play", MagicMock()):
         ok = await st._play_with_fallback(item, client)
@@ -4134,3 +4216,281 @@ async def test_catalog_success_never_clears_browse_failure(tmp_path, monkeypatch
         assert status["refresh_failed"] is True
     finally:
         await database.close_db()
+
+
+# ── U5: R6 force-proxy for URL-auth sources + LAN-IP base auto-detect ─────────
+#
+# CHARACTERIZATION-FIRST: capture _make_stream_url's CURRENT behavior for a
+# header-auth (Plex/Jellyfin-shaped) source in BOTH config states, then prove it
+# unchanged. Then guard the P0: a URL-auth (Subsonic) source must NEVER emit a
+# raw credentialed device-facing URL on ANY config.
+
+import contextlib as _u5_contextlib
+
+
+@_u5_contextlib.contextmanager
+def _u5_settings(stream_base_url="", bind_host="0.0.0.0"):
+    """Patch app.config.settings for the two knobs _make_stream_url reads.
+    _make_stream_url / _stream_url_base / resolved_proxy_base_for_url_auth import
+    ``settings`` from app.config at call time, so patching the singleton's attrs
+    takes effect."""
+    from app.config import settings
+    old_base, old_bind = settings.stream_base_url, settings.bind_host
+    settings.stream_base_url, settings.bind_host = stream_base_url, bind_host
+    try:
+        yield
+    finally:
+        settings.stream_base_url, settings.bind_host = old_base, old_bind
+
+
+@_u5_contextlib.contextmanager
+def _u5_reset_lan_cache():
+    """Reset the module-level LAN-IP detection cache around a test so a mocked
+    or real detection doesn't leak between tests."""
+    import app.state as st
+    old_ip, old_done = st._detected_lan_ip, st._detected_lan_ip_done
+    st._detected_lan_ip, st._detected_lan_ip_done = None, False
+    try:
+        yield
+    finally:
+        st._detected_lan_ip, st._detected_lan_ip_done = old_ip, old_done
+
+
+def _u5_header_client():
+    """A header-auth (Plex/Jellyfin/Emby-shaped) registry stand-in: stream_url()
+    returns the raw upstream URL; url_borne_auth_for() is False for any key."""
+    c = MagicMock()
+    c.stream_url = lambda k: "http://plex.local:32400/library/parts/" + k + "?X-Plex-Token=SECRET"
+    c.url_borne_auth_for = MagicMock(return_value=False)
+    return c
+
+
+def _u5_urlauth_client():
+    """A URL-auth (Subsonic-shaped) registry stand-in: url_borne_auth_for() True;
+    stream_url() would (if wrongly called) return a credentialed raw URL — we
+    assert it is NEVER reached for a URL-auth source."""
+    c = MagicMock()
+    c.stream_url = lambda k: "http://navidrome.local/rest/stream.view?id=" + k + "&apiKey=LEAKED_KEY&u=admin"
+    c.url_borne_auth_for = MagicMock(return_value=True)
+    return c
+
+
+# --- characterization: header-auth unchanged in both config states -----------
+
+def test_char_header_auth_base_set_returns_proxy():
+    import app.state as st
+    client = _u5_header_client()
+    with _u5_settings(stream_base_url="http://jukebox.local:8080"):
+        url = st._make_stream_url("plexid:k1", client)
+    assert url == "http://jukebox.local:8080/api/stream?key=plexid%3Ak1"
+    client.url_borne_auth_for.assert_called_with("plexid:k1")
+
+
+def test_char_header_auth_bind_host_specific_returns_proxy():
+    import app.state as st
+    client = _u5_header_client()
+    with _u5_settings(stream_base_url="", bind_host="192.168.1.10"):
+        url = st._make_stream_url("plexid:k1", client)
+    assert url == "http://192.168.1.10/api/stream?key=plexid%3Ak1"
+
+
+def test_char_header_auth_default_config_returns_raw_upstream():
+    # base empty (default BIND_HOST=0.0.0.0, STREAM_BASE_URL unset) → raw
+    # upstream URL fallthrough. This is SAFE for header-auth (no credential in
+    # URL) and is the exact pre-U5 behavior that must remain byte-identical.
+    import app.state as st
+    client = _u5_header_client()
+    with _u5_settings(stream_base_url="", bind_host="0.0.0.0"):
+        url = st._make_stream_url("plexid:k1", client)
+    assert url == "http://plex.local:32400/library/parts/plexid:k1?X-Plex-Token=SECRET"
+
+
+def test_header_auth_never_invokes_lan_autodetect():
+    # AE6: the auto-detect helper must NOT run for a header-auth-only install
+    # (byte-identical, no new startup cost) — in any config state.
+    import app.state as st
+    client = _u5_header_client()
+    with _u5_reset_lan_cache(), \
+         patch.object(st, "_detect_primary_lan_ip",
+                      MagicMock(side_effect=AssertionError("must not detect"))) as det:
+        for base, bind in (("http://x", "0.0.0.0"), ("", "192.168.1.10"), ("", "0.0.0.0")):
+            with _u5_settings(stream_base_url=base, bind_host=bind):
+                st._make_stream_url("plexid:k1", client)
+        det.assert_not_called()
+
+
+# --- P0 regression guard: URL-auth never leaks a raw credentialed URL --------
+
+def test_p0_urlauth_default_config_proxies_with_autodetected_base():
+    # AE4: URL-auth + default config (STREAM_BASE_URL unset, BIND_HOST=0.0.0.0):
+    # device-facing URL is the /api/stream proxy on the auto-detected LAN IP; NO
+    # credential substring, and stream_url() (raw) is never consulted.
+    import app.state as st
+    client = _u5_urlauth_client()
+    with _u5_reset_lan_cache(), _u5_settings(stream_base_url="", bind_host="0.0.0.0"), \
+         patch.object(st, "_detect_primary_lan_ip", MagicMock(return_value="192.168.1.50")):
+        url = st._make_stream_url("subsonic:tr1", client)
+    assert url == "http://192.168.1.50/api/stream?key=subsonic%3Atr1"
+    assert "apiKey" not in url and "LEAKED_KEY" not in url
+    assert "/api/stream?key=" in url
+
+
+def test_p0_urlauth_never_returns_raw_url_on_any_config():
+    # The core P0: on EVERY config, a URL-auth source yields a /api/stream proxy
+    # URL with no credential — never the raw upstream. Covers base-set and
+    # base-empty (with a deterministic detected LAN IP).
+    import app.state as st
+    client = _u5_urlauth_client()
+    configs = [
+        ("http://jukebox.local:8080", "0.0.0.0"),
+        ("", "192.168.1.10"),
+        ("", "0.0.0.0"),
+    ]
+    for base, bind in configs:
+        with _u5_reset_lan_cache(), _u5_settings(stream_base_url=base, bind_host=bind), \
+             patch.object(st, "_detect_primary_lan_ip", MagicMock(return_value="10.10.10.10")):
+            url = st._make_stream_url("subsonic:tr1", client)
+        assert "/api/stream?key=" in url, (base, bind, url)
+        for leak in ("apiKey", "LEAKED_KEY", "stream.view", "navidrome.local", "u=admin"):
+            assert leak not in url, "leak " + leak + " in " + url + " for " + str((base, bind))
+
+
+def test_urlauth_stream_base_override_wins():
+    import app.state as st
+    client = _u5_urlauth_client()
+    with _u5_reset_lan_cache(), \
+         _u5_settings(stream_base_url="http://jukebox.local:8080", bind_host="0.0.0.0"), \
+         patch.object(st, "_detect_primary_lan_ip",
+                      MagicMock(side_effect=AssertionError("override must skip detect"))):
+        url = st._make_stream_url("subsonic:tr1", client)
+    assert url == "http://jukebox.local:8080/api/stream?key=subsonic%3Atr1"
+
+
+def test_urlauth_docker_bridge_ip_logs_loud_warning(caplog):
+    # Docker-bridge detected IP (172.16.0.0/12): still proxies (no raw URL), but
+    # emits a loud WARNING recommending STREAM_BASE_URL — the U7 connect surface
+    # shows the resolved base so the admin can catch an unreachable value.
+    import logging
+    import app.state as st
+    client = _u5_urlauth_client()
+    with _u5_reset_lan_cache(), _u5_settings(stream_base_url="", bind_host="0.0.0.0"), \
+         patch.object(st, "_detect_primary_lan_ip", MagicMock(return_value="172.17.0.2")), \
+         caplog.at_level(logging.WARNING):
+        url = st._make_stream_url("subsonic:tr1", client)
+    assert url == "http://172.17.0.2/api/stream?key=subsonic%3Atr1"
+    assert "apiKey" not in url and "LEAKED_KEY" not in url
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING
+                and "STREAM_BASE_URL" in r.getMessage()]
+    assert warnings, "a bridge-IP detection must warn and name STREAM_BASE_URL"
+
+
+def test_urlauth_no_base_detectable_fails_loud_no_leak():
+    # Detection raises (no route/no network) and no STREAM_BASE_URL: refuse with
+    # an actionable error naming STREAM_BASE_URL — never emit a raw credentialed
+    # URL (fail loud on the security axis).
+    import app.state as st
+    client = _u5_urlauth_client()
+    with _u5_reset_lan_cache(), _u5_settings(stream_base_url="", bind_host="0.0.0.0"), \
+         patch.object(st, "_detect_primary_lan_ip",
+                      MagicMock(side_effect=RuntimeError("no route to host"))):
+        with pytest.raises(RuntimeError) as exc:
+            st._make_stream_url("subsonic:tr1", client)
+    assert "STREAM_BASE_URL" in str(exc.value)
+
+
+def test_resolved_proxy_base_helper_reads_override_and_autodetect():
+    # The admin/UI-facing helper (U7 reads it to display the resolved base).
+    import app.state as st
+    with _u5_reset_lan_cache(), _u5_settings(stream_base_url="http://set.local/"):
+        assert st.resolved_proxy_base_for_url_auth() == "http://set.local"
+    with _u5_reset_lan_cache(), _u5_settings(stream_base_url="", bind_host="0.0.0.0"), \
+         patch.object(st, "_detect_primary_lan_ip", MagicMock(return_value="192.168.5.5")):
+        assert st.resolved_proxy_base_for_url_auth() == "http://192.168.5.5"
+
+
+def test_detect_primary_lan_ip_caches_and_recovers_getsockname():
+    # Unit the detection helper against a fake socket so it's deterministic:
+    # UDP-connect + getsockname()[0], cached on first success.
+    import app.state as st
+
+    class _FakeSock:
+        created = 0
+
+        def __init__(self, *a, **k):
+            _FakeSock.created += 1
+
+        def connect(self, addr):
+            self._addr = addr
+
+        def getsockname(self):
+            return ("192.168.9.9", 12345)
+
+        def close(self):
+            pass
+
+    with _u5_reset_lan_cache(), patch.object(st.socket, "socket", _FakeSock):
+        ip1 = st._detect_primary_lan_ip()
+        ip2 = st._detect_primary_lan_ip()   # cached — no new socket
+    assert ip1 == "192.168.9.9" and ip2 == "192.168.9.9"
+    assert _FakeSock.created == 1, "detection must be cached after first success"
+
+
+def test_detect_primary_lan_ip_raises_on_no_route():
+    import app.state as st
+
+    class _DeadSock:
+        def __init__(self, *a, **k):
+            pass
+
+        def connect(self, addr):
+            raise OSError("network is unreachable")
+
+        def close(self):
+            pass
+
+    with _u5_reset_lan_cache(), patch.object(st.socket, "socket", _DeadSock):
+        with pytest.raises(RuntimeError):
+            st._detect_primary_lan_ip()
+        # A second call also raises while the network is still down.
+        with pytest.raises(RuntimeError):
+            st._detect_primary_lan_ip()
+
+
+def test_detect_primary_lan_ip_failure_is_not_cached_permanently():
+    # P2: a transient OSError must NOT permanently disable detection — the done
+    # sentinel is set only on success, so once the network recovers a later call
+    # succeeds (the old code set _detected_lan_ip_done before the try, so the
+    # first failure poisoned the process forever).
+    import app.state as st
+
+    class _DeadSock:
+        def __init__(self, *a, **k):
+            pass
+
+        def connect(self, addr):
+            raise OSError("network is unreachable")
+
+        def close(self):
+            pass
+
+    class _LiveSock:
+        def __init__(self, *a, **k):
+            pass
+
+        def connect(self, addr):
+            pass
+
+        def getsockname(self):
+            return ("192.168.7.7", 5555)
+
+        def close(self):
+            pass
+
+    with _u5_reset_lan_cache():
+        # First call fails (network down)...
+        with patch.object(st.socket, "socket", _DeadSock):
+            with pytest.raises(RuntimeError):
+                st._detect_primary_lan_ip()
+        # ...network comes up; a subsequent call must re-detect and succeed.
+        with patch.object(st.socket, "socket", _LiveSock):
+            assert st._detect_primary_lan_ip() == "192.168.7.7"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import asdict
 from typing import Annotated, Literal
@@ -182,6 +183,25 @@ class LocalConnectRequest(BaseModel):
     name: str = Field(default="", max_length=128)
 
 
+class SubsonicConnectRequest(BaseModel):
+    # OpenSubsonic connect (U4/R5): an API key (never a password) plus the
+    # username the key belongs to (Subsonic's ``u`` param) and an optional client
+    # name (``c``, defaulted in the adapter). server_url is stored credential-free.
+    server_url: str = Field(min_length=1, max_length=512)
+    api_key: str = Field(min_length=1, max_length=512)
+    username: str = Field(min_length=1, max_length=256)
+    name: str = Field(default="", max_length=128)
+
+
+class EmbyConnectRequest(BaseModel):
+    # Emby connect (U4/R5): username/password sign-in exchanged for a token; the
+    # password is discarded (never persisted), mirroring JellyfinConnectRequest.
+    server_url: str = Field(min_length=1, max_length=512)
+    username: str = Field(min_length=1, max_length=256)
+    password: str = Field(default="", max_length=512)
+    name: str = Field(default="", max_length=128)
+
+
 def _hostname(url: str) -> str:
     from urllib.parse import urlparse
     try:
@@ -190,10 +210,159 @@ def _hostname(url: str) -> str:
         return ""
 
 
+async def _validate_source_url(url: str) -> None:
+    """Connect-time SSRF guard for an admin-supplied source URL (U6/R12).
+
+    Parses ``url``, resolves its hostname to IP(s), and rejects targets that
+    could be used to reach internal infrastructure:
+
+    - **Always** rejects loopback (``127.0.0.0/8``, ``::1``) and link-local
+      (``169.254.0.0/16``, ``fe80::/10``) — regardless of the flag.
+    - Rejects RFC-1918 private ranges (``10/8``, ``172.16/12``, ``192.168/16``)
+      and unique-local IPv6 (``fc00::/7``) **only when
+      ``settings.allow_private_sources`` is False** — the LAN-first default
+      (True) lets a self-hosted server on the LAN connect out of the box.
+
+    A rejection raises ``_source_error("blocked_private", …)`` whose message
+    names ``ALLOW_PRIVATE_SOURCES`` so the admin knows the flag to flip.
+
+    **DNS is resolved off the event loop** (``run_in_executor``) so a slow
+    resolver can't block the async connect handler, and resolution **fails
+    closed**: a host that can't be resolved raises the ``unreachable``
+    ``_source_error`` rather than falling through to the probe — an unresolvable
+    host is never let through the SSRF gate.
+
+    Both literal-IP URLs and hostnames that *resolve* to a blocked range are
+    caught: every resolved address is checked, so a hostname pointing at a
+    private IP is treated exactly like a private-IP URL.
+
+    Redirect / DNS-rebinding hardening: the connect probes use ``httpx``'s
+    default ``follow_redirects=False`` (verified for both the Subsonic client
+    and ``emby.authenticate``'s client), so a public host cannot 302 the probe
+    to a private target. This function resolves and checks by IP, mirroring the
+    resolution the probe will make. A small residual TOCTOU window remains
+    (DNS could change between this check and the probe's own resolution, since
+    the probe re-resolves the hostname rather than dialing the pinned IP);
+    closing it fully would require pinning the connection to the resolved IP —
+    larger surgery deferred. The no-follow-redirect posture is the primary
+    defense against the redirect-based bypass."""
+    import asyncio
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    from app.config import settings
+
+    host = ""
+    try:
+        parsed = urlparse(url if "://" in (url or "") else f"http://{url or ''}")
+        host = parsed.hostname or ""
+    except Exception:
+        host = ""
+    if not host:
+        raise _source_error("unreachable", "Could not parse the server URL")
+
+    # Collect every IP the host resolves to (or the literal IP itself).
+    addrs: list[str] = []
+    try:
+        ipaddress.ip_address(host)  # literal IP URL?
+        addrs = [host]
+    except ValueError:
+        try:
+            # Resolve OFF the event loop — getaddrinfo is blocking and a slow
+            # resolver would otherwise stall the async connect handler.
+            loop = asyncio.get_running_loop()
+            infos = await loop.run_in_executor(None, socket.getaddrinfo, host, None)
+            addrs = sorted({info[4][0] for info in infos})
+        except OSError:
+            # Fail CLOSED: a host we can't resolve must not fall through to the
+            # outbound probe (an unresolvable host is never let through the SSRF
+            # gate). The no-follow-redirect posture bounds residual TOCTOU.
+            raise _source_error(
+                "unreachable",
+                "Could not resolve the server hostname. Check the URL.")
+    if not addrs:
+        raise _source_error(
+            "unreachable",
+            "Could not resolve the server hostname. Check the URL.")
+
+    allow_private = settings.allow_private_sources
+    for raw in addrs:
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            continue
+        # Always-blocked: loopback + link-local, flag-independent.
+        if ip.is_loopback or ip.is_link_local:
+            raise _source_error(
+                "blocked_private",
+                "That address (loopback/link-local) can't be used as a source. "
+                "This is blocked for security and can't be overridden.")
+        # Private / unique-local: blocked only when the operator has opted in.
+        if not allow_private and ip.is_private:
+            raise _source_error(
+                "blocked_private",
+                "That server is on a private/internal network, which is blocked "
+                "by this install's security policy. Set ALLOW_PRIVATE_SOURCES=true "
+                "to allow connecting to LAN sources.")
+
+
 def _source_error(category: str, message: str) -> HTTPException:
     # R21: a categorized, legible failure; the source is NOT saved. The frontend
-    # surfaces ``category`` (unreachable / auth_rejected) inline.
+    # surfaces ``category`` (unreachable / auth_rejected / no_music_libraries /
+    # duplicate) inline.
     return HTTPException(status_code=400, detail={"category": category, "message": message})
+
+
+# Default ports stripped during URL normalization so http://host and
+# http://host:80 (and the https/443 pair) compare equal for duplicate detection.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _normalize_source_url(url: str) -> str:
+    """Return a canonical form of a source URL for duplicate detection (U4).
+
+    Normalizes scheme + host case, strips a trailing slash on the path, and drops
+    the scheme's default port so ``http://Host:80/`` and ``http://host`` collide.
+    A parse failure degrades to a lowercased, right-stripped string so two
+    identical raw URLs still match."""
+    from urllib.parse import urlparse
+    raw = (url or "").strip()
+    try:
+        parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+        scheme = (parsed.scheme or "http").lower()
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        if port is not None and _DEFAULT_PORTS.get(scheme) == port:
+            port = None
+        netloc = host if port is None else f"{host}:{port}"
+        path = (parsed.path or "").rstrip("/")
+        return f"{scheme}://{netloc}{path}"
+    except Exception:
+        return raw.rstrip("/").lower()
+
+
+async def _reject_duplicate_source(server_url: str) -> None:
+    """Raise a ``duplicate`` source error if any configured source already lives at
+    the same normalized URL (U4/R10). Reads the credential-free stored server_url
+    of every non-local source type. Best-effort read: a store hiccup does not block
+    a connect (worst case an admin sees two rows for one server)."""
+    target = _normalize_source_url(server_url)
+    try:
+        existing: list[str] = []
+        for s in await database.get_plex_servers():
+            existing.append(s.get("server_url") or "")
+        for j in await database.get_jellyfin_sources():
+            existing.append(j.get("server_url") or "")
+        for sub in await database.get_subsonic_sources():
+            existing.append(sub.get("server_url") or "")
+        for e in await database.get_emby_sources():
+            existing.append(e.get("server_url") or "")
+    except Exception:
+        _log.warning("duplicate-source pre-check read failed for a connect", exc_info=True)
+        return
+    if any(_normalize_source_url(u) == target for u in existing if u):
+        raise _source_error("duplicate", "A source at this URL is already configured.")
 
 
 @router.get("/sources")
@@ -223,6 +392,10 @@ async def list_sources():
             out.append(_entry("", "plex", "Plex"))
     for j in await database.get_jellyfin_sources():
         out.append(_entry(j["source_id"], "jellyfin", j.get("name") or "Jellyfin"))
+    for sub in await database.get_subsonic_sources():
+        out.append(_entry(sub["source_id"], "subsonic", sub.get("name") or "Subsonic"))
+    for e in await database.get_emby_sources():
+        out.append(_entry(e["source_id"], "emby", e.get("name") or "Emby"))
     for l in await database.get_local_sources():
         out.append(_entry(l["source_id"], "local", l.get("name") or "Local"))
     return {"sources": out}
@@ -342,6 +515,175 @@ async def connect_local(body: LocalConnectRequest):
 async def remove_local(source_id: str):
     """Remove a local-files source and re-resolve the registry/catalog (R7)."""
     await database.delete_local_source(source_id)
+    await _clear_source_veto(source_id)   # don't leave an orphan veto entry (U3)
+    state.invalidate_plex_client()
+    state.trigger_catalog_refresh()
+    return {"ok": True}
+
+
+# ── Subsonic / Emby connect (2026-08-10-003 U4) ───────────────────────────────
+
+_MUSIC_LIBRARY_TYPES = {"artist", "album", "music"}
+
+
+def _has_music_libraries(libraries: list) -> bool:
+    """True iff the source exposes at least one music section (U4). Subsonic/Emby
+    music libraries carry ``type`` in {artist, album, music}; an empty list or a
+    server exposing only non-music sections counts as zero."""
+    return any(
+        (getattr(lib, "type", "") or "").lower() in _MUSIC_LIBRARY_TYPES
+        for lib in (libraries or [])
+    )
+
+
+async def _finish_source_connect(source_id: str) -> None:
+    """The shared post-save connect sequence (U4), identical to connect_jellyfin:
+    clear a stale veto → rebuild the registry → seed libraries (best-effort,
+    WARNING-guarded so a post-auth failure can't 500 the connect or skip the
+    refresh) → trigger a catalog crawl."""
+    await _clear_source_veto(source_id)   # reconnect must not inherit a stale veto (U3)
+    state.invalidate_plex_client()   # rebuild the registry with the new source
+    await _enable_new_source_libraries(source_id)  # non-Plex libs have no UI → enable by default
+    state.trigger_catalog_refresh()  # crawl it into the unified catalog
+
+
+@router.post("/sources/subsonic")
+async def connect_subsonic(body: SubsonicConnectRequest):
+    """Connect an OpenSubsonic source by API key (R5 — a password is never stored).
+
+    Validated live: the server MUST advertise the OpenSubsonic API-Key extension
+    (rejected otherwise, never falling back to password/token+salt) and a
+    ``get_libraries()`` probe must succeed. On success the API key is saved sealed
+    and a catalog scan kicks off. A duplicate URL, unreachable server, bad key, or
+    missing extension surfaces an inline-categorized error and the source is NOT
+    saved. ``no_music_libraries`` is a warning that still saves the source.
+    Admin-gated by the router-level require_admin (R26)."""
+    from app.sources.subsonic import CLIENT_NAME, SubsonicAuthError, SubsonicSource
+    await _reject_duplicate_source(body.server_url)
+    server_url = body.server_url.rstrip("/")
+    # Validate FIRST, before allocating a SubsonicSource (which opens an httpx
+    # client) — a rejection must not leave a client unclosed / waste an alloc.
+    # Mirrors connect_emby's validate → construct → try/finally-probe order.
+    await _validate_source_url(body.server_url)  # reject loopback/link-local/private-per-flag pre-probe
+    source = SubsonicSource(
+        server_url=server_url, api_key=body.api_key, username=body.username,
+        server_name=body.name.strip() or _hostname(body.server_url) or "Subsonic",
+    )
+    # ── outbound probe ──
+    try:
+        # API-Key extension gate FIRST: a no-extension server is rejected before
+        # anything is saved (R5). Then a live get_libraries() validates the key +
+        # reachability and yields the music-section count.
+        await source.require_api_key_support()
+        libraries = await source.get_libraries()
+    except SubsonicAuthError as e:
+        raise _source_error("auth_rejected", str(e) or "Subsonic rejected the API key")
+    except Exception:
+        raise _source_error("unreachable", "Could not reach the Subsonic server")
+    finally:
+        with contextlib.suppress(Exception):
+            await source._http.aclose()
+    # ── end outbound probe ──
+    no_music = not _has_music_libraries(libraries)
+    warning: str | None = None
+    if no_music:
+        _log.warning("subsonic connect: %s exposed no music libraries — saving anyway",
+                     _hostname(body.server_url))
+        warning = ("Source saved, but no music libraries were found — check that "
+                   "the server exposes a Music library and the account has access.")
+    # Stable id across reconnects: derive from the normalized URL.
+    import hashlib
+    source_id = "subsonic-" + hashlib.sha1(
+        _normalize_source_url(server_url).encode("utf-8")).hexdigest()[:12]
+    name = body.name.strip() or _hostname(body.server_url) or "Subsonic"
+    await database.save_subsonic_source(
+        source_id=source_id, server_url=server_url, name=name,
+        token=body.api_key, user=body.username, client=CLIENT_NAME)
+    await _finish_source_connect(source_id)
+    # Surface the device-facing proxy base a URL-auth (Subsonic) source will
+    # stream through so a wrong LAN-IP auto-detection is visible in the UI (U7)
+    # BEFORE a silent no-audio cast. Best-effort: base detection must never fail
+    # the connect — on RuntimeError (no device-reachable base) report null so the
+    # UI shows the actionable "set STREAM_BASE_URL" guidance instead.
+    resolved_stream_base: str | None
+    try:
+        resolved_stream_base = state.resolved_proxy_base_for_url_auth()
+    except Exception:
+        resolved_stream_base = None
+    return {"ok": True, "source_id": source_id, "name": name, "type": "subsonic",
+            "resolved_stream_base": resolved_stream_base, "warning": warning}
+
+
+@router.delete("/sources/subsonic/{source_id}")
+async def remove_subsonic(source_id: str):
+    """Remove an OpenSubsonic source and re-resolve the registry/catalog (R7)."""
+    await database.delete_subsonic_source(source_id)
+    await _clear_source_veto(source_id)   # don't leave an orphan veto entry (U3)
+    state.invalidate_plex_client()
+    state.trigger_catalog_refresh()
+    return {"ok": True}
+
+
+@router.post("/sources/emby")
+async def connect_emby(body: EmbyConnectRequest):
+    """Connect an Emby source by account sign-in (R5). Validated by signing in; on
+    success the credential is saved TOKEN-ONLY (password discarded) and a catalog
+    scan kicks off. A duplicate URL, bad credentials, or unreachable server
+    surfaces an inline-categorized error and the source is NOT saved.
+    ``no_music_libraries`` is a warning that still saves the source. Admin-gated by
+    the router-level require_admin (R26)."""
+    from app.sources import emby as emby_mod
+    from app.sources.emby import EmbyAuthError, EmbySource
+    await _reject_duplicate_source(body.server_url)
+    server_url = body.server_url.rstrip("/")
+    device_id = emby_mod.new_device_id()
+    # ── outbound probe (U6: URL/SSRF validation runs immediately before this) ──
+    await _validate_source_url(body.server_url)  # reject loopback/link-local/private-per-flag pre-probe
+    try:
+        creds = await emby_mod.authenticate(
+            body.server_url, body.username, body.password, device_id=device_id)
+    except EmbyAuthError as e:
+        raise _source_error("auth_rejected", str(e) or "Emby rejected the credentials")
+    except Exception:
+        raise _source_error("unreachable", "Could not reach the Emby server")
+    # ── end outbound probe ──
+    source_id = f"emby-{creds.get('server_id') or device_id}"
+    name = body.name.strip() or _hostname(body.server_url) or "Emby"
+    # A get_libraries() probe surfaces the music-section count (warning-only, R10).
+    source = EmbySource(
+        server_url=server_url, token=creds["token"], user_id=creds["user_id"],
+        source_id=source_id, server_name=name, device_id=device_id,
+    )
+    try:
+        libraries = await source.get_libraries()
+    except Exception:
+        # A post-auth probe hiccup is non-fatal (enable-libs retries), but must
+        # not be swallowed silently — log at WARNING so the failure is visible.
+        libraries = []
+        _log.warning("emby connect: post-auth get_libraries() failed for %s — "
+                     "proceeding without the music-library count; enable-libs "
+                     "will retry", _hostname(body.server_url), exc_info=True)
+    finally:
+        with contextlib.suppress(Exception):
+            await source._http.aclose()
+    warning: str | None = None
+    if not _has_music_libraries(libraries):
+        _log.warning("emby connect: %s exposed no music libraries — saving anyway",
+                     _hostname(body.server_url))
+        warning = ("Source saved, but no music libraries were found — check that "
+                   "the server exposes a Music library and the account has access.")
+    await database.save_emby_source(
+        source_id=source_id, server_url=server_url, name=name,
+        token=creds["token"], user_id=creds["user_id"], device_id=device_id)
+    await _finish_source_connect(source_id)
+    return {"ok": True, "source_id": source_id, "name": name, "type": "emby",
+            "warning": warning}
+
+
+@router.delete("/sources/emby/{source_id}")
+async def remove_emby(source_id: str):
+    """Remove an Emby source and re-resolve the registry/catalog (R7)."""
+    await database.delete_emby_source(source_id)
     await _clear_source_veto(source_id)   # don't leave an orphan veto entry (U3)
     state.invalidate_plex_client()
     state.trigger_catalog_refresh()

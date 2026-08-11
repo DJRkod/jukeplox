@@ -5,15 +5,17 @@ page on their phones to browse your library and queue songs — playing to a Chr
 AirPlay, or DLNA speaker, or to speakers wired to the machine. No app, no account, no
 password for guests.
 
-Point it at a **Plex** or **Jellyfin** server, a **local folder** of audio files, or any
-mix — Jukeplox merges them into one library.
+Point it at a **Plex**, **Jellyfin**, or **Emby** server, an **OpenSubsonic** server
+(Navidrome, gonic, Ampache, Nextcloud Music, LMS/Lyrion), a **local folder** of audio
+files, or any mix — Jukeplox merges them into one library.
 
 **Linux only** — Docker host networking (required for speaker discovery) isn't available
 on Mac/Windows Docker Desktop.
 
 ## Features
 
-- **Multi-source library** — Plex, Jellyfin, and local folders merged into one catalog.
+- **Multi-source library** — Plex, Jellyfin, Emby, OpenSubsonic (Navidrome & friends), and
+  local folders merged into one catalog.
 - **Cast anywhere** — Chromecast, AirPlay 2, DLNA/UPnP, or speakers wired to the host.
 - **No-app guest access** — guests browse and queue from a phone web page; no install, no
   account, no password.
@@ -103,6 +105,13 @@ you* stays off until you tick its libraries. **Rescan** rebuilds the catalog on 
 
 - **Jellyfin** — **Connect Jellyfin** and sign in. Nothing to mount; it's reached over the
   network like Plex, and your password is never stored (only a token).
+- **Emby** — **Connect Emby** → server URL + username + password. Like Jellyfin, nothing to
+  mount, and the password is never stored — it's exchanged for a token on connect and
+  discarded.
+- **OpenSubsonic** — **Connect Subsonic** → server URL + API key + username. Covers a range
+  of self-hosted servers (see below); **Navidrome is the validated reference**, the others are
+  best-effort. Casting a Subsonic source needs one extra setting — see
+  [Casting a Subsonic source](#casting-a-subsonic-source-stream_base_url).
 - **Local folder** — mount the folder **read-only**, then connect the *container* path (it's
   validated inside the container, so it must be a mount, not a bare host path). Add to the
   `docker run`:
@@ -113,13 +122,117 @@ you* stays off until you tick its libraries. **Rescan** rebuilds the catalog on 
 
   Then **Connect Local Folder** → `/music`.
 
+### OpenSubsonic servers
+
+One adapter covers the Subsonic/OpenSubsonic API family. **Navidrome is the validated
+reference server**; the rest are expected to work through the same adapter but are
+**best-effort only** — not validated:
+
+| Server | Status | Where to get the API key |
+|---|---|---|
+| **Navidrome** | Validated reference | **Settings → Users → (your user) → API key** |
+| gonic | Best-effort | User settings → API key / token |
+| Ampache | Best-effort | Web UI → account/preferences → API key (via its Subsonic-compat endpoint) |
+| Nextcloud Music | Best-effort | **Generate an app password** in Nextcloud (Settings → Security → *Devices & sessions*) and use it as the key |
+| LMS / Lyrion | Best-effort | User/API settings → API key |
+
+Connect under **Setup → Libraries → Connect Subsonic**: enter the **server URL**, the
+**API key**, and your **username**. Jukeplox confirms the server supports the OpenSubsonic
+**API-Key extension** on connect.
+
+**Legacy Subsonic servers that lack the API-Key extension are unsupported by design.**
+Jukeplox never stores a user's password, so a server that only offers the old
+password/token+salt auth is rejected at connect rather than silently downgrading. A static,
+revocable credential (an API key, or a Nextcloud-style app password) is fine — a raw account
+password is not.
+
+> **Note:** only Navidrome is validated on the reference rig. The other servers implement the
+> same API and are expected to work, but treat them as best-effort until you've confirmed your
+> own server connects and plays.
+
+### Casting a Subsonic source (`STREAM_BASE_URL`)
+
+Subsonic authentication rides in the request **URL** (the API key is a query parameter), so
+Jukeplox **always proxies** Subsonic streams through itself — a raw Subsonic URL (with its key)
+is never handed to a Chromecast or DLNA device. For that proxy to work, the cast device has to
+be able to reach Jukeplox at a device-reachable base URL:
+
+- **Host networking with a specific `BIND_HOST`** (the recommended setup), or `STREAM_BASE_URL`
+  explicitly set — this works automatically; nothing extra to do.
+- **Docker bridge networking** — the auto-detected address may be an **unreachable container
+  address** (e.g. `172.17.x.x`), so cast devices fetch from a base they can't reach and play
+  nothing. Set `STREAM_BASE_URL=http://<your-LAN-ip>` (add `:<PORT>` if not `80`), **or** run
+  with host networking (`--network host`).
+
+Local-speaker / **System Audio** (Direct) playback is unaffected — it never leaves the host, so
+no base URL is involved. Plex, Jellyfin, and Emby use header-based auth and don't require this.
+
+### Reference servers for testing (optional)
+
+Want to try the Subsonic and Emby paths before pointing Jukeplox at your real library? This
+`docker-compose.yml` spins up Navidrome, a second Subsonic server (gonic), and Emby to test
+against. **This is a local testing aid only** — not part of Jukeplox and not something you
+deploy.
+
+```yaml
+# docker-compose.yml — local testing aid only (Navidrome + gonic + Emby)
+services:
+  navidrome:
+    image: deluan/navidrome:latest
+    ports:
+      - "4533:4533"
+    environment:
+      ND_LOGLEVEL: info
+    volumes:
+      - ./music:/music:ro           # a folder of test audio
+      - navidrome-data:/data
+
+  gonic:
+    image: sentriz/gonic:latest
+    ports:
+      - "4747:80"
+    environment:
+      GONIC_MUSIC_PATH: /music
+      GONIC_PODCAST_PATH: /podcasts
+      GONIC_PLAYLISTS_PATH: /playlists
+      GONIC_CACHE_PATH: /cache
+    volumes:
+      - ./music:/music:ro           # same test audio
+      - gonic-data:/data
+      - gonic-cache:/cache
+      - gonic-podcasts:/podcasts
+      - gonic-playlists:/playlists
+
+  emby:
+    image: emby/embyserver:latest
+    ports:
+      - "8096:8096"
+    environment:
+      UID: "1000"
+      GID: "1000"
+    volumes:
+      - ./music:/mnt/music:ro       # same test audio, add as a Music library in Emby
+      - emby-config:/config
+
+volumes:
+  navidrome-data:
+  gonic-data:
+  gonic-cache:
+  gonic-podcasts:
+  gonic-playlists:
+  emby-config:
+```
+
+Bring them up with `docker compose up -d`, create a user + API key in each server's web UI
+(Navidrome `:4533`, gonic `:4747`, Emby `:8096`), then connect each from **Setup → Libraries**.
+
 ## Settings (`-e NAME=value`)
 
 | Variable | Default | What it's for |
 |---|---|---|
 | `BIND_HOST` | `0.0.0.0` | Your LAN IP — set it for Chromecast/DLNA casting. |
 | `PORT` | `80` | Web port (the host port directly, under host networking). |
-| `STREAM_BASE_URL` | from `BIND_HOST` | `http://<IP>:<PORT>` when `PORT` ≠ 80 with Chromecast/DLNA, or behind HTTPS. |
+| `STREAM_BASE_URL` | from `BIND_HOST` | `http://<IP>:<PORT>` when `PORT` ≠ 80 with Chromecast/DLNA, behind HTTPS, or to cast a Subsonic source under Docker bridge networking (see [Casting a Subsonic source](#casting-a-subsonic-source-stream_base_url)). |
 | `LOG_LEVEL` | `info` | `debug` for troubleshooting. |
 | `SESSION_TTL_HOURS` | `8` | How long an admin login lasts. |
 | `COOKIE_SECURE` | `false` | Set `true` behind an HTTPS reverse proxy. |
