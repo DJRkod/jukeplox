@@ -27,6 +27,18 @@
 
   let _config = null;
 
+  // ── Queue indicator state (added-to-queue in-place plan) ──────────────────
+  // Single source of truth for which catalog track_ids are currently queued.
+  // Rebuilt wholesale from every queue payload (WS queue_changed + the queue
+  // GET snapshot) via the applyQueue handle method, so a track that leaves the
+  // queue for history drops out and its ember clears (auto-clear on play).
+  let _queuedIds = new Set();
+  // One visually-hidden polite live region, mounted once, for AT confirmation.
+  let _queueLiveRegion = null;
+  // Per-row morph timers (clear-before-start) so a re-tap / re-render mid-morph
+  // never stacks overlapping sweeps.
+  const _queueMorphTimers = new WeakMap();
+
   // U7 state: rail drag-scrub bookkeeping. Declared early so U6's tap handler
   // can read _railDragging for its defensive bail-out (rail tap during drag).
   let _railDragging = false;
@@ -1431,12 +1443,22 @@
     return document.body.dataset.sourceLock === 'plex' && !!t && t.plex_held === false;
   }
 
-  async function addTrack(trackId, title, track, sourceServerName, sourceLabel) {
+  async function addTrack(trackId, title, track, sourceServerName, sourceLabel, rowEl) {
     if (_config.isLocked && _config.isLocked()) { _config.toast('Queuing is paused by the host'); return; }
     // U5 click-guard: a dimmed row's tap toasts instead of POSTing (the
     // isLocked guard above is the precedent). Server gate still backstops
     // call sites that pass no track object.
     if (_plexLocked(track)) { _config.toast(_SOURCE_LOCK_MSG); return; }
+    // Re-tap of an already-queued row is a client-side no-op (Decision 12): the
+    // ember already signals "in queue", so skip the POST and the duplicate toast
+    // (the exact corner-toast focus-pull this feature removes) and give a gentle
+    // ember re-pulse instead. Only for a plain add — a source-specified add is a
+    // "Play From Source…" reorder request and must still POST. The server 409
+    // stays the backstop for races.
+    if (!sourceServerName && trackId && _queuedIds.has(trackId)) {
+      _emberPulse(rowEl || _findTrackRow(trackId));
+      return;
+    }
     // Catalog "Play From Source…" (parity U3): re-POST the same catalog track_id
     // plus the chosen source's server_name. The server reorders the track's
     // holds so that source plays first (a preference — U9 play-time fallback
@@ -1454,9 +1476,25 @@
       _config.toast("That track's already in the queue"); return;
     }
     if (status === 200) {
-      if (data && data.warning === 'already_in_queue') _config.toast('Already in queue — added anyway');
-      else if (sourceLabel) _config.toast(`Added from ${sourceLabel}`);
-      else _config.toast('Added to queue!');
+      // In-place confirmation (added-to-queue plan): replace the success toast
+      // with the on-row Spark Sweep + a persistent ♪ ember, and announce to AT.
+      // Optimistically mark membership so the ember is instant; the queue_changed
+      // broadcast / next snapshot reconcile authoritatively (U2 applyQueue).
+      const alreadyWarn = !!(data && data.warning === 'already_in_queue');
+      if (trackId) _queuedIds.add(trackId);
+      const targetRow = rowEl || _findTrackRow(trackId);
+      if (targetRow) {
+        _applyQueuedEmber(targetRow);
+        _playQueueMorph(targetRow);
+        _announceQueue(alreadyWarn ? 'Already in queue' : 'Added to queue');
+      } else {
+        // No visible row to animate (e.g. queued from a context without the row
+        // on screen) — fall back to the toast, and light any matching rows.
+        if (alreadyWarn) _config.toast('Already in queue — added anyway');
+        else if (sourceLabel) _config.toast(`Added from ${sourceLabel}`);
+        else _config.toast('Added to queue!');
+        _redecorateQueued();
+      }
       // Hand the append receipt to the page (remove-own-queued-tracks U4).
       // The guest page persists it so it can show a remove (✕) on this entry
       // in the queue anytime before it plays; admin passes no onQueued and the
@@ -1542,8 +1580,9 @@
       e.stopPropagation();
       _openSheet(_trackKebabItems(track, sources, ctx, row), e.currentTarget);
     });
-    row.addEventListener('click', () => addTrack(track.track_id || track.id, track.title, track));
+    row.addEventListener('click', () => addTrack(track.track_id || track.id, track.title, track, null, null, row));
     _applyRatingTags(row, track);
+    _applyQueuedEmber(row);
     return row;
   }
 
@@ -1754,6 +1793,151 @@
   function _redecorateRatingTags() {
     document.querySelectorAll('.list-item.track-row[data-track-id]')
       .forEach(row => _applyRatingTags(row));
+  }
+
+  // ── Queue indicator: in-place "Added to queue" sweep + persistent ♪ ember ──
+  // Mirrors the ratings/tags decoration idiom above: an idempotent per-row
+  // applier keyed on row.dataset.trackId plus a full-list sweep, so rows that
+  // render before/after a queue change self-correct. All animation is
+  // transform/opacity/background only (never row height — the alpha rail's
+  // contain-intrinsic-size estimates depend on stable row heights). CSS is
+  // injected once from here (no new stylesheet link — static-discipline).
+
+  function _prefersReducedMotion() {
+    return !!(typeof window !== 'undefined' && window.matchMedia
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }
+
+  function _ensureQueueStyles() {
+    if (document.getElementById('jp-queue-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'jp-queue-styles';
+    // Sweep uses var(--accent-grad) (the scheme's accent gradient), confirm text
+    // var(--on-accent), ember var(--accent-ui) — all re-color with the theme.
+    style.textContent = `
+    .list-item.track-row { position: relative; }
+    .list-item.track-row.jp-queue-morph { overflow: hidden; }
+    .jp-qember { flex-shrink:0; display:inline-flex; align-items:center; justify-content:center; width:18px; color:var(--accent-ui,var(--accent)); font-size:1rem; line-height:1; filter:drop-shadow(0 0 5px color-mix(in srgb, var(--accent-ui,var(--accent)) 55%, transparent)); animation:jpQEmberBreathe 2.6s ease-in-out infinite; }
+    @keyframes jpQEmberBreathe { 0%,100%{opacity:.6;transform:scale(.9);} 50%{opacity:1;transform:scale(1.08);} }
+    .jp-qember.jp-qember-enter { animation:jpQEmberIn .45s ease both, jpQEmberBreathe 2.6s ease-in-out .45s infinite; }
+    @keyframes jpQEmberIn { from{opacity:0;transform:translateX(6px) scale(.6);} to{opacity:1;transform:none;} }
+    .jp-qember.jp-qember-pulse { animation:jpQEmberPulse .5s ease; }
+    @keyframes jpQEmberPulse { 0%,100%{transform:scale(1);} 45%{transform:scale(1.5);filter:drop-shadow(0 0 9px color-mix(in srgb, var(--accent-ui,var(--accent)) 70%, transparent));} }
+    .jp-qsweep { position:absolute; inset:0; z-index:1; transform:scaleX(0); transform-origin:left center; background:var(--accent-grad,var(--accent)); opacity:0; pointer-events:none; }
+    .jp-qconfirm { position:absolute; inset:0; z-index:2; display:flex; align-items:center; gap:.5rem; padding:0 .85rem; color:var(--on-accent,#111); font-weight:700; font-size:.86rem; opacity:0; pointer-events:none; text-shadow:0 1px 1px rgba(0,0,0,.18); }
+    .jp-queue-morph .list-info, .jp-queue-morph > .kebab-btn, .jp-queue-morph > .trk-rating { opacity:0; transition:opacity .18s; }
+    .jp-queue-morph .jp-qsweep { animation:jpQSweep 1.9s cubic-bezier(.4,0,.2,1) forwards; }
+    .jp-queue-morph .jp-qconfirm { animation:jpQText 1.9s ease forwards; }
+    .jp-queue-morph .jp-qconfirm .jp-qnote { display:inline-block; animation:jpQNote 1.9s ease; }
+    @keyframes jpQSweep {0%{transform:scaleX(0);opacity:1;transform-origin:left;}22%{transform:scaleX(1);opacity:1;transform-origin:left;}68%{transform:scaleX(1);opacity:1;transform-origin:right;}100%{transform:scaleX(0);opacity:0;transform-origin:right;}}
+    @keyframes jpQText {0%,10%{opacity:0;}24%,66%{opacity:1;}82%,100%{opacity:0;}}
+    @keyframes jpQNote {24%{transform:scale(.4) rotate(-18deg);}40%{transform:scale(1.4) rotate(6deg);}55%{transform:scale(1);}}
+    .jp-sr-only { position:absolute !important; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap; border:0; }
+    @media (prefers-reduced-motion: reduce){ .jp-qember, .jp-qember.jp-qember-enter, .jp-qember.jp-qember-pulse, .jp-queue-morph .jp-qsweep, .jp-queue-morph .jp-qconfirm, .jp-queue-morph .jp-qconfirm .jp-qnote { animation:none !important; } }`;
+    document.head.appendChild(style);
+  }
+
+  function _ensureQueueLiveRegion() {
+    if (_queueLiveRegion && document.body.contains(_queueLiveRegion)) return _queueLiveRegion;
+    _queueLiveRegion = document.createElement('div');
+    _queueLiveRegion.className = 'jp-sr-only';
+    _queueLiveRegion.setAttribute('role', 'status');
+    _queueLiveRegion.setAttribute('aria-live', 'polite');
+    document.body.appendChild(_queueLiveRegion);
+    return _queueLiveRegion;
+  }
+
+  // Announce to AT. Clear first, then set on the next frame so an identical
+  // repeat still re-announces (the sole confirmation on the reduced-motion path,
+  // where the sweep is skipped and the success toast is suppressed).
+  function _announceQueue(msg) {
+    const region = _ensureQueueLiveRegion();
+    region.textContent = '';
+    const set = () => { region.textContent = msg; };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(set);
+    else set();
+  }
+
+  function _findTrackRow(tid) {
+    if (!tid) return null;
+    const rows = document.querySelectorAll('.list-item.track-row[data-track-id]');
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.trackId === tid) return rows[i];
+    }
+    return null;
+  }
+
+  // Idempotent per-row applier. Adds a real, AT-visible ♪ ember (aria-label
+  // "in queue" — the glyph is decorative to AT) when the row's track is queued;
+  // removes it otherwise. Keyed on row.dataset.trackId so it can re-run freely.
+  function _applyQueuedEmber(row) {
+    const tid = row.dataset.trackId;
+    if (!tid) return;
+    const existing = row.querySelector(':scope > .jp-qember');
+    if (_queuedIds.has(tid)) {
+      row.dataset.queued = '1';
+      if (!existing) {
+        const em = document.createElement('span');
+        em.className = 'jp-qember jp-qember-enter';
+        em.setAttribute('aria-label', 'in queue');
+        em.textContent = '♪';
+        row.insertBefore(em, row.firstChild);
+      }
+    } else {
+      delete row.dataset.queued;
+      if (existing) existing.remove();
+    }
+  }
+
+  function _redecorateQueued() {
+    document.querySelectorAll('.list-item.track-row[data-track-id]')
+      .forEach(row => _applyQueuedEmber(row));
+  }
+
+  // In-place "Spark Sweep" on the tapper's own row. Reduced-motion → skip the
+  // sweep entirely (ember-only path; the live-region announcement is the AT
+  // confirmation). Per-row cancelable timer, cleared before start.
+  function _playQueueMorph(row) {
+    if (!row || _prefersReducedMotion()) return;
+    const prev = _queueMorphTimers.get(row);
+    if (prev) clearTimeout(prev);
+    row.classList.remove('jp-queue-morph');
+    let sweep = row.querySelector(':scope > .jp-qsweep');
+    if (!sweep) {
+      sweep = document.createElement('div');
+      sweep.className = 'jp-qsweep';
+      sweep.setAttribute('aria-hidden', 'true');
+      row.appendChild(sweep);
+    }
+    let conf = row.querySelector(':scope > .jp-qconfirm');
+    if (!conf) {
+      conf = document.createElement('div');
+      conf.className = 'jp-qconfirm';
+      conf.setAttribute('aria-hidden', 'true');
+      conf.innerHTML = '<span class="jp-qnote">♪</span> Added to queue';
+      row.appendChild(conf);
+    }
+    void row.offsetWidth;  // reflow so re-adding the class restarts the animation
+    row.classList.add('jp-queue-morph');
+    const t = setTimeout(() => {
+      row.classList.remove('jp-queue-morph');
+      const s = row.querySelector(':scope > .jp-qsweep');
+      const c = row.querySelector(':scope > .jp-qconfirm');
+      if (s) s.remove();
+      if (c) c.remove();
+      _queueMorphTimers.delete(row);
+    }, 1950);
+    _queueMorphTimers.set(row, t);
+  }
+
+  // Gentle acknowledgement when a user re-taps an already-queued row (the tap is
+  // a client-side no-op — no POST, no duplicate toast).
+  function _emberPulse(row) {
+    const em = row && row.querySelector(':scope > .jp-qember');
+    if (!em || _prefersReducedMotion()) return;
+    em.classList.remove('jp-qember-pulse');
+    void em.offsetWidth;
+    em.classList.add('jp-qember-pulse');
   }
 
   // Type-qualified source label for catalog "Play From Source…" entries (parity
@@ -4002,8 +4186,26 @@
     // Track ratings + tags (2026-06-26 plan U5): load-once like the meta above;
     // rows rendered before it lands self-correct via _redecorateRatingTags.
     _loadRatingTagMaps();
+    // Queue indicator (added-to-queue plan): inject the sweep/ember CSS and mount
+    // the AT live region once. Membership arrives via the applyQueue handle,
+    // pushed by each page from queue_changed + the queue-GET snapshot.
+    _ensureQueueStyles();
+    _ensureQueueLiveRegion();
     return {
       activateView,
+      // Queue membership push (added-to-queue plan): both pages call this from
+      // their queue_changed handler AND refreshQueueState (load / ws.onopen /
+      // visibilitychange), so cross-client live updates, fresh-navigation
+      // hydration, and reconnect resync all flow through one path. Rebuild the
+      // set wholesale so a played/removed track drops out and its ember clears.
+      applyQueue: (queueItems) => {
+        const next = new Set();
+        if (Array.isArray(queueItems)) {
+          queueItems.forEach(it => { const id = it && it.track_id; if (id) next.add(id); });
+        }
+        _queuedIds = next;
+        _redecorateQueued();
+      },
       // Guest visibility + facet tab gating (2026-06-26 plan U8). Pushed by
       // mountAppearance after the /api/appearance fetch; no-ops the hiding for
       // the admin page (admin keeps every facet). Drives both the tab bar and
