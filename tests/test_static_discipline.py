@@ -156,6 +156,11 @@ ADMIN_ALLOWED = {
     "sourcesList", "jfConnectError", "SOURCE_TYPE_LABELS", "_currentSources",
     "renderSourcesList", "loadSources", "connectJellyfin", "connectLocal", "removeSource",
     "rescanSources", "moveSourcePriority",
+    # OpenSubsonic + Emby connect (2026-08-10-003 U7): admin-only Setup chrome,
+    # mirroring connectJellyfin/connectLocal. Per-connect error/note elements are
+    # fetched inline and toggle/cancel/submit wiring is expression-statement, so
+    # these two connect functions are the only new top-level symbols.
+    "connectSubsonic", "connectEmby",
     # Source-grouped Libraries panel (Libraries-panel redesign): the last libraries
     # payload + which drill-ins are open + which switches are mid-request (so a
     # re-render preserves open state and blocks double-toggles). Rendering lives in

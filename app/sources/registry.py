@@ -50,7 +50,23 @@ class SourceRegistry:
     # ── stream (U3: returns a URL string for call-site compatibility; U4 moves
     #    the proxy to resolve_stream's url-or-path StreamTarget) ────────────────
 
+    def url_borne_auth_for(self, stream_key: str) -> bool:
+        """Does the source owning ``stream_key`` carry its credential in the
+        stream URL (U5)? Routes via ``_route`` and reads the owning source's
+        ``url_borne_auth`` flag (default False for header-auth Plex/Jellyfin/
+        Emby). ``_make_stream_url`` reads this to force-proxy URL-auth sources."""
+        return bool(getattr(self._route(stream_key), "url_borne_auth", False))
+
     def stream_url(self, stream_key: str) -> str:
+        """Raw device-facing upstream URL for a header-auth source.
+
+        SECURITY (R6 / P0): a URL-auth source (Subsonic) carries its credential
+        in the URL, so this accessor **refuses** it — returns ``""`` rather than
+        let a credentialed upstream URL escape to a device. Such sources are
+        force-proxied by ``_make_stream_url`` via ``/api/stream`` instead; a raw
+        credentialed URL must never leave through this method on any config."""
+        if self.url_borne_auth_for(stream_key):
+            return ""
         return self._route(stream_key).resolve_stream(stream_key).url or ""
 
     def resolve_stream(self, stream_key: str):
@@ -160,6 +176,8 @@ class SourceRegistry:
 class _NoopSource:
     """Returned by routing when the registry somehow holds no sources. Mirrors
     the old _NoopClient: enrichments degrade to empty, hard reads raise."""
+
+    url_borne_auth = False
 
     def _raise(self):
         raise RuntimeError("No media source available")

@@ -1,8 +1,9 @@
 # Installing Jukeplox
 
-A self-hosted party jukebox for your music — Plex, Jellyfin, or a local folder, merged into
-one library. Guests queue songs from their phones; playback goes to a Chromecast/AirPlay/DLNA
-speaker or to speakers wired to the machine.
+A self-hosted party jukebox for your music — Plex, Jellyfin, Emby, an OpenSubsonic server
+(Navidrome & friends), or a local folder, merged into one library. Guests queue songs from
+their phones; playback goes to a Chromecast/AirPlay/DLNA speaker or to speakers wired to the
+machine.
 
 **Linux + Docker only** (Mac/Windows Docker Desktop can't discover speakers). On
 **TrueNAS Scale**, use the Apps UI instead — see `TrueNAS-README.md`.
@@ -55,8 +56,14 @@ mounts the socket only when it exists.)
 **Port 80 taken?** Add `-e PORT=8096`; if you cast, also `-e STREAM_BASE_URL=http://<IP>:8096`.
 
 **Adding a local music folder?** Mount it **read-only** and connect the *container* path in
-step 5: add `-v /srv/music:/music:ro` to the command above. (Jellyfin needs no mount — it's
-reached over the network.)
+step 5: add `-v /srv/music:/music:ro` to the command above. (Network servers — Jellyfin, Emby,
+OpenSubsonic — need no mount; they're reached over the network.)
+
+**Casting from an OpenSubsonic server (Navidrome, gonic, …)?** Its streams are always proxied
+through Jukeplox, so a cast device must be able to reach this box. Under host networking with a
+correct `BIND_HOST` that's automatic; under Docker **bridge** networking set
+`-e STREAM_BASE_URL=http://<IP>` too, or cast devices fetch from an unreachable container
+address and play nothing. (Details: README → *Casting a Subsonic source*.)
 
 ### 4. (Optional) Play to the machine's own speakers
 
@@ -76,11 +83,13 @@ Open `http://<IP>` and:
 
 1. Set an admin password — **≥12 chars, no reset** (forgetting it means wiping data).
 2. Add a music source under **Setup → Libraries** — Plex (enter the code at plex.tv),
-   Jellyfin (sign in), or a local folder (`/music` from the mount above). Your own
-   servers' music libraries switch on and start indexing automatically; untick any
-   under **Edit libraries…**. A server *shared with you* connects too but stays off
-   until you tick its libraries there. A big library indexes in the background —
-   search fills in as it runs.
+   Jellyfin (sign in), Emby (URL + username + password), OpenSubsonic (URL + API key +
+   username — Navidrome is the validated reference, others are best-effort), or a local
+   folder (`/music` from the mount above). Your own servers' music libraries switch on and
+   start indexing automatically; untick any under **Edit libraries…**. A server *shared with
+   you* connects too but stays off until you tick its libraries there. A big library indexes
+   in the background — search fills in as it runs. (Per-server key/password details, and
+   casting from OpenSubsonic, are in the README.)
 3. Pick a speaker under **Setup → Output**.
 
 Share `http://<IP>` with guests — no app or password needed.

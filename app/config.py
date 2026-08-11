@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     # Plex server, so a fan-out (genre/credit recompute, search, art grid) can't
     # flood a small/shared server. Enforced per PlexClient — see app/plex/client.py.
     plex_max_concurrency: int = 6
+    # SSRF posture for admin-supplied source URLs (U6/R12). When True (the
+    # default), a connect to an RFC-1918 private / unique-local-IPv6 target is
+    # allowed — the primary use case is a self-hosted server on the LAN, so
+    # private-range connects work out of the box. Set ALLOW_PRIVATE_SOURCES=false
+    # to harden an install so private ranges are rejected at connect. Loopback and
+    # link-local are ALWAYS rejected regardless of this flag.
+    allow_private_sources: bool = True
 
     @model_validator(mode="after")
     def _resolve_secret_key(self) -> "Settings":

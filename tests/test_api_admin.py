@@ -62,6 +62,8 @@ def test_list_sources_combines_plex_and_jellyfin(client, mock_state):
                AsyncMock(return_value=[{"machine_id": "m1", "name": "Home Plex"}])), \
          patch("app.api.admin.database.get_jellyfin_sources",
                AsyncMock(return_value=[{"source_id": "jf-1", "name": "Den Jelly"}])), \
+         patch("app.api.admin.database.get_subsonic_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_emby_sources", AsyncMock(return_value=[])), \
          patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
          patch("app.api.admin.database.get_local_sources", AsyncMock(return_value=[])):
         resp = client.get("/admin/sources")
@@ -189,6 +191,704 @@ def test_remove_jellyfin_source(client, mock_state):
     dele.assert_awaited_once_with("jf-1")
 
 
+# ── Subsonic / Emby connect (2026-08-10-003 U4) ───────────────────────────────
+
+def _no_dupes():
+    """Patch context: no existing sources so _reject_duplicate_source is inert."""
+    return [
+        patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])),
+        patch("app.api.admin.database.get_jellyfin_sources", AsyncMock(return_value=[])),
+        patch("app.api.admin.database.get_subsonic_sources", AsyncMock(return_value=[])),
+        patch("app.api.admin.database.get_emby_sources", AsyncMock(return_value=[])),
+    ]
+
+
+def _lib(sid, type_="artist"):
+    from app.models import Library
+    return Library(key=f"{sid}:root", title="Music", type=type_, server_name="")
+
+
+def test_connect_subsonic_success_saves_credential_free_url_and_scans(client, mock_state):
+    # Covers AE1: valid key → saved (credential-free URL), enable runs between
+    # invalidate and refresh, refresh triggered.
+    save = AsyncMock()
+    order = []
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               AsyncMock(side_effect=lambda: order.append("probe"))))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.get_libraries",
+                               AsyncMock(side_effect=lambda: [_lib("subsonic")])))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        es.enter_context(patch("app.api.admin._clear_source_veto", AsyncMock()))
+        es.enter_context(patch("app.api.admin._enable_new_source_libraries",
+                               AsyncMock(side_effect=lambda sid: order.append("enable"))))
+        es.enter_context(patch("app.state.invalidate_plex_client",
+                               MagicMock(side_effect=lambda: order.append("invalidate"))))
+        es.enter_context(patch("app.state.trigger_catalog_refresh",
+                               MagicMock(side_effect=lambda: order.append("refresh"))))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nav.local:4533", "api_key": "APIKEY-abc",
+            "username": "dj", "name": "Navidrome"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["type"] == "subsonic" and body["name"] == "Navidrome"
+    assert body["source_id"].startswith("subsonic-")
+    save.assert_awaited_once()
+    kwargs = save.call_args.kwargs
+    assert kwargs["token"] == "APIKEY-abc" and kwargs["user"] == "dj"
+    # credential-free URL: no api key stored in server_url
+    assert "APIKEY-abc" not in kwargs["server_url"]
+    assert kwargs["server_url"] == "http://nav.local:4533"
+    # enable runs BETWEEN invalidate and refresh (empty-catalog regression order)
+    assert order == ["probe", "invalidate", "enable", "refresh"]
+
+
+def _subsonic_connect_probes(es, save):
+    """Shared patch set for a successful Subsonic connect (probe + save + finish)."""
+    es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+    es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                           AsyncMock()))
+    es.enter_context(patch("app.sources.subsonic.SubsonicSource.get_libraries",
+                           AsyncMock(return_value=[_lib("subsonic")])))
+    es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+    es.enter_context(patch("app.api.admin._clear_source_veto", AsyncMock()))
+    es.enter_context(patch("app.api.admin._enable_new_source_libraries", AsyncMock()))
+    es.enter_context(patch("app.state.invalidate_plex_client", MagicMock()))
+    es.enter_context(patch("app.state.trigger_catalog_refresh", MagicMock()))
+
+
+def test_connect_subsonic_reports_resolved_stream_base(client, mock_state):
+    # A URL-auth (Subsonic) source surfaces the device-facing proxy base so a wrong
+    # LAN-IP auto-detection is visible in the UI before a silent no-audio cast.
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        _subsonic_connect_probes(es, save)
+        es.enter_context(patch("app.state.resolved_proxy_base_for_url_auth",
+                               MagicMock(return_value="http://192.168.1.50")))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nav.local:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["resolved_stream_base"] == "http://192.168.1.50"
+    save.assert_awaited_once()
+
+
+def test_connect_subsonic_resolved_stream_base_null_when_unresolvable(client, mock_state):
+    # Best-effort: when no device-reachable base exists (RuntimeError), report null so
+    # the UI shows the actionable "set STREAM_BASE_URL" guidance — the connect still
+    # succeeds (base detection must never fail the connect).
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        _subsonic_connect_probes(es, save)
+        es.enter_context(patch("app.state.resolved_proxy_base_for_url_auth",
+                               MagicMock(side_effect=RuntimeError("no device-reachable base"))))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nav.local:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["resolved_stream_base"] is None
+    save.assert_awaited_once()
+
+
+def test_connect_subsonic_no_apikey_extension_rejected(client, mock_state):
+    # A server lacking the OpenSubsonic API-Key extension is rejected at connect.
+    from app.sources.subsonic import SubsonicAuthError
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               AsyncMock(side_effect=SubsonicAuthError("no API-Key extension"))))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://old.local:4040", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["category"] == "auth_rejected"
+    assert "API-Key" in detail["message"] or "extension" in detail["message"].lower()
+    save.assert_not_awaited()
+
+
+def test_connect_subsonic_unreachable_not_saved(client, mock_state):
+    import httpx
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               AsyncMock(side_effect=httpx.ConnectError("boom"))))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nope.local:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "unreachable"
+    save.assert_not_awaited()
+
+
+def test_connect_subsonic_bad_key_auth_rejected(client, mock_state):
+    from app.sources.subsonic import SubsonicAuthError
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               AsyncMock()))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.get_libraries",
+                               AsyncMock(side_effect=SubsonicAuthError("bad api key"))))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nav.local:4533", "api_key": "wrong", "username": "dj"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "auth_rejected"
+    save.assert_not_awaited()
+
+
+def test_connect_subsonic_no_music_libraries_warns_but_saves(client, mock_state):
+    # Connected but zero music sections → source still saved (warning-level, R10).
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               AsyncMock()))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.get_libraries",
+                               AsyncMock(return_value=[])))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        es.enter_context(patch("app.api.admin._clear_source_veto", AsyncMock()))
+        es.enter_context(patch("app.api.admin._enable_new_source_libraries", AsyncMock()))
+        es.enter_context(patch("app.state.invalidate_plex_client", MagicMock()))
+        es.enter_context(patch("app.state.trigger_catalog_refresh", MagicMock()))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nav.local:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 200
+    save.assert_awaited_once()   # saved despite no music libraries
+    # The zero-music-libraries case returns a warning on the 200 (no error category).
+    assert resp.json().get("warning")
+
+
+def test_connect_subsonic_duplicate_url_rejected(client, mock_state):
+    # A source already at the same normalized URL → duplicate, rejected before probe.
+    save = AsyncMock()
+    with patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_subsonic_sources",
+               AsyncMock(return_value=[{"source_id": "subsonic-x",
+                                        "server_url": "http://nav.local:4533"}])), \
+         patch("app.api.admin.database.get_emby_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.save_subsonic_source", save):
+        # trailing slash + default-equivalent form still collides after normalization
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nav.local:4533/", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "duplicate"
+    save.assert_not_awaited()
+
+
+def test_connect_subsonic_enable_failure_does_not_500(client, mock_state):
+    # A post-save library-seed failure (the empty-catalog gate's own get_libraries()
+    # raising inside _enable_new_source_libraries) must NOT 500 the connect nor skip
+    # the refresh — the enable is best-effort/WARNING-guarded.
+    import hashlib
+    sid = "subsonic-" + hashlib.sha1(
+        "http://nav.local:4533".encode("utf-8")).hexdigest()[:12]
+
+    class _FakeSrc:
+        source_id = sid
+        async def get_libraries(self):
+            raise RuntimeError("subsonic getArtists failed")
+
+    class _Reg:
+        sources = [_FakeSrc()]
+
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        # First call = connect probe (succeeds), then _enable reads the registry.
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               AsyncMock()))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.get_libraries",
+                               AsyncMock(return_value=[_lib("subsonic")])))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        es.enter_context(patch("app.api.admin._clear_source_veto", AsyncMock()))
+        es.enter_context(patch("app.state.get_plex_client", AsyncMock(return_value=_Reg())))
+        es.enter_context(patch("app.database.toggle_library", AsyncMock()))
+        es.enter_context(patch("app.state.invalidate_plex_client", MagicMock()))
+        scan = es.enter_context(patch("app.state.trigger_catalog_refresh", MagicMock()))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nav.local:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 200        # enable failure did not 500 the connect
+    scan.assert_called_once()             # trigger_catalog_refresh still fired
+
+
+def test_remove_subsonic_source(client, mock_state):
+    dele = AsyncMock()
+    with patch("app.api.admin.database.delete_subsonic_source", dele), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.delete("/admin/sources/subsonic/subsonic-abc")
+    assert resp.status_code == 200
+    dele.assert_awaited_once_with("subsonic-abc")
+
+
+def test_connect_emby_success_saves_token_only_and_scans(client, mock_state):
+    # Sign-in exchanges username/password for a token; password discarded, scan runs.
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.emby.authenticate",
+                               AsyncMock(return_value={"token": "etok", "user_id": "eu1",
+                                                       "server_id": "esrv"})))
+        es.enter_context(patch("app.sources.emby.EmbySource.get_libraries",
+                               AsyncMock(return_value=[_lib("emby-esrv")])))
+        es.enter_context(patch("app.api.admin.database.save_emby_source", save))
+        es.enter_context(patch("app.api.admin._clear_source_veto", AsyncMock()))
+        es.enter_context(patch("app.api.admin._enable_new_source_libraries", AsyncMock()))
+        es.enter_context(patch("app.state.invalidate_plex_client", MagicMock()))
+        scan = es.enter_context(patch("app.state.trigger_catalog_refresh", MagicMock()))
+        resp = client.post("/admin/sources/emby", json={
+            "server_url": "http://emby.local:8096", "username": "admin",
+            "password": "secret", "name": "Living Room"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["type"] == "emby" and body["name"] == "Living Room"
+    assert body["source_id"] == "emby-esrv"
+    save.assert_awaited_once()
+    kwargs = save.call_args.kwargs
+    assert kwargs["token"] == "etok" and kwargs["user_id"] == "eu1"
+    assert not ({"password", "pw"} & set(kwargs))   # password never persisted (R5)
+    scan.assert_called_once()
+
+
+def test_connect_emby_bad_credentials_not_saved(client, mock_state):
+    from app.sources.emby import EmbyAuthError
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.emby.authenticate",
+                               AsyncMock(side_effect=EmbyAuthError("nope"))))
+        es.enter_context(patch("app.api.admin.database.save_emby_source", save))
+        resp = client.post("/admin/sources/emby", json={
+            "server_url": "http://emby.local:8096", "username": "admin", "password": "bad"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "auth_rejected"
+    save.assert_not_awaited()
+
+
+def test_connect_emby_unreachable_not_saved(client, mock_state):
+    import httpx
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.emby.authenticate",
+                               AsyncMock(side_effect=httpx.ConnectError("boom"))))
+        es.enter_context(patch("app.api.admin.database.save_emby_source", save))
+        resp = client.post("/admin/sources/emby", json={
+            "server_url": "http://nope.local:8096", "username": "admin", "password": "x"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "unreachable"
+    save.assert_not_awaited()
+
+
+def test_connect_emby_no_music_libraries_warns_but_saves(client, mock_state):
+    # Connected but zero music sections → source still saved (warning-level, R10).
+    # Mirrors the Subsonic no-music test; asserts the `warning` field the fix added
+    # in place of the dead `no_music_libraries` error category.
+    save = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
+        es.enter_context(patch("app.sources.emby.authenticate",
+                               AsyncMock(return_value={"token": "etok", "user_id": "eu1",
+                                                       "server_id": "esrv"})))
+        es.enter_context(patch("app.sources.emby.EmbySource.get_libraries",
+                               AsyncMock(return_value=[])))
+        es.enter_context(patch("app.api.admin.database.save_emby_source", save))
+        es.enter_context(patch("app.api.admin._clear_source_veto", AsyncMock()))
+        es.enter_context(patch("app.api.admin._enable_new_source_libraries", AsyncMock()))
+        es.enter_context(patch("app.state.invalidate_plex_client", MagicMock()))
+        es.enter_context(patch("app.state.trigger_catalog_refresh", MagicMock()))
+        resp = client.post("/admin/sources/emby", json={
+            "server_url": "http://emby.local:8096", "username": "admin",
+            "password": "secret"})
+    assert resp.status_code == 200
+    save.assert_awaited_once()   # saved despite no music libraries
+    # The zero-music-libraries case returns a warning on the 200 (no error category).
+    assert resp.json().get("warning")
+
+
+def test_connect_emby_duplicate_url_rejected(client, mock_state):
+    # A source already at the same normalized URL → duplicate, rejected before the
+    # authenticate probe. Trailing-slash variant still collides after normalization.
+    save = AsyncMock()
+    auth = AsyncMock()
+    with patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_subsonic_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_emby_sources",
+               AsyncMock(return_value=[{"source_id": "emby-x",
+                                        "server_url": "http://emby.local:8096"}])), \
+         patch("app.sources.emby.authenticate", auth), \
+         patch("app.api.admin.database.save_emby_source", save):
+        # trailing slash still collides after normalization
+        resp = client.post("/admin/sources/emby", json={
+            "server_url": "http://emby.local:8096/", "username": "admin",
+            "password": "x"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "duplicate"
+    auth.assert_not_awaited()     # rejected before the outbound probe
+    save.assert_not_awaited()
+
+
+def test_remove_emby_source(client, mock_state):
+    dele = AsyncMock()
+    with patch("app.api.admin.database.delete_emby_source", dele), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()), \
+         patch("app.state.invalidate_plex_client", MagicMock()):
+        resp = client.delete("/admin/sources/emby/emby-abc")
+    assert resp.status_code == 200
+    dele.assert_awaited_once_with("emby-abc")
+
+
+# ── U6: connect-time SSRF URL validation ──────────────────────────────────────
+#
+# Helpers: patch DNS so a hostname resolves to a chosen IP without touching the
+# network, and toggle settings.allow_private_sources. Probes are patched to a
+# sentinel so a test can assert the outbound call NEVER happened on rejection.
+
+def _fake_getaddrinfo(ip):
+    """A socket.getaddrinfo stand-in that resolves any host to ``ip``."""
+    def _resolver(host, port, *a, **kw):
+        return [(2, 1, 6, "", (ip, 0))]
+    return _resolver
+
+
+def _resolve_to(ip):
+    """Patch the resolver used by _validate_source_url to return ``ip``."""
+    return patch("socket.getaddrinfo", side_effect=_fake_getaddrinfo(ip))
+
+
+def _allow_private(value):
+    return patch("app.config.settings.allow_private_sources", value)
+
+
+def test_connect_subsonic_private_lan_allowed_by_default(client, mock_state):
+    # Happy path — default ALLOW_PRIVATE_SOURCES=True: a first-run LAN connect to a
+    # 192.168.x.x server reaches the probe and succeeds.
+    save = AsyncMock()
+    probe = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(_allow_private(True))
+        es.enter_context(_resolve_to("192.168.1.50"))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               probe))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.get_libraries",
+                               AsyncMock(return_value=[_lib("subsonic")])))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        es.enter_context(patch("app.api.admin._clear_source_veto", AsyncMock()))
+        es.enter_context(patch("app.api.admin._enable_new_source_libraries", AsyncMock()))
+        es.enter_context(patch("app.state.invalidate_plex_client", MagicMock()))
+        es.enter_context(patch("app.state.trigger_catalog_refresh", MagicMock()))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nav.lan:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 200
+    probe.assert_awaited()          # reached the outbound probe
+    save.assert_awaited_once()
+
+
+def test_connect_subsonic_private_rejected_when_flag_off(client, mock_state):
+    # Error path — ALLOW_PRIVATE_SOURCES=False: a 192.168.x.x URL is rejected BEFORE
+    # any outbound call, with a category naming the flag.
+    save = AsyncMock()
+    probe = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(_allow_private(False))
+        es.enter_context(_resolve_to("192.168.1.50"))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               probe))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://nav.lan:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["category"] == "blocked_private"
+    assert "ALLOW_PRIVATE_SOURCES" in detail["message"]
+    probe.assert_not_awaited()      # rejected before the outbound probe
+    save.assert_not_awaited()
+
+
+@pytest.mark.parametrize("private_ip", ["192.168.1.10", "10.0.0.5", "172.16.4.9"])
+def test_connect_subsonic_all_rfc1918_ranges_rejected_when_flag_off(
+        client, mock_state, private_ip):
+    # Error path — every RFC-1918 range (192.168/16, 10/8, 172.16/12) is rejected
+    # pre-probe with the flag off.
+    save = AsyncMock()
+    probe = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(_allow_private(False))
+        es.enter_context(_resolve_to(private_ip))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               probe))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": f"http://{private_ip}:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "blocked_private"
+    probe.assert_not_awaited()
+    save.assert_not_awaited()
+
+
+@pytest.mark.parametrize("blocked_ip", ["127.0.0.1", "169.254.10.5", "::1", "fe80::1"])
+@pytest.mark.parametrize("allow", [True, False])
+def test_connect_subsonic_loopback_and_linklocal_always_rejected(
+        client, mock_state, blocked_ip, allow):
+    # Edge case — loopback (127.0.0.1, ::1) and link-local (169.254.x.x, fe80::/10)
+    # are rejected regardless of the flag (even with ALLOW_PRIVATE_SOURCES=True).
+    # The IPv6 cases (::1, fe80::1) match the _validate_source_url docstring, which
+    # names ::1 and fe80::/10 as always-blocked.
+    save = AsyncMock()
+    probe = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(_allow_private(allow))
+        es.enter_context(_resolve_to(blocked_ip))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               probe))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        # Bracket IPv6 literals so urlparse yields the host (bare v6 breaks parsing).
+        host = f"[{blocked_ip}]" if ":" in blocked_ip else blocked_ip
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": f"http://{host}:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "blocked_private"
+    probe.assert_not_awaited()
+    save.assert_not_awaited()
+
+
+def test_connect_subsonic_hostname_resolving_to_private_treated_as_private(
+        client, mock_state):
+    # A hostname (not a literal IP) that RESOLVES to a private IP is rejected like a
+    # private-IP URL when the flag is off.
+    save = AsyncMock()
+    probe = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(_allow_private(False))
+        es.enter_context(_resolve_to("10.1.2.3"))   # public-looking host, private A record
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               probe))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://music.example.com", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "blocked_private"
+    probe.assert_not_awaited()
+    save.assert_not_awaited()
+
+
+def test_connect_subsonic_public_url_unaffected(client, mock_state):
+    # Edge case — a public-resolving host connects normally (validation is a no-op).
+    save = AsyncMock()
+    probe = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(_allow_private(False))      # even hardened, public is fine
+        es.enter_context(_resolve_to("93.184.216.34"))   # public IP
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               probe))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.get_libraries",
+                               AsyncMock(return_value=[_lib("subsonic")])))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        es.enter_context(patch("app.api.admin._clear_source_veto", AsyncMock()))
+        es.enter_context(patch("app.api.admin._enable_new_source_libraries", AsyncMock()))
+        es.enter_context(patch("app.state.invalidate_plex_client", MagicMock()))
+        es.enter_context(patch("app.state.trigger_catalog_refresh", MagicMock()))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "https://music.example.net", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 200
+    probe.assert_awaited()
+    save.assert_awaited_once()
+
+
+def test_connect_subsonic_dns_failure_fails_closed(client, mock_state):
+    # P2: a host that can't be resolved must FAIL CLOSED — rejected as
+    # 'unreachable' before the outbound probe, never let through the SSRF gate.
+    import socket as _socket
+    save = AsyncMock()
+    probe = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(patch("socket.getaddrinfo",
+                               side_effect=_socket.gaierror("name resolution failed")))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource.require_api_key_support",
+                               probe))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://does-not-resolve.invalid:4533", "api_key": "k",
+            "username": "dj"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "unreachable"
+    probe.assert_not_awaited()   # never reached the outbound probe
+    save.assert_not_awaited()
+
+
+def test_connect_subsonic_loopback_rejected_before_source_constructed(client, mock_state):
+    # P2 (fix #5): a loopback/blocked URL is rejected and NO source row is saved
+    # and NO SubsonicSource (httpx client) is constructed — validation runs FIRST,
+    # before the source alloc.
+    save = AsyncMock()
+    ctor = MagicMock(side_effect=AssertionError(
+        "SubsonicSource must not be constructed for a blocked URL"))
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(_allow_private(True))          # even permissive, loopback is blocked
+        es.enter_context(_resolve_to("127.0.0.1"))
+        es.enter_context(patch("app.sources.subsonic.SubsonicSource", ctor))
+        es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))
+        resp = client.post("/admin/sources/subsonic", json={
+            "server_url": "http://127.0.0.1:4533", "api_key": "k", "username": "dj"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "blocked_private"
+    ctor.assert_not_called()      # no client allocated (no leak)
+    save.assert_not_awaited()     # no source row saved
+
+
+def test_connect_subsonic_probe_client_does_not_follow_redirects():
+    # Redirect / DNS-rebind hardening — the Subsonic probe client is constructed
+    # without follow_redirects (httpx default False), so a public host cannot 302
+    # the probe to a private target. Asserted structurally on the built client.
+    from app.sources.subsonic import SubsonicSource
+    import asyncio as _asyncio
+    src = SubsonicSource(server_url="http://nav.lan:4533", api_key="k", username="dj")
+    try:
+        assert src._http.follow_redirects is False
+    finally:
+        _asyncio.new_event_loop().run_until_complete(src._http.aclose())
+
+
+def test_connect_emby_private_rejected_when_flag_off(client, mock_state):
+    # Error path — Emby connect obeys the same SSRF guard: private IP rejected
+    # pre-probe with the flag off, message names the flag.
+    save = AsyncMock()
+    auth = AsyncMock(return_value={"token": "t", "user_id": "u", "server_id": "s"})
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(_allow_private(False))
+        es.enter_context(_resolve_to("192.168.1.10"))
+        es.enter_context(patch("app.sources.emby.authenticate", auth))
+        es.enter_context(patch("app.api.admin.database.save_emby_source", save))
+        resp = client.post("/admin/sources/emby", json={
+            "server_url": "http://emby.lan:8096", "username": "admin", "password": "x"})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["category"] == "blocked_private"
+    assert "ALLOW_PRIVATE_SOURCES" in detail["message"]
+    auth.assert_not_awaited()       # rejected before the outbound authenticate
+    save.assert_not_awaited()
+
+
+def test_connect_emby_loopback_rejected_regardless_of_flag(client, mock_state):
+    # Edge case — Emby loopback rejected even with the flag on.
+    save = AsyncMock()
+    auth = AsyncMock()
+    with contextlib.ExitStack() as es:
+        for p in _no_dupes():
+            es.enter_context(p)
+        es.enter_context(_allow_private(True))
+        es.enter_context(_resolve_to("127.0.0.1"))
+        es.enter_context(patch("app.sources.emby.authenticate", auth))
+        es.enter_context(patch("app.api.admin.database.save_emby_source", save))
+        resp = client.post("/admin/sources/emby", json={
+            "server_url": "http://localhost:8096", "username": "admin", "password": "x"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["category"] == "blocked_private"
+    auth.assert_not_awaited()
+    save.assert_not_awaited()
+
+
+def test_connect_emby_authenticate_client_does_not_follow_redirects():
+    # Redirect hardening for the Emby probe: emby.authenticate builds its httpx
+    # client without follow_redirects (default False). Verified by capturing the
+    # client passed through to the request.
+    import asyncio as _asyncio
+    import app.sources.emby as emby_mod
+
+    captured = {}
+    orig_client_cls = emby_mod.httpx.AsyncClient
+
+    def _spy(*a, **kw):
+        c = orig_client_cls(*a, **kw)
+        captured["follow_redirects"] = c.follow_redirects
+        return c
+
+    async def _run():
+        with patch.object(emby_mod.httpx, "AsyncClient", _spy):
+            with contextlib.suppress(Exception):
+                # No server; the request fails, but the client was built first.
+                await emby_mod.authenticate(
+                    "http://127.0.0.1:1", "u", "p", device_id="d")
+    _asyncio.new_event_loop().run_until_complete(_run())
+    assert captured.get("follow_redirects") is False
+
+
+def test_list_sources_includes_subsonic_and_emby(client, mock_state):
+    with patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_plex_config", AsyncMock(return_value=None)), \
+         patch("app.api.admin.database.get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_subsonic_sources",
+               AsyncMock(return_value=[{"source_id": "subsonic-1", "name": "Navidrome"}])), \
+         patch("app.api.admin.database.get_emby_sources",
+               AsyncMock(return_value=[{"source_id": "emby-1", "name": "Living Room"}])), \
+         patch("app.api.admin.database.get_local_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_disabled_sources",
+               AsyncMock(return_value=["emby-1"])):
+        resp = client.get("/admin/sources")
+    assert resp.status_code == 200
+    srcs = {s["source_id"]: s for s in resp.json()["sources"]}
+    assert srcs["subsonic-1"] == {"source_id": "subsonic-1", "type": "subsonic",
+                                  "name": "Navidrome", "enabled": True}
+    assert srcs["emby-1"] == {"source_id": "emby-1", "type": "emby",
+                              "name": "Living Room", "enabled": False}
+
+
+def test_sources_new_endpoints_require_auth(anon_client, mock_session):
+    assert anon_client.post("/admin/sources/subsonic", json={}).status_code == 401
+    assert anon_client.delete("/admin/sources/subsonic/x").status_code == 401
+    assert anon_client.post("/admin/sources/emby", json={}).status_code == 401
+    assert anon_client.delete("/admin/sources/emby/x").status_code == 401
+
+
 def test_rescan_sources_triggers_refresh(client, mock_state):
     with patch("app.state.trigger_catalog_refresh", MagicMock()) as scan, \
          patch("app.state.trigger_browse_index_refresh", MagicMock()):
@@ -201,6 +901,8 @@ def test_list_sources_includes_local(client, mock_state):
     with patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])), \
          patch("app.api.admin.database.get_plex_config", AsyncMock(return_value=None)), \
          patch("app.api.admin.database.get_jellyfin_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_subsonic_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_emby_sources", AsyncMock(return_value=[])), \
          patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
          patch("app.api.admin.database.get_local_sources",
                AsyncMock(return_value=[{"source_id": "local-abc", "name": "Vinyl Rips"}])):
@@ -306,6 +1008,8 @@ def test_list_sources_reports_veto_as_disabled(client, mock_state):
          patch("app.api.admin.database.get_plex_config", AsyncMock(return_value=None)), \
          patch("app.api.admin.database.get_jellyfin_sources",
                AsyncMock(return_value=[{"source_id": "jf-1", "name": "Den"}])), \
+         patch("app.api.admin.database.get_subsonic_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_emby_sources", AsyncMock(return_value=[])), \
          patch("app.api.admin.database.get_local_sources",
                AsyncMock(return_value=[{"source_id": "local-x", "name": "Vinyl"}])), \
          patch("app.api.admin.database.get_disabled_sources",
@@ -408,6 +1112,8 @@ def test_list_sources_fails_open_when_veto_unreadable(client, mock_state):
          patch("app.api.admin.database.get_plex_config", AsyncMock(return_value=None)), \
          patch("app.api.admin.database.get_jellyfin_sources",
                AsyncMock(return_value=[{"source_id": "jf-1", "name": "Den"}])), \
+         patch("app.api.admin.database.get_subsonic_sources", AsyncMock(return_value=[])), \
+         patch("app.api.admin.database.get_emby_sources", AsyncMock(return_value=[])), \
          patch("app.api.admin.database.get_local_sources", AsyncMock(return_value=[])), \
          patch("app.api.admin.database.get_disabled_sources",
                AsyncMock(side_effect=RuntimeError("settings read failed"))):

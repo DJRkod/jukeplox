@@ -61,6 +61,27 @@ CREATE TABLE IF NOT EXISTS local_sources (
     root_dir  TEXT NOT NULL       -- absolute root directory crawled by LocalSource
 );
 
+CREATE TABLE IF NOT EXISTS subsonic_sources (
+    source_id   TEXT PRIMARY KEY,   -- registry key namespace ({source_id}:{itemId})
+    server_url  TEXT NOT NULL,      -- CREDENTIAL-FREE base URL (the API key rides
+                                    -- query params only in server-side fetches, U5)
+    name        TEXT NOT NULL,      -- friendly display name for the source picker
+    token       TEXT NOT NULL,      -- OpenSubsonic API key — named `token` so the
+                                    -- _reseal helper (hardcoded on `token`) is reused
+    user        TEXT NOT NULL,      -- Subsonic username (u= common param)
+    client      TEXT NOT NULL       -- client id sent as c= common param
+);
+
+CREATE TABLE IF NOT EXISTS emby_sources (
+    source_id   TEXT PRIMARY KEY,   -- registry key namespace ({source_id}:{itemId})
+    server_url  TEXT NOT NULL,      -- CREDENTIAL-FREE base URL
+    name        TEXT NOT NULL,      -- friendly display name for the source picker
+    token       TEXT NOT NULL,      -- Emby AccessToken (X-Emby-Token) — credential is
+                                    -- TOKEN-ONLY, never the account password (R5)
+    user_id     TEXT NOT NULL,      -- Emby UserId minted at connect time
+    device_id   TEXT NOT NULL       -- stable DeviceId minted at connect time
+);
+
 CREATE TABLE IF NOT EXISTS enabled_libraries (
     section_key TEXT PRIMARY KEY,
     name        TEXT NOT NULL
@@ -332,6 +353,12 @@ async def _migrate_seal_credentials() -> None:
     await _reseal(
         "SELECT source_id, token FROM jellyfin_sources",
         "UPDATE jellyfin_sources SET token = ? WHERE source_id = ?", "source_id")
+    await _reseal(
+        "SELECT source_id, token FROM subsonic_sources",
+        "UPDATE subsonic_sources SET token = ? WHERE source_id = ?", "source_id")
+    await _reseal(
+        "SELECT source_id, token FROM emby_sources",
+        "UPDATE emby_sources SET token = ? WHERE source_id = ?", "source_id")
 
 
 async def close_db() -> None:
@@ -471,6 +498,78 @@ async def save_jellyfin_source(
 async def delete_jellyfin_source(source_id: str) -> None:
     db = _conn()
     await db.execute("DELETE FROM jellyfin_sources WHERE source_id = ?", (source_id,))
+    await db.commit()
+
+
+# ── subsonic sources (multi-source plan 2026-08-10-003 U3) ───────────────────
+
+async def get_subsonic_sources() -> list[dict]:
+    from app.sources import secrets
+    async with _conn().execute("SELECT * FROM subsonic_sources") as cur:
+        rows = [dict(row) async for row in cur]
+    for r in rows:
+        r["token"] = secrets.open_secret(r.get("token"))  # U3: opened for use
+    return rows
+
+
+async def save_subsonic_source(
+    source_id: str, server_url: str, name: str, token: str, user: str, client: str,
+) -> None:
+    """Upsert one OpenSubsonic source. Stores the API key only (never a password,
+    R5); the server_url is credential-free (the key rides query params only in
+    server-side fetches, U5). The token is sealed at rest via app.sources.secrets."""
+    from app.sources import secrets
+    db = _conn()
+    await db.execute(
+        "INSERT INTO subsonic_sources (source_id, server_url, name, token, user, client) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(source_id) DO UPDATE SET "
+        "server_url = excluded.server_url, name = excluded.name, token = excluded.token, "
+        "user = excluded.user, client = excluded.client",
+        (source_id, server_url, name, secrets.seal(token), user, client),  # U3 (R5a)
+    )
+    await db.commit()
+
+
+async def delete_subsonic_source(source_id: str) -> None:
+    db = _conn()
+    await db.execute("DELETE FROM subsonic_sources WHERE source_id = ?", (source_id,))
+    await db.commit()
+
+
+# ── emby sources (multi-source plan 2026-08-10-003 U3) ───────────────────────
+
+async def get_emby_sources() -> list[dict]:
+    from app.sources import secrets
+    async with _conn().execute("SELECT * FROM emby_sources") as cur:
+        rows = [dict(row) async for row in cur]
+    for r in rows:
+        r["token"] = secrets.open_secret(r.get("token"))  # U3: opened for use
+    return rows
+
+
+async def save_emby_source(
+    source_id: str, server_url: str, name: str, token: str, user_id: str, device_id: str,
+) -> None:
+    """Upsert one Emby source. Stores the AccessToken + UserId only — the account
+    password is never accepted here (R5: credential token-only). The server_url is
+    credential-free. The token is sealed at rest via app.sources.secrets (U3)."""
+    from app.sources import secrets
+    db = _conn()
+    await db.execute(
+        "INSERT INTO emby_sources (source_id, server_url, name, token, user_id, device_id) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(source_id) DO UPDATE SET "
+        "server_url = excluded.server_url, name = excluded.name, token = excluded.token, "
+        "user_id = excluded.user_id, device_id = excluded.device_id",
+        (source_id, server_url, name, secrets.seal(token), user_id, device_id),  # U3 (R5a)
+    )
+    await db.commit()
+
+
+async def delete_emby_source(source_id: str) -> None:
+    db = _conn()
+    await db.execute("DELETE FROM emby_sources WHERE source_id = ?", (source_id,))
     await db.commit()
 
 

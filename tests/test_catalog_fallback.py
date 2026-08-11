@@ -26,6 +26,9 @@ def _track(holds=None, stream_key="primary"):
 def _client():
     c = MagicMock()
     c.stream_url = lambda k: f"url:{k}"   # no STREAM_BASE_URL → registry resolves
+    # U5: header-auth source (Plex-shaped). A bare MagicMock would auto-create a
+    # truthy url_borne_auth_for, wrongly forcing the URL-auth proxy branch.
+    c.url_borne_auth_for = MagicMock(return_value=False)
     return c
 
 

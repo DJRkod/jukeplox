@@ -730,6 +730,8 @@
       <div style="margin-top:.75rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" id="btn-connect-plex">Connect Plex</button>
         <button class="btn btn-primary btn-sm" id="btn-connect-jellyfin-toggle">Connect Jellyfin</button>
+        <button class="btn btn-primary btn-sm" id="btn-connect-subsonic-toggle">Connect Subsonic</button>
+        <button class="btn btn-primary btn-sm" id="btn-connect-emby-toggle">Connect Emby</button>
         <button class="btn btn-primary btn-sm" id="btn-connect-local-toggle">Connect Local Folder</button>
         <button class="btn btn-sm" id="btn-rescan-sources"
                 style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Rescan</button>
@@ -754,6 +756,50 @@
                   style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Cancel</button>
         </div>
         <span id="jf-connect-error" style="display:none;font-size:.85rem;color:#f87171;margin-top:.4rem"></span>
+      </div>
+
+      <!-- OpenSubsonic connect (2026-08-10-003 U7): revealed by "Connect Subsonic",
+           mirroring the Jellyfin affordance. R5 — an API KEY is stored, never a
+           password; the help hint tells the admin where to generate one. After a
+           successful connect the resolved proxy base (U5) is surfaced so a wrong
+           LAN-IP auto-detection is visible before a silent no-audio cast. -->
+      <div id="subsonic-connect-form" style="display:none;margin-top:.6rem;padding:.7rem;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
+        <div class="panel-row" style="flex-wrap:wrap;gap:.5rem;align-items:center;margin:0">
+          <input id="subsonic-url" type="text" placeholder="http://navidrome.local:4533"
+                 style="flex:1;min-width:220px">
+          <input id="subsonic-key" type="password" placeholder="API key"
+                 autocomplete="off" style="width:160px">
+          <input id="subsonic-user" type="text" placeholder="Username" autocomplete="username"
+                 style="width:140px">
+          <input id="subsonic-name" type="text" placeholder="Name (optional)" style="width:140px">
+          <button class="btn btn-primary btn-sm" id="btn-connect-subsonic">Connect</button>
+          <button class="btn btn-sm" id="btn-cancel-subsonic"
+                  style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+        <p class="muted" style="font-size:.8rem;color:#888;margin:.45rem 0 0">
+          Generate an API key in your server's settings — Navidrome: Settings → Users →
+          your user → API key.</p>
+        <span id="subsonic-connect-error" style="display:none;font-size:.85rem;color:#f87171;margin-top:.4rem"></span>
+        <span id="subsonic-connect-note" style="display:none;font-size:.82rem;color:#888;margin-top:.4rem"></span>
+      </div>
+
+      <!-- Emby connect (2026-08-10-003 U7): revealed by "Connect Emby", mirroring
+           the Jellyfin affordance. Account sign-in exchanges username/password for
+           a token (R5 — the password is discarded, only the token is stored). -->
+      <div id="emby-connect-form" style="display:none;margin-top:.6rem;padding:.7rem;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
+        <div class="panel-row" style="flex-wrap:wrap;gap:.5rem;align-items:center;margin:0">
+          <input id="emby-url" type="text" placeholder="http://emby.local:8096"
+                 style="flex:1;min-width:220px">
+          <input id="emby-user" type="text" placeholder="Username" autocomplete="username"
+                 style="width:140px">
+          <input id="emby-pass" type="password" placeholder="Password"
+                 autocomplete="current-password" style="width:140px">
+          <input id="emby-name" type="text" placeholder="Name (optional)" style="width:140px">
+          <button class="btn btn-primary btn-sm" id="btn-connect-emby">Connect</button>
+          <button class="btn btn-sm" id="btn-cancel-emby"
+                  style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+        <span id="emby-connect-error" style="display:none;font-size:.85rem;color:#f87171;margin-top:.4rem"></span>
       </div>
 
       <!-- Local folder connect: revealed by the "Connect Local Folder" button,

@@ -47,6 +47,17 @@ class Capabilities:
 class MusicSource(ABC):
     """One connected media source behind a uniform interface."""
 
+    # ── auth model (R6, U5) ────────────────────────────────────────────────────
+
+    # Does this source carry its credential *in the stream URL* (query params)?
+    # Header-auth sources (Plex/Jellyfin/Emby) inject their credential
+    # server-side via StreamTarget.headers and leave it False. A URL-auth source
+    # (Subsonic) overrides to True — then U5 force-proxies every stream so the
+    # credentialed upstream URL is fetched only server-side and never reaches a
+    # Cast/DLNA device. Read at dispatch via ``url_borne_auth``, never a
+    # hardcoded ``source_type == "..."`` check (plan R6).
+    url_borne_auth: bool = False
+
     # ── identity ──────────────────────────────────────────────────────────────
 
     @property

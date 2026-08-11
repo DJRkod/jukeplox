@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import ipaddress
 import logging
 import random
+import socket
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -184,6 +186,33 @@ async def get_plex_client():
                     root_dir=l["root_dir"], source_id=l["source_id"], server_name=l["name"],
                 )
                 for l in local
+            ]
+        # Subsonic sources (2026-08-10-003 U4): same additive/gated posture — the
+        # loop is empty on installs without one, so a Plex-only registry stays
+        # byte-identical (AE6). token = the sealed-at-rest API key (opened by
+        # get_subsonic_sources); server_url is credential-free.
+        subsonic = await database.get_subsonic_sources()
+        if subsonic:
+            from app.sources.subsonic import SubsonicSource
+            sources += [
+                SubsonicSource(
+                    server_url=s["server_url"], api_key=s["token"], username=s["user"],
+                    source_id=s["source_id"], server_name=s["name"],
+                )
+                for s in subsonic
+            ]
+        # Emby sources (2026-08-10-003 U4): additive/gated like Jellyfin — empty
+        # loop keeps a Plex-only registry byte-identical (AE6). EmbySource is a
+        # JellyfinSource variant, so it takes the same constructor params.
+        emby = await database.get_emby_sources()
+        if emby:
+            from app.sources.emby import EmbySource
+            sources += [
+                EmbySource(
+                    server_url=e["server_url"], token=e["token"], user_id=e["user_id"],
+                    source_id=e["source_id"], server_name=e["name"], device_id=e["device_id"],
+                )
+                for e in emby
             ]
         if sources:
             _plex_client = SourceRegistry(sources)
@@ -1409,18 +1438,150 @@ def _stream_url_base() -> str:
     return base.rstrip("/") if base else ""
 
 
+def _proxy_stream_url(stream_key: str, base: str) -> str:
+    """A device-facing ``/api/stream`` proxy URL for ``stream_key`` on ``base``."""
+    return base + "/api/stream?key=" + urllib.parse.quote(stream_key, safe="")
+
+
+# ── LAN-IP auto-detect for URL-auth proxy base (U5) ───────────────────────────
+
+# Detection is cached at first use — the primary LAN IP does not change over a
+# run, and the UDP-connect (below) is cheap but needless to repeat. Stored as a
+# one-slot cache so it runs ONLY when a URL-auth source is actually streamed
+# (a Plex/Jellyfin/Emby-only install never touches this path → AE6 byte-identical
+# and no new startup cost).
+_detected_lan_ip: str | None = None
+_detected_lan_ip_done = False
+
+
+def _detect_primary_lan_ip() -> str:
+    """The host's primary outward-facing IP, via a UDP-connect + getsockname.
+
+    Opens an unconnected UDP socket and "connects" it toward an off-host target;
+    no packet is sent, but the kernel picks the source address it *would* use to
+    reach that target — i.e. the primary LAN interface's IP on a multi-homed or
+    default host. Cached after the first successful detection.
+
+    Raises ``RuntimeError`` if no address can be determined — the caller
+    (URL-auth proxy base) then fails loud rather than emitting a raw credentialed
+    URL (never leak, never silent). A failure is NOT cached: the ``done`` sentinel
+    is set only on a SUCCESSFUL detection, so a transient OSError (no route yet /
+    network coming up) does not permanently disable detection — a later call
+    re-attempts and can succeed."""
+    global _detected_lan_ip, _detected_lan_ip_done
+    if _detected_lan_ip_done and _detected_lan_ip:
+        return _detected_lan_ip
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # No traffic leaves the host; 8.8.8.8 is only a routing hint so the
+            # kernel selects the default-route source IP.
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError as exc:  # no route / no network — cannot establish a base
+        # Do NOT cache the negative: allow re-detection on the next call.
+        raise RuntimeError(f"LAN IP auto-detection failed: {exc}") from exc
+    if not ip or ip.startswith("127."):
+        raise RuntimeError(f"LAN IP auto-detection yielded a non-routable address: {ip!r}")
+    _detected_lan_ip = ip
+    _detected_lan_ip_done = True  # cache ONLY on success
+    return ip
+
+
+# Container/bridge ranges a LAN Cast/DLNA device typically cannot reach. The
+# classic Docker default bridge lives in 172.16.0.0/12; user-defined bridges and
+# 10.0.0.0/8 overlap real LANs, so we only treat the 172.16/12 range as the
+# unreachable-bridge heuristic (matches the plan's "e.g. 172.16.0.0/12" example)
+# — a host genuinely on 172.16/12 is rare and STREAM_BASE_URL is the escape.
+_BRIDGE_NET = ipaddress.ip_network("172.16.0.0/12")
+
+
+def _is_bridge_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip) in _BRIDGE_NET
+    except ValueError:
+        return False
+
+
+def resolved_proxy_base_for_url_auth() -> str:
+    """The device-reachable proxy base a URL-auth source must stream through.
+
+    ``STREAM_BASE_URL`` when set (always wins), else a specific (non-0.0.0.0)
+    ``BIND_HOST`` — both via ``_stream_url_base()`` so this can never disagree
+    with the header-auth path about what a "reachable base" is — otherwise the
+    auto-detected primary LAN IP as ``http://<ip>``. **Fail loud, never leak:**
+    - if no base can be established at all (detection raises), raise
+      ``RuntimeError`` naming ``STREAM_BASE_URL`` — the caller must refuse rather
+      than emit a raw credentialed URL;
+    - if the detected IP is on a container/bridge subnet (Docker-bridge case,
+      likely unreachable by a LAN device), emit a loud WARNING recommending
+      ``STREAM_BASE_URL`` (the U7 connect-time surface shows the resolved base so
+      the admin can catch an unreachable value before a silent no-audio cast).
+
+    Exposed (not just internal) so the admin connect endpoint / UI (U7) can read
+    the resolved base to display it."""
+    base = _stream_url_base()  # STREAM_BASE_URL, else a specific (non-0.0.0.0) BIND_HOST
+    if base:
+        return base
+    try:
+        ip = _detect_primary_lan_ip()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Cannot determine a device-reachable stream base for a URL-auth "
+            "(Subsonic) source, so its credentialed stream URL cannot be safely "
+            "proxied. Set STREAM_BASE_URL to this server's LAN address "
+            f"(e.g. http://192.168.1.10). ({exc})"
+        ) from exc
+    # Broadened warning (was 172.16/12-only): STREAM_BASE_URL is unset and we are
+    # serving a URL-auth source via an AUTO-DETECTED base, which a LAN Cast/DLNA
+    # device may not be able to reach (a bridge/container IP is the worst case,
+    # but any auto-detected interface can be wrong on a multi-homed host). Always
+    # recommend STREAM_BASE_URL; call out the bridge case explicitly.
+    if _is_bridge_ip(ip):
+        _log.warning(
+            "Stream base auto-detected a container/bridge IP %s for a URL-auth "
+            "(Subsonic) source — a LAN Cast/DLNA device likely cannot reach it. "
+            "Set STREAM_BASE_URL to this server's LAN address to guarantee "
+            "playback.", ip,
+        )
+    else:
+        _log.warning(
+            "STREAM_BASE_URL is not set — auto-detected stream base http://%s for "
+            "a URL-auth (Subsonic) source. If a LAN Cast/DLNA device can't reach "
+            "this address, set STREAM_BASE_URL to this server's LAN address to "
+            "guarantee playback.", ip,
+        )
+    return f"http://{ip}"
+
+
 def _make_stream_url(stream_key: str, client) -> str:
     """Return the playback URL for a track.
 
-    When BIND_HOST is set to a specific IP (not 0.0.0.0), or STREAM_BASE_URL is
-    set explicitly, returns a /api/stream proxy URL so Cast/DLNA devices that
-    can't reach Plex directly fetch the audio through Jukeplox instead.
-    """
+    Header-auth sources (Plex/Jellyfin/Emby) keep today's behavior: when
+    BIND_HOST is a specific IP (not 0.0.0.0) or STREAM_BASE_URL is set, return a
+    /api/stream proxy URL so Cast/DLNA devices that can't reach the source
+    directly fetch through Jukeplox; otherwise fall through to the source's raw
+    (credential-free) upstream URL.
+
+    URL-auth sources (Subsonic, ``url_borne_auth`` True — R6/P0): the raw
+    upstream URL carries the API key, so it is **never** handed to a device.
+    Always proxy via /api/stream, on ANY config. The proxy base is
+    STREAM_BASE_URL if set, else an auto-detected LAN IP; if no device-reachable
+    base can be established, this raises rather than emitting a credentialed URL
+    (fail loud on the security axis — never leak, never silent)."""
+    # URL-auth force-proxy branch. Guarded so the auto-detect helper runs ONLY
+    # when a URL-auth source is actually configured/streamed (AE6: a header-auth-
+    # only install is byte-identical and pays no new cost).
+    if getattr(client, "url_borne_auth_for", None) is not None \
+            and client.url_borne_auth_for(stream_key):
+        base = resolved_proxy_base_for_url_auth()
+        return _proxy_stream_url(stream_key, base)
+
     base = _stream_url_base()
     if base:
-        return (base
-                + "/api/stream?key="
-                + urllib.parse.quote(stream_key, safe=""))
+        return _proxy_stream_url(stream_key, base)
     return client.stream_url(stream_key)
 
 
