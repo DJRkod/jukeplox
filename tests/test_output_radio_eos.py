@@ -123,6 +123,29 @@ async def test_direct_radio_eos_does_not_advance(gst_mock):
     recon.assert_called_once()
 
 
+async def test_direct_teardown_pipeline_is_none_safe(gst_mock):
+    """_teardown_pipeline must not crash when self._pipeline is None. Radio's
+    error->reconnect->teardown cycle fires teardown from the GLib bus thread AND
+    the asyncio reconnect loop concurrently; one nulls self._pipeline between the
+    other's None-check and its set_state() call -> AttributeError: 'NoneType'
+    has no attribute 'set_state' (rig-caught 2026-08-11). Claim-then-teardown
+    (capture to a local, null the field first) makes it race-safe."""
+    _mock_gst, mock_pipeline = gst_mock
+    from app.output.direct import DirectAudioBackend
+    backend = DirectAudioBackend(advance_cb=lambda: None)
+
+    # No pipeline set -> teardown is a clean no-op, never AttributeError.
+    backend._pipeline = None
+    backend._teardown_pipeline()
+    assert backend._pipeline is None
+
+    # With a pipeline -> teardown claims it, nulls the field, and tears it down.
+    backend._pipeline = mock_pipeline
+    backend._teardown_pipeline()
+    assert backend._pipeline is None
+    mock_pipeline.set_state.assert_called()
+
+
 async def test_direct_radio_source_error_reconnects_not_advance(gst_mock):
     """ADV-1: a souphttpsrc RESOURCE error in radio mode reconnects, never
     advances (the ERROR path is suppressed too, not just _on_eos)."""

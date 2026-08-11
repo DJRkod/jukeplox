@@ -237,6 +237,46 @@ async def test_public_redirect_to_loopback_rejected(monkeypatch):
     assert all(r.url.host != _LOOPBACK_V4 for r in rec.requests)
 
 
+async def test_resolve_and_validate_uses_streaming_not_eager_read(monkeypatch):
+    """resolve_and_validate must probe with client.stream() (returns on headers,
+    body never read), NOT client.request()/get() which reads the body eagerly
+    and blocks forever on a live, endless radio stream — a healthy stream keeps
+    sending, so even the read timeout never fires (rig-caught P0, 2026-08-11).
+    A fake client records which method the resolver used."""
+    _patch_dns(monkeypatch, {"stream.example.invalid": _PUBLIC_V4})
+    calls = {"stream": 0, "eager": 0}
+
+    class _FakeStreamResp:
+        url = httpx.URL("http://stream.example.invalid/live")
+        is_redirect = False
+        headers: dict = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeClient:
+        def stream(self, method, url):
+            calls["stream"] += 1
+            return _FakeStreamResp()
+
+        async def request(self, *a, **k):  # the eager path that hangs on a stream
+            calls["eager"] += 1
+            raise AssertionError("resolve_and_validate used eager request()")
+
+        async def get(self, *a, **k):
+            calls["eager"] += 1
+            raise AssertionError("resolve_and_validate used eager get()")
+
+    out = await resolve_and_validate(
+        "http://stream.example.invalid/live", client=_FakeClient())
+    assert out == "http://stream.example.invalid/live"
+    assert calls["stream"] == 1, "must probe the hop with a streaming GET"
+    assert calls["eager"] == 0, "must never eagerly read the body"
+
+
 async def test_public_redirect_to_private_via_dns_rejected(monkeypatch):
     """SEC-002 variant: the redirect Location is a hostname that RESOLVES to a
     private IP -> still rejected (host, not just literal-IP, is re-validated)."""

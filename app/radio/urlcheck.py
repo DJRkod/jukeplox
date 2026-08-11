@@ -222,11 +222,15 @@ async def resolve_and_validate(
     current = url
     try:
         for _hop in range(MAX_REDIRECT_HOPS + 1):
-            # A HEAD would be cheaper, but many ICY / streaming servers mishandle
-            # HEAD (405 / hang) and some don't emit redirects for it. Use GET and
-            # never read the body — httpx does not stream the body until awaited.
-            resp = await client.request("GET", current)
-            try:
+            # Probe with a STREAMING GET so httpx returns as soon as the response
+            # HEADERS arrive and NEVER reads the body. This is load-bearing: the
+            # final hop is a live, ENDLESS radio stream with no Content-Length —
+            # a non-streaming client.request()/get() reads the body eagerly and
+            # would block forever (a healthy stream keeps sending, so even the
+            # read timeout never fires — verified on real hardware). A HEAD would
+            # be cheaper but many ICY/streaming servers mishandle it (405/hang).
+            # The `async with` aborts the body and closes the connection on exit.
+            async with client.stream("GET", current) as resp:
                 if not resp.is_redirect:
                     # Final hop. Its host was validated on the way in (either the
                     # entry validation or the previous hop's re-validation).
@@ -240,8 +244,6 @@ async def resolve_and_validate(
 
                 # Resolve relative Locations against the current URL.
                 next_url = urljoin(str(resp.url), location)
-            finally:
-                await resp.aclose()
 
             # RE-VALIDATE the redirect target BEFORE following it. This is the
             # SEC-002 guarantee: a public->private redirect is caught here.

@@ -638,11 +638,19 @@ class DirectAudioBackend:
         self._play_gen += 1
         self._armed_next = None
         self._pending_boundary = None
-        if self._pipeline:
-            bus = self._pipeline.get_bus()
+        # Claim the pipeline into a local and null the field FIRST, so two
+        # concurrent teardowns can't both pass the None-check and then race on
+        # a half-torn-down pipeline. Radio's error->reconnect->teardown cycle
+        # fires teardown from the GLib bus thread AND the asyncio reconnect loop
+        # concurrently; without the claim, one thread nulls self._pipeline
+        # between the other's check and its set_state() call (AttributeError:
+        # 'NoneType' has no attribute 'set_state' — rig-caught on a radio drop).
+        pipe = self._pipeline
+        self._pipeline = None
+        if pipe is not None:
+            bus = pipe.get_bus()
             bus.remove_signal_watch()
-            self._pipeline.set_state(Gst.State.NULL)
-            self._pipeline = None
+            pipe.set_state(Gst.State.NULL)
         self._is_playing = False
 
     async def pause(self) -> None:
