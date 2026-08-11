@@ -77,6 +77,13 @@ async def now_playing():
     # `current`, so a guest loading mid-outage rides the no-current branch and
     # still renders the "paused — output offline" note.
     output_snap = output_session.session_snapshot()
+    # Radio Mode (radio plan U7): the `radio` block lets a fresh / WS-gap client
+    # converge on the active station + status + live_title without a live
+    # RadioStateEvent. Identical for guest + admin (SG-05). Present in BOTH
+    # branches — a radio takeover holds `current`, so a guest loading mid-station
+    # rides the no-current branch and must still see the station.
+    from app.api.radio import radio_snapshot
+    radio_snap = radio_snapshot()
     if not s.current:
         return {
             "track_id": None, "title": None, "artist": None, "album": None,
@@ -88,6 +95,7 @@ async def now_playing():
             "closing_active": state._closing_active,
             "closing_message": state._closing_message,
             "output_session": output_snap,
+            "radio": radio_snap,
         }
     t = s.current.track
     return {
@@ -104,6 +112,7 @@ async def now_playing():
         "closing_active": state._closing_active,
         "closing_message": state._closing_message,
         "output_session": output_snap,
+        "radio": radio_snap,
     }
 
 
@@ -427,6 +436,10 @@ async def get_appearance():
         # paths when off (plan R8). browse_facets gates the toggleable guest tabs.
         "ratings_visible_to_guests": await database.get_ratings_visible_to_guests(),
         "tags_visible_to_guests": await database.get_tags_visible_to_guests(),
+        # Guest radio control (radio plan U7/U8, R9): the shared UI reads this to
+        # dim start/switch when off — COSMETIC; the server routes are the
+        # enforcement. Default off. U8 adds the Setup checkbox that writes it.
+        "guest_radio_control": await database.get_guest_radio_control(),
         "browse_facets": await database.get_browse_facets(),
         # Rating display style (2026-06-27): the shared appearance engine reads
         # this once on load and sets :root[data-rating-style]; CSS in rail.css

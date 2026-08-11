@@ -1286,12 +1286,18 @@ async def admin_now_playing():
     # because an outage hold clears `current` (the held item re-front-inserts),
     # so the no-current branch is exactly the one late joiners hit mid-outage.
     output_snap = await output_session.session_snapshot_admin()
+    # Radio Mode (radio plan U7): the `radio` block — IDENTICAL to the guest
+    # snapshot (SG-05), so both pages converge from one shape. Present in BOTH
+    # branches (a radio takeover holds `current`).
+    from app.api.radio import radio_snapshot
+    radio_snap = radio_snapshot()
     if not s.current:
         return {
             "is_playing": False, "is_paused": False,
             "closing_active": state._closing_active,
             "closing_message": state._closing_message,
             "output_session": output_snap,
+            "radio": radio_snap,
         }
     t = s.current.track
     return {
@@ -1307,6 +1313,7 @@ async def admin_now_playing():
         "closing_active": state._closing_active,
         "closing_message": state._closing_message,
         "output_session": output_snap,
+        "radio": radio_snap,
     }
 
 
@@ -1858,6 +1865,9 @@ async def get_settings():
         # off) + per-facet Browse toggles (default on). Hydrate the Setup checkboxes.
         "ratings_visible_to_guests": await database.get_ratings_visible_to_guests(),
         "tags_visible_to_guests": await database.get_tags_visible_to_guests(),
+        # Radio Mode (2026-08-11 plan U8, R9): guest radio-control toggle
+        # (default off). Hydrates the Setup checkbox.
+        "guest_radio_control": await database.get_guest_radio_control(),
         **{f"facet_{k}": v for k, v in (await database.get_browse_facets()).items()},
         # Closing Time mode (2026-06-24): off by default. Trigger song (title +
         # artist) and the send-off message are admin-editable; defaults are
@@ -1935,6 +1945,11 @@ class SettingsRequest(BaseModel):
     # OFF; the five Browse-facet flags default ON. Persisted as "1"/"0".
     ratings_visible_to_guests: bool | None = None
     tags_visible_to_guests: bool | None = None
+    # Radio Mode (2026-08-11 plan U8, R9): let guests start/switch radio
+    # stations. Default OFF; persisted "1"/"0"; server-enforced in
+    # app/api/radio.py (guest stop + browse always allowed). Client dim is
+    # cosmetic — the route is the enforcement.
+    guest_radio_control: bool | None = None
     facet_genre: bool | None = None
     facet_years: bool | None = None
     facet_mostplayed: bool | None = None
@@ -2214,6 +2229,7 @@ async def update_settings(body: SettingsRequest):
     # flags, all bool → "1"/"0". No appearance broadcast — guests pick these up
     # on the next load (live propagation is deferred per the plan).
     for _flag in ("ratings_visible_to_guests", "tags_visible_to_guests",
+                  "guest_radio_control",
                   "facet_genre", "facet_years", "facet_mostplayed",
                   "facet_recentlyadded", "facet_highestrated"):
         _v = getattr(body, _flag)

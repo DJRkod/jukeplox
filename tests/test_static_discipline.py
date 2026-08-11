@@ -217,6 +217,15 @@ FORBIDDEN_SYMBOLS = {
     # declaration); admin-only banner DETAIL is renderOutputSessionBanner
     # (allowlisted above). Forbidding the shared name fires on a per-page fork.
     "applyOutputSession",
+    # Radio Mode (2026-08-11 plan / FE7): the shared radio surfaces are single-
+    # source. browse's applyRadioState (station-card indicators + tab dot) lives
+    # ONLY in static/browse/index.js; playback's applyRadioNowPlaying (the NP
+    # widget takeover) lives ONLY in static/playback/index.js; setRadioControl
+    # (playback guest-control gate) and setGuestVisibility (browse guest facet +
+    # radio-control visibility, extended by radio) are shared handle exports.
+    # Per-page files dispatch the radio_state event to these handles by method
+    # call (never a declaration) — forbidding the names fires only on a fork.
+    "applyRadioState", "applyRadioNowPlaying", "setRadioControl", "setGuestVisibility",
     "gStartTick", "gStopTick", "gStartSync", "gStopSync",
     "startProgressTick", "stopProgressTick", "startProgressSync", "stopProgressSync",
     "gFmtMs", "fmtMs",
@@ -442,7 +451,10 @@ def test_no_forbidden_symbols_in_admin_app_js():
 FORBIDDEN_SYMBOL_PATTERNS = [
     # Plan 003 U4/U5: extended with _density / _magnetic to protect future
     # density-mode and magnetic-mode helpers added in static/browse/index.js.
-    re.compile(r"^(_rail|_alpha|_density|_magnetic|computeLetter|cancelRail)"),
+    # Radio Mode (2026-08-11 plan / FE7): _radio* reserved for the shared browse
+    # + playback modules — a future per-page _radio* fork (station list, hydrate,
+    # activate, announce helpers) must fail here.
+    re.compile(r"^(_rail|_alpha|_density|_magnetic|computeLetter|cancelRail|_radio)"),
 ]
 
 

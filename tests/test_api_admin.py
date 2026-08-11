@@ -4008,6 +4008,43 @@ def test_settings_persists_visibility_and_facet_flags(client, mock_state):
     assert persisted.get("facet_highestrated") == "1"
 
 
+# ── Radio Mode guest-control toggle (2026-08-11 plan U8, R9) ─────────────────
+
+def test_settings_persists_guest_radio_control(client, mock_state):
+    """U8/R9: guest_radio_control persists as '1'/'0' via set_setting, like the
+    sibling guest-visibility flags."""
+    with patch("app.database.set_setting", AsyncMock()) as ss, \
+         patch("app.events.bus.manager.broadcast_to_all", AsyncMock()):
+        resp_on = client.post("/admin/settings", json={"guest_radio_control": True})
+        persisted_on = {c.args[0]: c.args[1] for c in ss.call_args_list}
+        ss.reset_mock()
+        resp_off = client.post("/admin/settings", json={"guest_radio_control": False})
+        persisted_off = {c.args[0]: c.args[1] for c in ss.call_args_list}
+    assert resp_on.status_code == 200 and resp_off.status_code == 200
+    assert persisted_on.get("guest_radio_control") == "1"
+    assert persisted_off.get("guest_radio_control") == "0"
+
+
+def test_get_settings_echoes_guest_radio_control(client, mock_state):
+    """GET /settings reflects the stored flag; unset (default) hydrates False."""
+    store = {"guest_radio_control": "1"}
+    async def fake_get(key, default=None): return store.get(key, default)
+    with patch("app.database.get_setting", AsyncMock(side_effect=fake_get)):
+        resp = client.get("/admin/settings")
+    assert resp.status_code == 200
+    assert resp.json()["guest_radio_control"] is True
+    # Default (unset) is off.
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        resp = client.get("/admin/settings")
+    assert resp.json()["guest_radio_control"] is False
+
+
+def test_settings_guest_radio_control_requires_auth(anon_client, mock_session):
+    """A non-admin POST /settings is 401 (existing admin-auth pattern)."""
+    resp = anon_client.post("/admin/settings", json={"guest_radio_control": True})
+    assert resp.status_code == 401
+
+
 # ── Play-data curation endpoints (2026-07-03 plan U4) ────────────────────────
 
 def test_curation_endpoints_require_auth(anon_client, mock_session):

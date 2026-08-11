@@ -1092,6 +1092,56 @@ async def get_tags_visible_to_guests() -> bool:
     return (await get_setting("tags_visible_to_guests")) == "1"
 
 
+async def get_guest_radio_control() -> bool:
+    """Whether guests may START/SWITCH radio stations (radio plan U7/U8, R9).
+
+    Stored as "1"/"0" via the settings KV; DEFAULT OFF (guests are read-only-
+    visible with an always-allowed stop — start/switch is admin-gated). U7's
+    guest ``/api/radio/play`` and ``/api/radio/switch`` routes enforce this
+    server-side (403 when off); ``/api/appearance`` exposes it so the shared UI
+    can dim the control cosmetically. U8 adds the Setup checkbox that writes it."""
+    return (await get_setting("guest_radio_control")) == "1"
+
+
+# ── Radio Browser last-known-good mirror list (radio U1 / R13) ───────────────
+# The Radio Browser directory is discovered live off the `all.api.radio-browser.info`
+# A-pool; we persist the last successfully-discovered host list as a JSON array so
+# that when live discovery hard-fails (DNS down, every pooled host unreachable) the
+# radio client can still fall back to a known set of mirrors instead of surfacing an
+# immediate "directory unavailable". Anonymous service — the value carries no
+# credentials or PII, only public mirror hostnames.
+
+_RADIO_MIRRORS_KEY = "radio_last_known_mirrors"
+
+
+async def get_radio_last_known_mirrors() -> list[str]:
+    """Return the persisted last-known-good Radio Browser mirror hostnames.
+
+    Empty list if never persisted or the stored value is malformed (treated as
+    "no last-known-good" — the client then raises directory-unavailable)."""
+    raw = await get_setting(_RADIO_MIRRORS_KEY)
+    if not raw:
+        return []
+    try:
+        value = _json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(h) for h in value if isinstance(h, str) and h.strip()]
+
+
+async def set_radio_last_known_mirrors(hosts: list[str]) -> None:
+    """Persist the discovered Radio Browser mirror hostnames as last-known-good.
+
+    A no-op for an empty list so a transient discovery hiccup can never blow away
+    a good persisted set (never cache a transient failure as a definitive miss)."""
+    cleaned = [str(h) for h in (hosts or []) if isinstance(h, str) and h.strip()]
+    if not cleaned:
+        return
+    await set_setting(_RADIO_MIRRORS_KEY, _json.dumps(cleaned))
+
+
 async def get_browse_facets() -> dict[str, bool]:
     """Per-facet guest visibility, all default True. {facet_id: visible}."""
     return {

@@ -3738,6 +3738,7 @@ def test_appearance_fresh_install_defaults(client, mock_deps):
                            "rail_alpha_mode": "english",
                            "rail_artist_threshold": 2, "rail_album_threshold": 2,
                            "ratings_visible_to_guests": False, "tags_visible_to_guests": False,
+                           "guest_radio_control": False,
                            "browse_facets": {"genre": True, "years": True, "mostplayed": True,
                                              "recentlyadded": True, "highestrated": True},
                            "rating_style": "stars"}
@@ -3756,6 +3757,7 @@ def test_appearance_density_maps_to_waveform(client, mock_deps):
                     "rail_alpha_mode": "english",
                     "rail_artist_threshold": 2, "rail_album_threshold": 2,
                     "ratings_visible_to_guests": False, "tags_visible_to_guests": False,
+                    "guest_radio_control": False,
                     "browse_facets": {"genre": True, "years": True, "mostplayed": True,
                                       "recentlyadded": True, "highestrated": True},
                     "rating_style": "stars"}
@@ -3773,6 +3775,7 @@ def test_appearance_garbage_values_fall_back(client, mock_deps):
                     "rail_alpha_mode": "english",
                     "rail_artist_threshold": 2, "rail_album_threshold": 2,
                     "ratings_visible_to_guests": False, "tags_visible_to_guests": False,
+                    "guest_radio_control": False,
                     "browse_facets": {"genre": True, "years": True, "mostplayed": True,
                                       "recentlyadded": True, "highestrated": True},
                     "rating_style": "stars"}

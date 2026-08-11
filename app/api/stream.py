@@ -570,3 +570,70 @@ async def stream_flow(session_id: str, request: Request):
         media_type=session.content_type,
         headers=headers,
     )
+
+
+# ── Cast/DLNA radio transcode-proxy stream (radio plan U5) ────────────────────
+# Same api→output import direction as the flow route: the radio transcode-proxy
+# ENGINE lives in app/radio/stream.py and this route is its single HTTP consumer
+# surface. GStreamer-direct and AirPlay do NOT use this route — they connect to
+# the SSRF-validated final URL directly, host-side.
+from app.radio import stream as radio_stream  # noqa: E402
+
+
+async def _primed_radio_body(first: bytes, rest):
+    """The radio response body: the primed first chunk, then the bound generator
+    (identical priming discipline to ``_primed_flow_body`` — a never-started
+    generator would strand the single-consumer binding)."""
+    try:
+        yield first
+        async for chunk in rest:
+            yield chunk
+    finally:
+        await rest.aclose()
+
+
+@router.get("/api/radio/stream/{session_id}")
+async def stream_radio(session_id: str, request: Request):
+    """Serve the endless, Range-less radio transcode-proxy stream for the active
+    radio session (Cast/DLNA only).
+
+    Auth posture: **capability URL (SEC-001)** — deliberately NO
+    ``is_authorized_stream_key`` check. ``session_id`` is an unguessable 128-bit
+    token (``secrets.token_urlsafe(16)``) minted per radio station start; the id
+    itself IS the credential, exactly like the flow route. A wrong or stale id
+    404s below **having done NO upstream work** — the lookup is one registry read,
+    so this is never an open proxy, and a station switch/stop invalidates the id so
+    a stale device can't re-bind onto a new station.
+
+    Served chunked and Range-less (the Cast/DLNA live-read pattern): any Range
+    header is ignored and the response advertises ``Accept-Ranges: none`` — a live
+    radio stream has no byte-addressable past to seek into. Reconnect-on-drop
+    happens on the INGEST side (the session respawns ffmpeg from "now", never a
+    byte-offset resume) — the consumer just keeps reading the same session.
+
+    SINGLE-CONSUMER: exactly one consumer may be bound. A disconnect arms a grace
+    timer and a re-GET within it re-binds the SAME session mid-stream (Cast
+    receivers re-request after transient hiccups); a second concurrent GET while a
+    consumer is bound is rejected with 409. The binding is PRIMED here (first
+    ``__anext__`` awaited in the route) so a client that drops before Starlette's
+    first read can't strand the binding — identical to the flow route.
+    """
+    del request  # Range-less by design; the request carries nothing we honor
+    session = radio_stream.get_radio_stream(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="No active radio session")
+    headers = {"Accept-Ranges": "none", "Cache-Control": "no-store"}
+    try:
+        body = session.bind_consumer()
+    except radio_stream.RadioConsumerConflict:
+        raise HTTPException(
+            status_code=409, detail="Radio stream already bound to a consumer")
+    try:
+        first = await body.__anext__()  # the priming read (see docstring)
+    except StopAsyncIteration:
+        return Response(b"", media_type=session.content_type, headers=headers)
+    return StreamingResponse(
+        _primed_radio_body(first, body),
+        media_type=session.content_type,
+        headers=headers,
+    )

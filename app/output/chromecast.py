@@ -50,6 +50,13 @@ def _clean_chromecast_dbus_name(avahi_label: str, txt: dict[str, str]) -> str:
     return stripped.replace("-", " ")
 
 from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
+from app.output.radio_endless import (
+    RadioFailedHook,
+    ReconnectPolicy,
+    fire_radio_failed_hook,
+    is_radio_track,
+    radio_proxy_url,
+)
 from app.models import Track
 
 _CAST_AVAILABLE = False
@@ -207,6 +214,13 @@ class _AdvanceListener:
         self._backend = backend
 
     def new_media_status(self, status: Any) -> None:
+        # Radio endless mode fork (U4): checked FIRST — radio never enters flow
+        # (FE-3), and the per-track idle-reason matrix below carries no advance
+        # meaning for an endless stream. A terminal IDLE(ERROR/FINISHED) means
+        # the upstream dropped → RECOVER (re-LOAD), never advance.
+        if self._backend._radio_mode:
+            self._backend._radio_media_status(status)
+            return
         # U10 mode fork: while a flow session is live the per-track idle-
         # reason matrix below carries no advance meaning (no track boundaries
         # exist device-side) — route to the flow handler and leave the
@@ -423,6 +437,22 @@ class ChromecastBackend:
         # None interval → the module constant; tests inject per-instance.
         self._flow_poll_timer: Any = None
         self._flow_poll_interval_s: float | None = None
+
+        # ── radio endless mode (radio plan U4) ─────────────────────────────
+        # Set in play() when the metadata is a radio pseudo-Track, BEFORE the
+        # gapless_enabled() fork (FE-3) so radio never enters _play_flow (the
+        # queue stitcher). While True: no duration watchdog, stream_type=
+        # BUFFERED, and the per-track advance matrix is bypassed — a terminal
+        # IDLE(ERROR/FINISHED) or LOST→CONNECTED is a RECOVER (re-LOAD live),
+        # never an advance. Cleared on every finite play() / stop().
+        self._radio_mode: bool = False
+        self._radio_url: str = ""
+        self._radio_content_type: str = "audio/mpeg"
+        self._radio_title: str = ""
+        self._radio_reconnect = ReconnectPolicy()
+        # U7 wires this to a RadioStateEvent "offline"; called (no args) once
+        # the reconnect cap is exhausted (R12 — never indefinite silence).
+        self._radio_failed_hook: RadioFailedHook | None = None
 
         # Persistent CastBrowser state.  Callbacks fire from pychromecast's
         # internal thread, so all access to _cast_infos is protected by _discover_lock.
@@ -768,6 +798,9 @@ class ChromecastBackend:
         # session (router.stop() covers cross-backend switches; this covers
         # the same-backend device change, which never calls stop()).
         await self._flow_teardown()
+        # Radio (U4): a device switch also ends any station on the old device.
+        self._radio_mode = False
+        self._radio_url = ""
         from app import database
         stored = await database.get_setting(f"vol:chromecast:{device_id}")
         fallback = float(stored) if stored else 0.5
@@ -923,10 +956,26 @@ class ChromecastBackend:
 
     # ── playback ──────────────────────────────────────────────────────────────
 
+    def set_radio_failed_hook(self, hook: RadioFailedHook | None) -> None:
+        """Register (or clear) the endless-mode failed/offline callback (U4).
+        Called with no arguments once the reconnect cap is exhausted; U7 wires
+        it to a ``RadioStateEvent`` so a dead station surfaces as offline."""
+        self._radio_failed_hook = hook
+
     async def play(self, stream_url: str, metadata: Track) -> None:
         if not _CAST_AVAILABLE or self._cast is None:
             raise DeviceNotReadyError("Chromecast not available or no device selected")
         self._loop = asyncio.get_running_loop()
+        # Radio endless mode (U4): selected BEFORE the gapless_enabled() fork
+        # (FE-3) — otherwise a gapless-on install would route a radio track into
+        # _play_flow (the queue stitcher, which re-resolves finite library
+        # tracks). A radio pseudo-Track has no queue, no boundaries, no
+        # duration. Detected via the SG-03 sentinel (no play() signature change).
+        if is_radio_track(metadata):
+            await self._play_radio(stream_url, metadata)
+            return
+        # A finite dispatch clears any lingering radio state (mode switch back).
+        self._radio_mode = False
         # U10 mode switch: gapless on → FLOW MODE (one server-stitched stream
         # LOADed once; boundaries are the advance authority). The held resume
         # offset (prime_resume_offset) and any outage capture stash are
@@ -1124,6 +1173,161 @@ class ChromecastBackend:
         except Exception as exc:
             self._is_playing = False
             raise RuntimeError(f"Cast flow play failed: {exc}") from exc
+
+    # ── radio endless mode (radio plan U4) ────────────────────────────────────
+
+    async def _play_radio(self, stream_url: str, metadata: Track) -> None:
+        """RADIO dispatch — endless stream, no queue, no boundaries (U4).
+
+        Tears down any lingering flow session (a gapless-on install may have one
+        running), LOADs the station URL once with ``stream_type=BUFFERED``
+        (hardware-confirmed for open-ended chunked audio), and arms NO duration
+        watchdog (there is no track length). Terminal receiver states and socket
+        loss route through the radio recover path, not the per-track advance
+        matrix (see ``_radio_media_status`` / ``_on_connection_lost``)."""
+        # Radio never rides the flow stitcher (FE-3). Tear down any live flow
+        # session before entering radio mode so its boundaries can't fire
+        # against the radio media session.
+        await self._flow_teardown()
+        self._radio_mode = True
+        self._radio_title = getattr(metadata, "title", "") or ""
+        # U5: Cast fetches through the server-side transcode-proxy, not the raw
+        # station URL — the jukebox ingests the validated final URL (ICY-tolerant),
+        # normalizes the codec (no Ogg-style multi-minute hang), and serves it back
+        # Range-less behind a capability URL. The content-type is the transcode
+        # OUTPUT type (authoritative), NOT derived from the station URL extension.
+        # No device-reachable base configured → degrade to the direct URL (mirrors
+        # the flow _flow_base_url() fallback); the raw codec then rides to the
+        # device (rig can catch a mis-set STREAM_BASE_URL).
+        proxied = await radio_proxy_url(stream_url)
+        if proxied is not None:
+            self._radio_url, self._radio_content_type = proxied
+        else:
+            _log.warning(
+                "Cast radio: no STREAM_BASE_URL / specific BIND_HOST to build a "
+                "device-reachable transcode-proxy URL — falling back to the direct "
+                "station URL (raw codec may not play on constrained receivers)")
+            self._radio_url = stream_url
+            self._radio_content_type = _content_type(
+                stream_url,
+                getattr(metadata, "container", None),
+                getattr(metadata, "stream_key", "") or "",
+            )
+        self._radio_reconnect.begin()
+        # A radio LOAD is confirmed by its first PLAYING like any dispatch, but
+        # there is no per-track token machinery to key on — leave _confirm_token
+        # to whatever dispatch_play issued (session.py goes straight to the
+        # router for radio, so this is typically None).
+        from app.output import session
+        self._confirm_token = session.get_supervisor().current_token()
+        # LOAD the (proxied, when available) URL — never the raw station URL when a
+        # transcode-proxy was minted above.
+        await self._loop.run_in_executor(
+            None, self._sync_play_radio, self._radio_url, self._radio_content_type,
+            self._radio_title)
+        # No duration watchdog in radio mode (endless — nothing to time
+        # against). Bump the play token so any armed per-track watchdog from a
+        # prior dispatch goes stale.
+        self._cancel_watchdog()
+        self._play_token += 1
+        self._duration_ms = 0
+
+    def _sync_play_radio(self, stream_url: str, content_type: str,
+                         title: str) -> None:
+        """The radio LOAD (executor thread, mirrors _sync_play_flow) — BUFFERED
+        stream_type, no seek/duration assumptions."""
+        self._pos_snapshot_ms = 0
+        self._pos_snapshot_at = 0.0
+        try:
+            mc = self._cast.media_controller
+            _log.info("Cast radio LOAD: url=%s content_type=%s stream_type=%s",
+                      stream_url, content_type, FLOW_STREAM_TYPE)
+            if self._listener is None:
+                self._listener = _AdvanceListener(self)
+                mc.register_status_listener(self._listener)
+            mc.play_media(
+                stream_url,
+                content_type,
+                title=title,
+                current_time=0,
+                autoplay=True,
+                stream_type=FLOW_STREAM_TYPE,
+            )
+            mc.block_until_active(timeout=10)
+            self._is_playing = True
+        except Exception as exc:
+            self._is_playing = False
+            raise RuntimeError(f"Cast radio play failed: {exc}") from exc
+
+    def _radio_media_status(self, status: Any) -> None:
+        """Radio-mode media-status handler — CAST SOCKET THREAD (hops to the
+        loop like _on_eos). Replaces the per-track idle-reason matrix while a
+        station plays: a terminal IDLE(FINISHED/ERROR) is an upstream drop, not
+        a track end — RECOVER (re-LOAD live) instead of advancing (AE4/AE9)."""
+        if status.player_state in ("PLAYING", "BUFFERING") and getattr(
+                status, "current_time", None) is not None:
+            self._pos_snapshot_ms = int(status.current_time * 1000)
+            self._pos_snapshot_at = time.monotonic()
+        if status.player_state == "PLAYING":
+            # A sustained PLAYING run is what resets the reconnect budget
+            # (ADV-5) — mark the connection live so its lifetime is measured.
+            self._emit_confirmed_start()
+            self._radio_reconnect.mark_connected()
+        if (self._is_playing
+                and status.player_state == "IDLE"
+                and status.idle_reason in ("FINISHED", "ERROR")):
+            self._is_playing = False
+            loop = self._loop
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(self._radio_reconnect_schedule)
+                except RuntimeError:
+                    pass  # asyncio loop already closed — nowhere to deliver
+
+    def _radio_reconnect_schedule(self) -> None:
+        """Loop-side: spawn the bounded radio reconnect as its own task."""
+        if not self._radio_mode:
+            return
+        task = asyncio.get_running_loop().create_task(self._radio_reconnect_run())
+        task.add_done_callback(_log_flow_task_exc)
+
+    async def _radio_reconnect_run(self) -> None:
+        """Re-LOAD the station live from "now" (R12/ADV-5). Bounded + sustained-
+        progress-aware: a station dribbling a few seconds per attempt still
+        trips the cap. On exhaustion, surface the failed/offline state ONCE.
+
+        F5: an ITERATIVE loop driven by ``ReconnectPolicy.should_reconnect()`` —
+        NO self-recursion (a per-attempt ``await self._radio_reconnect_run()``
+        grew the call stack unboundedly on a station that failed every attempt).
+        The failed hook fires exactly once, when the cap is hit."""
+        while True:
+            if not self._radio_mode or self._cast is None:
+                return  # stopped / device switched — nothing to recover
+            if not self._radio_reconnect.should_reconnect():
+                _log.warning("Cast radio: reconnect cap reached — station offline")
+                self._radio_notify_failed()
+                return
+            await asyncio.sleep(self._radio_reconnect.backoff_s())
+            if not self._radio_mode or self._cast is None:
+                return
+            try:
+                await self._loop.run_in_executor(
+                    None, self._sync_play_radio, self._radio_url,
+                    self._radio_content_type, self._radio_title)
+                self._radio_reconnect.mark_connected()
+                _log.info("Cast radio: reconnected (attempt %d)",
+                          self._radio_reconnect.attempts)
+                return
+            except Exception:
+                # A failed re-LOAD is itself a drop — loop to consume the next
+                # attempt (bounded by the policy) or surface offline at the top.
+                _log.warning("Cast radio: reconnect attempt failed — retrying",
+                             exc_info=True)
+
+    def _radio_notify_failed(self) -> None:
+        # Cast-specific extra stays at the call site (F13).
+        self._is_playing = False
+        fire_radio_failed_hook(self._radio_failed_hook, _log, "Cast")
 
     def _detach_flow(self) -> Any | None:
         """Drop every reference/ledger for the current flow session (sync,
@@ -1561,6 +1765,11 @@ class ChromecastBackend:
 
     async def stop(self) -> None:
         self._cancel_watchdog()
+        # Radio (U4): stop ends the station — clear the mode so any in-flight
+        # reconnect (scheduled just before stop) no-ops instead of re-LOADing a
+        # stopped station.
+        self._radio_mode = False
+        self._radio_url = ""
         # U10: stop ends the flow playback outright — close the stitcher
         # (device switch routes here via router.swap_pending/activate paths;
         # set_device has its own teardown for the same-backend switch).
@@ -1632,6 +1841,17 @@ class ChromecastBackend:
         device-level failure by definition (R15) — report outage-suspected to
         the supervisor instead of ever advancing (R16). The watchdog is
         retired so it cannot fire a second signal for the same outage."""
+        if self._radio_mode:
+            # Radio (U4): a socket loss is just another endless-stream drop.
+            # LOST→CONNECTED destroys the media session (protocol capability
+            # map), so recovery is a re-LOAD live from now — schedule the same
+            # bounded reconnect the terminal-IDLE path uses, never an outage
+            # hold (there is no held queue position to resume to).
+            self._is_playing = False
+            self._cancel_watchdog()
+            _log.warning("Cast radio: connection LOST — scheduling reconnect")
+            self._radio_reconnect_schedule()
+            return
         if not self._is_playing:
             # pause() flips _is_playing False, so a Cast powered off while
             # USER-PAUSED lands here with a live session still interrupted —

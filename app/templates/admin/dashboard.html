@@ -632,6 +632,7 @@
         <button class="tab" data-view="mostplayed-view">Most Played</button>
         <button class="tab" data-view="recentlyadded-view">Recently Added</button>
         <button class="tab" data-view="highestrated-view">Highest Rated</button>
+        <button class="tab" data-view="radio-view"><span class="rd-tab-dot"></span>Radio</button>
       </div>
       <div id="browse-container" role="region" aria-label="Browse music">
         <!-- Search pane -->
@@ -679,6 +680,11 @@
         <!-- Highest Rated pane (2026-06-26 ratings-and-tags plan U7) -->
         <div id="highestrated-view" class="view">
           <div id="highestrated-list"><p class="a-loading">Loading…</p></div>
+        </div>
+        <!-- Radio pane (2026-08-11 radio-mode plan U9). Station browse renders
+             inside the shared browse module (mountBrowser); mount point only. -->
+        <div id="radio-view" class="view">
+          <div id="radio-list"><p class="a-loading">Loading…</p></div>
         </div>
       </div>
     </section>
@@ -1047,6 +1053,16 @@
           <label><input type="checkbox" id="ratings-visible-to-guests"> Track ratings</label>
           <label><input type="checkbox" id="tags-visible-to-guests"> Track tags</label>
           <button type="button" class="info-i" title="Off by default. You always see ratings and tags; guests see them only when checked here.">&#9432;</button>
+        </div>
+      </div>
+      <!-- Radio Mode (2026-08-11 plan U8, R9): let guests start/switch radio
+           stations. Default OFF; guest stop + browse always allowed; the server
+           (app/api/radio.py) enforces it. -->
+      <div class="panel-row">
+        <label>Radio control:</label>
+        <div class="radio-group">
+          <label><input type="checkbox" id="guest-radio-control"> Let guests start/switch radio stations</label>
+          <button type="button" class="info-i" title="Off by default. Guests can always stop radio and browse stations; only the host can start or switch a station unless this is checked.">&#9432;</button>
         </div>
       </div>
       <div class="panel-row">

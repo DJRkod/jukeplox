@@ -251,6 +251,37 @@ class OutputSessionEvent:
 
 
 @dataclass
+class RadioStateEvent:
+    """Radio Mode state changed (radio plan U7): a station started (connecting →
+    playing), stopped (idle), went offline after the per-backend reconnect cap /
+    proxy consumer-gone exhaustion (failed), or its live title changed.
+
+    Broadcast via ``manager.broadcast_to_all`` on EVERY transition AND on each
+    live-title change. Radio data is IDENTICAL for guest and admin — there is NO
+    guest-lean/admin-rich split (SG-05): R9 is read-only *visibility*, not
+    information asymmetry, so both audiences see the same station + status +
+    title. Late joiners / WS-gap clients converge from the mirrored ``radio``
+    block on the now-playing GET snapshots (guest + admin).
+
+    - ``active`` — whether a station has taken over the shared output (the queue is
+      held). The JS activates the radio widget from ``!!data.active`` on the WS
+      path, so this MUST be present or the widget never activates from a live push.
+    - ``station`` — the station dict (``Station.to_dict()``) or ``None`` when idle.
+    - ``status`` — one of ``connecting`` | ``playing`` | ``failed`` | ``idle``.
+    - ``live_title`` — the current sanitized live ``StreamTitle`` (plain text) or
+      ``None`` (station-name-only). The client MUST render it via ``textContent``,
+      never ``innerHTML`` (SEC-004 — it is untrusted third-party text)."""
+    type: str = "radio_state"
+    active: bool = False
+    station: dict | None = None
+    status: str = "idle"
+    live_title: str | None = None
+
+    def to_json(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class AirPlayProtocolChangedEvent:
     """Per-device AirPlay protocol decision changed (cliap2 vs cliraop).
 

@@ -12,6 +12,13 @@ from datetime import timedelta
 from typing import Any
 
 from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
+from app.output.radio_endless import (
+    RadioFailedHook,
+    ReconnectPolicy,
+    fire_radio_failed_hook,
+    is_radio_track,
+    radio_proxy_url,
+)
 from app.models import Track
 
 _DLNA_AVAILABLE = False
@@ -171,13 +178,22 @@ def _mime_type(container: str | None, stream_url: str, part_path: str = "") -> s
     return device_stream_content_type(stream_url, part_path, native)
 
 
-def _didl_metadata(title: str, stream_url: str, mime: str, duration_ms: int) -> str:
-    """Build a minimal DIDL-Lite XML string for SetAVTransportURI."""
-    duration_s = duration_ms // 1000
-    h = duration_s // 3600
-    m = (duration_s % 3600) // 60
-    s = duration_s % 60
-    dur_str = f"{h}:{m:02d}:{s:02d}"
+def _didl_metadata(title: str, stream_url: str, mime: str, duration_ms: int,
+                   *, omit_duration: bool = False) -> str:
+    """Build a minimal DIDL-Lite XML string for SetAVTransportURI.
+
+    ``omit_duration`` (radio plan U4): an endless radio stream has no length, so
+    the ``<res>`` carries NO ``duration`` attribute — advertising a bogus
+    ``0:00:00`` can make a renderer mis-estimate the track and fire a spurious
+    end-of-track. A finite track always carries its real duration."""
+    if omit_duration:
+        dur_attr = ""
+    else:
+        duration_s = duration_ms // 1000
+        h = duration_s // 3600
+        m = (duration_s % 3600) // 60
+        s = duration_s % 60
+        dur_attr = f'duration="{h}:{m:02d}:{s:02d}" '
     return (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"'
         ' xmlns:dc="http://purl.org/dc/elements/1.1/"'
@@ -185,7 +201,7 @@ def _didl_metadata(title: str, stream_url: str, mime: str, duration_ms: int) -> 
         f'<item id="1" parentID="0" restricted="1">'
         f"<dc:title>{html.escape(title)}</dc:title>"
         f"<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
-        f'<res duration="{dur_str}" protocolInfo="http-get:*:{mime}:*">'
+        f'<res {dur_attr}protocolInfo="http-get:*:{mime}:*">'
         f"{stream_url}</res>"
         "</item>"
         "</DIDL-Lite>"
@@ -339,6 +355,21 @@ class DlnaBackend:
         self._gapless_verdicts: dict[str, str] = {}
         # Map device_id → location URL (populated during discovery)
         self._device_locations: dict[str, str] = {}
+        # ── radio endless mode (radio plan U4) ─────────────────────────────
+        # Set in play() when the metadata is a radio pseudo-Track. While True:
+        # the SetNext gapless arming path is skipped, the DIDL omits duration,
+        # and _poll_eos treats 2×STOPPED as an upstream drop → RECONNECT
+        # (re-issue SetAVTransportURI+Play), never advance (AE4/AE9).
+        self._radio_mode: bool = False
+        self._radio_url: str = ""
+        # F14: the transcode OUTPUT content-type for the radio DIDL (authoritative,
+        # from radio_output_content_type via radio_proxy_url). "" = derive from the
+        # URL (the non-proxied fallback path / finite tracks).
+        self._radio_content_type: str = ""
+        self._radio_metadata: Track | None = None
+        self._radio_reconnect = ReconnectPolicy()
+        # U7 wires this to a RadioStateEvent "offline" (R12).
+        self._radio_failed_hook: RadioFailedHook | None = None
 
     # ── device discovery ──────────────────────────────────────────────────────
 
@@ -715,6 +746,37 @@ class DlnaBackend:
             # the plain-RuntimeError asymmetry with the Chromecast backend.
             raise DeviceNotReadyError("DLNA not available or no device selected")
         self._cancel_poll()
+        # Radio endless mode (U4, SG-03): carried on the pseudo-Track, not a
+        # play() signature change. Set BEFORE the poll starts so _poll_eos sees
+        # it. A finite track clears it — the radio branch is strictly additive.
+        self._radio_mode = is_radio_track(metadata)
+        # U5: for radio, DLNA fetches through the server-side transcode-proxy — the
+        # jukebox ingests the validated final URL (ICY-tolerant), normalizes the
+        # codec (no Ogg-style multi-minute hang), and serves it Range-less behind a
+        # capability URL. Substitute that device-facing URL for the raw station URL
+        # here so every SOAP call below (SetAVTransportURI, DIDL, current_uri,
+        # reconnect poll) uses it. No device-reachable base → degrade to the direct
+        # station URL (mirrors the Cast fallback). Finite tracks are untouched.
+        if self._radio_mode:
+            proxied = await radio_proxy_url(stream_url)
+            if proxied is not None:
+                stream_url = proxied[0]
+                # F14: capture the transcode OUTPUT content-type (authoritative)
+                # so the DIDL advertises it, NOT the extension-less proxy URL
+                # (which coincidentally falls to audio/mpeg only while mp3).
+                self._radio_content_type = proxied[1]
+            else:
+                # Fallback: direct raw station URL — no proxy, so let the DIDL
+                # derive the mime from the URL as before (reset any stale value).
+                self._radio_content_type = ""
+                _log.warning(
+                    "DLNA radio: no STREAM_BASE_URL / specific BIND_HOST to build "
+                    "a device-reachable transcode-proxy URL — falling back to the "
+                    "direct station URL (raw codec may not play)")
+        self._radio_url = stream_url if self._radio_mode else ""
+        self._radio_metadata = metadata if self._radio_mode else None
+        if self._radio_mode:
+            self._radio_reconnect.begin()
         # Fresh dispatch owns the boundary (U6 contract: play() clears the
         # armed slot; plan U8): drop every device-arm bookkeeping slot and
         # reset the arm-timing gate — the SetAVTransportURI below resets the
@@ -773,13 +835,21 @@ class DlnaBackend:
     def _track_didl(self, stream_url: str, metadata: Track) -> str:
         """DIDL-Lite for SetAVTransportURI AND SetNextAVTransportURI — plan
         U8's arming reuses play()'s exact metadata shape for the armed next."""
-        mime = _mime_type(
-            getattr(metadata, "container", None),
-            stream_url,
-            getattr(metadata, "stream_key", "") or "",
-        )
+        # F14: for a radio stream served through the transcode-proxy, the mime is
+        # the transcode OUTPUT content-type (tied to RADIO_ENCODE_FORMAT), captured
+        # in _radio_content_type — NOT derived from the extension-less proxy URL
+        # (which coincidentally lands on audio/mpeg only while the format is mp3).
+        if is_radio_track(metadata) and self._radio_content_type:
+            mime = self._radio_content_type
+        else:
+            mime = _mime_type(
+                getattr(metadata, "container", None),
+                stream_url,
+                getattr(metadata, "stream_key", "") or "",
+            )
         return _didl_metadata(metadata.title, stream_url, mime,
-                              metadata.duration_ms)
+                              metadata.duration_ms,
+                              omit_duration=is_radio_track(metadata))
 
     async def _poll_eos(self) -> None:
         # Require two consecutive STOPPED polls before firing advance. Real
@@ -873,8 +943,28 @@ class DlnaBackend:
                     from app.output import session
                     session.notify_confirmed(_confirm)
                 error_count = 0
+                if state_name == "PLAYING" and self._radio_mode:
+                    # Radio (U4/ADV-5): a sustained PLAYING run is proof the
+                    # station is delivering audio — mark the connection live so
+                    # its lifetime resets the reconnect budget on the next drop.
+                    self._radio_reconnect.mark_connected()
                 if state_name == "STOPPED" and self._is_playing:
                     stopped_count += 1
+                    if stopped_count >= 2 and self._radio_mode:
+                        # Radio (U4/AE4): a stream that STOPPED is an upstream
+                        # drop, not a track end — RECONNECT (re-issue
+                        # SetAVTransportURI+Play), never advance. Reset the
+                        # STOPPED run so a successful reconnect starts clean.
+                        stopped_count = 0
+                        handled = await self._radio_reconnect_poll()
+                        if handled:
+                            self._is_playing = False
+                            self._play_start = 0.0
+                            self._poll_task = None
+                            break
+                        # Reconnected — keep polling the same task for the
+                        # fresh stream.
+                        continue
                     if stopped_count >= 2:
                         # U8 (advance-authority table, "DLNA gapless" row):
                         # the renderer went STOPPED despite an ACCEPTED
@@ -941,11 +1031,12 @@ class DlnaBackend:
                             state_name, stopped_count,
                         )
                     stopped_count = 0
-                    if state_name == "PLAYING":
+                    if state_name == "PLAYING" and not self._radio_mode:
                         # U8 arm timing: the first PLAYING poll of this
                         # dispatch is the moment a stashed arm goes device-
                         # side (Linkplay refuses SetNext near track end —
-                        # deliver as EARLY in the track as possible).
+                        # deliver as EARLY in the track as possible). Radio
+                        # (U4) never arms a next — an endless stream has none.
                         if not self._playing_confirmed:
                             self._playing_confirmed = True
                             await self._send_setnext()
@@ -993,6 +1084,53 @@ class DlnaBackend:
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
         self._poll_task = None
+
+    # ── radio endless-mode reconnect (radio plan U4) ──────────────────────────
+
+    def set_radio_failed_hook(self, hook: RadioFailedHook | None) -> None:
+        """Register (or clear) the endless-mode failed/offline callback (U4).
+        Called with no arguments once the reconnect cap is exhausted; U7 wires
+        it to a ``RadioStateEvent`` so a dead station surfaces as offline."""
+        self._radio_failed_hook = hook
+
+    async def _radio_reconnect_poll(self) -> bool:
+        """Re-issue SetAVTransportURI+Play for the live station (R12/ADV-5).
+
+        Returns True when the reconnect cap is exhausted (the caller stops the
+        poll and the station is offline), False when a reconnect was issued and
+        the SAME poll should keep running for the fresh stream. Bounded +
+        sustained-progress-aware — a station STOPPING again within the sustained
+        window keeps burning the budget.
+
+        F5: an ITERATIVE loop, NO self-recursion — a failed SOAP re-issue loops
+        to consume the next attempt instead of recursing (which grew the stack on
+        a station that failed every re-issue)."""
+        while True:
+            if not self._radio_mode or self._dmr is None:
+                return True  # stopped / no device — end the poll
+            if not self._radio_reconnect.should_reconnect():
+                _log.warning("DLNA radio: reconnect cap reached — station offline")
+                self._radio_notify_failed()
+                return True
+            _log.info("DLNA radio: stream STOPPED — reconnecting (attempt %d)",
+                      self._radio_reconnect.attempts)
+            try:
+                didl = self._track_didl(self._radio_url, self._radio_metadata)
+                await self._dmr.async_set_transport_uri(
+                    self._radio_url,
+                    getattr(self._radio_metadata, "title", "") or "Radio", didl)
+                await self._dmr.async_play()
+                self._play_start = time.monotonic()
+                return False
+            except Exception:
+                # A failed re-issue is itself a drop; loop to consume the next
+                # attempt (bounded) or surface offline at the top.
+                _log.warning("DLNA radio: reconnect SOAP failed — retrying",
+                             exc_info=True)
+
+    def _radio_notify_failed(self) -> None:
+        # F13: shared hook-fire + swallow.
+        fire_radio_failed_hook(self._radio_failed_hook, _log, "DLNA")
 
     # ── gapless SetNext: arm/revoke/boundary (2026-07-11 plan U8) ─────────────
 
@@ -1393,6 +1531,11 @@ class DlnaBackend:
             "DLNA stop() entry: _is_playing=%s _dmr=%s",
             self._is_playing, self._dmr is not None,
         )
+        # Radio (U4): stop ends the station — clear the mode so the poll's
+        # reconnect path (if it races stop) can't re-issue a stopped station.
+        self._radio_mode = False
+        self._radio_url = ""
+        self._radio_metadata = None
         self._cancel_poll()
         if self._dmr and _DLNA_AVAILABLE:
             try:
