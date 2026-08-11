@@ -1035,6 +1035,10 @@ async def get_all_tags() -> dict[str, list[str]]:
         return out
 
 
+# Searchable + clickable tags: the pure tag matching / dedup-count helpers moved
+# to app/tag_utils.py (persistence stays here; search-layer matching lives there).
+
+
 async def get_top_rated_tracks(limit: int | None = 100) -> list[dict]:
     """Top-rated tracks for the Highest Rated leaderboard (plan U1/R11).
 

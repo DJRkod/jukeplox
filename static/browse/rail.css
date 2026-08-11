@@ -662,6 +662,24 @@
 .trk-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
 .trk-tag { display: inline-flex; align-items: center; gap: .3rem; border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: .1rem .5rem; font-size: .72rem; line-height: 1.3; }
 
+/* Clickable tag chips (2026-08-11 searchable-clickable-tags U5): drill to a
+   tag's tracks. Guest = whole chip is the link (.trk-tag.trk-tag-link); admin =
+   the label body links (.trk-tag-tx.trk-tag-link) while ✕ deletes. Interaction
+   mirrors .genre-chip; all accent routes through --accent-ui/--accent-grad/
+   --accent-dim so a scheme switch re-colors live. */
+.trk-tag-link { cursor: pointer; transition: background .12s, color .12s, border-color .12s; }
+.trk-tag.trk-tag-link:hover { background: var(--accent-dim); color: var(--accent-ui); border-color: var(--accent-ui); }
+.trk-tag.trk-tag-link:active { background: var(--accent-grad, var(--accent)); color: var(--on-accent); border-color: transparent; }
+.trk-tag .trk-tag-tx.trk-tag-link:hover { color: var(--accent-ui); }
+.trk-tag-link:focus-visible { outline: 2px solid var(--accent-ui, var(--accent)); outline-offset: 2px; }
+/* Long tag names truncate consistently (R11) — on row chips AND Tags-section
+   chips, which reuse .trk-tag. */
+.trk-tag .trk-tag-tx { display: inline-block; max-width: 14ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+/* Tags search-section chip count + inline match highlight (U6). The matched-tag
+   chip on a Tracks row is tinted so the user sees why the track surfaced. */
+.trk-tag-count { font-family: 'Space Mono', ui-monospace, monospace; font-size: .68rem; opacity: .7; }
+.trk-tag.trk-tag-match { border-color: var(--accent-ui, var(--accent)); color: var(--accent-ui, var(--accent)); background: var(--accent-dim); }
+
 /* Admin authoring (U6): editable pips clickable, faint until set; tag ✕ delete
    + "＋ tag" affordance. All authoring controls stopPropagation in JS so the
    row's click-to-queue never fires. */

@@ -1560,6 +1560,43 @@ async def track_tags(request: Request):
     return await database.get_all_tags()
 
 
+@router.get("/api/tag/tracks")
+async def tag_tracks(request: Request, tag: str = Query(..., min_length=1, max_length=40)):
+    """Every track carrying ``tag`` — the tag drill (plan U3/R6). Gated exactly
+    like /api/track-tags (R7/R8): withheld for guests when tags are hidden, full
+    for the admin. Catalog resolves identities from the local store; native does
+    a per-id get_track fan-out capped at the display limit (no bulk-by-id fetch),
+    exceptions skipped — mirrors /api/highest-rated. The frontend dedups the list
+    and shows the (capped, in native mode) rendered count. ``max_length`` matches
+    the stored per-tag cap so an over-long query is rejected before any work."""
+    from app import database, tag_utils
+    if not await _tag_search_visible(request):
+        return {"tag": tag, "tracks": []}
+    # Resolve the ONE exact tag the user clicked — NOT the whole-token search
+    # matcher. match_tags("cool") would also pull in "cool covers"/"cool-down",
+    # inflating the drill past the chip's per-tag count. Exact normalized-name
+    # lookup keeps the drill's deduped count equal to the search chip's count.
+    entry = tag_utils.invert_tags(await database.get_all_tags()).get(tag.strip().lower())
+    track_ids: list[str] = list(dict.fromkeys(entry["track_ids"])) if entry else []
+    if not track_ids:
+        return {"tag": tag, "tracks": []}
+    if await _catalog_active():
+        from app.catalog import views, store
+        fetched = await asyncio.gather(
+            *[store.get_track(t) for t in track_ids], return_exceptions=True)
+        tracks = [await views._track(r) for r in fetched if isinstance(r, dict)]
+    else:
+        limit = await database.get_most_played_display_limit()
+        client = await state.get_plex_client()
+        tracks = []
+        if client:
+            fetched = await asyncio.gather(
+                *[client.get_track(t) for t in track_ids[:limit]], return_exceptions=True)
+            tracks = [t for t in fetched if not isinstance(t, BaseException)]
+    return {"tag": tag,
+            "tracks": await _annotate_plex_held([_track_dict(t) for t in tracks], tracks)}
+
+
 @router.get("/api/highest-rated")
 async def highest_rated(request: Request):
     """Top-rated tracks leaderboard, mirroring /api/most-played (DB-backed with
@@ -1605,15 +1642,50 @@ def _dedup_by_id(items):
     return out
 
 
+async def _tag_search_visible(request: Request) -> bool:
+    """Whether tag surfacing (the Tags section + inline fold) may be served to
+    this viewer — same gate as /api/track-tags (R7/R8). Resolved BEFORE any tag
+    work so the tag-matching step is skipped for hidden guests, never built then
+    stripped (a stripped-but-computed set can leak membership)."""
+    from app import database
+    return await database.get_tags_visible_to_guests() or await _viewer_is_admin(request)
+
+
 @router.get("/api/search")
-async def search(q: str = Query(..., min_length=1)):
+async def search(request: Request, q: str = Query(..., min_length=1)):
+    from app import database, tag_utils
     if await _catalog_active():
-        from app.catalog import views
+        from app.catalog import views, store
         res = await views.search(q)
-        found = res["tracks"]
+        found = list(res["tracks"])  # Track objects (title/artist/album matches)
+        tags_section: list[dict] = []
+        # Gate FIRST — only reach the tag-matching step when visible/admin (R8).
+        if await _tag_search_visible(request):
+            matched = tag_utils.match_tags(q, await database.get_all_tags())
+            if matched:
+                union_ids = list({tid for e in matched for tid in e["track_ids"]})
+                fetched = await asyncio.gather(
+                    *[store.get_track(t) for t in union_ids], return_exceptions=True)
+                row_by_id = {tid: r for tid, r in zip(union_ids, fetched)
+                             if isinstance(r, dict)}
+                # Inline fold: tag-matched tracks that views.search never returned
+                # (a pure-tag query matches nothing by title/artist), deduped
+                # against title/artist/album matches (first-wins keeps those ahead).
+                fold = [await views._track(row_by_id[t]) for t in union_ids
+                        if t in row_by_id]
+                found = _dedup_by_id(found + fold)
+                # Chip count = post-dedup row count on the frontend dedup key
+                # (count-authority), computed once from the same resolved rows.
+                for e in matched:
+                    rows = [row_by_id[t] for t in e["track_ids"] if t in row_by_id]
+                    cnt = tag_utils.dedup_count(rows)
+                    if cnt:
+                        tags_section.append({"name": e["name"], "count": cnt})
+                tags_section.sort(key=lambda x: (-x["count"], x["name"].lower()))
         # plex_held from the holds views.search just loaded (plan U4).
         res["tracks"] = await _annotate_plex_held(
             [_track_dict(t) for t in found], found)
+        res["tags"] = tags_section
         return res
     client = await state.get_plex_client()
     if not client:
@@ -1684,7 +1756,18 @@ async def search(q: str = Query(..., min_length=1)):
                 groups[key] = dict(act)
         if groups:
             all_artists = list(all_artists) + [_credit_artist_dict(g) for g in groups.values()]
-    return {"tracks": all_tracks, "albums": all_albums, "artists": all_artists, "genres": all_genres}
+    # Tags section (native): section + drill only, no inline fold — native track
+    # ids key per-server so there is no local-tag identity to fold on (see plan
+    # Key Technical Decisions). Count is the distinct tagged-id count (best-effort;
+    # the drill header shows the capped rendered count).
+    tags_section: list[dict] = []
+    if await _tag_search_visible(request):
+        matched = tag_utils.match_tags(q, await database.get_all_tags())
+        tags_section = [{"name": e["name"], "count": len(set(e["track_ids"]))}
+                        for e in matched]
+        tags_section.sort(key=lambda x: (-x["count"], x["name"].lower()))
+    return {"tracks": all_tracks, "albums": all_albums, "artists": all_artists,
+            "genres": all_genres, "tags": tags_section}
 
 
 # ── Broad search (Tier 2: on-demand literal title-substring expansion) ──────────

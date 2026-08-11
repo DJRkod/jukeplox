@@ -1626,11 +1626,13 @@
     box.className = 'trk-tags';
     tags.forEach(t => {
       const chip = document.createElement('span');
-      chip.className = 'trk-tag';
+      chip.className = 'trk-tag trk-tag-link';   // guest: whole chip drills (U5)
       const tx = document.createElement('span');
       tx.className = 'trk-tag-tx';
       tx.textContent = t;          // R6: inert text, never innerHTML
       chip.appendChild(tx);
+      // stopPropagation so the row's click-to-queue never fires (U5).
+      chip.addEventListener('click', (e) => { e.stopPropagation(); _showTagTracks(t); });
       box.appendChild(chip);
     });
     return box;
@@ -1742,8 +1744,9 @@
       const chip = document.createElement('span');
       chip.className = 'trk-tag';
       const tx = document.createElement('span');
-      tx.className = 'trk-tag-tx';
+      tx.className = 'trk-tag-tx trk-tag-link';    // admin: label body drills; ✕ deletes (U5)
       tx.textContent = t;                          // R6: inert
+      tx.addEventListener('click', (e) => { e.stopPropagation(); _showTagTracks(t); });
       chip.appendChild(tx);
       const del = document.createElement('button');
       del.type = 'button';
@@ -1793,6 +1796,7 @@
   function _redecorateRatingTags() {
     document.querySelectorAll('.list-item.track-row[data-track-id]')
       .forEach(row => _applyRatingTags(row));
+    _markSearchTagMatches();  // late-loaded tag chips get the search match highlight (U6)
   }
 
   // ── Queue indicator: in-place "Added to queue" sweep + persistent ♪ ember ──
@@ -1968,6 +1972,25 @@
         // fallback contract: no id → entry disabled, never a dead drill.
         disabled: !t.album_id || !!(ctx && ctx.currentAlbumId && t.album_id === ctx.currentAlbumId),
         action: () => browseToAlbum(t.album_id, t.album, { pane }),
+      });
+    }
+    // "Go to tag" (2026-08-11 searchable-clickable-tags U6). Tags come from the
+    // gated _tagsMap (populated only when tags are visible to this viewer /
+    // admin), so a hidden guest gets zero entries and no "Go to tag…" header.
+    // ≤4 inline; >4 collapse into a sub-sheet listing the ROW's tags. Labels
+    // render via _openSheet's textContent (inert, R10).
+    const _tagTid = t.track_id || t.id;
+    const _rowTags = (_tagsMap && _tagTid && _tagsMap[_tagTid]) || [];
+    if (_rowTags.length && _rowTags.length <= 4) {
+      _rowTags.forEach(tag => items.push({
+        label: `Go to tag — ${tag}`, action: () => _showTagTracks(tag),
+      }));
+    } else if (_rowTags.length > 4) {
+      items.push({
+        label: 'Go to tag…',
+        action: () => _openSheet(_rowTags.map(tag => ({
+          label: tag, action: () => _showTagTracks(tag),
+        })), row && row.querySelector('.kebab-btn')),
       });
     }
     // Per-source override. CATALOG mode (parity U3): the merged track carries its
@@ -2366,6 +2389,19 @@
 
   function _restoreSearchView() {
     _albumTracksGen++; _artistAlbumsGen++;
+    if (lastSearchData) renderSearchResults(lastSearchData);
+    else document.getElementById('search-results').innerHTML = '';
+    _restoreScroll('search-results', 'search');
+  }
+
+  // Shared search-results restore for the in-place search drill-ins (genre→albums
+  // and tag→tracks): restore the entry filter tab, re-render the cached search
+  // results, restore scroll. Distinct from _restoreSearchView (which bumps the
+  // album/artist drill generations for the browse-pane back paths).
+  function _restoreSearchResultsView(returnFilter) {
+    searchFilter = returnFilter;
+    document.querySelectorAll('.filter-tab').forEach(t =>
+      t.classList.toggle('active', t.dataset.filter === searchFilter));
     if (lastSearchData) renderSearchResults(lastSearchData);
     else document.getElementById('search-results').innerHTML = '';
     _restoreScroll('search-results', 'search');
@@ -3385,17 +3421,9 @@
       // Wayfinding bar (plan U3) replaces the default back-btn row.
       backElFn: (goBack, style) => _wayfindBar(
         { label: 'Search', onTap: goBack }, [{ label: style }]),
-      onBack: () => {
-        // Restore the filter tab that was active at chip-tap time so back
-        // never lands on a filtered view that excludes genres (review
-        // decision, corroborated).
-        searchFilter = _searchStyleReturnFilter;
-        document.querySelectorAll('.filter-tab').forEach(t =>
-          t.classList.toggle('active', t.dataset.filter === searchFilter));
-        if (lastSearchData) renderSearchResults(lastSearchData);
-        else document.getElementById('search-results').innerHTML = '';
-        _restoreScroll('search-results', 'search');
-      },
+      // Restore the filter tab active at chip-tap time so back never lands on a
+      // filtered view that excludes genres (review decision, corroborated).
+      onBack: () => _restoreSearchResultsView(_searchStyleReturnFilter),
       albumRowFn: _styleAlbumRow,
       // Tile-view U2: releases within a genre follow the global view setting.
       tileRowFn: _styleAlbumTile,
@@ -3412,10 +3440,73 @@
   }
 
   function _showSearchStyleAlbums(style) {
+    _cancelTagDrill();                 // opening a genre drill supersedes any in-flight tag drill
     _ensureSearchStyleView();
     _searchStyleReturnFilter = searchFilter;
     _captureScroll('search-results', 'search');
     _searchStyleView.show(style);
+  }
+
+  // ── Tag drill-in (2026-08-11 searchable-clickable-tags plan U4) ────────────
+  // A tag chip / "Go to tag" kebab entry drills into a flat list of every track
+  // carrying the tag, in-place in #search-results — the genre-drill PATTERN
+  // (in-place, wayfinding, back restores the entry filter) but a TRACK list, so
+  // it is a new view (createStyleAlbumView renders albums, not tracks). Guarded
+  // by _tagDrillGen so an in-flight fetch bails when the container is rebuilt
+  // (new search, filter-tab tap, back-nav, drill-to-drill) — the
+  // cancel-on-external-rebuild contract.
+  let _tagDrillGen = 0;
+  let _tagDrillReturnFilter = 'all';
+  let _tagDrillActive = false;   // a drill is currently showing in #search-results
+
+  function _cancelTagDrill() { _tagDrillGen++; _tagDrillActive = false; }
+
+  function _restoreTagDrillBack() { _restoreSearchResultsView(_tagDrillReturnFilter); }
+
+  async function _showTagTracks(tag) {
+    if (_searchStyleView) _searchStyleView.cancel();  // supersede an in-flight genre drill
+    _tagDrillReturnFilter = searchFilter;
+    _captureScroll('search-results', 'search');
+    const gen = ++_tagDrillGen;                        // drill-to-drill: bump BEFORE fetch
+    _tagDrillActive = true;
+    const el = document.getElementById('search-results');
+    el.innerHTML = '';
+    el.appendChild(_wayfindBar(
+      { label: 'Search', onTap: () => { _cancelTagDrill(); _restoreTagDrillBack(); } },
+      [{ label: '#' + tag }]));
+    const host = document.createElement('div');
+    el.appendChild(host);
+    host.innerHTML = '<div class="loading">Loading…</div>';   // header known immediately; never a blank screen
+    let data = null;
+    try {
+      const [, body] = await _api('GET', '/api/tag/tracks?tag=' + encodeURIComponent(tag));
+      data = body;
+    } catch (e) { data = null; }
+    if (gen !== _tagDrillGen) return;                 // superseded by a newer rebuild
+    host.innerHTML = '';
+    if (!data || !Array.isArray(data.tracks)) {       // error: inline message + retry, back stays live
+      const err = document.createElement('div');
+      err.className = 'loading';
+      err.textContent = 'Couldn’t load tracks. ';
+      const retry = document.createElement('button');
+      retry.className = 'tag-drill-retry';
+      retry.textContent = 'Retry';
+      retry.addEventListener('click', () => _showTagTracks(tag));
+      err.appendChild(retry);
+      host.appendChild(err);
+      return;
+    }
+    const rows = deduplicateTracks(data.tracks);      // count == rendered rows (count-authority)
+    if (!rows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'loading';
+      empty.textContent = `No tracks tagged “${tag}”.`;   // textContent: inert, XSS-safe
+      host.appendChild(empty);
+      return;
+    }
+    host.insertAdjacentHTML('beforeend',
+      `<div class="section-header cat-head"><h3>${rows.length} track${rows.length === 1 ? '' : 's'}</h3></div>`);
+    rows.forEach(rd => host.appendChild(makeTrackRowMulti(rd)));
   }
 
   function _ensureGenreBrowser() {
@@ -3716,6 +3807,25 @@
   let lastSearchData = null;
   let lastSearchQuery = '';
   let searchFilter = 'all';
+  // Matched-tag names (lowercased) for the current search → highlight the
+  // already-rendered _tagsMap chip on matched Tracks rows (U6 inline mark). A
+  // scoped post-pass on #search-results, re-applied when the rating/tag maps
+  // load late (see _redecorateRatingTags). Scoped to .list-item chips so the
+  // Tags-section chips themselves are not marked.
+  let _searchTagMatch = new Set();
+  function _markSearchTagMatches() {
+    // During a tag drill #search-results holds drill rows, not search results —
+    // _searchTagMatch reflects the search query, not the drill tag, so marking
+    // those rows would tint chips meaninglessly. Skip while a drill is active.
+    if (_tagDrillActive) return;
+    const el = document.getElementById('search-results');
+    if (!el) return;
+    el.querySelectorAll('.list-item .trk-tag').forEach(chip => {
+      const tx = chip.querySelector('.trk-tag-tx');
+      chip.classList.toggle('trk-tag-match',
+        !!(tx && _searchTagMatch.has(tx.textContent.trim().toLowerCase())));
+    });
+  }
   // Per-filter-tab scroll memory within a single search (2026-07-01 ce-debug).
   // Keyed by filter name → scrollTop. Switching tabs rebuilds #search-results in
   // place; on guest the scroller is the ANCESTOR (#content), so without this an
@@ -3771,6 +3881,7 @@
         // Input clear rebuilds the container outside renderSearchResults —
         // cancel any in-flight drill-in fetch so it can't append stale rows.
         if (_searchStyleView) _searchStyleView.cancel();
+        _cancelTagDrill();
         _teardownBroadTier();
         document.getElementById('search-results').innerHTML = '';
         lastSearchData = null;
@@ -3848,14 +3959,21 @@
     // Status fetch happens before any DOM work; the generation guard drops a
     // stale render if a newer query/tab-tap superseded us during the await.
     const gen = ++_searchRenderGen;
+    const tagGenAtEntry = _tagDrillGen;   // detect a drill opened during our await
     const scanStatus = await _searchScanStatus(data, searchFilter);
     if (gen !== _searchRenderGen) return;
+    // If the user opened a tag drill DURING the scan-status await, it supersedes
+    // this render — bail so we don't cancel it and wipe its container to blank
+    // (the scan-status probe only feeds the tracks-empty hint; it must not veto a
+    // drill the user started after the tab tap). Code-review race fix.
+    if (_tagDrillGen !== tagGenAtEntry) return;
     // Single chokepoint for every #search-results rebuild (new query,
-    // filter-tab tap, back-from-drill-in): bump the search drill-in's
-    // generation FIRST so an in-flight style-albums fetch bails instead of
-    // appending stale rows after this render. Typing or tab-tapping during
-    // drill-in is the intended exit path (review fix, corroborated).
+    // filter-tab tap, back-from-drill-in): bump the search drill-ins'
+    // generations FIRST so an in-flight style-albums OR tag-tracks fetch bails
+    // instead of appending stale rows after this render. Typing or tab-tapping
+    // during drill-in is the intended exit path (review fix, corroborated).
     if (_searchStyleView) _searchStyleView.cancel();
+    _cancelTagDrill();
     // Any rebuild invalidates the prior broad-tier cursor/observer/sentinel
     // (they pointed into the now-cleared DOM). Tear down before wiping.
     _teardownBroadTier();
@@ -3863,6 +3981,12 @@
     el.innerHTML = '';
     const f = searchFilter;
     let any = false;
+    // Tags tab shown only when the query returns tag matches (which the server
+    // only sends when visible/admin) — mirrors the Genres tab's zero-result
+    // behavior (U6). Matched names drive the inline chip highlight (below).
+    const tagsTab = document.querySelector('.filter-tab[data-filter="tags"]');
+    if (tagsTab) tagsTab.style.display = (data.tags && data.tags.length) ? '' : 'none';
+    _searchTagMatch = new Set((data.tags || []).map(tg => (tg.name || '').toLowerCase()));
     const scanning = !!(scanStatus && scanStatus.scanning);
 
     if ((f === 'all' || f === 'artists') && data.artists && data.artists.length) {
@@ -3905,6 +4029,33 @@
         '<div class="section-header cat-head"><h3>Tracks</h3></div>'
         + '<div class="loading">Tracks are still being indexed — check back shortly.</div>');
     }
+    // Tags (2026-08-11 searchable-clickable-tags U6) — before Genres (a tag is a
+    // more specific match than a genre). Chips reuse the .trk-tag class + drill
+    // interaction from U5; the backend already orders them count-desc, ties
+    // alphabetical. Names are inert textContent (R10). Truncation via .trk-tag-tx.
+    if ((f === 'all' || f === 'tags') && data.tags && data.tags.length) {
+      any = true;
+      el.insertAdjacentHTML('beforeend', '<div class="section-header cat-head"><h3>Tags</h3></div>');
+      const chipWrap = document.createElement('div');
+      chipWrap.style.cssText = 'padding:.75rem';
+      data.tags.forEach(tg => {
+        const chip = document.createElement('span');
+        chip.className = 'trk-tag trk-tag-link';
+        const tx = document.createElement('span');
+        tx.className = 'trk-tag-tx';
+        tx.textContent = tg.name;
+        chip.appendChild(tx);
+        if (tg.count != null) {
+          const c = document.createElement('span');
+          c.className = 'trk-tag-count';
+          c.textContent = tg.count;
+          chip.appendChild(c);
+        }
+        chip.addEventListener('click', () => _showTagTracks(tg.name));
+        chipWrap.appendChild(chip);
+      });
+      el.appendChild(chipWrap);
+    }
     // Genres LAST in All per origin R2 (broadest, least-specific match
     // type). Chip cluster reuses the Genres tab's presentation.
     if ((f === 'all' || f === 'genres') && data.genres && data.genres.length) {
@@ -3940,6 +4091,7 @@
       // expansion, not auto-fire on incidental scroll.
       _setupBroadTier(data);
     }
+    _markSearchTagMatches();  // highlight matched-tag chips on Tracks rows (U6)
   }
 
   // ── Tier 2: broad literal title-substring expansion ───────────────────────
