@@ -2012,6 +2012,10 @@ async function loadSettings() {
       const el = document.getElementById('facet-' + f);
       if (el) el.checked = s['facet_' + f] !== false;
     });
+    // Radio TAB visibility (2026-08-12): default OFF (opt-in), so hydrate checked
+    // only on an explicit true — unlike the five facets above (default ON).
+    const fRadio = document.getElementById('facet-radio');
+    if (fRadio) fRadio.checked = s.facet_radio === true;
     // Closing Time (2026-06-24): hydrate toggle + trigger song/message. The GET
     // returns the resolved Semisonic defaults when unset, so the boxes show the
     // current values; clearing a box persists "" (and that trigger never fires).
@@ -2108,6 +2112,9 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
     const el = document.getElementById('facet-' + f);
     if (el) body['facet_' + f] = el.checked;
   });
+  // Radio TAB visibility (2026-08-12): default-OFF opt-in, sent as its own bool.
+  const fRadioEl = document.getElementById('facet-radio');
+  if (fRadioEl) body.facet_radio = fRadioEl.checked;
   // Closing Time (2026-06-24): toggle + trigger song/message. Strings persist
   // as typed (server trims); a blank trigger simply never fires.
   const ctEnabledEl = document.getElementById('closing-time-enabled');
