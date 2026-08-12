@@ -1997,6 +1997,10 @@ def _backend_type_of(backend) -> str | None:
     for name in ("direct", "chromecast", "dlna", "airplay", "plexplayer"):
         if backend is globals().get(f"{name}_backend"):
             return name
+    # Server-fed backends live in the lazy cache, not a module global (U2).
+    for sf_type, inst in _server_fed_backends.items():
+        if backend is inst:
+            return sf_type
     return None
 
 
@@ -2959,6 +2963,22 @@ async def setup() -> None:
         _disabled_sources_sync = set(await database.get_disabled_sources())
     except Exception:
         _disabled_sources_sync = set()
+
+    # Boot-restore ordering (2026-08-11 plan U2, R17): re-construct + start any
+    # ENABLED server-fed backend BEFORE _set_backend_by_type points the router at
+    # a persisted selection. Enabled-ness is persisted separately from selection,
+    # so a backend can be enabled without being selected (its server still starts,
+    # ready for clients). If the enable path raises (e.g. a port conflict), the
+    # backend stays dormant and a persisted selection of it will HOLD in
+    # _set_backend_by_type rather than fall to the host speakers.
+    for _sf in SERVER_FED_BACKEND_TYPES:
+        try:
+            if await database.get_backend_enabled(_sf):
+                await enable_server_fed_backend(_sf)
+        except Exception:
+            _log.warning("boot: enabling server-fed backend %r failed — it stays "
+                         "dormant", _sf, exc_info=True)
+
     _set_backend_by_type(backend_type)
     if device_id != "default" and output_router.active:
         if backend_type in {"chromecast", "airplay", "dlna", "plexplayer"}:
@@ -3043,7 +3063,125 @@ async def setup() -> None:
     await queue_engine.load_from_db()
 
 
+# ── server-fed backends: dormant opt-in activation (2026-08-11 plan U2) ──────
+# Unlike the five EAGER backends above (constructed in setup(), stored in module
+# globals, listed in _get_backend's static dict), the server-fed backends
+# (Snapcast, Sendspin) are DORMANT BY DEFAULT: their module is never imported
+# and no instance is constructed until an admin enables the backend (R16). A
+# disabled server-fed backend costs ~0 at runtime, and its heavy library
+# (``snapcast`` / ``aiosendspin`` + PyAV) is only imported inside the enable
+# path. Enabled-ness is persisted SEPARATELY from selection and restored at boot
+# BEFORE the router is pointed at a persisted server-fed selection, so a selected
+# server-fed backend can never fall through to the host speakers (R17).
+
+SERVER_FED_BACKEND_TYPES: tuple[str, ...] = ("snapcast", "sendspin")
+
+# Live enabled-state mirror (settings-backed, gapless_enabled shape): read sync
+# on the registration path, written by set_backend_enabled + the setup() restore.
+_server_fed_enabled: dict[str, bool] = {t: False for t in SERVER_FED_BACKEND_TYPES}
+# Lazily-constructed instances, keyed by type. Absence = dormant (not
+# constructed). _get_backend returns the cached instance or None — NEVER direct.
+_server_fed_backends: dict[str, Any] = {}
+
+
+def is_server_fed_backend(backend_type: str) -> bool:
+    return backend_type in SERVER_FED_BACKEND_TYPES
+
+
+def server_fed_backend_enabled(backend_type: str) -> bool:
+    """Live enabled mirror for a server-fed backend (sync, no DB read)."""
+    return _server_fed_enabled.get(backend_type, False)
+
+
+def get_server_fed_backend(backend_type: str):
+    """The constructed instance for an enabled server-fed backend, or None when
+    dormant. NEVER falls back to ``direct_backend`` — a None here means the
+    caller must HOLD, not blast the queue out the host speakers (R17)."""
+    return _server_fed_backends.get(backend_type)
+
+
+def _construct_server_fed_backend(backend_type: str):
+    """Function-local import + construct — the single construction chokepoint.
+    The import is deliberately inside the function so a disabled backend imports
+    nothing at boot (dormancy). U5/U7 own the concrete classes."""
+    if backend_type == "snapcast":
+        from app.output.snapcast import SnapcastBackend
+        return SnapcastBackend(advance_cb=_do_advance)
+    if backend_type == "sendspin":
+        from app.output.sendspin import SendspinBackend
+        return SendspinBackend(advance_cb=_do_advance)
+    raise ValueError(f"{backend_type!r} is not a server-fed backend type")
+
+
+async def enable_server_fed_backend(backend_type: str):
+    """Construct (if needed) + start the backend's server, and mark it enabled.
+    Idempotent. The enabled mirror flips to True ONLY after a successful start —
+    a start failure evicts the half-built instance and re-raises so a failed
+    enable stays 'failed' (the U9 toggle latches on this), never
+    'enabled-but-dead'."""
+    if backend_type not in SERVER_FED_BACKEND_TYPES:
+        raise ValueError(f"{backend_type!r} is not a server-fed backend type")
+    backend = _server_fed_backends.get(backend_type)
+    if backend is None:
+        backend = _construct_server_fed_backend(backend_type)
+        _server_fed_backends[backend_type] = backend
+    starter = getattr(backend, "enable", None)  # backend-owned server start
+    if callable(starter):
+        try:
+            await starter()
+        except BaseException:
+            _server_fed_backends.pop(backend_type, None)
+            _server_fed_enabled[backend_type] = False
+            raise
+    _server_fed_enabled[backend_type] = True
+    return backend
+
+
+async def disable_server_fed_backend(backend_type: str) -> None:
+    """Stop the backend's server, evict the instance, and mark it disabled.
+    Idempotent. If the disabled backend was the active router output, drop the
+    router to a held state rather than silently activating direct — re-selection
+    UX belongs to the admin layer (U9), and an implicit host-speaker fall is
+    exactly the R17 leak we forbid."""
+    backend = _server_fed_backends.pop(backend_type, None)
+    _server_fed_enabled[backend_type] = False
+    if backend is not None:
+        if output_router.active is backend:
+            try:
+                output_router.set_backend(None)
+            except Exception:
+                _log.warning("disable %s: router detach failed", backend_type,
+                             exc_info=True)
+        stopper = getattr(backend, "disable", None)
+        if callable(stopper):
+            try:
+                await stopper()
+            except Exception:
+                _log.warning("disable %s: backend teardown failed", backend_type,
+                             exc_info=True)
+
+
+async def set_backend_enabled(backend_type: str, value: bool):
+    """Persist + apply an enable/disable toggle for a server-fed backend. On
+    enable, constructs + starts (raising on failure without persisting True); on
+    disable, tears down. Returns the backend on enable, None on disable."""
+    from app import database
+    if value:
+        backend = await enable_server_fed_backend(backend_type)
+        await database.set_backend_enabled(backend_type, True)
+        return backend
+    await disable_server_fed_backend(backend_type)
+    await database.set_backend_enabled(backend_type, False)
+    return None
+
+
 def _get_backend(backend_type: str):
+    if backend_type in SERVER_FED_BACKEND_TYPES:
+        # Dormant-aware: the lazily-constructed instance, or None when not
+        # enabled/constructed. NEVER direct_backend — a persisted server-fed
+        # selection resolving to direct would blast the queue out the host
+        # speakers (R17). Callers treat None as "hold".
+        return _server_fed_backends.get(backend_type)
     return {
         "direct": direct_backend,
         "chromecast": chromecast_backend,
@@ -3057,6 +3195,12 @@ def _set_backend_by_type(backend_type: str) -> None:
     backend = _get_backend(backend_type)
     if backend:
         output_router.set_backend(backend)
+    elif backend_type in SERVER_FED_BACKEND_TYPES:
+        # Known server-fed type selected but not constructed/enabled → HOLD.
+        # Do NOT fall through to direct (that is the R17 host-speaker leak).
+        _log.warning(
+            "output backend %r is selected but not enabled/constructed — "
+            "holding (no host-speaker fallback)", backend_type)
 
 
 # ── stranded-queue evaluation + removal (2026-08-04-002 plexplayer plan U6) ──

@@ -94,6 +94,25 @@ Open `http://<IP>` and:
 
 Share `http://<IP>` with guests — no app or password needed.
 
+### 6. (Optional) Synchronized multi-room
+
+Under **Setup → Optional integrations** you can enable two **off-by-default**,
+server-fed multi-room backends (both baked into the image; nothing runs until
+enabled):
+
+- **Snapcast** — jukeplox runs an embedded `snapserver` and streams the current
+  queue in sync to any Snapcast clients; group them into zones with per-client
+  volume. Optionally point at an external snapserver by host/port (read + assign
+  only — jukeplox never rewrites a server you don't own).
+- **Sendspin** *(experimental)* — an in-process, mDNS-advertised Sendspin server;
+  pair clients with a short PIN.
+
+They stream the single shared queue (one stream, zoned — not different songs per
+room) and don't change local output: **System Audio** stays how the host's own
+speakers play. Set `BIND_HOST` to the server's LAN IP so Sendspin advertises a
+reachable address. snapserver's control/web ports bind loopback; the client
+stream port (1704) is LAN-facing.
+
 ## Settings (`-e NAME=value`)
 
 | Variable | Default | What it's for |

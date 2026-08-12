@@ -1360,6 +1360,61 @@ async def get_gapless_enabled() -> bool:
     return (await get_setting("gapless_enabled")) == "1"
 
 
+# ── server-fed backend (Snapcast/Sendspin) opt-in state (2026-08-11 plan U2) ──
+# Zone + pairing state lives in the existing settings KV table (the gapless /
+# zone_vol / gapless_verdict precedent) — NO _migrate_columns ALTER is needed
+# because nothing here adds a column to an existing table; a dedicated table
+# would be over-engineering for a handful of namespaced keys.
+
+
+async def get_backend_enabled(backend_type: str) -> bool:
+    """Whether a dormant-by-default server-fed backend (``snapcast``/``sendspin``)
+    is enabled. Stored as ``"1"``/``"0"`` under ``{backend_type}_enabled``;
+    default OFF — read once at boot into app.state's live mirror and on the
+    settings GET. Persisted SEPARATELY from ``output_backend_type`` (enabled ≠
+    selected), so a backend can be enabled-and-running without being the active
+    output, and a persisted selection can be restored only if still enabled."""
+    return (await get_setting(f"{backend_type}_enabled")) == "1"
+
+
+async def set_backend_enabled(backend_type: str, value: bool) -> None:
+    """Persist the enabled flag for a server-fed backend ("1"/"0")."""
+    await set_setting(f"{backend_type}_enabled", "1" if value else "0")
+
+
+async def get_sealed_setting(key: str) -> str | None:
+    """Read a settings-KV value stored sealed (Fernet), opened via the credential
+    chokepoint. Legacy plaintext passes through; a lost/rotated key degrades to
+    ``""`` (never raises). The Sendspin pairing PSK uses this (U8)."""
+    from app.sources import secrets
+    return secrets.open_secret(await get_setting(key))
+
+
+async def set_sealed_setting(key: str, plaintext: str | None) -> None:
+    """Seal a credential (Fernet, ``enc:fernet:`` prefix) BEFORE it touches the
+    settings table — MANDATORY for the Sendspin PSK (never plaintext at rest,
+    R24 posture). An empty/None value clears the row."""
+    from app.sources import secrets
+    await set_setting(key, secrets.seal(plaintext) or "")
+
+
+async def get_zone_volume(backend_type: str, group_id: str) -> float | None:
+    """Persisted per-group zone volume (0..1) under
+    ``zone_vol:{backend}:{group_id}``, or None when unset (a corrupted value also
+    reads as None → the caller falls back to the live tree)."""
+    raw = await get_setting(f"zone_vol:{backend_type}:{group_id}")
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def set_zone_volume(backend_type: str, group_id: str, level: float) -> None:
+    await set_setting(
+        f"zone_vol:{backend_type}:{group_id}",
+        f"{max(0.0, min(1.0, level)):.4f}")
+
+
 # Valid stored values for the per-device gapless behavioral verdict (2026-07-11
 # supervisor plan U8). Absence of a row IS the third state ("unverified") —
 # only DECIDED verdicts are stored, so clearing a row re-opens behavioral

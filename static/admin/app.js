@@ -593,6 +593,12 @@ const PROTOCOL_LABELS = {
   airplay: 'AirPlay',
   chromecast: 'Chromecast',
   dlna: 'DLNA',
+  // Server-fed multi-room backends (2026-08-11 plan U5/U7). Whole-backend
+  // selections managed via the Admin → Setup "Optional integrations" panel +
+  // zoning UI (U9), not per-device Via picker options — labelled here but
+  // deliberately absent from VIA_DEFAULT_ORDER.
+  snapcast: 'Snapcast',
+  sendspin: 'Sendspin',
 };
 // Default Via priority when a device has multiple verified protocols and
 // no per-device preference is stored. AirPlay first reflects its lower
@@ -2347,6 +2353,318 @@ document.getElementById('logout-link').addEventListener('click', async (e) => {
 
 // ── Initial load ───────────────────────────────────────────────────────────
 
+// ── Optional integrations: server-fed multi-room backends (plan U9) ──────────
+// Admin-only Setup chrome (guests never load this template). The zone sliders
+// reuse the master volume's --vol-fill visual treatment but POST to their own
+// per-client/per-group endpoints — a distinct admin surface (like the Sources
+// panel), NOT a fork of the shared playback/browse modules. Enable is the
+// explicit opt-in; Sendspin carries an "Experimental" badge (no separate modal).
+let _integrationsData = null;
+let _zoneVolTimers = {};
+
+async function loadIntegrations() {
+  try {
+    _integrationsData = await api('/admin/output/integrations');
+  } catch (e) {
+    _integrationsData = null;
+  }
+  renderMultiroomPanel();
+}
+
+function renderMultiroomPanel() {
+  const host = document.getElementById('multiroom-panel');
+  if (!host) return;
+  if (!_integrationsData) {
+    host.innerHTML = '<p style="color:#a55;font-size:.85rem">Could not load integrations.</p>';
+    return;
+  }
+  host.innerHTML = '';
+  for (const backend of ['snapcast', 'sendspin']) {
+    const info = _integrationsData[backend] || {};
+    const card = document.createElement('div');
+    card.className = 'panel-row';
+    card.style.cssText = 'display:block;border:1px solid var(--border);border-radius:8px;padding:.75rem 1rem;margin-bottom:.6rem';
+    const label = PROTOCOL_LABELS[backend] || backend;
+    const badge = info.experimental
+      ? ' <span title="Technical preview — protocol may change" style="font-size:.7rem;background:#4a3a1a;color:#e8c877;border-radius:4px;padding:.1rem .35rem;vertical-align:middle">Experimental</span>'
+      : '';
+    const clientNote = info.connected
+      ? (info.client_count > 0
+          ? `${info.client_count} client${info.client_count === 1 ? '' : 's'} connected`
+          : 'No clients connected — audio is running but not audible')
+      : 'Off';
+    card.innerHTML =
+      `<div style="display:flex;align-items:center;gap:.6rem;justify-content:space-between">
+         <div><strong>${esc(label)}</strong>${badge}
+           <div style="font-size:.8rem;color:#999" data-role="status">${esc(clientNote)}</div></div>
+         ${backend === 'sendspin'
+           ? '<span style="font-size:.8rem;color:#999">Coming soon — <a href="https://github.com/DJRkod/jukeplox/issues/28" target="_blank" rel="noopener" style="color:#8ab">tracked</a></span>'
+           : `<label style="display:flex;align-items:center;gap:.4rem;font-size:.85rem">
+           <input type="checkbox" data-backend="${backend}" ${info.enabled ? 'checked' : ''}> Enable</label>`}
+       </div>
+       <div data-role="failure" style="display:none;color:#e88;font-size:.8rem;margin-top:.4rem"></div>
+       <div data-role="config"></div>
+       <div data-role="zones" style="margin-top:.6rem"></div>
+       <div data-role="pairing" style="margin-top:.6rem"></div>`;
+    // Sendspin is deferred (real aiosendspin integration is tracked in #28) — no
+    // enable toggle yet; Snapcast is the shipped server-fed backend.
+    const toggle = card.querySelector('input[type=checkbox]');
+    if (toggle) toggle.addEventListener('change', () => toggleIntegration(backend, toggle, card));
+    host.appendChild(card);
+    // The external-server form is available for Snapcast whether enabled or not
+    // (saving it applies the config and enables the backend).
+    if (backend === 'snapcast') renderExternalConfig(card);
+    if (backend === 'snapcast' && info.enabled && info.connected) {
+      loadZones(backend, card);
+    }
+  }
+}
+
+async function toggleIntegration(backend, toggle, card) {
+  const fail = card.querySelector('[data-role="failure"]');
+  fail.style.display = 'none';
+  toggle.disabled = true;
+  const status = card.querySelector('[data-role="status"]');
+  if (toggle.checked) status.textContent = 'Enabling…';
+  try {
+    const r = await fetch(`/admin/output/integrations/${backend}/toggle`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: toggle.checked }),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      const msg = (body.detail && body.detail.message) || 'Failed to change state';
+      // Latch to "failed" with the toggle reflecting the true (unchanged) state,
+      // never a silent revert.
+      toggle.checked = !toggle.checked;
+      fail.textContent = msg;
+      fail.style.display = 'block';
+      return;
+    }
+    await loadIntegrations();
+  } catch (e) {
+    toggle.checked = !toggle.checked;
+    fail.textContent = 'Network error';
+    fail.style.display = 'block';
+  } finally {
+    toggle.disabled = false;
+  }
+}
+
+function zonePost(path, body) {
+  return fetch('/admin/output/' + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+async function loadZones(backend, card) {
+  const zonesEl = card.querySelector('[data-role="zones"]');
+  zonesEl.innerHTML = '<span style="font-size:.8rem;color:#777">Loading zones…</span>';
+  try {
+    const data = await api(`/admin/output/${backend}/zones`);
+    renderZoneTree(backend, zonesEl, data.zones || [], !!data.can_manage_topology);
+  } catch (e) {
+    zonesEl.innerHTML = '<span style="font-size:.8rem;color:#a55">Zones unavailable</span>';
+  }
+}
+
+function renderZoneTree(backend, zonesEl, zones, canManageTopology) {
+  zonesEl.innerHTML = '';
+  if (!zones.length) {
+    zonesEl.innerHTML = '<span style="font-size:.8rem;color:#777">No clients connected.</span>';
+    return;
+  }
+  const groupIds = zones.map(g => g.group_id);
+  for (const group of zones) {
+    const gwrap = document.createElement('div');
+    gwrap.style.cssText = 'border-left:2px solid var(--border);padding-left:.6rem;margin-bottom:.5rem';
+    gwrap.appendChild(renderGroupHeader(backend, group, canManageTopology));
+    const clients = document.createElement('div');
+    clients.style.cssText = 'max-height:12rem;overflow-y:auto';
+    for (const client of group.clients || []) {
+      clients.appendChild(renderZoneSlider(backend, group.group_id, client, groupIds));
+    }
+    gwrap.appendChild(clients);
+    zonesEl.appendChild(gwrap);
+  }
+}
+
+function renderGroupHeader(backend, group, canManageTopology) {
+  const hdr = document.createElement('div');
+  hdr.style.cssText = 'display:flex;align-items:center;gap:.4rem;margin:.35rem 0;font-size:.8rem;flex-wrap:wrap';
+  const label = document.createElement('strong');
+  label.textContent = group.name || 'Group';
+  label.style.color = '#ddd';
+  const gname = group.name || 'Group';
+  // Group volume — the mean of members, applied as a proportional fan-out.
+  const gvol = document.createElement('input');
+  gvol.type = 'range'; gvol.min = '0'; gvol.max = '100';
+  const members = group.clients || [];
+  const mean = members.length
+    ? members.reduce((a, c) => a + (c.volume || 0), 0) / members.length : 0;
+  gvol.value = String(Math.round(mean * 100));
+  gvol.style.setProperty('--vol-fill', gvol.value + '%');
+  gvol.setAttribute('aria-label', gname + ' volume');
+  gvol.addEventListener('input', () => {
+    gvol.style.setProperty('--vol-fill', gvol.value + '%');
+    const key = 'g:' + backend + ':' + group.group_id;
+    clearTimeout(_zoneVolTimers[key]);
+    _zoneVolTimers[key] = setTimeout(() => {
+      zonePost(`${backend}/group/${encodeURIComponent(group.group_id)}/volume`,
+               { level: Number(gvol.value) / 100 }).catch(() => {});
+    }, 150);
+  });
+  const gmuteLbl = document.createElement('label');
+  gmuteLbl.style.cssText = 'display:flex;align-items:center;gap:.2rem;color:#999';
+  const gmute = document.createElement('input');
+  gmute.type = 'checkbox'; gmute.checked = !!group.muted;
+  gmute.setAttribute('aria-label', gname + ' mute');
+  gmute.addEventListener('change', () =>
+    zonePost(`${backend}/group/${encodeURIComponent(group.group_id)}/mute`,
+             { muted: gmute.checked }).catch(() => {}));
+  gmuteLbl.appendChild(gmute); gmuteLbl.appendChild(document.createTextNode('mute'));
+  hdr.appendChild(label); hdr.appendChild(gvol); hdr.appendChild(gmuteLbl);
+  // Topology controls — embedded Snapcast only (external is read + assign-only).
+  if (canManageTopology && backend === 'snapcast') {
+    const rename = document.createElement('button');
+    rename.className = 'btn btn-sm'; rename.textContent = 'Rename';
+    rename.style.cssText = 'background:transparent;color:var(--muted);border:1px solid var(--border)';
+    rename.addEventListener('click', async () => {
+      const name = prompt('New group name:', group.name || '');
+      if (name == null) return;
+      await zonePost(`snapcast/group/${encodeURIComponent(group.group_id)}/rename`, { name });
+      showToast('Group renamed');
+    });
+    const dissolve = document.createElement('button');
+    dissolve.className = 'btn btn-sm'; dissolve.textContent = 'Dissolve';
+    dissolve.style.cssText = 'background:transparent;color:#c77;border:1px solid var(--border)';
+    dissolve.addEventListener('click', async () => {
+      if (!confirm('Dissolve this group? Its clients become ungrouped.')) return;
+      await fetch(`/admin/output/snapcast/group/${encodeURIComponent(group.group_id)}`,
+                  { method: 'DELETE' });
+      showToast('Group dissolved');
+    });
+    hdr.appendChild(rename); hdr.appendChild(dissolve);
+  }
+  return hdr;
+}
+
+function renderZoneSlider(backend, groupId, client, groupIds) {
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;align-items:center;gap:.5rem;margin:.25rem 0;flex-wrap:wrap';
+  const name = document.createElement('span');
+  name.textContent = client.name;
+  name.style.cssText = 'font-size:.8rem;min-width:8rem;color:#ccc';
+  const slider = document.createElement('input');
+  slider.type = 'range';
+  slider.min = '0'; slider.max = '100';
+  slider.value = String(Math.round((client.volume || 0) * 100));
+  // Reuse the master slider's --vol-fill visual treatment.
+  slider.style.setProperty('--vol-fill', slider.value + '%');
+  slider.setAttribute('aria-label', `${client.name} volume`);
+  slider.addEventListener('input', () => {
+    slider.style.setProperty('--vol-fill', slider.value + '%');
+    const key = backend + ':' + client.client_id;
+    clearTimeout(_zoneVolTimers[key]);
+    _zoneVolTimers[key] = setTimeout(() => {
+      zonePost(`${backend}/client/${encodeURIComponent(client.client_id)}/volume`,
+               { level: Number(slider.value) / 100 }).catch(() => {});
+    }, 150);
+  });
+  row.appendChild(name);
+  row.appendChild(slider);
+  // Per-client mute.
+  const muteLbl = document.createElement('label');
+  muteLbl.style.cssText = 'display:flex;align-items:center;gap:.2rem;font-size:.75rem;color:#999';
+  const mute = document.createElement('input');
+  mute.type = 'checkbox'; mute.checked = !!client.muted;
+  mute.setAttribute('aria-label', `${client.name} mute`);
+  mute.addEventListener('change', () =>
+    zonePost(`${backend}/client/${encodeURIComponent(client.client_id)}/mute`,
+             { muted: mute.checked }).catch(() => {}));
+  muteLbl.appendChild(mute); muteLbl.appendChild(document.createTextNode('mute'));
+  row.appendChild(muteLbl);
+  // Assign to another existing group (Snapcast only — non-destructive).
+  if (backend === 'snapcast' && groupIds && groupIds.length > 1) {
+    const sel = document.createElement('select');
+    sel.setAttribute('aria-label', `${client.name} group`);
+    sel.style.cssText = 'font-size:.75rem';
+    for (const gid of groupIds) {
+      const opt = document.createElement('option');
+      opt.value = gid; opt.textContent = gid === groupId ? '(here)' : gid;
+      if (gid === groupId) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener('change', async () => {
+      await zonePost(`snapcast/group/${encodeURIComponent(sel.value)}/assign`,
+                     { client_id: client.client_id });
+      showToast('Client moved');
+    });
+    row.appendChild(sel);
+  }
+  return row;
+}
+
+function renderExternalConfig(card) {
+  const el = card.querySelector('[data-role="config"]');
+  if (!el) return;
+  const inp = 'padding:.3rem;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:4px';
+  el.innerHTML =
+    `<details style="margin-top:.4rem"><summary style="cursor:pointer;font-size:.8rem;color:#aaa">Configure server…</summary>
+       <div style="display:flex;flex-direction:column;gap:.35rem;margin-top:.4rem;font-size:.8rem;max-width:22rem">
+         <label><input type="radio" name="snap-mode" value="embedded" checked> Embedded (built-in server)</label>
+         <label><input type="radio" name="snap-mode" value="external"> External server</label>
+         <input data-role="ext-host" placeholder="external host / IP" style="${inp}">
+         <input data-role="ext-port" placeholder="control port (default 1705)" style="${inp}">
+         <input data-role="ext-feed" placeholder="tcp feed url e.g. tcp://host:4953" style="${inp}">
+         <button class="btn btn-primary btn-sm" data-role="save-config">Save + apply</button>
+       </div></details>`;
+  el.querySelector('[data-role="save-config"]').addEventListener('click', async () => {
+    const mode = el.querySelector('input[name="snap-mode"]:checked').value;
+    const body = {
+      mode,
+      host: el.querySelector('[data-role="ext-host"]').value || null,
+      port: Number(el.querySelector('[data-role="ext-port"]').value) || 1705,
+      feed_url: el.querySelector('[data-role="ext-feed"]').value || null,
+    };
+    try {
+      const r = await zonePost('snapcast/connect', body);
+      if (r.ok) { showToast('Snapcast configured'); loadIntegrations(); }
+      else {
+        const b = await r.json().catch(() => ({}));
+        showToast((b.detail && (b.detail.message || b.detail)) || 'Config failed');
+      }
+    } catch (e) { showToast('Config failed'); }
+  });
+}
+
+function renderPairingPanel(card) {
+  const el = card.querySelector('[data-role="pairing"]');
+  el.innerHTML =
+    `<button class="btn btn-sm" data-role="show-pin" style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Show pairing PIN</button>
+     <span data-role="pin" style="font-family:monospace;margin-left:.5rem"></span>
+     <button class="btn btn-sm" data-role="rotate" style="margin-left:.5rem;background:transparent;color:var(--muted);border:1px solid var(--border)">Rotate key…</button>`;
+  el.querySelector('[data-role="show-pin"]').addEventListener('click', async () => {
+    try {
+      const r = await api('/admin/output/sendspin/pairing');
+      el.querySelector('[data-role="pin"]').textContent = r.pin || '';
+    } catch (e) { showToast('Could not get pairing PIN'); }
+  });
+  el.querySelector('[data-role="rotate"]').addEventListener('click', () => rotateSendspinPairing());
+}
+
+async function rotateSendspinPairing() {
+  if (!confirm('Rotate the Sendspin pairing key? This disconnects all paired clients.')) return;
+  try {
+    const r = await fetch('/admin/output/sendspin/pairing/rotate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    });
+    if (r.ok) showToast('Pairing key rotated'); else showToast('Rotate failed');
+  } catch (e) { showToast('Rotate failed'); }
+}
+
 (async () => {
   const state = await refreshQueueState();
   if (state && state.current) {
@@ -2358,4 +2676,5 @@ document.getElementById('logout-link').addEventListener('click', async (e) => {
   loadSettings();
   loadRuleEditors();
   loadVolume();
+  loadIntegrations();
 })();

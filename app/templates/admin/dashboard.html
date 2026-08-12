@@ -723,6 +723,20 @@
       <div id="output-device-hint" style="display:none; margin-top:.5rem; color:#bbb; font-size:.9rem;"></div>
     </section>
 
+    <!-- Optional integrations (server-fed multi-room backends — 2026-08-11 plan U9).
+         Admin-only chrome: guests never load this template. Dormant by default;
+         enabling is the explicit opt-in (Sendspin's enable IS its experimental
+         acknowledgement — a badge, no separate modal). Populated by
+         admin/app.js::renderMultiroomPanel — no new <script> or stylesheet. -->
+    <section id="optional-integrations">
+      <h2>Optional integrations</h2>
+      <p class="muted" style="font-size:.85rem;color:#888;margin:.25rem 0 .6rem">
+        Server-fed multi-room output. Off by default; enabling starts an embedded
+        server and streams the current queue to synchronized clients with
+        per-zone volume. Local speakers still use Direct output.</p>
+      <div id="multiroom-panel"><p style="color:#555;font-size:.85rem">Loading…</p></div>
+    </section>
+
     <!-- Libraries -->
     <!-- ── Libraries: connected sources (connect/remove/rescan/priority) +
          Plex library selection, unified into one panel (multi-source U14) ──── -->
