@@ -290,8 +290,10 @@ async def get_plex_client():
             ]
         # Subsonic sources (2026-08-10-003 U4): same additive/gated posture — the
         # loop is empty on installs without one, so a Plex-only registry stays
-        # byte-identical (AE6). token = the sealed-at-rest API key (opened by
-        # get_subsonic_sources); server_url is credential-free.
+        # byte-identical (AE6). token = the sealed-at-rest secret (opened by
+        # get_subsonic_sources); server_url is credential-free. auth_mode
+        # ('apikey' | 'token', 2026-08-11-003) is read from the DB — NO network
+        # probe here, so the registry build stays offline and cheap.
         subsonic = await database.get_subsonic_sources()
         if subsonic:
             from app.sources.subsonic import SubsonicSource
@@ -299,6 +301,7 @@ async def get_plex_client():
                 SubsonicSource(
                     server_url=s["server_url"], api_key=s["token"], username=s["user"],
                     source_id=s["source_id"], server_name=s["name"],
+                    auth_mode=s.get("auth_mode", "apikey"),
                 )
                 for s in subsonic
             ]

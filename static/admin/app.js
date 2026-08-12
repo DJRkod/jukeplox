@@ -1511,9 +1511,11 @@ async function connectLocal() {
 }
 
 async function connectSubsonic() {
-  // Mirrors connectJellyfin: POST an API key (R5 — never a password). Error +
-  // note elements are looked up inline (no module-level const) to keep the
-  // per-page top-level surface minimal for the discipline allowlist.
+  // ONE credential field auto-routed by the server's capability (2026-08-11-003):
+  // an API key where the server advertises apiKeyAuthentication, else the account
+  // password (token+salt). Error + note elements are looked up inline (no
+  // module-level const) to keep the per-page top-level surface minimal for the
+  // discipline allowlist.
   const btn = document.getElementById('btn-connect-subsonic');
   const err = document.getElementById('subsonic-connect-error');
   const note = document.getElementById('subsonic-connect-note');
@@ -1524,7 +1526,7 @@ async function connectSubsonic() {
   err.style.display = 'none';
   note.style.display = 'none';
   if (!url || !key || !user) {
-    err.textContent = 'Server URL, API key and username are required.';
+    err.textContent = 'Server URL, API key or password, and username are required.';
     err.style.display = '';
     return;
   }
@@ -1532,13 +1534,13 @@ async function connectSubsonic() {
   try {
     const resp = await fetch('/admin/sources/subsonic', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ server_url: url, api_key: key, username: user, name }),
+      body: JSON.stringify({ server_url: url, secret: key, username: user, name }),
     });
     if (!resp.ok) {
       let cat = 'unreachable', msg = '';
       try { const e = await resp.json(); if (e.detail) { cat = e.detail.category || cat; msg = e.detail.message || ''; } } catch {}
       err.textContent =
-        cat === 'auth_rejected' ? (msg || 'Subsonic rejected the API key.')
+        cat === 'auth_rejected' ? (msg || 'The server rejected the API key or password.')
         : cat === 'unreachable' ? 'Could not reach the Subsonic server. Check the URL.'
         : cat === 'duplicate' ? 'A source at this URL is already configured.'
         : cat === 'blocked_private' ? (msg || 'That address is blocked. Set ALLOW_PRIVATE_SOURCES to connect a private-range server.')
@@ -1546,8 +1548,8 @@ async function connectSubsonic() {
       err.style.display = '';
       return;
     }
-    let base = null, warning = null;
-    try { const ok = await resp.json(); base = ok.resolved_stream_base; warning = ok.warning; } catch {}
+    let base = null, warning = null, authMode = null;
+    try { const ok = await resp.json(); base = ok.resolved_stream_base; warning = ok.warning; authMode = ok.auth_mode; } catch {}
     ['subsonic-url', 'subsonic-key', 'subsonic-user', 'subsonic-name'].forEach(id => { document.getElementById(id).value = ''; });
     document.getElementById('subsonic-connect-form').style.display = 'none';
     // The zero-music-libraries case saves the source (200) and returns a warning
@@ -1560,7 +1562,10 @@ async function connectSubsonic() {
       ? 'Streaming via ' + base + ' — set STREAM_BASE_URL to override if a Cast/DLNA device can\'t reach it.'
       : 'Could not auto-detect a device-reachable streaming address — set STREAM_BASE_URL to this server\'s LAN address or Cast/DLNA playback may be silent.';
     note.style.display = '';
-    showToast('Subsonic connected — scanning…');
+    // Tell the admin which auth was negotiated (apiKey vs token+salt password).
+    const via = authMode === 'token' ? ' via username/password'
+      : authMode === 'apikey' ? ' via API key' : '';
+    showToast('Subsonic connected' + via + ' — scanning…');
     loadSources();
   } catch {
     err.textContent = 'Could not reach the Subsonic server. Check the URL.';

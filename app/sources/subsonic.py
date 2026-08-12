@@ -8,12 +8,20 @@ concurrency semaphore, a TTL cache, small parse helpers, and the
 ``{source_id}:{native}`` key namespace via ``_make_id``/``_strip`` — so the
 providers read alike.
 
-Auth model (R5): a Subsonic connection stores an **API key** minted via the
-OpenSubsonic *API-Key extension* (``getOpenSubsonicExtensions`` →
-``apiKeyAuthentication``). We NEVER store or fall back to a password or the
-legacy ``token``+``salt`` scheme — a server without the extension is rejected at
-connect (``require_api_key_support``). Every request carries the common params
-``u`` / ``v`` / ``c`` / ``f=json`` plus ``apiKey=<key>``.
+Auth model (2026-08-11-003, token+salt fallback): a Subsonic connection stores a
+**secret** whose meaning is set by the negotiated ``auth_mode``. When the server
+advertises the OpenSubsonic *API-Key extension* (``getOpenSubsonicExtensions`` →
+``apiKeyAuthentication``) the secret is an **API key** and requests carry
+``apiKey=<key>`` (the original, preferred path). When the server lacks the
+extension — Navidrome, gonic, and most self-hosted servers — the secret is the
+account **password** and requests use the standard Subsonic **token+salt** auth:
+``u`` + ``s=<fresh random salt>`` + ``t=md5(password+salt)``, a fresh salt per
+request. The cleartext password is NEVER transmitted (no legacy ``p=``) and is
+sealed at rest. Common params are always ``u`` / ``v`` / ``c`` / ``f=json`` plus
+the mode-specific auth params. Capability detection at connect uses a dedicated
+credential-free probe (``_probe_extensions_unauth``); the secret is then proven
+by an authenticated ``validate_credentials`` call (NOT the no-network
+``get_libraries``).
 
 Credential-in-URL (R6): unlike Plex/Jellyfin (header auth), Subsonic auths via
 query params, so a stream URL carries the key. ``url_borne_auth`` is ``True`` so
@@ -43,7 +51,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -63,6 +73,20 @@ _CACHE_TTL = 300  # seconds — mirrors JellyfinSource / PlexClient
 _SUBSONIC_CAPS = Capabilities(native_search=True, genres=True)
 
 _API_KEY_EXTENSION = "apikeyauthentication"
+
+# The two auth modes a Subsonic source can use. ``apikey`` = the secret is an
+# OpenSubsonic API key (apiKey= param); ``token`` = the secret is the account
+# password, sent as u/s/t token+salt. Validated at construction/reconfigure so a
+# typo ('Token', 'apiKey') fails loudly rather than silently emitting the wrong
+# auth params at request time.
+_VALID_AUTH_MODES = ("apikey", "token")
+
+
+def _check_auth_mode(mode: str) -> None:
+    """Raise ``ValueError`` on an unrecognized auth mode (construction/reconfigure)."""
+    if mode not in _VALID_AUTH_MODES:
+        raise ValueError(
+            f"invalid auth_mode {mode!r}; expected one of {_VALID_AUTH_MODES}")
 
 # Safety bounds on getAlbumList2 pagination so a server that never returns a short
 # final page can't loop forever. 500-album pages × 400 pages = 200k albums, well
@@ -162,9 +186,17 @@ class SubsonicSource(MusicSource):
         server_name: str = "",
         http: httpx.AsyncClient | None = None,
         max_concurrency: int | None = None,
+        auth_mode: str = "apikey",
     ) -> None:
         self.server_url = server_url.rstrip("/")
-        self._api_key = api_key
+        # ``_secret`` is the API key (apikey mode) OR the account password
+        # (token mode); ``_auth_mode`` decides how _common_params uses it. The
+        # ``api_key`` parameter name is kept for back-compat — in apikey mode it
+        # IS the api key; in token mode the caller passes the password here and
+        # sets auth_mode="token" (or calls set_auth).
+        self._secret = api_key
+        _check_auth_mode(auth_mode)
+        self._auth_mode = auth_mode
         self.username = username
         self._source_id = source_id or "subsonic"
         self.server_name = server_name
@@ -222,13 +254,36 @@ class SubsonicSource(MusicSource):
     # ── request plumbing ──────────────────────────────────────────────────────
 
     def _common_params(self) -> dict:
-        return {
+        base = {
             "u": self.username,
             "v": API_VERSION,
             "c": CLIENT_NAME,
             "f": "json",
-            "apiKey": self._api_key,
         }
+        if self._auth_mode == "token":
+            # Standard Subsonic token+salt: fresh random salt per request,
+            # t=md5(password+salt). The cleartext password is never sent (no
+            # legacy p=). md5 is the wire protocol here, NOT a security
+            # primitive — usedforsecurity=False documents that (and dodges FIPS
+            # lint). token_hex(8) → 16 hex chars, well past the spec's 6-char
+            # salt floor.
+            salt = secrets.token_hex(8)
+            token = hashlib.md5(
+                (self._secret + salt).encode("utf-8"), usedforsecurity=False
+            ).hexdigest()
+            return {**base, "s": salt, "t": token}
+        return {**base, "apiKey": self._secret}
+
+    def set_auth(self, auth_mode: str, secret: str | None = None) -> None:
+        """Reconfigure the auth mode (and optionally the secret) on an existing
+        source. The connect route probes capability, then routes THIS one source
+        into the detected mode via set_auth — avoiding a second SubsonicSource
+        (each __init__ opens its own httpx client, which would leak past the
+        route's single ``finally: aclose()``)."""
+        _check_auth_mode(auth_mode)
+        self._auth_mode = auth_mode
+        if secret is not None:
+            self._secret = secret
 
     def _endpoint(self, name: str) -> str:
         return f"{self.server_url}/rest/{name}.view"
@@ -262,30 +317,40 @@ class SubsonicSource(MusicSource):
     def _store(self, key: str, value: Any) -> None:
         self._cache[key] = _CacheEntry(value=value)
 
-    # ── extension detection (API-Key gating, U2/U4) ───────────────────────────
+    # ── extension detection (capability probe, U2/U4) ─────────────────────────
 
-    async def supports_api_key(self) -> bool:
-        """True iff the server advertises the OpenSubsonic API-Key extension."""
-        if (c := self._cached("apikey_ext")) is not None:
-            return c
-        body = await self._call("getOpenSubsonicExtensions")
-        exts = body.get("openSubsonicExtensions", []) or []
-        ok = any(
-            str(e.get("name", "")).lower() == _API_KEY_EXTENSION for e in exts
-        )
-        self._store("apikey_ext", ok)
-        return ok
+    async def _probe_extensions_unauth(self) -> bool:
+        """Credential-free capability probe (connect-time, pre-validation).
 
-    async def require_api_key_support(self) -> None:
-        """Raise ``SubsonicAuthError`` if the server lacks API-Key auth — the
-        connect handler rejects a no-extension server here (never falls back to a
-        password or token+salt, R5)."""
-        if not await self.supports_api_key():
-            raise SubsonicAuthError(
-                "This server does not support the OpenSubsonic API-Key "
-                "authentication extension, which Jukeplox requires "
-                "(a password is never stored)."
+        Issues ``getOpenSubsonicExtensions`` with ONLY ``v``/``c``/``f`` — no
+        ``apiKey``/``u``/``s``/``t``/``p``. The OpenSubsonic spec allows this
+        endpoint unauthenticated so a client can discover apiKey support before
+        choosing how to auth; calling it through ``_call``/``_common_params``
+        (which inject the credential) would transmit the still-unvalidated secret,
+        so this path deliberately bypasses them. Returns ``True`` iff
+        ``apiKeyAuthentication`` is advertised. Raises on a hard error (non-2xx or
+        a Subsonic ``failed`` status) so the connect route can apply its
+        no-silent-downgrade policy."""
+        params = {"v": API_VERSION, "c": CLIENT_NAME, "f": "json"}
+        async with self._sem:
+            resp = await self._http.get(
+                self._endpoint("getOpenSubsonicExtensions"), params=params
             )
+        resp.raise_for_status()
+        body = resp.json().get("subsonic-response", {}) or {}
+        if body.get("status") == "failed":
+            raise RuntimeError("getOpenSubsonicExtensions returned failed")
+        exts = body.get("openSubsonicExtensions", []) or []
+        return any(str(e.get("name", "")).lower() == _API_KEY_EXTENSION for e in exts)
+
+    async def validate_credentials(self) -> None:
+        """Prove the secret with an AUTHENTICATED request in the current mode.
+
+        Issues ``ping`` through ``_call`` (which carries the mode's auth params),
+        so a Subsonic ``failed`` auth code (40/41/44) raises ``SubsonicAuthError``.
+        This is the real connect-time secret check — ``get_libraries`` is a
+        no-network synthetic and validates nothing."""
+        await self._call("ping")
 
     # ── parse helpers ─────────────────────────────────────────────────────────
 
