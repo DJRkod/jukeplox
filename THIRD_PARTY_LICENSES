@@ -1,6 +1,6 @@
 # Third-Party Licenses
 
-Jukeplox is licensed under GPL-2.0 (see `LICENSE`). It additionally bundles or
+Jukeplox is licensed under GPL-2.0-or-later (see `LICENSE`). It additionally bundles or
 builds on the third-party components listed here.
 
 ## Vendored binaries (committed in this repository)
