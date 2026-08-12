@@ -20,7 +20,6 @@
 /admin/plex/index-status
 /admin/plex/libraries
 /admin/plex/libraries/
-/admin/plex/rescan
 /admin/queue
 /admin/queue/
 /admin/queue/clear
@@ -31,10 +30,12 @@
 /admin/settings
 /admin/sources
 /admin/sources/
+/admin/sources/emby
 /admin/sources/jellyfin
 /admin/sources/local
 /admin/sources/priority
 /admin/sources/rescan
+/admin/sources/subsonic
 /admin/surprise/recent
 /admin/track-rating
 /admin/track-tags
@@ -63,5 +64,6 @@
 /api/search
 /api/search/broad
 /api/servers
+/api/tag/tracks
 /api/track-ratings
 /api/track-tags

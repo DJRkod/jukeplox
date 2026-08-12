@@ -3249,7 +3249,7 @@ def test_search_no_rules_single_plex_call_per_library(mock_deps):
     resp = c.get("/api/search?q=beatles")
     assert plex.search.await_count == 1
     data = resp.json()
-    assert set(data.keys()) == {"tracks", "albums", "artists", "genres"}
+    assert set(data.keys()) == {"tracks", "albums", "artists", "genres", "tags"}
 
 
 def test_search_variant_cap_bounds_plex_calls(mock_deps):
@@ -4805,3 +4805,285 @@ async def test_queue_changed_annotate_failure_fails_open(catalog_env):
                AsyncMock(side_effect=RuntimeError("boom"))):
         await _annotate_queue_event(ev)
     assert ev.queue[0].plex_held is True
+
+
+# ── Searchable tags in /api/search (2026-08-11 plan U2) ──────────────────────
+import contextlib as _ctx
+
+
+def _tag_row(identity, title="T", artist="A", album="B", disc=1, trk=1):
+    return {"identity": identity, "title": title, "artist": artist, "album": album,
+            "disc_number": disc, "track_number": trk}
+
+
+@_ctx.contextmanager
+def _catalog_search(*, visible, admin=False, views_tracks=None, all_tags=None, rows=None):
+    rows = rows or {}
+    with _ctx.ExitStack() as st:
+        st.enter_context(patch("app.api.guest._catalog_active", AsyncMock(return_value=True)))
+        st.enter_context(patch("app.catalog.views.search", AsyncMock(return_value={
+            "tracks": list(views_tracks or []), "albums": [], "artists": [], "genres": []})))
+        st.enter_context(patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=visible)))
+        st.enter_context(patch("app.api.guest._viewer_is_admin", AsyncMock(return_value=admin)))
+        st.enter_context(patch("app.database.get_all_tags", AsyncMock(return_value=all_tags or {})))
+        st.enter_context(patch("app.catalog.store.get_track", AsyncMock(side_effect=lambda i: rows.get(i))))
+        st.enter_context(patch("app.catalog.views._track",
+                               AsyncMock(side_effect=lambda row, *a, **k: make_track(tid=row["identity"]))))
+        st.enter_context(patch("app.api.guest._annotate_plex_held",
+                               AsyncMock(side_effect=lambda dicts, *a, **k: dicts)))
+        yield
+
+
+def test_search_tags_hidden_from_guest_catalog(mock_deps):
+    """Covers AE2 (search half): guest + visibility OFF → no Tags section, no
+    tag-only tracks, title/artist/album hits still present, match step skipped."""
+    title_hit = make_track(tid="title-1")
+    with _catalog_search(visible=False, admin=False, views_tracks=[title_hit],
+                         all_tags={"tagonly-1": ["cool"]},
+                         rows={"tagonly-1": _tag_row("tagonly-1")}):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/search?q=cool").json()
+    assert body.get("tags") == []
+    ids = {t["track_id"] for t in body["tracks"]}
+    assert "title-1" in ids and "tagonly-1" not in ids
+
+
+def test_search_tags_shown_and_folded_for_admin_catalog(mock_deps):
+    """Covers AE1/AE3/AE5: visible → Tags section present, a pure-tag-match track
+    folds inline, and a title+tag double-match appears once."""
+    title_hit = make_track(tid="title-1")
+    with _catalog_search(visible=True, admin=True, views_tracks=[title_hit],
+                         all_tags={"tagonly-1": ["cool"], "title-1": ["cool"]},
+                         rows={"tagonly-1": _tag_row("tagonly-1", title="Tagged", album="Q"),
+                               "title-1": _tag_row("title-1", title="Song", album="B")}):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/search?q=cool").json()
+    assert any(s["name"] == "cool" and s["count"] == 2 for s in body["tags"])
+    ids = [t["track_id"] for t in body["tracks"]]
+    assert set(ids) >= {"title-1", "tagonly-1"}          # pure-tag track folded in
+    assert ids.count("title-1") == 1                      # double-match deduped (AE5)
+
+
+def test_search_tags_shown_to_guest_when_visible_catalog(mock_deps):
+    """Covers AE3: guest with visibility ON gets the Tags section."""
+    with _catalog_search(visible=True, admin=False, views_tracks=[],
+                         all_tags={"g1": ["cool"]}, rows={"g1": _tag_row("g1")}):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/search?q=cool").json()
+    assert [s["name"] for s in body["tags"]] == ["cool"]
+
+
+def test_search_tags_native_section_only_no_fold(mock_deps):
+    """Native mode: Tags section served, but tag-only tracks are NOT folded inline
+    (native has no local-tag identity mapping)."""
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)) as _ca:
+        _ca.return_value = False  # force native branch
+        with patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=True)), \
+             patch("app.database.get_all_tags", AsyncMock(return_value={"n1": ["cool"], "n2": ["cool"]})):
+            from app.main import app
+            body = TestClient(app, raise_server_exceptions=True).get("/api/search?q=cool").json()
+    assert any(s["name"] == "cool" and s["count"] == 2 for s in body["tags"])
+    assert "n1" not in {t["track_id"] for t in body["tracks"]}  # no inline fold in native
+
+
+# ── /api/tag/tracks drill endpoint (2026-08-11 plan U3) ──────────────────────
+
+def test_tag_tracks_withheld_from_guest_when_hidden(mock_deps):
+    """Covers AE2 (drill half)."""
+    with patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=False)), \
+         patch("app.api.guest._viewer_is_admin", AsyncMock(return_value=False)), \
+         patch("app.database.get_all_tags", AsyncMock(return_value={"t1": ["cool"]})):
+        from app.main import app
+        resp = TestClient(app, raise_server_exceptions=True).get("/api/tag/tracks?tag=cool")
+    assert resp.status_code == 200 and resp.json() == {"tag": "cool", "tracks": []}
+
+
+def test_tag_tracks_catalog_returns_tagged_tracks(mock_deps):
+    """Covers AE4: drill returns every track carrying the tag (catalog)."""
+    rows = {"c1": _tag_row("c1"), "c2": _tag_row("c2", title="Two")}
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=True)), \
+         patch("app.database.get_all_tags", AsyncMock(return_value={"c1": ["cool"], "c2": ["cool"]})), \
+         patch("app.catalog.store.get_track", AsyncMock(side_effect=lambda i: rows.get(i))), \
+         patch("app.catalog.views._track", AsyncMock(side_effect=lambda row, *a, **k: make_track(tid=row["identity"]))), \
+         patch("app.api.guest._annotate_plex_held", AsyncMock(side_effect=lambda dicts, *a, **k: dicts)):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/tag/tracks?tag=cool").json()
+    assert body["tag"] == "cool"
+    assert {t["track_id"] for t in body["tracks"]} == {"c1", "c2"}
+
+
+def test_tag_tracks_unknown_tag_empty(mock_deps):
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=True)), \
+         patch("app.database.get_all_tags", AsyncMock(return_value={"c1": ["cool"]})):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/tag/tracks?tag=nope").json()
+    assert body == {"tag": "nope", "tracks": []}
+
+
+def test_tag_tracks_rejects_overlong_tag(mock_deps):
+    from app.main import app
+    resp = TestClient(app, raise_server_exceptions=True).get("/api/tag/tracks?tag=" + "x" * 41)
+    assert resp.status_code == 422
+
+
+def test_tag_tracks_native_caps_fanout(mock_deps):
+    """Native per-id fan-out is capped at the display limit (no bulk-by-id fetch)."""
+    _, plex = mock_deps
+    plex.get_track = AsyncMock(side_effect=lambda tid: make_track(tid=tid))
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=False)), \
+         patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=True)), \
+         patch("app.database.get_most_played_display_limit", AsyncMock(return_value=2)), \
+         patch("app.database.get_all_tags",
+               AsyncMock(return_value={"n1": ["cool"], "n2": ["cool"], "n3": ["cool"]})):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/tag/tracks?tag=cool").json()
+    assert len(body["tracks"]) == 2
+    assert plex.get_track.await_count == 2
+
+
+# ── Regressions: genre/tag same-name isolation (2026-08-11 plan U7) ──────────
+
+def test_search_genre_tag_same_name_no_leak_when_hidden(mock_deps):
+    """A same-named genre is served identically whether or not a tag of that name
+    exists — with tags hidden, the tag's presence changes nothing on the
+    guest-visible genre surface (no tag-existence oracle via the genre chip)."""
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=False)), \
+         patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=False)), \
+         patch("app.api.guest._viewer_is_admin", AsyncMock(return_value=False)), \
+         patch("app.database.get_genre_cache", AsyncMock(return_value=[{"name": "chill", "count": 3}])), \
+         patch("app.database.get_all_tags", AsyncMock(return_value={"x": ["chill"]})):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/search?q=chill").json()
+    assert body["tags"] == []                                   # tag hidden
+    assert any(g["name"] == "chill" for g in body["genres"])    # genre surface unaffected
+
+
+# ── Code-review fixes: exact-tag drill, gate-first, admin bypass (2026-08-11) ──
+
+def test_tag_tracks_exact_tag_not_token_overfetch(mock_deps):
+    """Drill 'cool' returns ONLY 'cool' tracks, not token-overlapping 'cool covers'
+    (the drill uses exact-tag lookup, not the search token matcher)."""
+    rows = {"c1": _tag_row("c1"), "c2": _tag_row("c2")}
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=True)), \
+         patch("app.database.get_all_tags", AsyncMock(return_value={"c1": ["cool"], "c2": ["cool covers"]})), \
+         patch("app.catalog.store.get_track", AsyncMock(side_effect=lambda i: rows.get(i))), \
+         patch("app.catalog.views._track", AsyncMock(side_effect=lambda row, *a, **k: make_track(tid=row["identity"]))), \
+         patch("app.api.guest._annotate_plex_held", AsyncMock(side_effect=lambda d, *a, **k: d)):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/tag/tracks?tag=cool").json()
+    assert {t["track_id"] for t in body["tracks"]} == {"c1"}   # 'cool covers' track excluded
+
+
+def test_tag_tracks_admin_bypasses_gate_when_hidden(mock_deps):
+    """Covers AE-adjacent U3 scenario: admin drills even when tags are hidden to guests."""
+    rows = {"c1": _tag_row("c1")}
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=False)), \
+         patch("app.api.guest._viewer_is_admin", AsyncMock(return_value=True)), \
+         patch("app.database.get_all_tags", AsyncMock(return_value={"c1": ["cool"]})), \
+         patch("app.catalog.store.get_track", AsyncMock(side_effect=lambda i: rows.get(i))), \
+         patch("app.catalog.views._track", AsyncMock(side_effect=lambda row, *a, **k: make_track(tid=row["identity"]))), \
+         patch("app.api.guest._annotate_plex_held", AsyncMock(side_effect=lambda d, *a, **k: d)):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/tag/tracks?tag=cool").json()
+    assert {t["track_id"] for t in body["tracks"]} == {"c1"}
+
+
+def test_search_hidden_guest_skips_tag_augmentation(mock_deps):
+    """Gate-first (AE2): a hidden guest never reaches the tag resolve step — the
+    augmentation is skipped, not built-then-stripped (store.get_track uncalled)."""
+    store_get = AsyncMock(side_effect=lambda i: _tag_row(i))
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.catalog.views.search", AsyncMock(return_value={"tracks": [], "albums": [], "artists": [], "genres": []})), \
+         patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=False)), \
+         patch("app.api.guest._viewer_is_admin", AsyncMock(return_value=False)), \
+         patch("app.database.get_all_tags", AsyncMock(return_value={"x": ["cool"]})), \
+         patch("app.catalog.store.get_track", store_get), \
+         patch("app.api.guest._annotate_plex_held", AsyncMock(side_effect=lambda d, *a, **k: d)):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/search?q=cool").json()
+    assert body["tags"] == []
+    store_get.assert_not_called()   # tag-matching step skipped for hidden guest
+
+
+# ── Residual coverage from Tier-2 review (2026-08-11) ─────────────────────────
+
+def _row_track(row):
+    """Build a Track that preserves the row's dedup-key fields, so drill dedup and
+    the chip's dedup_count operate on the same metadata (count-consistency test)."""
+    return Track(id=row["identity"], title=row["title"], artist=row["artist"],
+                 album=row["album"], duration_ms=1000, stream_key="/p/x.flac",
+                 server_name="cat")
+
+
+def test_search_chip_count_equals_drill_deduped_count(mock_deps):
+    """Count-authority: the Tags-section chip count equals the drill's post-dedup
+    rendered count, including a same-key collision (two rows collapse to one)."""
+    from app import tag_utils
+    rows = {
+        "c1": _tag_row("c1", title="Teardrop", album="Mezzanine"),
+        "c2": _tag_row("c2", title="Teardrop", album="Mezzanine"),  # collision → collapses
+        "c3": _tag_row("c3", title="Flim", album="Come to Daddy"),
+    }
+    all_tags = {"c1": ["cool"], "c2": ["cool"], "c3": ["cool"]}
+    common = dict(
+        get_tags_visible=AsyncMock(return_value=True),
+        get_all=AsyncMock(return_value=all_tags),
+        store_get=AsyncMock(side_effect=lambda i: rows.get(i)),
+        vtrack=AsyncMock(side_effect=lambda row, *a, **k: _row_track(row)),
+        passthru=AsyncMock(side_effect=lambda d, *a, **k: d),
+    )
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=True)), \
+         patch("app.catalog.views.search", AsyncMock(return_value={"tracks": [], "albums": [], "artists": [], "genres": []})), \
+         patch("app.database.get_tags_visible_to_guests", common["get_tags_visible"]), \
+         patch("app.database.get_all_tags", common["get_all"]), \
+         patch("app.catalog.store.get_track", common["store_get"]), \
+         patch("app.catalog.views._track", common["vtrack"]), \
+         patch("app.api.guest._annotate_plex_held", common["passthru"]):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        search_body = c.get("/api/search?q=cool").json()
+        drill_body = c.get("/api/tag/tracks?tag=cool").json()
+    chip = next(t for t in search_body["tags"] if t["name"] == "cool")
+    drill_deduped = tag_utils.dedup_count(drill_body["tracks"])
+    assert chip["count"] == 2                 # c1/c2 collapse, c3 distinct
+    assert chip["count"] == drill_deduped     # chip count == drill rendered count
+
+
+def test_search_broad_never_returns_tag_only_tracks(mock_deps):
+    """search_broad (Tier-2) has no tag surface: a tag-name query returns no
+    tag-only tracks and no 'tags' key (Plex hub search can't see local tags)."""
+    with patch("app.database.get_all_tags", AsyncMock(return_value={"only-by-tag": ["cool"]})):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/search/broad?q=cool").json()
+    assert "tags" not in body
+    assert "only-by-tag" not in {t.get("track_id") for t in body.get("tracks", [])}
+
+
+def test_tag_tracks_native_passes_exact_stored_id_to_get_track(mock_deps):
+    """Native drill passes the stored (prefixed) id verbatim to the source facade
+    — it does not mangle/remap the id before routing (guards the fan-out)."""
+    _, plex = mock_deps
+    plex.get_track = AsyncMock(side_effect=lambda tid: make_track(tid=tid))
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=False)), \
+         patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=True)), \
+         patch("app.database.get_most_played_display_limit", AsyncMock(return_value=100)), \
+         patch("app.database.get_all_tags", AsyncMock(return_value={"server2:42": ["cool"]})):
+        from app.main import app
+        TestClient(app, raise_server_exceptions=True).get("/api/tag/tracks?tag=cool")
+    plex.get_track.assert_awaited_once_with("server2:42")
+
+
+def test_search_native_serves_tags_no_inline_fold(mock_deps):
+    """Native mode (the two-same-type-Plex case: _catalog_active False) serves the
+    Tags section but never folds tag-only tracks inline."""
+    with patch("app.api.guest._catalog_active", AsyncMock(return_value=False)), \
+         patch("app.database.get_tags_visible_to_guests", AsyncMock(return_value=True)), \
+         patch("app.database.get_all_tags", AsyncMock(return_value={"n1": ["cool"]})):
+        from app.main import app
+        body = TestClient(app, raise_server_exceptions=True).get("/api/search?q=cool").json()
+    assert [s["name"] for s in body["tags"]] == ["cool"]
+    assert "n1" not in {t["track_id"] for t in body["tracks"]}  # no inline fold in native
