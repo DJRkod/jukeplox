@@ -447,9 +447,10 @@ def test_connect_subsonic_probe_error_and_lookup_failure_refuses(client, mock_st
         es.enter_context(patch("app.api.admin.database.get_jellyfin_sources", AsyncMock(return_value=[])))
         es.enter_context(patch("app.api.admin.database.get_emby_sources", AsyncMock(return_value=[])))
         es.enter_context(patch("app.api.admin._validate_source_url", AsyncMock()))
-        # First get_subsonic_sources call (dup-check) ok; second (prior-mode) raises.
+        # The shared prior-mode read raises; the dup-check's own fallback read
+        # then returns [] — prior_lookup_ok is False, so a probe failure refuses.
         es.enter_context(patch("app.api.admin.database.get_subsonic_sources",
-                               AsyncMock(side_effect=[[], RuntimeError("db down")])))
+                               AsyncMock(side_effect=[RuntimeError("db down"), []])))
         es.enter_context(patch("app.sources.subsonic.SubsonicSource._probe_extensions_unauth",
                                AsyncMock(side_effect=httpx.ConnectError("probe boom"))))
         es.enter_context(patch("app.api.admin.database.save_subsonic_source", save))

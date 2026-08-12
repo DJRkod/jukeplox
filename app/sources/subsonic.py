@@ -81,6 +81,13 @@ _API_KEY_EXTENSION = "apikeyauthentication"
 # auth params at request time.
 _VALID_AUTH_MODES = ("apikey", "token")
 
+
+def _check_auth_mode(mode: str) -> None:
+    """Raise ``ValueError`` on an unrecognized auth mode (construction/reconfigure)."""
+    if mode not in _VALID_AUTH_MODES:
+        raise ValueError(
+            f"invalid auth_mode {mode!r}; expected one of {_VALID_AUTH_MODES}")
+
 # Safety bounds on getAlbumList2 pagination so a server that never returns a short
 # final page can't loop forever. 500-album pages × 400 pages = 200k albums, well
 # past any real library; the total cap is a second belt.
@@ -188,8 +195,7 @@ class SubsonicSource(MusicSource):
         # IS the api key; in token mode the caller passes the password here and
         # sets auth_mode="token" (or calls set_auth).
         self._secret = api_key
-        if auth_mode not in _VALID_AUTH_MODES:
-            raise ValueError(f"invalid auth_mode {auth_mode!r}; expected one of {_VALID_AUTH_MODES}")
+        _check_auth_mode(auth_mode)
         self._auth_mode = auth_mode
         self.username = username
         self._source_id = source_id or "subsonic"
@@ -274,8 +280,7 @@ class SubsonicSource(MusicSource):
         into the detected mode via set_auth — avoiding a second SubsonicSource
         (each __init__ opens its own httpx client, which would leak past the
         route's single ``finally: aclose()``)."""
-        if auth_mode not in _VALID_AUTH_MODES:
-            raise ValueError(f"invalid auth_mode {auth_mode!r}; expected one of {_VALID_AUTH_MODES}")
+        _check_auth_mode(auth_mode)
         self._auth_mode = auth_mode
         if secret is not None:
             self._secret = secret

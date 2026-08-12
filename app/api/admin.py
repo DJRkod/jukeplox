@@ -344,14 +344,19 @@ def _normalize_source_url(url: str) -> str:
         return raw.rstrip("/").lower()
 
 
-async def _reject_duplicate_source(server_url: str, *, allow_source_id: str | None = None) -> None:
+async def _reject_duplicate_source(
+    server_url: str, *, allow_source_id: str | None = None,
+    subsonic_rows: list[dict] | None = None,
+) -> None:
     """Raise a ``duplicate`` source error if a DIFFERENT configured source already
     lives at the same normalized URL (U4/R10). Reads the credential-free stored
     server_url of every non-local source type. ``allow_source_id`` exempts one
     Subsonic source so an admin can RE-connect it (rotate a key/password, flip the
-    auth mode) — a same-source reconnect is an upsert, not a duplicate. Best-effort
-    read: a store hiccup does not block a connect (worst case an admin sees two
-    rows for one server)."""
+    auth mode) — a same-source reconnect is an upsert, not a duplicate.
+    ``subsonic_rows`` lets the caller pass an already-fetched Subsonic source list
+    (get_subsonic_sources decrypts every sealed token, so the connect route reads
+    it once and shares it); ``None`` means read it here. Best-effort read: a store
+    hiccup does not block a connect (worst case an admin sees two rows)."""
     target = _normalize_source_url(server_url)
     try:
         existing: list[str] = []
@@ -359,7 +364,8 @@ async def _reject_duplicate_source(server_url: str, *, allow_source_id: str | No
             existing.append(s.get("server_url") or "")
         for j in await database.get_jellyfin_sources():
             existing.append(j.get("server_url") or "")
-        for sub in await database.get_subsonic_sources():
+        subs = subsonic_rows if subsonic_rows is not None else await database.get_subsonic_sources()
+        for sub in subs:
             if allow_source_id and sub.get("source_id") == allow_source_id:
                 continue  # the same source re-connecting — not a duplicate
             existing.append(sub.get("server_url") or "")
@@ -584,28 +590,31 @@ async def connect_subsonic(body: SubsonicConnectRequest):
     import hashlib
     source_id = "subsonic-" + hashlib.sha1(
         _normalize_source_url(server_url).encode("utf-8")).hexdigest()[:12]
-    # Allow RE-connecting this same source (rotate a key/password, flip auth mode)
-    # — only a DIFFERENT source at the same URL is a duplicate.
-    await _reject_duplicate_source(body.server_url, allow_source_id=source_id)
-    # Validate before allocating a SubsonicSource (which opens an httpx client) —
-    # a rejection must not leave a client unclosed / waste an alloc.
-    await _validate_source_url(body.server_url)  # reject loopback/link-local/private-per-flag pre-probe
-
-    # Prior auth mode for THIS source (reconnect). An apiKey source must never be
-    # silently downgraded to password storage by a single failed capability probe.
-    # ``prior_lookup_ok`` tracks whether the read itself succeeded: if it failed
-    # AND the probe later fails, we cannot rule out an existing apiKey source, so
-    # we refuse rather than blindly fall back to token (fail-safe).
+    # One read of the stored Subsonic sources, shared by the duplicate check and
+    # the prior-mode lookup below (get_subsonic_sources decrypts every sealed
+    # token, so read it once). ``prior_lookup_ok`` tracks whether the read
+    # succeeded: if it failed AND the probe later fails, we cannot rule out an
+    # existing apiKey source, so we refuse rather than blindly fall back to token
+    # (fail-safe). An apiKey source must never be silently downgraded.
     prior_mode: str | None = None
     prior_lookup_ok = True
+    subsonic_rows: list[dict] | None = None
     try:
-        for s in await database.get_subsonic_sources():
-            if s.get("source_id") == source_id:
-                prior_mode = s.get("auth_mode")
-                break
+        subsonic_rows = await database.get_subsonic_sources()
+        prior_mode = next(
+            (s.get("auth_mode") for s in subsonic_rows if s.get("source_id") == source_id),
+            None)
     except Exception:
         prior_lookup_ok = False
         _log.warning("subsonic connect: prior-source lookup failed", exc_info=True)
+
+    # Allow RE-connecting this same source (rotate a key/password, flip auth mode)
+    # — only a DIFFERENT source at the same URL is a duplicate.
+    await _reject_duplicate_source(
+        body.server_url, allow_source_id=source_id, subsonic_rows=subsonic_rows)
+    # Validate before allocating a SubsonicSource (which opens an httpx client) —
+    # a rejection must not leave a client unclosed / waste an alloc.
+    await _validate_source_url(body.server_url)  # reject loopback/link-local/private-per-flag pre-probe
 
     source = SubsonicSource(
         server_url=server_url, api_key=body.secret, username=body.username,
