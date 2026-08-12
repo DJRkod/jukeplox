@@ -11,7 +11,7 @@ by the LLM rather than merged as-is, and there's no guarantee of review or respo
 you want to change something, the most reliable path is to open an issue describing the
 problem or idea.
 
-**Fork freely.** Jukeplox is [GPL-2.0](LICENSE) — you're welcome to fork and adapt it for
-your own use under those terms.
+**Fork freely.** Jukeplox is [GPL-2.0-or-later](LICENSE) — you're welcome to fork and adapt
+it for your own use under those terms.
 
 Found a security issue? Please don't open a public issue — see [SECURITY.md](SECURITY.md).

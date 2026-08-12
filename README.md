@@ -262,6 +262,9 @@ the `git_sha` (the `image_tag` may show an internal release-train name; that's e
 
 ## License
 
-Jukeplox is licensed under **GPL-2.0** — see [`LICENSE`](LICENSE). It bundles third-party
-AirPlay binaries and builds on system libraries (ffmpeg, GStreamer) and Python packages,
-documented in [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).
+Jukeplox is licensed under **GPL-2.0-or-later** — see [`LICENSE`](LICENSE). Specifically,
+you may redistribute and/or modify it under the terms of the GNU General Public License as
+published by the Free Software Foundation, either version 2 of the License, or (at your
+option) any later version. It bundles third-party AirPlay binaries and builds on system
+libraries (ffmpeg, GStreamer) and Python packages, documented in
+[`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).

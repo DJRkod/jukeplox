@@ -37,8 +37,8 @@ Music Assistant builds these binaries from two C codebases derived from OwnTone:
 
 Jukeplox interacts with both only via subprocess invocation (no library linkage),
 which is "mere aggregation" per the FSF GPL FAQ and does not place Jukeplox's own
-code under additional obligations. Jukeplox itself is GPL-2.0 (top-level `LICENSE`),
-which is also the GPL-2.0 text required to accompany these binaries. See
+code under additional obligations. Jukeplox itself is GPL-2.0-or-later; its top-level
+`LICENSE` contains the GPL-2.0 text required to accompany these binaries. See
 `THIRD_PARTY_LICENSES` for the full attribution with the pinned source commit.
 
 ## Rebuilding
