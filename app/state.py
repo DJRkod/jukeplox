@@ -80,6 +80,107 @@ from app.lyrics.prefetch import schedule_prefetch
 queue_engine = QueueEngine()
 output_router = OutputRouter()
 
+# Radio Mode session (radio plan U3) — the non-destructive takeover of the shared
+# output for internet-radio playback. Exposed as a module-level singleton
+# mirroring queue_engine/output_router. Its `active` flag backs radio_active()
+# below, which gates _should_auto_start()/_do_advance() exactly like the outage
+# hold does — so a station takeover keeps the (held) track queue inert without
+# arming the outage reconnect machinery.
+from app.radio.session import RadioSession  # noqa: E402  (after the singletons)
+
+radio_session = RadioSession()
+
+
+def radio_active() -> bool:
+    """True while a radio station has taken over the shared output (the track
+    queue is held for its lifetime). Mirrors ``output_hold_active()``: consulted
+    by ``_should_auto_start()`` and ``_do_advance()`` so the held queue consumes
+    ZERO items while a station plays, and lifted the moment radio stops (FE-1).
+    A no-op (always False) when radio has never been activated."""
+    return radio_session.is_active()
+
+
+# ── RadioStateEvent broadcast wiring (radio plan U7) ──────────────────────────
+# The session is the single source of state/title truth; U7 broadcasts a
+# RadioStateEvent {station, status, live_title} via broadcast_to_all on EVERY
+# transition AND on each title change (identical for guest+admin, SG-05). The
+# event data is read from the session snapshot (app.api.radio.radio_snapshot).
+#
+# Thread-marshaling (SG-04): the Direct free-title hook fires on a GLib bus
+# thread, and a backend failed-hook can fire from a device/watcher thread — so
+# the broadcast is always marshaled onto THIS captured event loop via
+# run_coroutine_threadsafe (a plain create_task would fail off-loop). The loop is
+# captured in setup(); a listener that fires before setup (shouldn't happen in
+# the app) is dropped with a debug log rather than raising.
+_radio_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def _do_broadcast_radio_state() -> None:
+    """Broadcast the current RadioStateEvent to everyone (guest + admin, SG-05)."""
+    from app.api.radio import radio_snapshot
+    from app.events.bus import manager
+    from app.events.types import RadioStateEvent
+    snap = radio_snapshot()
+    ev = RadioStateEvent(
+        active=snap["active"],
+        station=snap["station"],
+        status=snap["status"],
+        live_title=snap["live_title"],
+    )
+    try:
+        await manager.broadcast_to_all(ev)
+    except Exception:
+        _log.warning("radio: RadioStateEvent broadcast failed", exc_info=True)
+
+
+def _broadcast_radio_state() -> None:
+    """Fire-and-forget RadioStateEvent broadcast, marshaled onto the app loop.
+
+    Safe to call from any thread (Direct GLib bus, device/watcher threads) — it
+    schedules the coroutine on the captured loop via run_coroutine_threadsafe.
+    Called on session state transitions and title changes (the U7 listeners)."""
+    loop = _radio_loop
+    if loop is None:
+        _log.debug("radio: broadcast requested before loop captured (dropped)")
+        return
+    if loop.is_closed():
+        # F9: GLib/device-watcher threads can fire hooks after the loop is torn
+        # down — run_coroutine_threadsafe on a closed loop raises. Drop quietly.
+        _log.debug("radio: broadcast requested after loop closed (dropped)")
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_do_broadcast_radio_state(), loop)
+    except Exception:
+        _log.debug("radio: scheduling RadioStateEvent broadcast failed",
+                   exc_info=True)
+
+
+def _on_radio_failed() -> None:
+    """A backend reconnect-cap / proxy consumer-gone exhaustion fired (R12).
+
+    Flip the session to the ``failed`` (offline) status and broadcast (F3).
+    ``mark_failed()`` returns True when it actually transitioned — in that case it
+    already notified the state listeners (which broadcast), so we must NOT
+    broadcast again (no double-broadcast on the normal edge). When it returns
+    False (already ``failed`` — e.g. a proxy consumer-gone firing after the
+    backend already capped out), we direct-broadcast so the offline edge still
+    reaches clients. Idempotent + no double-broadcast."""
+    transitioned = radio_session.mark_failed()
+    if not transitioned:
+        _broadcast_radio_state()
+
+
+def _register_radio_listeners() -> None:
+    """Subscribe the U7 broadcast to the session's transition + title changes.
+
+    Idempotent (add_*_listener dedups) so a re-setup() in tests doesn't stack
+    listeners. Both a state transition and a title change emit a RadioStateEvent
+    (DL-007 — the event carries the live_title)."""
+    radio_session.add_state_listener(_broadcast_radio_state)
+    # A title change is a lighter event, but the simplest correct thing (per the
+    # plan) is to re-broadcast the full RadioStateEvent with the new live_title.
+    radio_session.add_title_listener(lambda _title: _broadcast_radio_state())
+
 # One instance per protocol — advance_cb wired in setup()
 direct_backend: DirectAudioBackend | None = None
 chromecast_backend: ChromecastBackend | None = None
@@ -1752,15 +1853,17 @@ async def clear_closing_and_continue() -> None:
 def _should_auto_start() -> bool:
     """Whether a queue_changed should kick off playback: something is queued,
     nothing is playing, no advance already pending, NOT frozen for Closing
-    Time, and NOT held by a device-level outage (supervisor plan U2) — the
-    hold re-front-inserts the interrupted item, and auto-start would
-    immediately re-dispatch it to the dead device."""
+    Time, NOT held by a device-level outage (supervisor plan U2), and NOT held
+    by a radio takeover (radio plan U3) — the outage/radio hold re-front-inserts
+    the interrupted item, and auto-start would otherwise immediately re-dispatch
+    it (to the dead device, or to the output radio just took over — FE-1)."""
     from app.output import session as output_session
     return (not queue_engine.state.is_playing
             and bool(queue_engine.queue)
             and not _auto_advance_pending
             and not _closing_active
-            and not output_session.output_hold_active())
+            and not output_session.output_hold_active()
+            and not radio_active())
 
 
 async def _do_advance() -> None:
@@ -1769,6 +1872,8 @@ async def _do_advance() -> None:
     from app.output import session as output_session
     if output_session.output_hold_active():
         return  # outage hold: the queue is frozen until resume (plan U2, R15)
+    if radio_active():
+        return  # radio took over the output: the held queue is inert until stop (radio U3, FE-1)
     captured_gen = _advance_gen
     if _advance_lock.locked():
         return  # skip is in progress; let it own the advance
@@ -2002,6 +2107,57 @@ async def _play_with_fallback(item, client) -> bool:
                     f"{item.track.title!r}"
                 )
     return False
+
+
+async def _resume_radio_hold() -> None:
+    """Resume the track queue after a radio station stops (radio plan U3, FE-2).
+
+    No existing seam resumes a bare-``hold_current`` paused queue: ``_do_advance``
+    early-returns under a hold and is EOS-driven, and ``session.manual_resume``
+    is gated by the outage flag radio deliberately never sets. So this is the
+    explicit radio-resume dispatch: pop the held front into ``current`` via
+    ``queue_engine.advance()`` (it retires nothing — ``current`` is None while
+    held, so ``advance`` just promotes the front) and play it from 0:00 through
+    ``_play_with_fallback`` (ADV-2).
+
+    ``_play_with_fallback`` honors the held item's ``play_recorded`` mark (no
+    double-count on resume — R8) and, if the held source died during a long
+    station session, degrades to skip (try the next item) or an outage hold
+    (``DeviceNotReadyError`` → ``enter_output_hold``) rather than raising. Called
+    only by ``RadioSession.stop()`` AFTER it has cleared ``radio_active`` — the
+    gate must be down or ``_play_with_fallback``'s own effects would be inert.
+
+    No-op on an empty queue (an empty-queue takeover held nothing) and, like
+    ``_do_advance``, runs under ``_advance_lock`` so it can't race a real EOS
+    advance.
+    """
+    from app.output.base import DeviceNotReadyError
+    from app.output import session as output_session
+    async with _advance_lock:
+        for _ in range(_MAX_CONSECUTIVE_FAILURES):
+            if output_session.output_hold_active():
+                return  # a hold landed while consuming failures (mirror _do_advance)
+            next_item = await queue_engine.advance()
+            if not next_item:
+                return  # empty queue — nothing was held; return to idle cleanly
+            client = await get_plex_client()
+            if not client:
+                return
+            try:
+                if await _play_with_fallback(next_item, client):
+                    return
+            except DeviceNotReadyError as exc:
+                _log.warning(
+                    "_resume_radio_hold: device-level failure (%s: %s) — outage hold",
+                    type(exc).__name__, exc,
+                )
+                await output_session.enter_output_hold("dispatch_failed")
+                return
+            _log.warning("Radio resume: all holders failed for %r; skipping",
+                         next_item.track.title)
+            await _emit_track_skipped(next_item.track)
+        _log.error("_resume_radio_hold: gave up after %d consecutive failures",
+                   _MAX_CONSECUTIVE_FAILURES)
 
 
 async def _trigger_auto_advance() -> None:
@@ -2675,6 +2831,46 @@ async def setup() -> None:
         pms_factory=_plexplayer_pms_factory,
         is_current=_plexplayer_is_current,
     )
+
+    # ── Radio Mode wiring (radio plan U7) ─────────────────────────────────────
+    # Capture the app event loop for the thread-marshaled RadioStateEvent
+    # broadcast (the Direct title hook fires on a GLib thread; a backend
+    # failed-hook can fire off-loop). Then subscribe the U7 broadcast to the
+    # session's transition + title changes, wire each backend's failed-hook to
+    # the "station offline" path (R12/U4), and feed the Direct FREE bus-tag title
+    # into the session (U6). The Cast/DLNA/AirPlay periodic ICY read is owned by
+    # the session itself (U6); those backends only need the failed hook here.
+    global _radio_loop
+    _radio_loop = asyncio.get_running_loop()
+    _register_radio_listeners()
+    for _b in (direct_backend, chromecast_backend, dlna_backend, airplay_backend):
+        if _b is None:
+            continue
+        if hasattr(_b, "set_radio_failed_hook"):
+            _b.set_radio_failed_hook(_on_radio_failed)
+        else:
+            # F15: a backend that forgot the radio failed-hook can never surface a
+            # "station offline" state — catch it loudly rather than silently.
+            _log.warning("radio: backend %s lacks set_radio_failed_hook — its "
+                         "station-offline path is dead", type(_b).__name__)
+    # Direct's live title is FREE (GStreamer bus tag) — feed it straight into the
+    # session, which re-sanitizes + notifies the title listeners (→ RadioStateEvent).
+    if direct_backend is not None and hasattr(direct_backend, "set_radio_title_hook"):
+        direct_backend.set_radio_title_hook(radio_session.set_title)
+    # U5 proxy consumer-gone exhaustion (Cast/DLNA) also means "station offline".
+    # F3: register _on_radio_failed as the DEFAULT consumer-gone callback so EVERY
+    # per-station transcode-proxy session minted by radio_proxy_url gets it — the
+    # old one-shot attach against current_radio_stream() (None at boot) never
+    # covered the per-station sessions, so the grace-expiry offline path was dead.
+    try:
+        from app.radio import stream as _radio_stream
+        _radio_stream.set_default_consumer_gone_callback(_on_radio_failed)
+        # Also cover any session that happens to already exist at setup time.
+        _rs = _radio_stream.current_radio_stream()
+        if _rs is not None:
+            _rs.add_consumer_gone_listener(_on_radio_failed)
+    except Exception:
+        _log.debug("radio: could not wire consumer-gone default", exc_info=True)
 
     # Create ONE shared AsyncZeroconf — the single in-process mDNS stack for
     # ALL passive discovery (2026-06-15 plan U5). Chromecast's CastBrowser and

@@ -14,6 +14,14 @@ import threading
 from typing import Any
 
 from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
+from app.output.radio_endless import (
+    RadioFailedHook,
+    RadioTitleHook,
+    ReconnectPolicy,
+    fire_radio_failed_hook,
+    is_radio_track,
+)
+from app.radio.icy import sanitize_title
 from app.models import Track
 
 _log = logging.getLogger(__name__)
@@ -108,6 +116,35 @@ class DirectAudioBackend:
         # torn-down/preempted pipeline must never double-advance past the
         # skip's new dispatch.
         self._play_gen: int = 0
+        # ── radio endless mode (radio plan U4) ─────────────────────────────
+        # Set True in play() when the metadata is a radio pseudo-Track
+        # (is_radio_track / duration_ms=0 + sentinel; SG-03 — no play()
+        # signature change). While True, BOTH bus advance authorities are
+        # suppressed: _on_eos and _on_error (ADV-1) reconnect the live URL via
+        # playbin instead of firing advance_cb. Cleared on every finite play().
+        self._radio_mode: bool = False
+        self._radio_url: str = ""
+        # Bounded, sustained-progress-aware reconnect policy (R12/ADV-5).
+        self._radio_reconnect = ReconnectPolicy()
+        # U7 wires this to a RadioStateEvent "offline" — called (no args) once
+        # the reconnect cap is exhausted so a dead station never reads as
+        # indefinite silence. None until wired.
+        self._radio_failed_hook: RadioFailedHook | None = None
+        # ── radio live title (radio plan U6, FREE on Direct) ───────────────
+        # GStreamer's playbin/souphttpsrc parse ICY in-band metadata for free
+        # and post GST_MESSAGE_TAG on the bus carrying GST_TAG_TITLE — repeatedly
+        # (once at start, then on each new StreamTitle). In radio mode we read
+        # that tag (newest-wins) and hand it to the session via a callback so the
+        # title flows to U7's RadioStateEvent broadcast. No manual ICY parsing on
+        # Direct. Cleared on every new station / stop (a stale title must never
+        # outlive its station). The title is UNTRUSTED (SEC-004): it is sanitized
+        # in the callback before any sink; the WS sink carries it as a plain JSON
+        # string the client renders via textContent (U7 contract).
+        self._radio_title: str | None = None
+        # Called (sanitized title | None) whenever a new StreamTitle arrives on
+        # the bus in radio mode. None until U7/session wires it via
+        # set_radio_title_hook. Best-effort — a raising hook never breaks the bus.
+        self._radio_title_hook: RadioTitleHook | None = None
 
     # ── device enumeration ────────────────────────────────────────────────────
 
@@ -137,8 +174,39 @@ class DirectAudioBackend:
 
     # ── playback ──────────────────────────────────────────────────────────────
 
+    def set_radio_failed_hook(self, hook: RadioFailedHook | None) -> None:
+        """Register (or clear) the endless-mode failed/offline callback (U4).
+
+        Called with no arguments after the reconnect cap is exhausted — U7 wires
+        it to a ``RadioStateEvent`` so a dead station surfaces as "offline"
+        rather than indefinite silence (R12)."""
+        self._radio_failed_hook = hook
+
+    def set_radio_title_hook(self, hook: RadioTitleHook | None) -> None:
+        """Register (or clear) the endless-mode live-title callback (U6).
+
+        Called with the newest SANITIZED live title (or ``None``) whenever a new
+        ``StreamTitle`` arrives on the GStreamer bus in radio mode — U7 wires it
+        to a ``RadioStateEvent`` so the "now playing" line follows the station's
+        live title. FREE on Direct: GStreamer parses ICY metadata itself."""
+        self._radio_title_hook = hook
+
     async def play(self, stream_url: str, metadata: Track) -> None:
         self._loop = asyncio.get_running_loop()
+        # Radio endless mode (U4, SG-03): carried on the pseudo-Track, not a
+        # play() signature change. Set BEFORE the executor spawns the pipeline
+        # so the bus handlers (which can fire before run_in_executor returns)
+        # already see the mode. A finite track clears it — the radio branch is
+        # strictly additive and gated on this flag.
+        self._radio_mode = is_radio_track(metadata)
+        self._radio_url = stream_url if self._radio_mode else ""
+        if self._radio_mode:
+            self._radio_reconnect.begin()
+            # Clear any prior station's live title (U6): a stale title must never
+            # outlive its station. The bus will re-post the new station's title.
+            # A reconnect of the SAME station also calls play() and clears here —
+            # correct, the fresh pipeline re-emits the current title tag.
+            self._set_radio_title(None)
         # Capture the supervisor's per-dispatch token BEFORE the executor
         # spawns the pipeline: the bus can report PLAYING before
         # run_in_executor returns (plan U1).
@@ -220,6 +288,11 @@ class DirectAudioBackend:
         bus.add_signal_watch()
         bus.connect("message::eos", self._on_eos)
         bus.connect("message::error", self._on_error)
+        # Radio live title (U6): playbin/souphttpsrc parse ICY in-band metadata
+        # for free and post GST_MESSAGE_TAG carrying GST_TAG_TITLE. Connected
+        # unconditionally (cheap); the handler no-ops outside radio mode so finite
+        # playback is byte-identical.
+        bus.connect("message::tag", self._on_tag)
         # Confirmed-start signals (2026-07-11 supervisor plan U1). The
         # pre-existing watch handled eos/error only — playback *start* had no
         # data-plane signal at all.
@@ -239,6 +312,14 @@ class DirectAudioBackend:
         pipeline.set_state(Gst.State.PLAYING)
 
     def _on_eos(self, bus, message) -> None:
+        if self._radio_mode:
+            # Endless mode (U4/AE4): a radio stream must never advance. A clean
+            # EOS on a live stream means the upstream closed — reconnect the
+            # same URL, never fire advance_cb. (souphttpsrc usually surfaces a
+            # drop as an ERROR, not EOS, but a graceful close lands here.)
+            _log.info("Radio: bus EOS on endless stream — reconnecting")
+            self._radio_reconnect_on_loop()
+            return
         if self._pending_boundary is not None:
             # Advance-authority table (plan U7, R16): with an armed next
             # consumed at about-to-finish, STREAM_START is the SOLE advance
@@ -277,6 +358,19 @@ class DirectAudioBackend:
         # subsequent EOS. The error paths below own what happens next (plan
         # U7 — the two-class split is UNCHANGED in gapless mode).
         self._pending_boundary = None
+        if self._radio_mode and not self._is_sink_resource_error(message, err):
+            # Endless mode (U4/ADV-1): a live radio drop surfaces HERE as a
+            # souphttpsrc RESOURCE/source ERROR, not a clean EOS — and _on_error
+            # would normally ADVANCE the (held) queue on the golden-path backend
+            # (the party-stall posture). Radio suppresses that: reconnect the
+            # same URL instead. A genuine local audio-sink RESOURCE failure
+            # (device died) still falls through to the outage path below — a
+            # dead sink is a device failure even for radio, and reconnecting the
+            # source would not fix it.
+            _log.warning("Radio: source ERROR on endless stream (%s) — "
+                         "reconnecting, not advancing", err)
+            self._radio_reconnect_on_loop()
+            return
         if self._is_sink_resource_error(message, err):
             # Device-level: the local audio sink failed (R16 — report, never
             # advance). Same GLib-thread → loop hop as the EOS path.
@@ -291,6 +385,50 @@ class DirectAudioBackend:
         # advance-on-ERROR party-stall posture, preserved by R15.
         if self._advance_cb and self._loop:
             asyncio.run_coroutine_threadsafe(self._advance_cb(), self._loop)
+
+    # ── radio live title from the bus (radio plan U6) ─────────────────────────
+
+    def _on_tag(self, bus, message) -> None:
+        """GStreamer bus TAG handler — reads the live ICY ``StreamTitle`` for free.
+
+        Only acts in radio mode: playbin surfaces the station's in-band title as
+        ``GST_TAG_TITLE`` on a ``GST_MESSAGE_TAG`` (posted once at start, then on
+        each new StreamTitle). We read it newest-wins, sanitize it (SEC-004 —
+        untrusted third-party text), and, when it actually changed, hand it to the
+        session hook so it flows to U7's broadcast. Fires on a GLib bus thread;
+        the hook must be thread-tolerant (U7 marshals to the loop). Never raises
+        into the bus. Outside radio mode this is a no-op — finite tracks carry
+        their own title and never drive the radio title line."""
+        if not self._radio_mode:
+            return
+        try:
+            taglist = message.parse_tag()
+            ok, raw = taglist.get_string(Gst.TAG_TITLE)
+        except Exception:
+            return
+        if not ok or not raw:
+            return
+        title = sanitize_title(raw)
+        if title is None or title == self._radio_title:
+            return  # empty/blank, or unchanged — no spurious re-broadcast
+        self._set_radio_title(title)
+
+    def _set_radio_title(self, title: str | None) -> None:
+        """Store the current radio title (newest-wins) and notify the U6 hook.
+
+        Idempotent for an unchanged value (a None-clear on an already-None title
+        does not re-notify). The stored value is already sanitized. The hook is
+        best-effort — a raising hook is swallowed so the bus thread never dies."""
+        if title == self._radio_title:
+            return
+        self._radio_title = title
+        hook = self._radio_title_hook
+        if hook is None:
+            return
+        try:
+            hook(title)
+        except Exception:  # pragma: no cover - hook is best-effort
+            _log.debug("Radio: title hook raised (ignored)", exc_info=True)
 
     def _on_state_changed(self, bus, message) -> None:
         """Confirmed-start (plan U1): the playbin itself reaching PLAYING means
@@ -324,6 +462,55 @@ class DirectAudioBackend:
         self._confirm_token = None
         from app.output import session
         session.notify_confirmed_threadsafe(self._loop, token)
+
+    # ── radio endless-mode reconnect (radio plan U4) ──────────────────────────
+
+    def _radio_reconnect_on_loop(self) -> None:
+        """Marshal a radio reconnect from the GLib bus thread to the asyncio
+        loop (same hop as the EOS advance). No-op without a loop."""
+        self._is_playing = False
+        if self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._radio_reconnect_run(), self._loop)
+
+    async def _radio_reconnect_run(self) -> None:
+        """Re-open the live station URL via a fresh playbin (R12/ADV-5).
+
+        Bounded + sustained-progress-aware: only a connection that actually
+        played for a while resets the attempt budget, so a station dribbling a
+        few bytes per attempt still trips the cap. On exhaustion, surface the
+        failed/offline state (U7 hook) instead of retrying forever.
+
+        F5: an ITERATIVE loop, NO self-recursion (a per-attempt recursion grew
+        the call stack unboundedly on a station that failed every attempt). The
+        failed hook fires exactly once, when the cap is hit."""
+        while True:
+            if not self._radio_mode:
+                return  # a stop / finite dispatch raced us — nothing to reconnect
+            if not self._radio_reconnect.should_reconnect():
+                _log.warning("Radio: reconnect cap reached — station offline")
+                self._radio_notify_failed()
+                return
+            await asyncio.sleep(self._radio_reconnect.backoff_s())
+            if not self._radio_mode:
+                return  # stopped while we backed off
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, self._sync_play, self._radio_url)
+                # The re-PLAY drove the pipeline; mark the fresh connection so its
+                # lifetime is measured against the next drop (sustained-progress).
+                self._radio_reconnect.mark_connected()
+                _log.info("Radio: reconnected to endless stream (attempt %d)",
+                          self._radio_reconnect.attempts)
+                return
+            except Exception:
+                # A failed re-open is itself a drop; loop to consume the next
+                # attempt (bounded by the policy) or surface offline at the top.
+                _log.warning("Radio: reconnect attempt failed — retrying",
+                             exc_info=True)
+
+    def _radio_notify_failed(self) -> None:
+        # F13: shared hook-fire + swallow.
+        fire_radio_failed_hook(self._radio_failed_hook, _log, "Direct")
 
     # ── gapless: arm/consume/boundary (2026-07-11 plan U7) ────────────────────
 
@@ -451,11 +638,19 @@ class DirectAudioBackend:
         self._play_gen += 1
         self._armed_next = None
         self._pending_boundary = None
-        if self._pipeline:
-            bus = self._pipeline.get_bus()
+        # Claim the pipeline into a local and null the field FIRST, so two
+        # concurrent teardowns can't both pass the None-check and then race on
+        # a half-torn-down pipeline. Radio's error->reconnect->teardown cycle
+        # fires teardown from the GLib bus thread AND the asyncio reconnect loop
+        # concurrently; without the claim, one thread nulls self._pipeline
+        # between the other's check and its set_state() call (AttributeError:
+        # 'NoneType' has no attribute 'set_state' — rig-caught on a radio drop).
+        pipe = self._pipeline
+        self._pipeline = None
+        if pipe is not None:
+            bus = pipe.get_bus()
             bus.remove_signal_watch()
-            self._pipeline.set_state(Gst.State.NULL)
-            self._pipeline = None
+            pipe.set_state(Gst.State.NULL)
         self._is_playing = False
 
     async def pause(self) -> None:
@@ -469,6 +664,14 @@ class DirectAudioBackend:
             self._is_playing = True
 
     async def stop(self) -> None:
+        # End radio endless mode here (not in _teardown_pipeline, which
+        # _sync_play also calls mid-reconnect): stop() is the real "station is
+        # over" edge, so a reconnect scheduled just before it must not re-open a
+        # stopped station.
+        self._radio_mode = False
+        self._radio_url = ""
+        # Clear the live title (U6) so a stopped station's title can't linger.
+        self._set_radio_title(None)
         await asyncio.get_running_loop().run_in_executor(None, self._teardown_pipeline)
 
     async def set_volume(self, level: float) -> None:

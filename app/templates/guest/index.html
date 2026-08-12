@@ -385,6 +385,7 @@
   <div class="tab" data-view="mostplayed-view">Most Played</div>
   <div class="tab" data-view="recentlyadded-view">Recently Added</div>
   <div class="tab" data-view="highestrated-view">Highest Rated</div>
+  <div class="tab" data-view="radio-view"><span class="rd-tab-dot"></span>Radio</div>
 </div>
 
 <div id="content-frame">
@@ -452,6 +453,12 @@
     <!-- Highest Rated (2026-06-26 ratings-and-tags plan U7) -->
     <div id="highestrated-view" class="view">
       <div id="highestrated-list"><div class="loading">Loading…</div></div>
+    </div>
+
+    <!-- Radio (2026-08-11 radio-mode plan U9). Station browse renders inside the
+         shared browse module (mountBrowser); this is just the mount point. -->
+    <div id="radio-view" class="view">
+      <div id="radio-list"><div class="loading">Loading…</div></div>
     </div>
   </div>
 </div>

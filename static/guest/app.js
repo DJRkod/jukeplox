@@ -250,7 +250,7 @@ function setLocked(locked) {
 
 // ── Tabs ──────────────────────────────────────────────────────────────────
 
-const BROWSE_VIEWS = new Set(['search-view', 'artists-view', 'albums-view', 'genres-view', 'years-view', 'mostplayed-view', 'recentlyadded-view']);
+const BROWSE_VIEWS = new Set(['search-view', 'artists-view', 'albums-view', 'genres-view', 'years-view', 'mostplayed-view', 'recentlyadded-view', 'radio-view']);
 
 // Shared-module handles, declared up-front (not at their mount site below) so
 // switchTab — which reads browseHandle — is safe to call at load time. The mobile
@@ -329,6 +329,15 @@ const playbackHandle = mountPlayback({
   },
   onPlayState: (playing) =>
     document.getElementById('now-dot').classList.toggle('on', playing),
+  // Radio Mode now-playing (2026-08-11 plan U10): guest STOP is ALWAYS allowed
+  // (R9) — POST /api/radio/stop, which resumes the held queue; the WS radio_state
+  // broadcast repaints the widget. "Browse stations" routes to the Radio tab (a
+  // read-only browse action always allowed); start/switch there is server-gated.
+  // authMode:'guest' → the module dims the control-adjacent affordance when
+  // guest_radio_control is off (cosmetic; the server enforces).
+  authMode: 'guest',
+  onRadioStop: () => api('POST', '/api/radio/stop'),
+  onRadioBrowse: () => switchTab('radio-view'),
   // Idle "add music" nudge (2026-06-17 plan 006 U2): when the mobile Now tab is
   // idle (nothing playing, empty queue) the shared module shows a nudge that
   // routes here → the Search tab. Top-level config (like onNameTap/onPlayState)
@@ -383,6 +392,17 @@ function connectWS() {
     const msg = JSON.parse(e.data);
     if (msg.type === 'now_playing_changed') playbackHandle.applyNowPlaying(msg);
     else if (msg.type === 'playback_state_changed') playbackHandle.applyPlaybackState(msg);
+    else if (msg.type === 'radio_state') {
+      // Radio Mode (2026-08-11 plan U9): repaint the Radio-tab active-dot +
+      // station-card indicators live. Null-guard mirrors the browse embers —
+      // a broadcast can race first paint before the browse module mounts.
+      if (browseHandle && browseHandle.applyRadioState) browseHandle.applyRadioState(msg);
+      // Radio now-playing surface (plan U10): the same event drives the shared
+      // playback widget (station/state/live-title/queue-paused notice + STOP).
+      // Distinct name from browse's applyRadioState (FE6 — no cross-module
+      // collision on the shared handle).
+      playbackHandle.applyRadioNowPlaying(msg);
+    }
     else if (msg.type === 'closing_time') playbackHandle.applyClosingTime(msg);
     else if (msg.type === 'output_session') playbackHandle.applyOutputSession(msg);
     else if (msg.type === 'track_skipped') playbackHandle.showSkipped(msg);
@@ -432,7 +452,7 @@ connectWS();
     // guarantees a render with the receipt present (race fix).
     onQueued: (receipt) => { queueReceipts.save(receipt); refreshQueueState(); },
   });
-  appearanceHandle = mountAppearance({ getHandle: () => browseHandle });
+  appearanceHandle = mountAppearance({ getHandle: () => browseHandle, getPlaybackHandle: () => playbackHandle });
 })();
 
 // ── Initial load ──────────────────────────────────────────────────────────

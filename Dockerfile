@@ -60,11 +60,18 @@ FROM python:3.12-slim-bookworm
 # OGG->FLAC transcode. ffmpeg's FLAC muxer writes none, and without one a
 # constrained Cast receiver (JBL Charge 5) blind-byte-estimates a seek, desyncs,
 # and ERRORs at end-of-track (2026-06-17).
+#
+# `gstreamer1.0-libav` gives GStreamer the libav (avdec_*) decoders — notably
+# avdec_aac for AAC/HE-AAC, which a large share of internet-radio stations use.
+# Without it the Direct backend fails such stations with "missing a plug-in"
+# (rig-caught 2026-08-11). It depends on the SAME bookworm libav .59 the image
+# already ships for cliap2, so there is no ABI conflict with AirPlay.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-tools \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
     gstreamer1.0-pulseaudio \
     gstreamer1.0-alsa \
     gir1.2-gstreamer-1.0 \

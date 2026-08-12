@@ -36,6 +36,12 @@ import uuid
 from typing import Any
 
 from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
+from app.output.radio_endless import (
+    RadioFailedHook,
+    ReconnectPolicy,
+    fire_radio_failed_hook,
+    is_radio_track,
+)
 from app.models import Track
 
 _log = logging.getLogger(__name__)
@@ -651,6 +657,23 @@ class AirPlayBackend:
         self._is_playing: bool = False
         self._stop_requested: bool = False
 
+        # ── radio endless mode (radio plan U4) ─────────────────────────────
+        # Set in play() when the metadata is a radio pseudo-Track (SG-03 — no
+        # play() signature change). While True, the process-watcher's end-of-
+        # input must NOT advance: a live stream shouldn't "end", so ffmpeg is
+        # restarted against the URL instead (AE4/AE9). Cleared on finite play()
+        # / stop() / teardown.
+        self._radio_mode: bool = False
+        self._radio_url: str = ""
+        self._radio_metadata: Track | None = None
+        self._radio_reconnect = ReconnectPolicy()
+        # True only while a radio reconnect is re-driving play(): keeps the
+        # reconnect's play() from re-arming (begin()) the attempt counter, so
+        # the bounded budget is preserved across a restart.
+        self._radio_reconnecting: bool = False
+        # U7 wires this to a RadioStateEvent "offline" (R12).
+        self._radio_failed_hook: RadioFailedHook | None = None
+
     # ── device discovery ──────────────────────────────────────────────────────
 
     def register_resolved(
@@ -1188,6 +1211,16 @@ class AirPlayBackend:
             # teardown path clears these unconditionally.
             self._current_stream_url = stream_url
             self._current_metadata = metadata
+            # Radio endless mode (U4): the watcher reads _radio_mode to decide
+            # end-of-input → reconnect vs advance. Set here (after teardown
+            # cleared it) so a reconnect play() re-arms it from the same track.
+            self._radio_mode = is_radio_track(metadata)
+            self._radio_url = stream_url if self._radio_mode else ""
+            self._radio_metadata = metadata if self._radio_mode else None
+            if self._radio_mode and not self._radio_reconnecting:
+                # Fresh station start — arm the bounded reconnect budget. A
+                # restart (reconnect) preserves the running counter instead.
+                self._radio_reconnect.begin()
             self._cliap2_proc = await asyncio.create_subprocess_exec(
                 *child_args,
                 stdin=read_fd,
@@ -1432,6 +1465,17 @@ class AirPlayBackend:
 
         self._exit_handled = True
         self._is_playing = False
+
+        if self._radio_mode:
+            # Radio (U4/AE4): a live stream shouldn't "end". Whatever the exit
+            # code, cliap2/cliraop reaching end-of-input means the upstream
+            # dropped — RECONNECT (restart ffmpeg+binary against the URL),
+            # never advance and never route to the outage classifier. The
+            # watcher owns its own teardown-and-restart here.
+            self._process_watcher_task = None
+            await self._radio_restart(returncode)
+            return
+
         tail_str = "\n  ".join(self._stderr_tail) if self._stderr_tail else "(no output)"
         # returncode=0 means the binary processed the entire stream and
         # exited cleanly — that's the natural "track ended" path for
@@ -1608,8 +1652,80 @@ class AirPlayBackend:
         # Flush — without SENDMETA the receiver never sees the buffered fields.
         await self._send_command("ACTION", "SENDMETA")
 
+    # ── radio endless-mode reconnect (radio plan U4) ──────────────────────────
+
+    def set_radio_failed_hook(self, hook: RadioFailedHook | None) -> None:
+        """Register (or clear) the endless-mode failed/offline callback (U4).
+        Called with no arguments once the reconnect cap is exhausted; U7 wires
+        it to a ``RadioStateEvent`` so a dead station surfaces as offline."""
+        self._radio_failed_hook = hook
+
+    async def _radio_restart(self, returncode: int | None) -> None:
+        """Restart ffmpeg+binary against the live station URL (R12/ADV-5).
+
+        Bounded + sustained-progress-aware: a station that keeps dropping within
+        the sustained window still trips the cap. On exhaustion, surface the
+        failed/offline state ONCE instead of restarting forever.
+
+        F5: an ITERATIVE loop, NO self-recursion. The prior version recursed in
+        its ``except`` AFTER the ``finally`` cleared ``_radio_reconnecting`` — so
+        the recursive ``play()`` re-armed ``begin()`` and reset the budget →
+        potential infinite recursion. Here we set ``_radio_reconnecting=True``
+        ONCE for the whole reconnect episode (so each attempt's ``play()`` skips
+        ``begin()``) and clear it exactly once when the episode ends."""
+        url = self._radio_url
+        metadata = self._radio_metadata
+        if not self._radio_mode or url is None or metadata is None:
+            return  # stopped / not radio — nothing to restart
+
+        # Enter the reconnect episode ONCE — every attempt's play() must NOT
+        # re-arm begin() (that would reset the bounded budget mid-recovery).
+        self._radio_reconnecting = True
+        try:
+            while True:
+                if not self._radio_mode or self._radio_url is None \
+                        or self._radio_metadata is None:
+                    return  # a stop raced us — nothing to restart
+                if not self._radio_reconnect.should_reconnect():
+                    _log.warning("AirPlay radio: reconnect cap reached (last "
+                                 "rc=%s) — station offline", returncode)
+                    # Tear the dead session down and mark offline.
+                    await self._teardown(send_stop=False, caller="radio_offline")
+                    self._radio_notify_failed()
+                    return
+                _log.info("AirPlay radio: end-of-input (rc=%s) — reconnecting "
+                          "(attempt %d)", returncode,
+                          self._radio_reconnect.attempts)
+                # Tear the dead session down (frees ffmpeg/FIFO/readers), then
+                # re-drive play() WITHOUT re-arming the budget. _teardown clears
+                # _radio_* / _current_*, so re-supply the URL/metadata to play().
+                await self._teardown(send_stop=False, caller="radio_reconnect")
+                await asyncio.sleep(self._radio_reconnect.backoff_s())
+                try:
+                    await self.play(url, metadata)
+                    # A fresh spawn = a fresh connection; its lifetime resets the
+                    # budget on the NEXT drop only if it sustains.
+                    self._radio_reconnect.mark_connected()
+                    return
+                except Exception:
+                    # A failed restart is itself a drop — loop to consume the
+                    # next attempt (bounded) or surface offline at the top. Do
+                    # NOT clear _radio_reconnecting here (that would let the next
+                    # play() re-arm begin()).
+                    _log.warning("AirPlay radio: reconnect restart failed — "
+                                 "retrying", exc_info=True)
+        finally:
+            self._radio_reconnecting = False
+
+    def _radio_notify_failed(self) -> None:
+        # F13: shared hook-fire + swallow.
+        fire_radio_failed_hook(self._radio_failed_hook, _log, "AirPlay")
+
     async def stop(self) -> None:
         self._stop_requested = True
+        self._radio_mode = False
+        self._radio_url = ""
+        self._radio_metadata = None
         await self._teardown(send_stop=True, caller="stop")
 
     async def _teardown(self, *, send_stop: bool, caller: str = "unknown") -> None:
@@ -1681,6 +1797,13 @@ class AirPlayBackend:
         # rather than respawning a stale URL.
         self._current_stream_url = None
         self._current_metadata = None
+        # Radio (U4): a reconnect restart re-supplies these to play() (and sets
+        # _radio_reconnecting so the budget is preserved); a plain teardown
+        # clears them so a stray watcher can't reconnect a stopped station.
+        if not self._radio_reconnecting:
+            self._radio_mode = False
+            self._radio_url = ""
+            self._radio_metadata = None
 
         # Cancel reader / watcher tasks and await their cancellation so a
         # stale watcher cannot fire advance_cb after a new session starts.

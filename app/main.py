@@ -80,6 +80,7 @@ from app.api.admin import router as admin_router, admin_ws_router, page_router a
 from app.api.guest import router as guest_router
 from app.api.stream import router as stream_router
 from app.api.playback import router as playback_router
+from app.api.radio import guest_router as radio_guest_router, admin_router as radio_admin_router
 
 app.include_router(auth_router)
 app.include_router(admin_page_router)
@@ -88,6 +89,10 @@ app.include_router(admin_ws_router)
 app.include_router(guest_router)
 app.include_router(stream_router)
 app.include_router(playback_router)
+# Radio Mode (radio plan U7): guest browse/current/stop/play/switch (guest_router,
+# no auth; play/switch gated server-side) + admin play/switch/stop (require_admin).
+app.include_router(radio_guest_router)
+app.include_router(radio_admin_router)
 
 
 @app.get("/health")

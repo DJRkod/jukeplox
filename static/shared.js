@@ -117,6 +117,13 @@ const APPEARANCE_RAIL_MODES = [
 // the pages, hence a getter + null guards rather than a direct reference).
 function mountAppearance(opts) {
   const getHandle = (opts && opts.getHandle) || (() => null);
+  // Radio Mode (2026-08-11 plan U10): the playback handle also needs the
+  // install-wide guest_radio_control flag so the radio now-playing surface dims
+  // its control-adjacent affordance for a guest when off (cosmetic; the server
+  // enforces). Optional getter (assigned async on the pages, like getHandle);
+  // absent → no-op. Reuses this one appearance-fetch path (load / appearance_
+  // changed / reconnect all funnel through _apply) rather than a second fetch.
+  const getPlaybackHandle = (opts && opts.getPlaybackHandle) || (() => null);
   const defaults = {
     scheme: 'gold-rush', rail_mode: 'vanilla', view: 'list',
     // International rail (plan 004): install-wide, not a per-device override.
@@ -125,6 +132,11 @@ function mountAppearance(opts) {
     // five Browse-facet toggles. Install-wide (no per-device override), like the
     // rail-alpha defaults; pushed to the browse handle via setGuestVisibility.
     ratings_visible_to_guests: false, tags_visible_to_guests: false, browse_facets: null,
+    // Radio Mode (2026-08-11 plan U9/U8): whether a guest may start/switch a
+    // station. Install-wide, exposed via /api/appearance; pushed to the browse
+    // handle via setGuestVisibility so the Radio-tab station cards dim + no-op
+    // the tap for a guest when off. Server route (U7) is the real enforcement.
+    guest_radio_control: false,
     // Rating display style (2026-06-27 plan U3): install-wide look for the 0–5
     // rating, applied as a :root[data-rating-style] attribute; CSS in rail.css
     // restyles every .trk-pip. Default stars (also the bare-CSS default).
@@ -197,7 +209,13 @@ function mountAppearance(opts) {
       // Ratings/tags guest visibility + facet tab gating (plan U8). Install-wide,
       // so push defaults directly; the handle no-ops for the admin page.
       if (h && h.setGuestVisibility) h.setGuestVisibility(
-        defaults.ratings_visible_to_guests, defaults.tags_visible_to_guests, defaults.browse_facets);
+        defaults.ratings_visible_to_guests, defaults.tags_visible_to_guests, defaults.browse_facets,
+        defaults.guest_radio_control);
+      // Radio Mode (plan U10): push the guest-control flag to the playback
+      // handle's radio now-playing surface too (dims the control-adjacent
+      // affordance when off). No-ops on admin (authMode:'admin' → always allowed).
+      const ph = getPlaybackHandle();
+      if (ph && ph.setRadioControl) ph.setRadioControl(defaults.guest_radio_control);
       _refreshPanel();
     };
     const reduced = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -226,6 +244,9 @@ function mountAppearance(opts) {
           defaults.tags_visible_to_guests = data.tags_visible_to_guests;
         if (data.browse_facets && typeof data.browse_facets === 'object')
           defaults.browse_facets = data.browse_facets;
+        // Radio Mode guest control (plan U9): drives the Radio-tab card gating.
+        if (typeof data.guest_radio_control === 'boolean')
+          defaults.guest_radio_control = data.guest_radio_control;
         // Rating display style (plan U3): validate against the known set.
         if (data.rating_style === 'stars' || data.rating_style === 'dots' || data.rating_style === 'bars')
           defaults.rating_style = data.rating_style;

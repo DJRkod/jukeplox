@@ -4267,6 +4267,479 @@
     }
   }
 
+  // ── Radio Mode station browse (2026-08-11 radio-mode plan U9) ───────────────
+  // A first-class station-browse surface inside the shared browse module: the
+  // "Radio" tab renders a curated landing (genre quick-picks primary + a
+  // liveness-rechecked "popular" list) with faceted search, station cards, and
+  // loading / empty / directory-unavailable states — single-source across guest
+  // and admin. Playback control (start / switch / stop) is enforced server-side;
+  // this view owns only the browse-list start/switch affordance (U10 owns the
+  // now-playing STOP control). All station text (name, live_title, tags) is
+  // untrusted third-party data (SEC-004) and is rendered via textContent / DOM
+  // node creation — never innerHTML string interpolation.
+
+  // Live radio session state, hydrated from GET /api/radio/current on the first
+  // radio-view visit and kept current by the WS radio_state event (pushed by the
+  // page via the applyRadioState handle). Shape mirrors the U7 now-playing radio
+  // block: { active, station|null, status, live_title }. `station.stationuuid`
+  // identifies the active card for the playing/connecting indicator + no-op tap.
+  let _radioState = { active: false, station: null, status: 'idle', live_title: null };
+  // Last-good landing payload ({ tags, popular }) so a transient refetch failure
+  // keeps the last view rather than blanking it (reconnect-resync learning).
+  let _radioLanding = null;
+  // Generation guard: a newer landing/search render supersedes an in-flight one
+  // (rapid tab re-entry, a search fired while the landing is still loading).
+  let _radioGen = 0;
+  // Hydrate generation guard (FE2): a WS radio_state landing during the
+  // GET /api/radio/current await must not be overwritten by the stale snapshot
+  // when the fetch resolves. applyRadioState bumps this to invalidate an
+  // in-flight hydrate; _radioHydrateCurrent captures + re-checks it.
+  let _radioHydrateGen = 0;
+  // In-flight guard (FE4): a double-tap on a station card before the WS
+  // confirmation arrives must not fire two POSTs (play then switch).
+  let _radioActivating = false;
+
+  // Inject the radio-view CSS once (no new stylesheet link — static-discipline).
+  // Mirrors _ensureQueueStyles. All colors follow the active scheme via the
+  // shared custom properties so the surface re-tints with the theme.
+  function _ensureRadioStyles() {
+    if (document.getElementById('jp-radio-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'jp-radio-styles';
+    style.textContent = `
+    .rd-search { display:flex; gap:.5rem; padding:.75rem; }
+    .rd-search input { flex:1; min-width:0; }
+    /* Self-styled buttons so the surface is consistent on guest (no .btn class
+       there) and admin alike; scheme-following. */
+    .rd-search .btn, .rd-retry { cursor:pointer; border:0; border-radius:6px; padding:.45rem .8rem; font:inherit; font-weight:600; color:var(--on-accent,#111); background:var(--accent-ui,var(--accent)); }
+    .rd-search .btn:hover, .rd-retry:hover { filter:brightness(1.08); }
+    .rd-section-head { padding:.6rem .75rem .3rem; font-size:.78rem; letter-spacing:.04em; text-transform:uppercase; color:var(--muted,#8a8a8a); }
+    .rd-genres { display:flex; flex-wrap:wrap; gap:.5rem; padding:.4rem .75rem .75rem; }
+    .rd-genre { cursor:pointer; }
+    .rd-cards { display:flex; flex-direction:column; }
+    .rd-card { display:flex; align-items:center; gap:.7rem; padding:.55rem .75rem; cursor:pointer; border:0; background:transparent; width:100%; text-align:left; color:inherit; font:inherit; }
+    .rd-card:hover { background:color-mix(in srgb, var(--accent-ui,var(--accent)) 10%, transparent); }
+    .rd-card[aria-disabled="true"] { opacity:.5; cursor:default; }
+    .rd-card[aria-disabled="true"]:hover { background:transparent; }
+    .rd-fav { flex-shrink:0; width:40px; height:40px; border-radius:6px; object-fit:cover; background:var(--surface2,#222); display:flex; align-items:center; justify-content:center; font-size:1.2rem; overflow:hidden; }
+    .rd-fav img { width:100%; height:100%; object-fit:cover; }
+    .rd-info { flex:1; min-width:0; }
+    .rd-name { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .rd-meta { font-size:.8rem; color:var(--muted,#8a8a8a); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .rd-state { flex-shrink:0; font-size:.75rem; font-weight:700; color:var(--accent-ui,var(--accent)); display:flex; align-items:center; gap:.35rem; }
+    .rd-state .rd-eq { display:inline-block; width:.8rem; height:.8rem; }
+    .rd-card.is-active { background:color-mix(in srgb, var(--accent-ui,var(--accent)) 16%, transparent); }
+    .rd-empty, .rd-error { padding:1.25rem .75rem; color:var(--muted,#8a8a8a); text-align:center; }
+    .rd-error .rd-retry { margin-left:.4rem; }
+    .rd-skeleton { display:flex; flex-direction:column; gap:.15rem; padding:.5rem .75rem; }
+    .rd-skel-row { height:52px; border-radius:6px; background:linear-gradient(90deg, var(--surface2,#222) 25%, color-mix(in srgb, var(--surface2,#222) 60%, #444) 50%, var(--surface2,#222) 75%); background-size:200% 100%; animation:rdShimmer 1.2s linear infinite; }
+    @keyframes rdShimmer { from{background-position:200% 0;} to{background-position:-200% 0;} }
+    #tabs .tab[data-view="radio-view"] .now-dot.on, #tabs .tab[data-view="radio-view"] .rd-tab-dot.on { display:inline-block; }
+    .rd-tab-dot { display:none; width:8px; height:8px; border-radius:50%; background:var(--accent-ui,var(--accent)); margin-right:.35rem; vertical-align:middle; box-shadow:0 0 6px var(--accent-ui,var(--accent)); }
+    .rd-tab-dot.on { display:inline-block; }
+    @media (prefers-reduced-motion: reduce){ .rd-skel-row { animation:none; } }`;
+    document.head.appendChild(style);
+  }
+
+  // Whether a station tap may start/switch playback. Guests are gated by the
+  // server-enforced guest_radio_control flag (mirrored client-side for UX —
+  // the server route is the real enforcement, U7/U8). Admin always may. When
+  // false, cards render dimmed with a hint and taps do not POST (they'd 403);
+  // browsing still works.
+  function _radioControlAllowed() {
+    if (_config && _config.authMode === 'admin') return true;
+    return !!(_config && _config.guestRadioControl);
+  }
+
+  // Generic inline station glyph fallback (DL-006). Rendered when a station has
+  // no favicon URL, or its <img> errors — no server fetch (SSRF posture intact).
+  function _radioFavFallback(box) {
+    box.textContent = '📻';
+  }
+
+  // Build the favicon slot. Renders the station favicon client-side only; an
+  // absent/empty URL or a load error falls back to the generic glyph. The URL is
+  // used only as an <img src> (the browser fetches it, not the server).
+  function _radioFavicon(station) {
+    const box = document.createElement('div');
+    box.className = 'rd-fav';
+    const url = station && typeof station.favicon === 'string' ? station.favicon.trim() : '';
+    if (url) {
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.alt = '';
+      img.addEventListener('error', () => { img.remove(); _radioFavFallback(box); });
+      img.src = url;   // client-side fetch only; never proxied server-side
+      box.appendChild(img);
+    } else {
+      _radioFavFallback(box);
+    }
+    return box;
+  }
+
+  // codec / bitrate meta line for a card (e.g. "MP3 · 128 kbps"). All optional.
+  function _radioCardMeta(station) {
+    const parts = [];
+    if (station.codec) parts.push(String(station.codec).toUpperCase());
+    if (station.bitrate) parts.push(station.bitrate + ' kbps');
+    if (station.countrycode) parts.push(String(station.countrycode).toUpperCase());
+    return parts.join(' · ');
+  }
+
+  // POST a station to play or switch. If a station is already playing we switch
+  // (server holds the queue once at first takeover — play would re-hold, DL-002);
+  // otherwise we play. The already-playing station's tap is a no-op (handled by
+  // the caller). Optimistic UI is avoided; the WS radio_state event repaints.
+  async function _radioActivate(station) {
+    if (!_radioControlAllowed()) { _config.toast('Radio control is off for guests'); return; }
+    // FE4: in-flight guard — two taps before the WS confirmation would fire two
+    // POSTs (play then switch). The following radio_state event repaints the UI.
+    if (_radioActivating) return;
+    _radioActivating = true;
+    try {
+      const playing = !!(_radioState && _radioState.active && _radioState.station);
+      const path = playing ? '/api/radio/switch' : '/api/radio/play';
+      const [status] = await _api('POST', path, station);
+      if (status === 403) { _config.toast('Radio control is off for guests'); return; }
+      if (status < 200 || status >= 300) { _config.toast('Could not start station'); return; }
+      // Success: the server broadcasts a radio_state event → applyRadioState
+      // repaints the active card. No optimistic mutation here.
+    } finally {
+      _radioActivating = false;
+    }
+  }
+
+  // One station card. Tapping activates (play/switch) unless it's the already-
+  // playing station (no-op, DL-002) or control is disabled for this viewer.
+  function _radioCard(station) {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'rd-card';
+    if (station && station.stationuuid) card.dataset.stationuuid = station.stationuuid;
+    card.appendChild(_radioFavicon(station));
+
+    const info = document.createElement('div');
+    info.className = 'rd-info';
+    const name = document.createElement('div');
+    name.className = 'rd-name';
+    name.textContent = (station && station.name) || 'Unknown station';  // SEC-004: inert text
+    info.appendChild(name);
+    const meta = document.createElement('div');
+    meta.className = 'rd-meta';
+    meta.textContent = _radioCardMeta(station || {});
+    info.appendChild(meta);
+    card.appendChild(info);
+
+    // Active-session indicator slot (playing / connecting), filled by
+    // _radioDecorateCard from the live _radioState.
+    const state = document.createElement('div');
+    state.className = 'rd-state';
+    card.appendChild(state);
+
+    card.addEventListener('click', () => {
+      const active = _radioState && _radioState.active && _radioState.station;
+      // No-op tap on the already-playing station (DL-002).
+      if (active && _radioState.station.stationuuid === station.stationuuid) return;
+      _radioActivate(station);
+    });
+    _radioDecorateCard(card);
+    return card;
+  }
+
+  // Reflect the live _radioState onto one card: mark the active station with a
+  // playing/connecting indicator, and dim+hint every card when a guest can't
+  // control radio (browsing stays available). Idempotent — safe to re-run on
+  // each radio_state event across all rendered cards.
+  function _radioDecorateCard(card) {
+    const uuid = card.dataset.stationuuid;
+    const active = _radioState && _radioState.active && _radioState.station;
+    const isThis = active && _radioState.station.stationuuid === uuid;
+    const state = card.querySelector(':scope > .rd-state');
+    card.classList.toggle('is-active', !!isThis);
+    if (state) {
+      state.textContent = '';
+      if (isThis) {
+        const label = _radioState.status === 'connecting' ? 'Connecting…'
+          : _radioState.status === 'failed' ? 'Offline'
+          : 'Playing';
+        state.textContent = label;
+      }
+    }
+    // Guest gating: dim + block start/switch when control is off. The active
+    // station is never dimmed (its tap is already a no-op, and STOP lives in the
+    // now-playing surface which is always allowed).
+    const gated = !_radioControlAllowed() && !isThis;
+    if (gated) {
+      card.setAttribute('aria-disabled', 'true');
+      card.title = 'Radio control is off for guests';
+    } else {
+      card.removeAttribute('aria-disabled');
+      if (card.title === 'Radio control is off for guests') card.removeAttribute('title');
+    }
+  }
+
+  // Re-decorate every rendered radio card from the current _radioState. Called
+  // by applyRadioState so a live transition repaints without a re-fetch.
+  function _radioRedecorate() {
+    document.querySelectorAll('#radio-list .rd-card[data-stationuuid]')
+      .forEach(card => _radioDecorateCard(card));
+  }
+
+  // Render a list of station cards into a container. Empty → the empty state.
+  function _radioRenderCards(host, stations, emptyMsg) {
+    host.textContent = '';
+    if (!stations || !stations.length) {
+      const empty = document.createElement('div');
+      empty.className = 'rd-empty';
+      empty.textContent = emptyMsg || 'No stations found.';
+      host.appendChild(empty);
+      return;
+    }
+    const wrap = document.createElement('div');
+    wrap.className = 'rd-cards';
+    stations.forEach(s => { if (s && s.stationuuid) wrap.appendChild(_radioCard(s)); });
+    host.appendChild(wrap);
+  }
+
+  // The search box + filter row. Kept at the top of the radio view across the
+  // landing and the results states so a user can always search (R3 degrade-to-
+  // search). Submitting fires _radioSearch with the query.
+  function _radioSearchBar() {
+    const bar = document.createElement('div');
+    bar.className = 'rd-search';
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.id = 'radio-search-input';
+    input.placeholder = 'Search stations by name, genre, country…';
+    input.autocomplete = 'off';
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'btn';
+    go.textContent = 'Search';
+    const submit = () => {
+      const q = input.value.trim();
+      if (q) _radioSearch(q); else _radioLoadLanding();
+    };
+    go.addEventListener('click', submit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    bar.appendChild(input);
+    bar.appendChild(go);
+    return bar;
+  }
+
+  // A skeleton loading state for the station list region.
+  function _radioSkeleton(host) {
+    host.textContent = '';
+    const sk = document.createElement('div');
+    sk.className = 'rd-skeleton';
+    for (let i = 0; i < 6; i++) {
+      const r = document.createElement('div');
+      r.className = 'rd-skel-row';
+      sk.appendChild(r);
+    }
+    host.appendChild(sk);
+  }
+
+  // The explicit "radio directory unavailable" state (R13) — degrades to a
+  // usable search box (still present above) plus a retry.
+  function _radioUnavailable(host, retry) {
+    host.textContent = '';
+    const box = document.createElement('div');
+    box.className = 'rd-error';
+    box.textContent = 'Radio directory unavailable. ';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'rd-retry btn';
+    btn.textContent = 'Retry';
+    btn.addEventListener('click', retry);
+    box.appendChild(btn);
+    host.appendChild(box);
+  }
+
+  // Build the radio view's stable frame: search bar + a content host the
+  // landing / search / states render into. Returns the content host element.
+  function _radioFrame(root) {
+    root.textContent = '';
+    root.appendChild(_radioSearchBar());
+    const host = document.createElement('div');
+    host.id = 'radio-content';
+    root.appendChild(host);
+    return host;
+  }
+
+  // Curated landing: genre quick-picks (primary) from `tags`, then a "popular"
+  // station list. The popular set's liveness-recheck / tag-filter policy lives
+  // server-side (U7) — this view treats the curated result as opaque.
+  function _radioRenderLanding(host, landing) {
+    host.textContent = '';
+    const tags = (landing && Array.isArray(landing.tags)) ? landing.tags : [];
+    const popular = (landing && Array.isArray(landing.popular)) ? landing.popular : [];
+
+    if (tags.length) {
+      const head = document.createElement('div');
+      head.className = 'rd-section-head';
+      head.textContent = 'Genres';
+      host.appendChild(head);
+      const chips = document.createElement('div');
+      chips.className = 'rd-genres';
+      tags.forEach(tag => {
+        if (!tag || !tag.name) return;
+        const chip = document.createElement('span');
+        chip.className = 'genre-chip rd-genre';
+        chip.textContent = tag.name;  // SEC-004: inert text
+        if (tag.stationcount != null) {
+          const c = document.createElement('span');
+          c.className = 'trk-tag-count';
+          c.textContent = tag.stationcount;
+          chip.appendChild(c);
+        }
+        chip.addEventListener('click', () => _radioSearch(tag.name));
+        chips.appendChild(chip);
+      });
+      host.appendChild(chips);
+    }
+
+    const head = document.createElement('div');
+    head.className = 'rd-section-head';
+    head.textContent = 'Popular stations';
+    host.appendChild(head);
+    const cards = document.createElement('div');
+    host.appendChild(cards);
+    _radioRenderCards(cards, popular, 'No popular stations right now.');
+  }
+
+  // Fetch + render the curated landing. A transient failure keeps the last-good
+  // landing on screen (reconnect-resync); a directory-unavailable payload
+  // renders the explicit unavailable state; the search box is always usable.
+  async function _radioLoadLanding() {
+    _ensureRadioStyles();
+    const root = document.getElementById('radio-list');
+    if (!root) return;
+    const gen = ++_radioGen;
+    // Only rebuild the frame if it's not already present (preserves a typed
+    // search term when re-entering the tab isn't in play).
+    let host = document.getElementById('radio-content');
+    if (!host || !root.contains(host)) host = _radioFrame(root);
+    // If we already have a good landing, show it immediately (no skeleton flash),
+    // then refresh in the background; else show the skeleton.
+    if (_radioLanding) _radioRenderLanding(host, _radioLanding);
+    else _radioSkeleton(host);
+    let data = null;
+    try {
+      const [, body] = await _api('GET', '/api/radio/stations');
+      data = body;
+    } catch (_) { data = null; }
+    if (gen !== _radioGen) return;                       // superseded
+    if (!data) {
+      // Transient fetch failure: keep the last-good landing if we have one,
+      // else show the unavailable state (with the search box still above).
+      if (!_radioLanding) _radioUnavailable(host, _radioLoadLanding);
+      return;
+    }
+    if (data.unavailable) { _radioLanding = null; _radioUnavailable(host, _radioLoadLanding); return; }
+    _radioLanding = { tags: data.tags || [], popular: data.popular || [] };
+    _radioRenderLanding(host, _radioLanding);
+  }
+
+  // Faceted search: query the directory and render the station results. The
+  // query maps to name/genre/country/tag server-side (U7). Keeps the search box.
+  async function _radioSearch(query) {
+    _ensureRadioStyles();
+    const root = document.getElementById('radio-list');
+    if (!root) return;
+    const gen = ++_radioGen;
+    let host = document.getElementById('radio-content');
+    if (!host || !root.contains(host)) host = _radioFrame(root);
+    // Reflect the query into the search box so a genre-chip search shows its term.
+    const input = document.getElementById('radio-search-input');
+    if (input && input.value.trim() !== query) input.value = query;
+    _radioSkeleton(host);
+    let data = null;
+    try {
+      const [, body] = await _api('GET', '/api/radio/stations?' + _radioSearchParams(query));
+      data = body;
+    } catch (_) { data = null; }
+    if (gen !== _radioGen) return;                       // superseded
+    if (!data) { _radioUnavailable(host, () => _radioSearch(query)); return; }
+    if (data.unavailable) { _radioUnavailable(host, () => _radioSearch(query)); return; }
+    _radioRenderCards(host, data.stations || [], `No stations match “${query}”.`);
+  }
+
+  // Query params for the free-text search box. The server route (app/api/radio.py)
+  // declares the free-text param as `q` and evaluates `tag` FIRST — so emitting
+  // `name=`/`tag=` did an exact-tag lookup and returned nothing (FE1). The single
+  // free-text box maps to `q=` only; genre/country/tag FACET selections (if any)
+  // are their own explicit params. encodeURIComponent guards the untrusted-
+  // through-us user input.
+  function _radioSearchParams(query) {
+    return 'q=' + encodeURIComponent(query);
+  }
+
+  // Entry point for the radio tab (wired into activateView). Marks the view
+  // active, hides the alpha rail (station cards are a flat list), hydrates the
+  // live session on first visit, and renders the curated landing.
+  function loadRadio() {
+    _ensureRadioStyles();
+    _deactivateRail();                 // flat station list — no alpha rail
+    // Hydrate the live session snapshot once so the active-card indicator is
+    // correct even without a WS event since load; a failure leaves the last
+    // known state (never blanks — reconnect-resync learning).
+    _radioHydrateCurrent();
+    _radioLoadLanding();
+  }
+
+  // Pull GET /api/radio/current so a fresh navigator / WS-gap client converges
+  // on the active station indicator. A transient failure keeps _radioState.
+  async function _radioHydrateCurrent() {
+    const myGen = ++_radioHydrateGen;   // FE2: invalidate if a WS write lands mid-fetch
+    let data = null;
+    try {
+      const [, body] = await _api('GET', '/api/radio/current');
+      data = body;
+    } catch (_) { data = null; }
+    if (!data || typeof data !== 'object') return;
+    // A WS applyRadioState during the await bumped _radioHydrateGen — its state is
+    // newer than this snapshot, so don't overwrite it with the stale hydrate.
+    if (myGen !== _radioHydrateGen) return;
+    _radioState = {
+      active: !!data.active,
+      station: data.station || null,
+      status: data.status || 'idle',
+      live_title: data.live_title != null ? data.live_title : null,
+    };
+    _radioRedecorate();
+    _radioSyncTabIndicator();
+  }
+
+  // Apply a WS radio_state event (pushed by the page). Repaints card indicators
+  // and the tab active-dot live. Shared read-path for guest + admin; U10's now-
+  // playing surface reads the SAME event — keep this the single browse-side
+  // consumer so the two stay coherent (RadioStateEvent = { station, status,
+  // live_title }).
+  function applyRadioState(msg) {
+    if (!msg) return;
+    _radioHydrateGen++;   // FE2: a live WS write invalidates any in-flight hydrate
+    _radioState = {
+      // A null station in the event means radio is idle/stopped.
+      active: !!(msg.station) && msg.status !== 'idle',
+      station: msg.station || null,
+      status: msg.status || 'idle',
+      live_title: msg.live_title != null ? msg.live_title : null,
+    };
+    _radioRedecorate();
+    _radioSyncTabIndicator();
+  }
+
+  // Toggle the Radio tab's active-indicator dot to reflect a currently-playing
+  // station (DL-001). The tab is ALWAYS visible (R9 read-only visibility); only
+  // the dot reflects on/off. Present on both guest (.now-dot reuse) and admin.
+  function _radioSyncTabIndicator() {
+    const on = !!(_radioState && _radioState.active && _radioState.station);
+    document.querySelectorAll('#tabs .tab[data-view="radio-view"] .rd-tab-dot')
+      .forEach(dot => dot.classList.toggle('on', on));
+  }
+
   // ── Tab activation hooks (called by the page when tabs switch) ────────────
 
   // ── Browse facet visibility (2026-06-26 ratings-and-tags plan U8) ───────────
@@ -4305,6 +4778,7 @@
     else if (viewId === 'mostplayed-view') loadMostPlayed();
     else if (viewId === 'recentlyadded-view') loadRecentlyAdded();
     else if (viewId === 'highestrated-view') loadHighestRated();
+    else if (viewId === 'radio-view') loadRadio();
   }
 
   // ── Mount entry point ─────────────────────────────────────────────────────
@@ -4362,13 +4836,27 @@
       // mountAppearance after the /api/appearance fetch; no-ops the hiding for
       // the admin page (admin keeps every facet). Drives both the tab bar and
       // the all-songs 'rated' sort option (read at render time).
-      setGuestVisibility: (ratingsVisible, tagsVisible, facets) => {
+      setGuestVisibility: (ratingsVisible, tagsVisible, facets, guestRadioControl) => {
         if (!_config) return;
         _config.ratingsVisible = !!ratingsVisible;
         _config.tagsVisible = !!tagsVisible;
         if (facets && typeof facets === 'object') _config.facets = facets;
+        // Radio Mode (2026-08-11 plan U9): whether a GUEST may start/switch a
+        // station (server-enforced; this only drives the card dim/hint + no-op
+        // tap). Undefined (older shared.js) leaves the prior value untouched so
+        // the flag can't be clobbered to off by a call that omits it.
+        if (typeof guestRadioControl === 'boolean') {
+          _config.guestRadioControl = guestRadioControl;
+          // A live flip re-dims / re-enables already-rendered cards.
+          _radioRedecorate();
+        }
         _applyTabVisibility();
       },
+      // Radio Mode (2026-08-11 plan U9): the page dispatches the WS radio_state
+      // event here so the Radio tab's active-dot + station-card indicators
+      // update live. A method call (not a per-page declaration) keeps the read
+      // path single-source and out of the per-page allowlist.
+      applyRadioState,
       // Cross-surface navigation (2026-06-10 nav plan U2/U5): pages route
       // name taps here. opts.origin = {label, jump} names the surface the
       // user came from; jump is the page's own return action.

@@ -225,6 +225,13 @@ const playbackHandle = mountPlayback({
     isPlaying = playing;
     btnPause.textContent = playing ? '⏸' : '▶';
   },
+  // Radio Mode now-playing (2026-08-11 plan U10): admin has full control. STOP
+  // resumes the held queue (admin override, always permitted). "Browse stations"
+  // activates the shared Radio browse view (start/switch lives there, U9).
+  // authMode:'admin' → the module never dims the control-adjacent affordance.
+  authMode: 'admin',
+  onRadioStop: () => api('POST', '/admin/radio/stop'),
+  onRadioBrowse: () => { if (browseHandle && browseHandle.activateView) browseHandle.activateView('radio-view'); },
   // Supervisor plan U4: every applyOutputSession hydration path (WS event,
   // snapshot re-pull, resume()'s /api/now-playing refetch) also refreshes the
   // admin-rich banner — renderOutputSessionBanner degrades to the generic
@@ -503,6 +510,17 @@ function connectWS() {
     const msg = JSON.parse(e.data);
     if (msg.type === 'now_playing_changed') playbackHandle.applyNowPlaying(msg);
     else if (msg.type === 'playback_state_changed') playbackHandle.applyPlaybackState(msg);
+    else if (msg.type === 'radio_state') {
+      // Radio Mode (2026-08-11 plan U9): repaint the Radio-tab active-dot +
+      // station-card indicators live. Null-guard: browse mounts in an IIFE and
+      // a broadcast can race first paint.
+      if (browseHandle && browseHandle.applyRadioState) browseHandle.applyRadioState(msg);
+      // Radio now-playing surface (plan U10): the same event drives the shared
+      // playback widget (station/state/live-title/queue-paused notice + STOP).
+      // Distinct name from browse's applyRadioState (FE6 — no cross-module
+      // collision on the shared handle).
+      playbackHandle.applyRadioNowPlaying(msg);
+    }
     else if (msg.type === 'closing_time') playbackHandle.applyClosingTime(msg);
     else if (msg.type === 'output_session') {
       // Supervisor plan U4: shared lean note via the playback module, then the
@@ -1119,7 +1137,7 @@ let appearanceHandle;
     isLocked: () => false,  // admin bypasses the guest lock by design
     toast: showToast,
   });
-  appearanceHandle = mountAppearance({ getHandle: () => browseHandle });
+  appearanceHandle = mountAppearance({ getHandle: () => browseHandle, getPlaybackHandle: () => playbackHandle });
 })();
 
 // ── Tabs (browse mode switching) ───────────────────────────────────────────
@@ -1975,6 +1993,10 @@ async function loadSettings() {
     if (rvg) rvg.checked = s.ratings_visible_to_guests === true;
     const tvg = document.getElementById('tags-visible-to-guests');
     if (tvg) tvg.checked = s.tags_visible_to_guests === true;
+    // Radio Mode (2026-08-11 plan U8, R9): guest radio-control flag defaults OFF
+    // (hydrate true only on an explicit true).
+    const grc = document.getElementById('guest-radio-control');
+    if (grc) grc.checked = s.guest_radio_control === true;
     ['genre', 'years', 'mostplayed', 'recentlyadded', 'highestrated'].forEach(f => {
       const el = document.getElementById('facet-' + f);
       if (el) el.checked = s['facet_' + f] !== false;
@@ -2068,6 +2090,9 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
   if (rvgEl) body.ratings_visible_to_guests = rvgEl.checked;
   const tvgEl = document.getElementById('tags-visible-to-guests');
   if (tvgEl) body.tags_visible_to_guests = tvgEl.checked;
+  // Radio Mode (2026-08-11 plan U8, R9): guest radio-control flag (boolean).
+  const grcEl = document.getElementById('guest-radio-control');
+  if (grcEl) body.guest_radio_control = grcEl.checked;
   ['genre', 'years', 'mostplayed', 'recentlyadded', 'highestrated'].forEach(f => {
     const el = document.getElementById('facet-' + f);
     if (el) body['facet_' + f] = el.checked;

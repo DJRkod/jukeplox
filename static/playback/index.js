@@ -93,6 +93,23 @@ window.mountPlayback = function mountPlayback(config) {
         </div>
       </div>
       <div class="np-output-note" hidden></div>
+      <div class="np-radio" hidden>
+        <div class="np-radio-row">
+          <div class="np-radio-fav" aria-hidden="true">📻</div>
+          <div class="np-radio-text">
+            <div class="np-radio-name"></div>
+            <div class="np-radio-sub">
+              <span class="np-radio-live" aria-hidden="true"><span class="np-radio-eq"><i></i><i></i><i></i></span></span>
+              <span class="np-radio-title"></span>
+            </div>
+          </div>
+        </div>
+        <div class="np-radio-queuenote" hidden></div>
+        <div class="np-radio-controls">
+          <button type="button" class="np-radio-stop">Stop radio</button>
+          <button type="button" class="np-radio-browse" hidden>Browse stations</button>
+        </div>
+      </div>
       <div class="np-lyrics" hidden>
         <div class="np-lyrics-slot">
           <button type="button" class="np-lyrics-pill" aria-expanded="false" hidden>♪ Lyrics</button>
@@ -138,6 +155,16 @@ window.mountPlayback = function mountPlayback(config) {
     artist: npRoot.querySelector('.np-artist'),
     nudge: npRoot.querySelector('.np-nudge'),
     outputNote: npRoot.querySelector('.np-output-note'),
+    // Radio Mode now-playing (2026-08-11 plan U10)
+    radio: npRoot.querySelector('.np-radio'),
+    radioRow: npRoot.querySelector('.np-radio-row'),
+    radioFav: npRoot.querySelector('.np-radio-fav'),
+    radioName: npRoot.querySelector('.np-radio-name'),
+    radioLive: npRoot.querySelector('.np-radio-live'),
+    radioTitle: npRoot.querySelector('.np-radio-title'),
+    radioQueueNote: npRoot.querySelector('.np-radio-queuenote'),
+    radioStop: npRoot.querySelector('.np-radio-stop'),
+    radioBrowse: npRoot.querySelector('.np-radio-browse'),
   } : null;
 
   // ── lyrics panel (2026-06-17 plan 008 U3/U4) ──────────────────────────
@@ -431,6 +458,282 @@ window.mountPlayback = function mountPlayback(config) {
     _renderProgress();
   }
 
+  // ── Radio Mode now-playing (2026-08-11 radio plan U10) ────────────────
+  // An additive MODE of the Now Playing widget, gated on radio.active. When a
+  // station takes over the shared output the queue is held+preserved (R8), so
+  // the track NP is idle; this block replaces it with the station identity,
+  // its connecting/playing/failed state + a liveness affordance (R6/R12), the
+  // untrusted live title (SEC-004: textContent only), a "queue paused — N
+  // tracks preserved" reassurance (DL-003), and the always-allowed guest STOP
+  // (DL-005). It is single-source: guest + admin render identically; per-page
+  // behavior (the STOP call, routing to the station browser) is injected via
+  // config callbacks (cfg.onRadioStop / cfg.onRadioBrowse). Driven by the WS
+  // `radio_state` event AND the now-playing snapshot's `radio` block, so a
+  // late/reconnecting client converges; a transient fetch failure keeps the
+  // last-known station (never blanks to "Nothing playing").
+
+  // Last applied radio block: { active, station|null, status, live_title }.
+  let _radio = { active: false, station: null, status: 'idle', live_title: null };
+  let _radioLive = null;   // the sr-only role=status live region for state announcements
+  // Generation guard (FE3): a WS radio_state landing during resume()'s
+  // /api/now-playing await must not be overwritten by the stale snapshot when
+  // the fetch resolves. applyRadioNowPlaying bumps this on entry; resume()
+  // captures + re-checks it before applying data.radio (mirrors _osGen).
+  let _radioStateGen = 0;
+  // Pending rAF id for the a11y live-region announce (FE5): two rapid calls
+  // must coalesce so AT doesn't announce the intermediate state.
+  let _announceRafId = null;
+  let _radioGuestControl = false;   // guest may start/switch (cosmetic dim only; server enforces)
+  const _radioAuthMode = cfg.authMode === 'admin' ? 'admin' : 'guest';   // 'admin' → always may control
+
+  // Inject the radio now-playing CSS once (no new stylesheet link — static-
+  // discipline). Scheme-following via the shared custom properties, mirroring
+  // the browse module's _ensureRadioStyles. The equalizer bars are the liveness
+  // affordance (they keep moving even when no title arrives, so a title-less
+  // station never reads as stuck); prefers-reduced-motion freezes them but the
+  // "● live" dot + the role=status announcement still convey liveness.
+  function _ensureRadioNpStyles() {
+    if (document.getElementById('jp-radio-np-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'jp-radio-np-styles';
+    style.textContent = `
+    .np-radio { display:flex; flex-direction:column; gap:.55rem; }
+    .np-radio-row { display:flex; align-items:center; gap:.7rem; }
+    .np-radio-fav { flex-shrink:0; width:44px; height:44px; border-radius:8px; object-fit:cover; overflow:hidden; background:var(--surface2,#222); display:flex; align-items:center; justify-content:center; font-size:1.3rem; }
+    .np-radio-fav img { width:100%; height:100%; object-fit:cover; }
+    .np-radio-text { flex:1; min-width:0; }
+    .np-radio-name { font-weight:700; font-size:1.05rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .np-radio-sub { display:flex; align-items:center; gap:.4rem; min-width:0; color:var(--muted,#8a8a8a); font-size:.86rem; }
+    .np-radio-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .np-radio-live { display:inline-flex; align-items:center; gap:.35rem; flex-shrink:0; color:var(--accent-ui,var(--accent)); font-weight:700; }
+    /* Equalizer liveness affordance: three animated bars. Kept running for the
+       whole station lifetime so a missing title never reads as stuck. */
+    .np-radio-eq { display:inline-flex; align-items:flex-end; gap:2px; height:.85rem; }
+    .np-radio-eq i { display:block; width:3px; height:100%; border-radius:1px; background:currentColor; transform-origin:bottom; animation:npRdEq .9s ease-in-out infinite; }
+    .np-radio-eq i:nth-child(2){ animation-delay:.3s; }
+    .np-radio-eq i:nth-child(3){ animation-delay:.6s; }
+    @keyframes npRdEq { 0%,100%{ transform:scaleY(.35);} 50%{ transform:scaleY(1);} }
+    /* Connecting: a pulsing single dot; Failed/offline: a steady muted dot. */
+    .np-radio.is-connecting .np-radio-eq i { animation:npRdPulse 1s ease-in-out infinite; }
+    @keyframes npRdPulse { 0%,100%{ opacity:.3; } 50%{ opacity:1; } }
+    .np-radio.is-failed { }
+    .np-radio.is-failed .np-radio-live { color:var(--danger,#e0564f); }
+    .np-radio.is-failed .np-radio-eq i { animation:none; transform:scaleY(.5); opacity:.7; }
+    .np-radio-queuenote { font-size:.82rem; color:var(--muted,#8a8a8a); padding:.4rem .55rem; border-radius:6px; background:color-mix(in srgb, var(--accent-ui,var(--accent)) 8%, transparent); border-left:3px solid var(--accent-ui,var(--accent)); }
+    .np-radio-controls { display:flex; gap:.5rem; flex-wrap:wrap; }
+    .np-radio-controls button { cursor:pointer; border:0; border-radius:6px; padding:.45rem .85rem; font:inherit; font-weight:600; color:var(--on-accent,#111); background:var(--accent-ui,var(--accent)); }
+    .np-radio-controls button:hover { filter:brightness(1.08); }
+    .np-radio-browse { background:transparent !important; color:var(--accent-ui,var(--accent)) !important; box-shadow:inset 0 0 0 1px var(--accent-ui,var(--accent)); }
+    .np-radio-controls button[aria-disabled="true"] { opacity:.5; cursor:default; }
+    .np-radio-controls button[aria-disabled="true"]:hover { filter:none; }
+    @media (prefers-reduced-motion: reduce){ .np-radio-eq i { animation:none !important; transform:scaleY(.6); } }`;
+    document.head.appendChild(style);
+  }
+
+  function _ensureRadioLiveRegion() {
+    if (_radioLive && document.body.contains(_radioLive)) return _radioLive;
+    _radioLive = document.createElement('div');
+    _radioLive.className = 'jp-sr-only';
+    _radioLive.setAttribute('role', 'status');
+    _radioLive.setAttribute('aria-live', 'polite');
+    document.body.appendChild(_radioLive);
+    return _radioLive;
+  }
+
+  // Announce the current radio state to AT (DL-004). Clear then set on the next
+  // frame so a repeat (e.g. failed→failed re-broadcast) still re-announces —
+  // the queue-ember live-region precedent.
+  function _announceRadio(msg) {
+    if (!msg) return;
+    const region = _ensureRadioLiveRegion();
+    region.textContent = '';
+    // FE5: coalesce a rapid second call — cancel the pending frame so only the
+    // latest message is announced (AT never reads the intermediate state). The
+    // clear-then-set idiom is preserved (repeat states still re-announce).
+    if (typeof requestAnimationFrame === 'function') {
+      if (_announceRafId) cancelAnimationFrame(_announceRafId);
+      _announceRafId = requestAnimationFrame(() => { _announceRafId = null; region.textContent = msg; });
+    } else {
+      region.textContent = msg;
+    }
+  }
+
+  // Render the station favicon client-side only (SSRF posture: the browser
+  // fetches it, never the server — DL-006). Absent/empty URL or a load error
+  // falls back to the generic 📻 glyph.
+  function _renderRadioFav(station) {
+    const box = _npEls && _npEls.radioFav;
+    if (!box) return;
+    box.textContent = '';
+    const url = station && typeof station.favicon === 'string' ? station.favicon.trim() : '';
+    if (url) {
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.alt = '';
+      img.addEventListener('error', () => { img.remove(); box.textContent = '📻'; });
+      img.src = url;
+      box.appendChild(img);
+    } else {
+      box.textContent = '📻';
+    }
+  }
+
+  // Whether the current viewer may start/switch (cosmetic only — the server
+  // enforces, U7). Admin always; guest only when guest_radio_control is on.
+  function _radioControlAllowed() {
+    return _radioAuthMode === 'admin' || !!_radioGuestControl;
+  }
+
+  // The queue-paused reassurance (DL-003). N = the preserved queue length the
+  // module already tracks (_queueLen, kept current by applyQueue). Shown while
+  // radio is active; hidden when radio stops (the queue resumes). Singular/plural
+  // and a zero-queue variant so an empty-queue takeover reads correctly.
+  function _renderRadioQueueNote() {
+    const el = _npEls && _npEls.radioQueueNote;
+    if (!el) return;
+    if (!_radio.active) { el.hidden = true; return; }
+    if (_queueLen > 0) {
+      el.textContent = _queueLen === 1
+        ? 'Track queue paused — 1 track preserved'
+        : `Track queue paused — ${_queueLen} tracks preserved`;
+    } else {
+      el.textContent = 'Track queue paused — it will resume when radio stops';
+    }
+    el.hidden = false;
+  }
+
+  // Apply the radio block to the widget. Additive: when inactive, hide the radio
+  // block and let the track NP path own the widget unchanged (the caller's
+  // applyNowPlaying / _setIdle already runs). All station/title text is untrusted
+  // (SEC-004) → textContent only.
+  function applyRadioNowPlaying(data) {
+    if (!data) return;
+    _radioStateGen++;   // FE3: a live WS write invalidates any in-flight resume() snapshot
+    _ensureRadioNpStyles();
+    const prevStatus = _radio.status;
+    const prevActive = _radio.active;
+    const prevUuid = _radio.station && _radio.station.stationuuid;
+    _radio = {
+      active: !!data.active,
+      station: data.station || null,
+      status: data.status || (data.active ? 'connecting' : 'idle'),
+      live_title: (typeof data.live_title === 'string' && data.live_title) ? data.live_title : null,
+    };
+    if (!_npEls || !_npEls.radio) return;
+
+    if (!_radio.active || !_radio.station) {
+      // Radio off → restore the track now-playing widget. The other regions were
+      // hidden while radio was on; un-hide the track row + lyrics wrapper so the
+      // idle/track path shows through. (The output-note has its own hidden gate.)
+      _npEls.radio.hidden = true;
+      _setTrackRegionsHidden(false);
+      _renderRadioQueueNote();   // hides the note
+      if (prevActive) _announceRadio('Radio stopped — track queue resuming');
+      return;
+    }
+
+    // Radio on → take over the widget: hide the track row + lyrics + progress,
+    // show the radio block. The track NP state underneath is left intact so a
+    // later stop restores it (applyNowPlaying still fires on the held front).
+    _setTrackRegionsHidden(true);
+    _npEls.radio.hidden = false;
+
+    const st = _radio.station;
+    const name = (typeof st.name === 'string' && st.name) ? st.name : 'Radio station';
+    _npEls.radioName.textContent = name;      // SEC-004: textContent, never innerHTML
+    _renderRadioFav(st);
+
+    // Status class drives the liveness affordance treatment.
+    _npEls.radio.classList.toggle('is-connecting', _radio.status === 'connecting');
+    _npEls.radio.classList.toggle('is-playing', _radio.status === 'playing');
+    _npEls.radio.classList.toggle('is-failed', _radio.status === 'failed');
+
+    // The live title (DL-007). null → station-name-only: show a state word so the
+    // sub-line is never empty and a missing title never reads as stuck (R6).
+    let subText;
+    if (_radio.status === 'failed') subText = 'Station offline';
+    else if (_radio.status === 'connecting') subText = 'Connecting…';
+    else subText = _radio.live_title || 'Live';
+    _npEls.radioTitle.textContent = subText;   // SEC-004: textContent only
+
+    _renderRadioQueueNote();
+    _syncRadioControls();
+
+    // Announce state transitions (DL-004). Only on an actual change of status or
+    // station so a title-only update doesn't spam AT; a title update is polite
+    // enough to skip (the visual affordance + "Live" carry it).
+    const changed = !prevActive || prevStatus !== _radio.status || prevUuid !== st.stationuuid;
+    if (changed) {
+      if (_radio.status === 'connecting') _announceRadio(`Connecting to ${name}`);
+      else if (_radio.status === 'failed') _announceRadio(`${name} offline`);
+      else _announceRadio(`Radio playing: ${name}`);
+    }
+  }
+
+  // Hide/show the track-NP regions (row, lyrics wrapper, progress, nudge) so the
+  // radio block replaces them without destroying their state. The output-note
+  // keeps its own hidden gate (an outage while radio is active is not expected,
+  // but leaving its gate alone is the safe additive default).
+  function _setTrackRegionsHidden(hidden) {
+    if (npRoot) {
+      const row = npRoot.querySelector('.np-row');
+      if (row) row.hidden = hidden;
+      const lyr = npRoot.querySelector('.np-lyrics');
+      // Only force-hide lyrics while radio is on; when restoring, let _renderLyrics
+      // own its visibility (it keeps the reserved slot shown), so just clear hidden.
+      if (lyr) lyr.hidden = hidden ? true : lyr.hidden;
+    }
+    if (progressRoot) progressRoot.hidden = hidden;   // R5: no progress bar for radio
+    if (_npEls && _npEls.nudge && hidden) _npEls.nudge.hidden = true;
+  }
+
+  // Wire + gate the radio controls. STOP is ALWAYS visible + enabled for guests
+  // (R9/DL-005) and calls cfg.onRadioStop (the page POSTs /api/radio/stop). The
+  // "Browse stations" affordance routes to the station browser (U9 owns
+  // start/switch); it is shown only when the page wired cfg.onRadioBrowse. When
+  // guest_radio_control is off, that (control-adjacent) affordance renders
+  // DISABLED — not hidden (R9 keeps radio visible) — with a host-only label; the
+  // dim is cosmetic, the server enforces.
+  let _radioControlsWired = false;
+  function _syncRadioControls() {
+    if (!_npEls || !_npEls.radioStop) return;
+    if (!_radioControlsWired) {
+      _radioControlsWired = true;
+      _npEls.radioStop.addEventListener('click', () => {
+        if (cfg.onRadioStop) cfg.onRadioStop();
+      });
+      if (_npEls.radioBrowse) {
+        _npEls.radioBrowse.addEventListener('click', () => {
+          if (_npEls.radioBrowse.getAttribute('aria-disabled') === 'true') return;
+          if (cfg.onRadioBrowse) cfg.onRadioBrowse();
+        });
+      }
+    }
+    // Browse/switch affordance: present only if the page injected the callback.
+    if (_npEls.radioBrowse) {
+      const show = !!cfg.onRadioBrowse;
+      _npEls.radioBrowse.hidden = !show;
+      if (show) {
+        const allowed = _radioControlAllowed();
+        _npEls.radioBrowse.setAttribute('aria-disabled', allowed ? 'false' : 'true');
+        if (allowed) {
+          _npEls.radioBrowse.removeAttribute('aria-label');
+        } else {
+          _npEls.radioBrowse.setAttribute('aria-label', 'Station control — host only');
+        }
+      }
+    }
+  }
+
+  // Push the guest-control flag (from /api/appearance via the page/shared.js).
+  // Cosmetic dim of the control-adjacent affordance only; the server route is
+  // the real enforcement. Admin passes authMode:'admin' at mount → always allowed.
+  function setRadioControl(allowed) {
+    _radioGuestControl = !!allowed;
+    if (_radio.active) _syncRadioControls();
+  }
+
   // ── lyrics (2026-06-17 plan 008) ──────────────────────────────────────
 
   // Called from applyNowPlaying's track-change branch and _setIdle. Clears
@@ -632,6 +935,9 @@ window.mountPlayback = function mountPlayback(config) {
   function applyQueue(queue, history) {
     _queueLen = (queue || []).length;   // gate the idle nudge: empty queue only
     _updateNudge();
+    // Radio queue-paused reassurance rides the queue length (DL-003): keep the
+    // "N tracks preserved" note current while a station holds the queue.
+    _renderRadioQueueNote();
     if (queueRoot) {
       const items = queue || [];
       if (!items.length) {
@@ -728,6 +1034,10 @@ window.mountPlayback = function mountPlayback(config) {
     // and the now-stale snapshot must not overwrite the newer push (e.g.
     // re-lock the UI the push just unlocked).
     const osGen = _osGen;
+    // Radio snapshot ordering guard (FE3, mirrors osGen): a WS radio_state push
+    // landing during the fetch bumps _radioStateGen; the stale snapshot must not
+    // overwrite the newer push.
+    const radioGen = _radioStateGen;
     try {
       const resp = await fetch('/api/now-playing');
       if (!resp.ok) {
@@ -748,6 +1058,15 @@ window.mountPlayback = function mountPlayback(config) {
       // phone, WS gap) converges on refetch — the WS/GET resync contract. Runs
       // in both branches because the hold clears `current`.
       if (data && data.output_session && osGen === _osGen) applyOutputSession(data.output_session);
+      // Radio Mode (radio plan U10): hydrate the radio block from the snapshot so
+      // a fresh / reconnecting / visibility-restored client converges on the
+      // active station without waiting for a live radio_state event (the same
+      // event+snapshot resync contract as the outage note). Applied in BOTH
+      // branches because a station takeover holds `current` (data.title is null
+      // mid-station), so radio must render on the no-current path too. A transient
+      // fetch failure never reaches here (the !resp.ok / catch branches keep the
+      // last-known station), honoring "don't blank to Nothing playing".
+      if (data && data.radio && radioGen === _radioStateGen) applyRadioNowPlaying(data.radio);
       if (data && data.title) {
         applyNowPlaying(data);
         const p = await fetch('/api/playback/position');
@@ -995,5 +1314,6 @@ window.mountPlayback = function mountPlayback(config) {
 
   return { applyNowPlaying, applyPlaybackState, applyQueue, applyClosingTime,
            applyOutputSession, outputSessionGen: () => _osGen,
+           applyRadioNowPlaying, setRadioControl,
            showSkipped, setIdle: _setIdle, suspend, resume };
 };
