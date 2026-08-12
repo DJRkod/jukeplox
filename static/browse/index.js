@@ -4307,32 +4307,39 @@
     const style = document.createElement('style');
     style.id = 'jp-radio-styles';
     style.textContent = `
+    /* Radio view parity (2026-08-12): the search box, section labels and station
+       rows mirror the app's own #search-bar input / .pb-label / .list-item so the
+       tab reads as native chrome, not a bolt-on. Values track those rules. */
     .rd-search { display:flex; gap:.5rem; padding:.75rem; }
-    .rd-search input { flex:1; min-width:0; }
+    .rd-search input { flex:1; min-width:0; padding:.65rem 1rem; border-radius:8px; border:1px solid var(--border,rgba(255,255,255,.14)); background:var(--surface,#1a1a1a); color:var(--text,#eee); font:inherit; font-size:.95rem; }
+    .rd-search input:focus { outline:none; border-color:var(--accent-ui,var(--accent)); }
     /* Self-styled buttons so the surface is consistent on guest (no .btn class
-       there) and admin alike; scheme-following. */
-    .rd-search .btn, .rd-retry { cursor:pointer; border:0; border-radius:6px; padding:.45rem .8rem; font:inherit; font-weight:600; color:var(--on-accent,#111); background:var(--accent-ui,var(--accent)); }
+       there) and admin alike; scheme-following. Radius matches the input. */
+    .rd-search .btn, .rd-retry { cursor:pointer; border:0; border-radius:8px; padding:.45rem .9rem; font:inherit; font-weight:600; color:var(--on-accent,#111); background:var(--accent-ui,var(--accent)); }
     .rd-search .btn:hover, .rd-retry:hover { filter:brightness(1.08); }
-    .rd-section-head { padding:.6rem .75rem .3rem; font-size:.78rem; letter-spacing:.04em; text-transform:uppercase; color:var(--muted,#8a8a8a); }
+    .rd-section-head { padding:.6rem .75rem .2rem; font-size:.68rem; letter-spacing:.05em; text-transform:uppercase; color:var(--muted,#8a8a8a); }
     .rd-genres { display:flex; flex-wrap:wrap; gap:.5rem; padding:.4rem .75rem .75rem; }
     .rd-genre { cursor:pointer; }
     .rd-cards { display:flex; flex-direction:column; }
-    .rd-card { display:flex; align-items:center; gap:.7rem; padding:.55rem .75rem; cursor:pointer; border:0; background:transparent; width:100%; text-align:left; color:inherit; font:inherit; }
-    .rd-card:hover { background:color-mix(in srgb, var(--accent-ui,var(--accent)) 10%, transparent); }
+    /* Station row = .list-item: same gap, padding, hairline divider, hover. */
+    .rd-card { display:flex; align-items:center; gap:.75rem; padding:.7rem .75rem; cursor:pointer; border:0; border-bottom:1px solid var(--divider,rgba(255,255,255,.08)); background:transparent; width:100%; text-align:left; color:inherit; font:inherit; transition:background .1s; }
+    .rd-card:hover { background:var(--surface,#1a1a1a); }
     .rd-card[aria-disabled="true"] { opacity:.5; cursor:default; }
     .rd-card[aria-disabled="true"]:hover { background:transparent; }
-    .rd-fav { flex-shrink:0; width:40px; height:40px; border-radius:6px; object-fit:cover; background:var(--surface2,#222); display:flex; align-items:center; justify-content:center; font-size:1.2rem; overflow:hidden; }
+    .rd-fav { flex-shrink:0; width:44px; height:44px; border-radius:4px; object-fit:cover; background:var(--surface2,#242424); display:flex; align-items:center; justify-content:center; font-size:1.2rem; overflow:hidden; }
     .rd-fav img { width:100%; height:100%; object-fit:cover; }
     .rd-info { flex:1; min-width:0; }
-    .rd-name { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .rd-meta { font-size:.8rem; color:var(--muted,#8a8a8a); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .rd-name { font-size:.9rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .rd-meta { font-size:.78rem; color:var(--muted,#8a8a8a); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .rd-state { flex-shrink:0; font-size:.75rem; font-weight:700; color:var(--accent-ui,var(--accent)); display:flex; align-items:center; gap:.35rem; }
     .rd-state .rd-eq { display:inline-block; width:.8rem; height:.8rem; }
-    .rd-card.is-active { background:color-mix(in srgb, var(--accent-ui,var(--accent)) 16%, transparent); }
+    /* Active station keeps an accent tint (a meaningful state, not just hover). */
+    .rd-card.is-active { background:color-mix(in srgb, var(--accent-ui,var(--accent)) 14%, transparent); }
+    .rd-card.is-active:hover { background:color-mix(in srgb, var(--accent-ui,var(--accent)) 18%, transparent); }
     .rd-empty, .rd-error { padding:1.25rem .75rem; color:var(--muted,#8a8a8a); text-align:center; }
     .rd-error .rd-retry { margin-left:.4rem; }
     .rd-skeleton { display:flex; flex-direction:column; gap:.15rem; padding:.5rem .75rem; }
-    .rd-skel-row { height:52px; border-radius:6px; background:linear-gradient(90deg, var(--surface2,#222) 25%, color-mix(in srgb, var(--surface2,#222) 60%, #444) 50%, var(--surface2,#222) 75%); background-size:200% 100%; animation:rdShimmer 1.2s linear infinite; }
+    .rd-skel-row { height:60px; border-radius:4px; background:linear-gradient(90deg, var(--surface2,#242424) 25%, color-mix(in srgb, var(--surface2,#242424) 60%, #444) 50%, var(--surface2,#242424) 75%); background-size:200% 100%; animation:rdShimmer 1.2s linear infinite; }
     @keyframes rdShimmer { from{background-position:200% 0;} to{background-position:-200% 0;} }
     #tabs .tab[data-view="radio-view"] .now-dot.on, #tabs .tab[data-view="radio-view"] .rd-tab-dot.on { display:inline-block; }
     .rd-tab-dot { display:none; width:8px; height:8px; border-radius:50%; background:var(--accent-ui,var(--accent)); margin-right:.35rem; vertical-align:middle; box-shadow:0 0 6px var(--accent-ui,var(--accent)); }
@@ -4743,11 +4750,14 @@
   // ── Tab activation hooks (called by the page when tabs switch) ────────────
 
   // ── Browse facet visibility (2026-06-26 ratings-and-tags plan U8) ───────────
-  // The five toggleable facets → their tab's data-view. Search/Artists/Albums/
-  // Now are never toggleable. display:none removes a flex child with no gap (R14).
+  // The toggleable tabs → their tab's data-view. Search/Artists/Albums/Now are
+  // never toggleable. display:none removes a flex child with no gap (R14). The
+  // five Browse facets default ON (visible until hidden); Radio defaults OFF
+  // (opt-in, mirrors guest_radio_control) — see _applyTabVisibility.
   const _FACET_VIEW = {
     genre: 'genres-view', years: 'years-view', mostplayed: 'mostplayed-view',
     recentlyadded: 'recentlyadded-view', highestrated: 'highestrated-view',
+    radio: 'radio-view',
   };
 
   function _ratingVisibleToViewer() {
@@ -4764,7 +4774,10 @@
     Object.keys(_FACET_VIEW).forEach(facet => {
       const tab = document.querySelector(`#tabs [data-view="${_FACET_VIEW[facet]}"]`);
       if (!tab) return;
-      let show = admin ? true : (facets[facet] !== false);
+      // Radio is opt-in: hidden for guests unless explicitly enabled (fail-closed
+      // on an undefined flag). The five Browse facets default visible (!== false).
+      let show = admin ? true
+        : (facet === 'radio' ? facets.radio === true : facets[facet] !== false);
       if (facet === 'highestrated' && !_ratingVisibleToViewer()) show = false;
       tab.style.display = show ? '' : 'none';
     });

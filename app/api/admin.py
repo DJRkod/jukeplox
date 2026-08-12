@@ -2249,6 +2249,9 @@ class SettingsRequest(BaseModel):
     facet_mostplayed: bool | None = None
     facet_recentlyadded: bool | None = None
     facet_highestrated: bool | None = None
+    # Radio tab visibility (2026-08-12): DEFAULT OFF (opt-in), unlike the five
+    # facets above. Hides the Radio tab from guests until turned on.
+    facet_radio: bool | None = None
     # Closing Time mode (2026-06-24 plan): off-by-default toggle plus the
     # admin-editable trigger song (title + artist) and send-off message. Strings
     # persist as-given (trimmed); an enabled-but-blank trigger simply never fires.
@@ -2525,7 +2528,7 @@ async def update_settings(body: SettingsRequest):
     for _flag in ("ratings_visible_to_guests", "tags_visible_to_guests",
                   "guest_radio_control",
                   "facet_genre", "facet_years", "facet_mostplayed",
-                  "facet_recentlyadded", "facet_highestrated"):
+                  "facet_recentlyadded", "facet_highestrated", "facet_radio"):
         _v = getattr(body, _flag)
         if _v is not None:
             await database.set_setting(_flag, "1" if _v else "0")

@@ -1166,11 +1166,18 @@ async def set_radio_last_known_mirrors(hosts: list[str]) -> None:
 
 
 async def get_browse_facets() -> dict[str, bool]:
-    """Per-facet guest visibility, all default True. {facet_id: visible}."""
-    return {
+    """Per-tab guest visibility. {tab_id: visible}.
+
+    The five Browse facets default True (visible until the admin hides one with an
+    explicit "0"). ``radio`` is the exception — it defaults OFF (opt-in, mirroring
+    guest_radio_control), so the Radio tab is hidden from guests until the admin
+    turns it on with an explicit "1"."""
+    facets = {
         f: (await get_setting(f"facet_{f}")) != "0"
         for f in BROWSE_FACETS
     }
+    facets["radio"] = (await get_setting("facet_radio")) == "1"
+    return facets
 
 
 # ── genre cache ───────────────────────────────────────────────────────────────

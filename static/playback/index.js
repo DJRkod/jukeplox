@@ -498,6 +498,11 @@ window.mountPlayback = function mountPlayback(config) {
     style.id = 'jp-radio-np-styles';
     style.textContent = `
     .np-radio { display:flex; flex-direction:column; gap:.55rem; }
+    /* The .np-radio display:flex above outweighs the UA [hidden]{display:none}
+       rule (equal specificity, author sheet wins on source order) — without this
+       guard the radio block (and its "Stop radio" button) stays visible even
+       when applyRadioNowPlaying sets .hidden with no station playing. */
+    .np-radio[hidden] { display:none; }
     .np-radio-row { display:flex; align-items:center; gap:.7rem; }
     .np-radio-fav { flex-shrink:0; width:44px; height:44px; border-radius:8px; object-fit:cover; overflow:hidden; background:var(--surface2,#222); display:flex; align-items:center; justify-content:center; font-size:1.3rem; }
     .np-radio-fav img { width:100%; height:100%; object-fit:cover; }

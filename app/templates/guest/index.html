@@ -385,7 +385,10 @@
   <div class="tab" data-view="mostplayed-view">Most Played</div>
   <div class="tab" data-view="recentlyadded-view">Recently Added</div>
   <div class="tab" data-view="highestrated-view">Highest Rated</div>
-  <div class="tab" data-view="radio-view"><span class="rd-tab-dot"></span>Radio</div>
+  <!-- Radio is opt-in (default OFF): hidden until the admin enables it, then
+       revealed by _applyTabVisibility (which clears this inline display). Fail-
+       closed if /api/appearance never resolves. Admin dashboard shows it always. -->
+  <div class="tab" data-view="radio-view" style="display:none"><span class="rd-tab-dot"></span>Radio</div>
 </div>
 
 <div id="content-frame">
