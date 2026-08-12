@@ -22,6 +22,21 @@ dependencies = [
     "async-upnp-client>=0.40",
     "mutagen>=1.47",
     "cryptography>=43",
+    # Server-fed multi-room backends (2026-08-11 plan U3). Baked into the ONE
+    # image; both backends are DORMANT by default (imported only inside their
+    # enable path — R16), so a disabled backend pays no import/runtime cost.
+    # EXACT pins, deliberately: aiosendspin had ~9 breaking majors in ~8 months
+    # (isolated behind app/output/sendspin_adapter.py), and snapcast's control
+    # surface is version-sensitive. The `[server]` extra drags in PyAV/numpy/
+    # pillow (attributed in THIRD_PARTY_LICENSES). Exact versions are the
+    # settle-at-image-build values (plan "Deferred to Implementation").
+    "snapcast==2.3.8",
+    "aiosendspin[server]==9.1.0",
+    # snapcast 2.3.8 imports `packaging` but does NOT declare it as a dependency
+    # (undeclared transitive) — the embedded snapserver control connect fails at
+    # runtime with "No module named 'packaging'" without it. Caught on the arm64
+    # rig 2026-08-12 (the in-image e2e masked it because pytest pulls packaging).
+    "packaging>=23",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +50,12 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    # 2026-08-11 plan U10: the snapclient-subprocess e2e is the R18 hardware-free
+    # gate. It skips where the binary is absent (Windows dev) and MUST pass inside
+    # the built image — a bare skip does not satisfy R18.
+    "requires_snapclient: needs the snapserver+snapclient binaries (in-image gate)",
+]
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]

@@ -10,8 +10,22 @@ COPY vendor/airplay/cliap2-linux-x86_64   /staging/cliap2-amd64
 COPY vendor/airplay/cliap2-linux-aarch64  /staging/cliap2-arm64
 COPY vendor/airplay/cliraop-linux-x86_64  /staging/cliraop-amd64
 COPY vendor/airplay/cliraop-linux-aarch64 /staging/cliraop-arm64
-RUN cp /staging/cliap2-${TARGETARCH}  /cliap2  && \
-    cp /staging/cliraop-${TARGETARCH} /cliraop && \
+# TARGETARCH is auto-populated by BuildKit/buildx (the normal multi-arch CI
+# path). Fall back to `uname -m` when it is empty so the build ALSO works on the
+# classic (non-BuildKit) builder — otherwise the arch suffix is blank and the cp
+# fails with "can't stat /staging/cliap2-" (hit building natively on the arm64
+# rig, 2026-08-12).
+RUN set -eux; \
+    a="${TARGETARCH:-}"; \
+    if [ -z "$a" ]; then \
+        case "$(uname -m)" in \
+            x86_64) a=amd64 ;; \
+            aarch64|arm64) a=arm64 ;; \
+            *) echo "unsupported build arch $(uname -m)"; exit 1 ;; \
+        esac; \
+    fi; \
+    cp /staging/cliap2-"$a"  /cliap2  && \
+    cp /staging/cliraop-"$a" /cliraop && \
     chmod +x /cliap2 /cliraop
 
 # ── builder ──────────────────────────────────────────────────────────────────
@@ -84,7 +98,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libevent-pthreads-2.1-7 \
     libcurl4 \
     libconfuse2 \
+    snapserver \
+    snapclient \
     && rm -rf /var/lib/apt/lists/*
+
+# ── snapserver version gate (2026-08-11 plan U3) ──────────────────────────────
+# The base image is pinned to bookworm, whose apt suite ships snapcast **0.26.0**
+# (verified 2026-08-12 at image build — the plan's "0.27.0" assumption was wrong).
+# So `apt-get install snapserver` above deterministically lands in-range without
+# an exact `=version` pin (which would be fragile across amd64/arm64 binNMU
+# revisions). This RUN is the HARD BUILD GATE: if a future base-image bump rolls
+# the suite into 0.30.x (a known-incompatible series) or below 0.26, the build
+# FAILS here rather than silently shipping an untested snapserver. 0.26 supports
+# the tcp source + JSON-RPC control + idle_threshold the backend needs (proven by
+# the U10 in-image e2e). `snapclient` is bundled as the hardware-free receiver.
+RUN set -eux; \
+    v="$(snapserver --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    echo "snapserver version: ${v}"; \
+    major="$(echo "$v" | cut -d. -f1)"; minor="$(echo "$v" | cut -d. -f2)"; \
+    if [ "$major" != "0" ] || [ "$minor" -lt 26 ] || [ "$minor" -ge 30 ]; then \
+        echo "ERROR: snapserver ${v} is outside the supported [0.26, 0.30) range (plan U3)"; \
+        exit 1; \
+    fi
 
 COPY --from=builder /install /usr/local
 COPY --from=airplay-bin /cliap2  /usr/local/bin/cliap2
@@ -93,6 +128,11 @@ COPY --from=airplay-bin /cliraop /usr/local/bin/cliraop
 WORKDIR /app
 COPY app/ ./app/
 COPY static/ ./static/
+# Stub snapserver.conf (2026-08-11 plan U3/U4): snapserver silently ignores its
+# CLI --stream.* args when its config file is missing, so the embedded
+# supervisor always launches it with --config=/app/config/snapserver.conf. The
+# stub carries only empty section headers; all real config is passed on the CLI.
+COPY config/ ./config/
 
 # Build-info ARGs — passed via `--build-arg` at docker build time so the
 # running container can report exactly which commit + build timestamp it

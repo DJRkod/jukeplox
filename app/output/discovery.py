@@ -95,6 +95,10 @@ GAPLESS_CAPABILITY = {
     # behavioral verdict after the first successful armed boundary
     # (PUT-append to a player-owned queue is a hardware-validation item).
     "plexplayer": "unverified",
+    # Server-fed multi-room backends (2026-08-11 plan U5/U7): one continuous
+    # server-stitched feed → gapless is a natural property of the transport.
+    "snapcast": "supported",
+    "sendspin": "supported",
 }
 
 # Backends whose gapless verdict is per-DEVICE (behavioral, cached in the
@@ -282,13 +286,20 @@ def _state_backend(backend: str) -> Any:
     app.state (and the watcher's injected lookup can replace it in
     tests)."""
     from app import state
-    return {
+    inst = {
         "direct": state.direct_backend,
         "airplay": state.airplay_backend,
         "chromecast": state.chromecast_backend,
         "dlna": state.dlna_backend,
         "plexplayer": state.plexplayer_backend,
     }.get(backend)
+    if inst is not None:
+        return inst
+    # Server-fed backends (2026-08-11 plan U5/U7) live in the lazy activation
+    # cache, not a module global — None when the backend is dormant.
+    if state.is_server_fed_backend(backend):
+        return state.get_server_fed_backend(backend)
+    return None
 
 
 def host_for(d, backend: str, backend_for: Callable[[str], Any] | None = None,

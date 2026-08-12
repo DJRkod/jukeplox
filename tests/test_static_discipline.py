@@ -192,6 +192,22 @@ ADMIN_ALLOWED = {
     "browseHandle",
     # Appearance engine mount handle (2026-06-11 glow-up U5 — wiring only)
     "appearanceHandle",
+    # Optional integrations: server-fed multi-room backends (2026-08-11 plan U9).
+    # Admin-only Setup chrome — the enable toggles, zoning client-tree sliders,
+    # and Sendspin pairing panel. The zone sliders reuse the master slider's
+    # --vol-fill visual but POST to their own per-client/per-group endpoints
+    # (a distinct admin surface, NOT a fork of the shared playback/browse
+    # modules — like the Sources / Recent-Plays panels).
+    "_integrationsData", "_zoneVolTimers",
+    "loadIntegrations", "renderMultiroomPanel", "toggleIntegration",
+    "loadZones", "renderZoneTree", "renderZoneSlider",
+    "renderPairingPanel", "rotateSendspinPairing",
+    # Full zoning control plane (U9 review follow-up): group header
+    # (volume/mute/rename/dissolve), per-client mute + assign dropdown, the
+    # POST helper, and the external-Snapcast config form. Same admin-only Setup
+    # chrome as above — POSTs to the per-backend zone endpoints, not a shared
+    # renderer.
+    "zonePost", "renderGroupHeader", "renderExternalConfig",
 }
 
 # Forbidden symbols: forked copies of the shared module's responsibilities.

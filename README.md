@@ -16,7 +16,8 @@ on Mac/Windows Docker Desktop.
 
 - **Multi-source library** — Plex, Jellyfin, Emby, OpenSubsonic (Navidrome & friends), and
   local folders merged into one catalog.
-- **Cast anywhere** — Chromecast, AirPlay 2, DLNA/UPnP, or speakers wired to the host.
+- **Cast anywhere** — Chromecast, AirPlay 2, DLNA/UPnP, or speakers wired to the host;
+  optional synchronized multi-room via Snapcast (and experimental Sendspin).
 - **No-app guest access** — guests browse and queue from a phone web page; no install, no
   account, no password.
 - **Party-ready** — shared queue, now playing, search, genre and most-played browse,
@@ -95,6 +96,30 @@ Two headless-ALSA gotchas on some hosts:
 - The container doesn't inherit the host's `/etc/asound.conf`. If your host defines a custom `default` PCM (softvol / dmix / a fixed rate), bind-mount it: `-v /etc/asound.conf:/etc/asound.conf:ro`.
 
 Then choose **System Audio** in Setup → Output.
+
+## Multi-room output (Snapcast + Sendspin — optional)
+
+Jukeplox can be the source for **synchronized whole-home audio** via two open,
+server-fed backends. They ship inside the one image but are **off by default** —
+nothing runs until you enable it under **Setup → Optional integrations**:
+
+- **Snapcast** — jukeplox runs an embedded `snapserver`; any number of Snapcast
+  clients (a Pi, a Linux box, a phone app) play the current queue in sync. You
+  can also point it at an **external** snapserver by host/port. Group clients into
+  zones and set per-client / per-zone volume from the admin panel.
+- **Sendspin** *(experimental — technical preview, protocol may change)* — an
+  in-process Sendspin server advertised over mDNS; pair ESPHome / browser / CLI
+  clients with a short PIN.
+
+Both stream the **single** playback queue (one stream, zoned across clients — not
+different songs per room). Enabling one does **not** change local output:
+`--device /dev/snd` / **System Audio** stays the way you hear the host's own
+speakers — the host is only part of the multi-room mesh if a Snapcast/Sendspin
+*client* also runs on it.
+
+Host-networking notes: snapserver's control (1705) and web (1780) ports bind to
+loopback; the client stream port (1704) is LAN-facing by design. Set `BIND_HOST`
+to this server's LAN IP so Sendspin advertises a reachable address.
 
 ## More music sources
 

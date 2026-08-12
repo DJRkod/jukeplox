@@ -1097,7 +1097,7 @@ async def list_output_devices(bust: bool = Query(False)):
 
 class SetOutputRequest(BaseModel):
     backend_type: Literal['direct', 'chromecast', 'dlna', 'airplay',
-                          'plexplayer']
+                          'plexplayer', 'snapcast', 'sendspin']
     device_id: str = "default"
     host: str | None = None
     # Two-phase stranded-tracks switch confirm (2026-08-04-002 plan U6 —
@@ -1628,6 +1628,233 @@ async def retest_airplay_protocol(device_id: str):
         device_id, name, host, port, txt, force=True,
     )
     return {"device_id": device_id, "protocol": verdict}
+
+
+# ── Optional integrations (server-fed backends) status + toggle (plan U9) ────
+
+@router.get("/output/integrations")
+async def output_integrations():
+    """Status of the dormant-by-default server-fed backends for the Admin →
+    Setup panel: enabled, connected, experimental, and live client count."""
+    out = {}
+    for name in ("snapcast", "sendspin"):
+        b = state.get_server_fed_backend(name)
+        connected = bool(b is not None and b.is_connected())
+        clients = 0
+        if connected:
+            try:
+                clients = len(await b.discover_devices())
+            except Exception:
+                clients = 0
+        out[name] = {
+            "enabled": state.server_fed_backend_enabled(name),
+            "connected": connected,
+            "experimental": name == "sendspin",
+            "client_count": clients,
+        }
+    return out
+
+
+class IntegrationToggleRequest(BaseModel):
+    enabled: bool
+
+
+@router.post("/output/integrations/{backend}/toggle")
+async def toggle_integration(backend: str, body: IntegrationToggleRequest):
+    if backend not in ("snapcast", "sendspin"):
+        raise HTTPException(status_code=404, detail="unknown integration")
+    try:
+        await state.set_backend_enabled(backend, body.enabled)
+    except Exception as exc:
+        # Enable failed (port conflict / readiness timeout / external
+        # unreachable). Surface it so the UI latches the toggle to "failed"
+        # with a retry — never a silent revert (R15/U9 interaction states).
+        raise HTTPException(status_code=502, detail={
+            "category": "enable_failed", "message": str(exc)})
+    return {"ok": True, "enabled": state.server_fed_backend_enabled(backend)}
+
+
+# ── Snapcast zoning (2026-08-11 plan U6) ──────────────────────────────────────
+# All endpoints are admin-gated by the router-level require_admin (AE7). The
+# topology endpoints (rename/dissolve) additionally 403 on an external server —
+# jukeplox never destroys a topology it does not own (R9/AE3).
+
+def _snapcast_backend():
+    """The enabled Snapcast backend, or 404 when it is dormant/disabled."""
+    b = state.get_server_fed_backend("snapcast")
+    if b is None or not b.is_connected():
+        raise HTTPException(status_code=404,
+                            detail="Snapcast backend is not enabled")
+    return b
+
+
+class SnapcastConnectRequest(BaseModel):
+    mode: Literal["embedded", "external"] = "embedded"
+    host: str | None = None
+    port: int = 1705
+    feed_url: str | None = None
+
+
+class ZoneVolumeRequest(BaseModel):
+    level: float
+
+
+class ZoneMuteRequest(BaseModel):
+    muted: bool
+
+
+class ZoneAssignRequest(BaseModel):
+    client_id: str
+
+
+class ZoneRenameRequest(BaseModel):
+    name: str
+
+
+@router.post("/output/snapcast/connect")
+async def snapcast_connect(body: SnapcastConnectRequest):
+    """Persist the Snapcast mode/config and (re)enable the backend. An external
+    host is validated fail-closed (loopback/link-local always blocked; private
+    blocked unless ALLOW_PRIVATE_SOURCES) BEFORE anything is persisted."""
+    if body.mode == "external":
+        if not body.host:
+            raise HTTPException(status_code=400, detail="external mode needs a host")
+        await _validate_source_url(body.host)  # SSRF gate (categorized 400)
+    await database.set_setting("snapcast_mode", body.mode)
+    if body.host is not None:
+        await database.set_setting("snapcast_external_host", body.host)
+    await database.set_setting("snapcast_external_port", str(body.port))
+    if body.feed_url is not None:
+        await database.set_setting("snapcast_external_feed_url", body.feed_url)
+    # Re-enable to pick up the new config (disable first if already enabled).
+    if state.server_fed_backend_enabled("snapcast"):
+        await state.disable_server_fed_backend("snapcast")
+    await state.set_backend_enabled("snapcast", True)
+    return {"ok": True, "mode": body.mode}
+
+
+@router.get("/output/snapcast/zones")
+async def snapcast_zones():
+    b = _snapcast_backend()
+    return {"zones": await b.list_zones(),
+            "can_manage_topology": b.can_manage_topology()}
+
+
+@router.post("/output/snapcast/client/{client_id}/volume")
+async def snapcast_client_volume(client_id: str, body: ZoneVolumeRequest):
+    await _snapcast_backend().set_client_volume(client_id, body.level)
+    return {"ok": True}
+
+
+@router.post("/output/snapcast/client/{client_id}/mute")
+async def snapcast_client_mute(client_id: str, body: ZoneMuteRequest):
+    await _snapcast_backend().set_client_mute(client_id, body.muted)
+    return {"ok": True}
+
+
+@router.post("/output/snapcast/group/{group_id}/volume")
+async def snapcast_group_volume(group_id: str, body: ZoneVolumeRequest):
+    await _snapcast_backend().set_group_volume(group_id, body.level)
+    return {"ok": True}
+
+
+@router.post("/output/snapcast/group/{group_id}/mute")
+async def snapcast_group_mute(group_id: str, body: ZoneMuteRequest):
+    await _snapcast_backend().set_group_mute(group_id, body.muted)
+    return {"ok": True}
+
+
+@router.post("/output/snapcast/group/{group_id}/assign")
+async def snapcast_group_assign(group_id: str, body: ZoneAssignRequest):
+    """Assign a client into an existing group — allowed on embedded AND external
+    (assign-between-existing is non-destructive, R9/AE3)."""
+    await _snapcast_backend().assign_client_to_group(body.client_id, group_id)
+    return {"ok": True}
+
+
+@router.post("/output/snapcast/group/{group_id}/rename")
+async def snapcast_group_rename(group_id: str, body: ZoneRenameRequest):
+    try:
+        await _snapcast_backend().rename_group(group_id, body.name)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    return {"ok": True}
+
+
+@router.delete("/output/snapcast/group/{group_id}")
+async def snapcast_group_dissolve(group_id: str):
+    try:
+        await _snapcast_backend().dissolve_group(group_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    return {"ok": True}
+
+
+# ── Sendspin pairing + zoning (2026-08-11 plan U8) — EXPERIMENTAL ─────────────
+# Admin-gated by the router-level require_admin. The PSK is served plaintext ONLY
+# here (to an authenticated admin) and never logged / never sent sealed; rotate
+# requires an explicit confirm because it disconnects all paired clients.
+
+def _sendspin_backend():
+    b = state.get_server_fed_backend("sendspin")
+    if b is None or not b.is_connected():
+        raise HTTPException(status_code=404,
+                            detail="Sendspin backend is not enabled")
+    return b
+
+
+class SendspinRotateRequest(BaseModel):
+    confirm: bool = False
+
+
+@router.get("/output/sendspin/pairing")
+async def sendspin_pairing():
+    """A fresh short-lived pairing PIN (preferred over displaying the raw PSK)."""
+    b = _sendspin_backend()
+    return {"pin": await b.get_pairing_pin()}
+
+
+@router.post("/output/sendspin/pairing/rotate")
+async def sendspin_pairing_rotate(body: SendspinRotateRequest):
+    if not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="rotating the pairing key disconnects all paired clients — "
+                   "resend with confirm=true")
+    await _sendspin_backend().rotate_pairing()
+    return {"ok": True}
+
+
+@router.get("/output/sendspin/zones")
+async def sendspin_zones():
+    b = _sendspin_backend()
+    return {"zones": await b.list_zones(), "experimental": True}
+
+
+@router.post("/output/sendspin/client/{client_id}/volume")
+async def sendspin_client_volume(client_id: str, body: ZoneVolumeRequest):
+    await _sendspin_backend().set_client_volume(client_id, body.level)
+    return {"ok": True}
+
+
+@router.post("/output/sendspin/client/{client_id}/mute")
+async def sendspin_client_mute(client_id: str, body: ZoneMuteRequest):
+    await _sendspin_backend().set_client_mute(client_id, body.muted)
+    return {"ok": True}
+
+
+@router.post("/output/sendspin/group/{group_id}/volume")
+async def sendspin_group_volume(group_id: str, body: ZoneVolumeRequest):
+    await _sendspin_backend().set_group_volume(group_id, body.level)
+    return {"ok": True}
+
+
+@router.post("/output/sendspin/group/{group_id}/mute")
+async def sendspin_group_mute(group_id: str, body: ZoneMuteRequest):
+    # Parity with the Snapcast group-mute route — the backend implements
+    # set_group_mute (ZONING_CONTRACT), so the HTTP surface must expose it too.
+    await _sendspin_backend().set_group_mute(group_id, body.muted)
+    return {"ok": True}
 
 
 @router.post("/playback/no-audio")

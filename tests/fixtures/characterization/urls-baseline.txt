@@ -3,10 +3,16 @@
 /admin/history/remove-play
 /admin/login
 /admin/most-played/remove
+/admin/output/
 /admin/output/active
 /admin/output/airplay-protocols
 /admin/output/devices
 /admin/output/devices/
+/admin/output/integrations
+/admin/output/integrations/
+/admin/output/sendspin/pairing
+/admin/output/sendspin/pairing/rotate
+/admin/output/snapcast/group/
 /admin/pattern-rules
 /admin/playback/no-audio
 /admin/playback/pause
@@ -26,6 +32,7 @@
 /admin/queue/lock
 /admin/queue/move
 /admin/queue/unlock
+/admin/radio/stop
 /admin/scan-status
 /admin/settings
 /admin/sources
@@ -59,6 +66,11 @@
 /api/queue
 /api/queue/surprise
 /api/queue/undo
+/api/radio/current
+/api/radio/play
+/api/radio/stations
+/api/radio/stop
+/api/radio/switch
 /api/recently-added
 /api/scan-status
 /api/search
