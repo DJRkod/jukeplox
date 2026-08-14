@@ -42,5 +42,5 @@ class SeekRequest(BaseModel):
 @router.post("/admin/playback/seek", dependencies=[Depends(require_admin)])
 async def playback_seek(body: SeekRequest):
     """Seek to position — admin only."""
-    await state.output_router.seek(body.position_ms)
-    return {"ok": True}
+    from app import playback_control
+    return await playback_control.playback_seek(body.position_ms)

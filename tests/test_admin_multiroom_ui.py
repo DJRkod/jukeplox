@@ -126,3 +126,66 @@ def test_admin_js_full_zoning_control_plane():
     assert "snapcast/connect" in js                       # external config form
     # topology controls gated on can_manage_topology (embedded only)
     assert "canManageTopology" in js
+
+
+def test_sendspin_card_is_no_longer_hidden_behind_coming_soon():
+    js = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    assert "Coming soon" not in js
+    assert "issues/28" not in js
+
+
+def test_admin_js_pairs_the_way_the_protocol_does():
+    """The operator enters a code read off the speaker. Jukeplox must never
+    display a code for the operator to type into the speaker — that flow does
+    not exist in this protocol, and the old panel had it backwards."""
+    js = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    # the inverted flow is gone
+    assert "Show pairing PIN" not in js
+    assert "rotateSendspinPairing" not in js
+    assert "/sendspin/pairing" not in js
+    # the real flow is present: all three methods, a code entry, pair + unpair
+    for needle in ("Code from the speaker", "/sendspin/pair",
+                   "/unpair", "/sendspin/speakers"):
+        assert needle in js, f"admin/app.js missing {needle}"
+
+
+def test_paired_list_and_unpair_are_always_reachable():
+    """Pairing is the only authority boundary a speaker has, so the paired list
+    is a security surface — it must not be tucked behind a disclosure widget."""
+    js = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    start = js.find("async function renderPairingPanel")
+    assert start > 0, "renderPairingPanel missing"
+    end = js.find("\nfunction ", start + 1)
+    body = js[start:end if end > start else len(js)]
+    assert "Paired speakers" in body
+    assert "<details" not in body             # not hidden behind an expander
+    assert "data-unpair" in body
+    # unpairing a live speaker is destructive and immediate → confirm first
+    assert "Unpair this speaker?" in js
+
+
+def test_delay_trim_is_capability_gated_not_backend_gated():
+    js = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    assert "delay_ms" in js and "/delay" in js
+    assert "client.delay_ms !== undefined" in js
+
+
+def test_every_api_helper_call_passes_a_method_first():
+    """api() is api(method, path, body). Passing the URL as the first argument
+    binds it to `method`, leaves `path` undefined, and the fetch throws — a
+    silent, total failure of whatever panel made the call. Two of these sat in
+    the multiroom panel unnoticed because the UI tests only read source text."""
+    import re
+    js = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    bad = re.findall(r"api\(\s*['\"`]/", js)
+    assert not bad, (
+        f"{len(bad)} api() call(s) pass a URL where the HTTP method belongs")
+
+
+def test_pairing_panel_guards_against_overlapping_renders_and_double_submit():
+    js = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    assert "_pairingGen" in js                    # stale-response guard
+    assert "pairBtn.disabled = true" in js        # no double-pair
+    # Pairing is asynchronous — the toast must not claim completion.
+    assert "Speaker paired'" not in js
+    assert "Pairing started" in js

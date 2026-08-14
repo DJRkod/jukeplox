@@ -104,8 +104,14 @@ enabled):
   queue in sync to any Snapcast clients; group them into zones with per-client
   volume. Optionally point at an external snapserver by host/port (read + assign
   only — jukeplox never rewrites a server you don't own).
-- **Sendspin** *(experimental)* — an in-process, mDNS-advertised Sendspin server;
-  pair clients with a short PIN.
+- **Sendspin** *(experimental)* — an in-process, mDNS-advertised Sendspin server
+  for ESPHome speakers and other Sendspin receivers. Pushes song info and cover
+  art to speakers with a screen and accepts transport commands back; per-speaker
+  volume, mute and per-room delay trim. Pair by picking the speaker in the admin
+  panel and entering the code the speaker provides (a fixed code on the device, a
+  code it displays, or a supplied token). Pairings persist across restarts and
+  are encrypted at rest. A paired speaker can control playback and is not subject
+  to the guest toggles — unpair it there to revoke that.
 
 They stream the single shared queue (one stream, zoned — not different songs per
 room) and don't change local output: **System Audio** stays how the host's own

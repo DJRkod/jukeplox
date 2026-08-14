@@ -150,8 +150,14 @@ def tmp_settings(tmp_path, monkeypatch):
 
 @pytest.fixture
 async def db(tmp_settings):
+    # Must close: aiosqlite's connection runs on a NON-daemon thread, so leaving
+    # it open hangs the pytest process at interpreter exit, after the tests have
+    # already passed.
     await database.init_db()
-    return tmp_settings
+    try:
+        yield tmp_settings
+    finally:
+        await database.close_db()
 
 
 async def test_set_backend_enabled_persists_and_applies(db, fake_construct):

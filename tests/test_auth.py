@@ -18,8 +18,15 @@ def tmp_settings(tmp_path, monkeypatch):
 
 @pytest.fixture
 async def db(tmp_settings):
+    # close_db() is mandatory, not tidiness: aiosqlite runs its connection on a
+    # NON-daemon thread, so leaving it open blocks threading._shutdown and hangs
+    # the pytest process AFTER the tests have passed. pytest-timeout cannot
+    # catch that — it is an interpreter-exit hang, not an in-test one.
     await database.init_db()
-    return tmp_settings
+    try:
+        yield tmp_settings
+    finally:
+        await database.close_db()
 
 
 # ── local password ────────────────────────────────────────────────────────────

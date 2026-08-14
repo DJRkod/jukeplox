@@ -32,6 +32,10 @@ dependencies = [
     # settle-at-image-build values (plan "Deferred to Implementation").
     "snapcast==2.3.8",
     "aiosendspin[server]==9.1.0",
+    # Used DIRECTLY by sendspin_adapter to decode album art before handing it to
+    # the artwork role. It arrives transitively via aiosendspin[server] today,
+    # but relying on that would break the moment that extra is repackaged.
+    "pillow>=10",
     # snapcast 2.3.8 imports `packaging` but does NOT declare it as a dependency
     # (undeclared transitive) — the embedded snapserver control connect fails at
     # runtime with "No module named 'packaging'" without it. Caught on the arm64

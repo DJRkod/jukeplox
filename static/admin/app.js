@@ -2371,7 +2371,7 @@ let _zoneVolTimers = {};
 
 async function loadIntegrations() {
   try {
-    _integrationsData = await api('/admin/output/integrations');
+    _integrationsData = await api('GET', '/admin/output/integrations');
   } catch (e) {
     _integrationsData = null;
   }
@@ -2404,25 +2404,22 @@ function renderMultiroomPanel() {
       `<div style="display:flex;align-items:center;gap:.6rem;justify-content:space-between">
          <div><strong>${esc(label)}</strong>${badge}
            <div style="font-size:.8rem;color:#999" data-role="status">${esc(clientNote)}</div></div>
-         ${backend === 'sendspin'
-           ? '<span style="font-size:.8rem;color:#999">Coming soon — <a href="https://github.com/DJRkod/jukeplox/issues/28" target="_blank" rel="noopener" style="color:#8ab">tracked</a></span>'
-           : `<label style="display:flex;align-items:center;gap:.4rem;font-size:.85rem">
-           <input type="checkbox" data-backend="${backend}" ${info.enabled ? 'checked' : ''}> Enable</label>`}
+         <label style="display:flex;align-items:center;gap:.4rem;font-size:.85rem">
+           <input type="checkbox" data-backend="${backend}" ${info.enabled ? 'checked' : ''}> Enable</label>
        </div>
        <div data-role="failure" style="display:none;color:#e88;font-size:.8rem;margin-top:.4rem"></div>
        <div data-role="config"></div>
        <div data-role="zones" style="margin-top:.6rem"></div>
        <div data-role="pairing" style="margin-top:.6rem"></div>`;
-    // Sendspin is deferred (real aiosendspin integration is tracked in #28) — no
-    // enable toggle yet; Snapcast is the shipped server-fed backend.
     const toggle = card.querySelector('input[type=checkbox]');
     if (toggle) toggle.addEventListener('change', () => toggleIntegration(backend, toggle, card));
     host.appendChild(card);
     // The external-server form is available for Snapcast whether enabled or not
     // (saving it applies the config and enables the backend).
     if (backend === 'snapcast') renderExternalConfig(card);
-    if (backend === 'snapcast' && info.enabled && info.connected) {
+    if (info.enabled && info.connected) {
       loadZones(backend, card);
+      if (backend === 'sendspin') renderPairingPanel(card);
     }
   }
 }
@@ -2469,7 +2466,7 @@ async function loadZones(backend, card) {
   const zonesEl = card.querySelector('[data-role="zones"]');
   zonesEl.innerHTML = '<span style="font-size:.8rem;color:#777">Loading zones…</span>';
   try {
-    const data = await api(`/admin/output/${backend}/zones`);
+    const data = await api('GET', `/admin/output/${backend}/zones`);
     renderZoneTree(backend, zonesEl, data.zones || [], !!data.can_manage_topology);
   } catch (e) {
     zonesEl.innerHTML = '<span style="font-size:.8rem;color:#a55">Zones unavailable</span>';
@@ -2592,6 +2589,31 @@ function renderZoneSlider(backend, groupId, client, groupIds) {
              { muted: mute.checked }).catch(() => {}));
   muteLbl.appendChild(mute); muteLbl.appendChild(document.createTextNode('mute'));
   row.appendChild(muteLbl);
+  // Per-room delay trim, shown when the backend reports one. Gated on the
+  // capability rather than the backend name, so anything that grows a delay
+  // readback later picks the control up without a UI change.
+  if (client.delay_ms !== undefined && client.delay_ms !== null) {
+    const delayLbl = document.createElement('label');
+    delayLbl.style.cssText = 'display:flex;align-items:center;gap:.2rem;font-size:.75rem;color:#999';
+    const delay = document.createElement('input');
+    delay.type = 'number'; delay.min = '0'; delay.max = '2000'; delay.step = '10';
+    delay.value = String(client.delay_ms || 0);
+    delay.style.cssText = 'width:4.5rem;font-size:.75rem;padding:.15rem .3rem;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:4px';
+    delay.setAttribute('aria-label', `${client.name} delay in milliseconds`);
+    // Debounced like the sibling volume slider — a number input fires on every
+    // arrow-key step, and each one is a network write to a speaker.
+    delay.addEventListener('input', () => {
+      const key = backend + ':delay:' + client.client_id;
+      clearTimeout(_zoneVolTimers[key]);
+      _zoneVolTimers[key] = setTimeout(() => {
+        zonePost(`${backend}/client/${encodeURIComponent(client.client_id)}/delay`,
+                 { delay_ms: Math.max(0, Number(delay.value) || 0) }).catch(() => {});
+      }, 300);
+    });
+    delayLbl.appendChild(delay);
+    delayLbl.appendChild(document.createTextNode('ms delay'));
+    row.appendChild(delayLbl);
+  }
   // Assign to another existing group (Snapcast only — non-destructive).
   if (backend === 'snapcast' && groupIds && groupIds.length > 1) {
     const sel = document.createElement('select');
@@ -2646,30 +2668,121 @@ function renderExternalConfig(card) {
   });
 }
 
-function renderPairingPanel(card) {
-  const el = card.querySelector('[data-role="pairing"]');
-  el.innerHTML =
-    `<button class="btn btn-sm" data-role="show-pin" style="background:var(--surface2);color:var(--text);border:1px solid var(--border)">Show pairing PIN</button>
-     <span data-role="pin" style="font-family:monospace;margin-left:.5rem"></span>
-     <button class="btn btn-sm" data-role="rotate" style="margin-left:.5rem;background:transparent;color:var(--muted);border:1px solid var(--border)">Rotate key…</button>`;
-  el.querySelector('[data-role="show-pin"]').addEventListener('click', async () => {
-    try {
-      const r = await api('/admin/output/sendspin/pairing');
-      el.querySelector('[data-role="pin"]').textContent = r.pin || '';
-    } catch (e) { showToast('Could not get pairing PIN'); }
-  });
-  el.querySelector('[data-role="rotate"]').addEventListener('click', () => rotateSendspinPairing());
-}
+// Pairing runs the way the protocol defines it: you read a code off the speaker
+// and enter it here. Jukeplox never displays a code for you to type into the
+// speaker — the previous panel had that backwards. The method list and its
+// rules come from the API rather than being duplicated here, so a browser and
+// an API client cannot disagree about what pairing accepts.
+let _pairingGen = 0;
 
-async function rotateSendspinPairing() {
-  if (!confirm('Rotate the Sendspin pairing key? This disconnects all paired clients.')) return;
+async function renderPairingPanel(card) {
+  const el = card.querySelector('[data-role="pairing"]');
+  // Monotonic guard: pair/unpair each trigger a refresh, so two renders can be
+  // in flight at once and an older response must not paint over a newer one.
+  const gen = ++_pairingGen;
+  let data;
   try {
-    const r = await fetch('/admin/output/sendspin/pairing/rotate', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ confirm: true }),
+    data = await api('GET', '/admin/output/sendspin/speakers');
+  } catch (e) {
+    if (gen !== _pairingGen) return;
+    el.innerHTML = '<div style="font-size:.8rem;color:#e88">Could not load speakers</div>';
+    return;
+  }
+  if (gen !== _pairingGen) return;   // superseded while fetching
+  const unpaired = (data.discovered || []).filter(s => !s.paired);
+  const paired = data.paired || [];
+
+  const opts = unpaired.map(s =>
+    `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('');
+  const methods = data.methods || [];
+  const methodOpts = methods.map(m =>
+    `<option value="${esc(m.id)}" data-needs-target="${m.requires_client_id ? '1' : ''}"
+      >${esc(m.label)}</option>`).join('');
+  const codeHint = m => (methods.find(x => x.id === m) || {}).code_format || '';
+
+  // The paired list is always visible while the backend is enabled. Pairing is
+  // the ONLY authority boundary a Sendspin speaker has — a paired speaker can
+  // skip and pause — so this list is the security surface, not a nicety.
+  const pairedRows = paired.length
+    ? paired.map(s =>
+        `<div style="display:flex;align-items:center;justify-content:space-between;padding:.3rem 0;border-bottom:1px solid var(--divider)">
+           <span>${esc(s.name)}</span>
+           <button class="btn btn-sm" data-unpair="${esc(s.id)}"
+             style="background:transparent;color:var(--muted);border:1px solid var(--border)">Unpair</button>
+         </div>`).join('')
+    : '<div style="font-size:.8rem;color:#999">No speakers paired yet</div>';
+
+  el.innerHTML =
+    `<div style="font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;color:#999;margin-bottom:.3rem">Paired speakers</div>
+     ${pairedRows}
+     <div style="font-size:.7rem;letter-spacing:.05em;text-transform:uppercase;color:#999;margin:.7rem 0 .3rem">Pair a speaker</div>
+     <div style="display:flex;flex-wrap:wrap;gap:.4rem;align-items:center">
+       <select data-role="pair-method" style="font-size:.85rem">${methodOpts}</select>
+       <select data-role="pair-target" style="font-size:.85rem">
+         ${opts || '<option value="">No new speakers found</option>'}
+       </select>
+       <input data-role="pair-code" placeholder="Code from the speaker"
+         style="font-size:.85rem;padding:.3rem .5rem;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text)">
+       <button class="btn btn-sm" data-role="pair-go">Pair</button>
+     </div>
+     <div data-role="pair-error" style="display:none;color:#e88;font-size:.8rem;margin-top:.4rem"></div>`;
+
+  const methodSel = el.querySelector('[data-role="pair-method"]');
+  const targetSel = el.querySelector('[data-role="pair-target"]');
+  const codeEl = el.querySelector('[data-role="pair-code"]');
+  const errEl = el.querySelector('[data-role="pair-error"]');
+  // Whether a speaker must be chosen is the API's call, not a hardcoded rule
+  // here — a pairing token, for instance, names its own speaker.
+  const syncTarget = () => {
+    const opt = methodSel.selectedOptions[0];
+    targetSel.style.display = opt && opt.dataset.needsTarget ? '' : 'none';
+    codeEl.placeholder = codeHint(methodSel.value) || 'Code from the speaker';
+  };
+  methodSel.addEventListener('change', syncTarget);
+  syncTarget();
+
+  const pairBtn = el.querySelector('[data-role="pair-go"]');
+  pairBtn.addEventListener('click', async () => {
+    if (pairBtn.disabled) return;        // no double-submit
+    errEl.style.display = 'none';
+    pairBtn.disabled = true;
+    const body = {
+      method: methodSel.value,
+      code: codeEl.value.trim(),
+      client_id: targetSel.style.display === 'none' ? '' : targetSel.value,
+    };
+    try {
+      await api('POST', '/admin/output/sendspin/pair', body);
+      // The server has REGISTERED the attempt; the handshake completes
+      // asynchronously. Saying "paired" here would send the operator off to
+      // pair again and cancel the attempt already running.
+      showToast('Pairing started — watch the paired list');
+      renderPairingPanel(card);
+      loadZones('sendspin', card);       // a newly paired speaker gets controls
+    } catch (e) {
+      errEl.textContent = e.detail || 'Pairing failed';
+      errEl.style.display = '';          // leave the code field usable for a retry
+      pairBtn.disabled = false;
+    }
+  });
+
+  el.querySelectorAll('[data-unpair]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      const id = btn.getAttribute('data-unpair');
+      if (!confirm('Unpair this speaker? It stops playing immediately and loses control.')) return;
+      btn.disabled = true;
+      try {
+        await api('POST', `/admin/output/sendspin/client/${encodeURIComponent(id)}/unpair`);
+        showToast('Speaker unpaired');
+        renderPairingPanel(card);
+        loadZones('sendspin', card);
+      } catch (e) {
+        showToast('Unpair failed');
+        btn.disabled = false;
+      }
     });
-    if (r.ok) showToast('Pairing key rotated'); else showToast('Rotate failed');
-  } catch (e) { showToast('Rotate failed'); }
+  });
 }
 
 (async () => {
