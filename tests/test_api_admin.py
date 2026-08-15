@@ -5089,3 +5089,255 @@ async def test_revalidate_noop_without_lock(switch_catalog_env):
     assert removed == 0
     assert [i.track_id for i in qe.queue] == ["p1", "j1"]
     notice.assert_not_awaited()
+
+
+# ── Memory attribution probe (observability unit, R3 / AE5) ───────────────────
+
+@pytest.fixture
+def probe_clean():
+    """The probe is process-global state; leaving it tracing would slow every
+    later test and leak snapshots between them.
+
+    _HELD is released here rather than by a trailing statement in each test —
+    an assertion failure before such a line would leak the allocation for the
+    rest of the session.
+    """
+    from app import memory_probe
+    memory_probe.stop()
+    _HELD.clear()
+    try:
+        yield memory_probe
+    finally:
+        memory_probe.stop()
+        _HELD.clear()
+
+
+_HELD: list = []
+
+
+def _allocate_a_lot(n: int = 12000):
+    """A deliberate, attributable allocation for the diff to find."""
+    _HELD.append(["jukeplox-memory-probe-marker-%d" % i for i in range(n)])
+
+
+def test_memory_probe_requires_auth(anon_client, mock_session):
+    assert anon_client.get("/admin/diagnostics/memory").status_code == 401
+    assert anon_client.post("/admin/diagnostics/memory/start", json={}).status_code == 401
+    assert anon_client.post("/admin/diagnostics/memory/stop").status_code == 401
+    assert anon_client.post(
+        "/admin/diagnostics/memory/snapshot", json={"label": "x"}).status_code == 401
+    assert anon_client.get(
+        "/admin/diagnostics/memory/diff?before=a&after=b").status_code == 401
+
+
+def test_memory_probe_is_off_by_default(client, probe_clean):
+    body = client.get("/admin/diagnostics/memory").json()
+    assert body["tracing"] is False
+    assert body["snapshots"] == []
+
+
+def test_memory_probe_start_snapshot_diff_happy_path(client, probe_clean):
+    assert client.post("/admin/diagnostics/memory/start", json={}).json()["tracing"]
+    assert client.post(
+        "/admin/diagnostics/memory/snapshot", json={"label": "before"}).status_code == 200
+    _allocate_a_lot()
+    assert client.post(
+        "/admin/diagnostics/memory/snapshot", json={"label": "after"}).status_code == 200
+
+    resp = client.get("/admin/diagnostics/memory/diff?before=before&after=after")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["entries"], "a diff across real allocation must rank something"
+    assert body["entries"][0]["size_diff_kb"] > 0
+    # Epochs make the measured window visible rather than assumed.
+    assert body["after_at"] >= body["before_at"]
+    assert body["elapsed_s"] >= 0
+
+
+def test_memory_probe_diff_ranks_the_allocating_site_first(client, probe_clean):
+    """Covers AE5. A diff taken across a period of deliberate allocation must
+    rank the allocating site above unrelated ones — otherwise the output is a
+    list, not an attribution."""
+    client.post("/admin/diagnostics/memory/start", json={})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "base"})
+    _allocate_a_lot()
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "loaded"})
+
+    body = client.get(
+        "/admin/diagnostics/memory/diff?before=base&after=loaded&limit=5").json()
+    top = body["entries"][0]
+    assert any("_allocate_a_lot" in frame or "test_api_admin" in frame
+               for frame in top["traceback"]), top["traceback"]
+
+
+def test_memory_probe_snapshot_before_start_is_rejected(client, probe_clean):
+    """Edge: a snapshot with tracing off would be empty and misleading."""
+    resp = client.post("/admin/diagnostics/memory/snapshot", json={"label": "x"})
+    assert resp.status_code == 409
+    assert "not tracing" in resp.json()["detail"]
+
+
+def test_memory_probe_diff_needs_two_snapshots(client, probe_clean):
+    """Only one snapshot exists, so the count guard is what must fire."""
+    client.post("/admin/diagnostics/memory/start", json={})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "only"})
+    resp = client.get("/admin/diagnostics/memory/diff?before=only&after=only")
+    assert resp.status_code == 409
+    assert "two snapshots" in resp.json()["detail"]
+
+
+def test_memory_probe_diff_rejects_same_snapshot_both_sides(client, probe_clean):
+    """With two snapshots present the count guard passes, so this reaches the
+    before==after guard — which the count-guard test above never did."""
+    client.post("/admin/diagnostics/memory/start", json={})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "a"})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "b"})
+    resp = client.get("/admin/diagnostics/memory/diff?before=a&after=a")
+    assert resp.status_code == 400
+    assert "different snapshots" in resp.json()["detail"]
+
+
+def test_memory_probe_diff_rejects_unknown_label(client, probe_clean):
+    client.post("/admin/diagnostics/memory/start", json={})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "a"})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "b"})
+    resp = client.get("/admin/diagnostics/memory/diff?before=a&after=nope")
+    # Unknown identifier is 404 here as everywhere else in the admin API.
+    assert resp.status_code == 404
+
+
+def test_memory_probe_output_is_bounded(client, probe_clean):
+    """Edge: the response must stay bounded however many sites exist."""
+    from app import memory_probe
+
+    client.post("/admin/diagnostics/memory/start", json={})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "a"})
+    _allocate_a_lot(5000)
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "b"})
+
+    body = client.get(
+        "/admin/diagnostics/memory/diff?before=a&after=b&limit=3").json()
+    assert len(body["entries"]) <= 3
+    assert body["sites"] >= len(body["entries"])
+    assert body["truncated"] is (body["sites"] > 3)
+    # Over the cap is refused by validation rather than silently honoured.
+    over = client.get(
+        f"/admin/diagnostics/memory/diff?before=a&after=b"
+        f"&limit={memory_probe.MAX_ENTRIES + 1}")
+    assert over.status_code == 422
+
+
+def test_memory_probe_start_twice_says_so(client, probe_clean):
+    """Error path: restarting would discard the history a baseline was taken
+    against, so a second start reports instead of silently resetting."""
+    first = client.post("/admin/diagnostics/memory/start", json={}).json()
+    assert first["already_tracing"] is False
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "keep"})
+
+    second = client.post("/admin/diagnostics/memory/start", json={}).json()
+    assert second["already_tracing"] is True
+    assert "keep" in second["snapshots"], "an in-progress measurement was discarded"
+
+
+def test_memory_probe_stop_clears_snapshots(client, probe_clean):
+    client.post("/admin/diagnostics/memory/start", json={})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "a"})
+    body = client.post("/admin/diagnostics/memory/stop").json()
+    assert body["was_tracing"] is True
+    assert body["tracing"] is False
+    assert body["snapshots"] == []
+
+
+def test_memory_probe_snapshot_cap_is_enforced(client, probe_clean):
+    """Edge: the diagnostic must not become the memory problem it is chasing."""
+    from app import memory_probe
+
+    client.post("/admin/diagnostics/memory/start", json={})
+    for i in range(memory_probe.MAX_SNAPSHOTS):
+        assert client.post("/admin/diagnostics/memory/snapshot",
+                           json={"label": f"s{i}"}).status_code == 200
+    over = client.post("/admin/diagnostics/memory/snapshot", json={"label": "one-too-many"})
+    assert over.status_code == 409
+    assert "limit" in over.json()["detail"]
+
+
+def test_memory_probe_start_accepts_no_body(client, probe_clean):
+    """Every field has a default, so the obvious POST with no body must work —
+    it used to 422, hidden by every test sending json={}."""
+    resp = client.post("/admin/diagnostics/memory/start")
+    assert resp.status_code == 200
+    assert resp.json()["tracing"] is True
+
+
+def test_memory_probe_snapshot_refuses_silent_overwrite(client, probe_clean):
+    """A snapshot can take seconds on a large heap — long enough to trip a
+    client timeout. A blind retry that overwrote the baseline would leave the
+    caller diffing a sample against itself and concluding nothing grew."""
+    client.post("/admin/diagnostics/memory/start", json={})
+    assert client.post("/admin/diagnostics/memory/snapshot",
+                       json={"label": "base"}).status_code == 200
+
+    dup = client.post("/admin/diagnostics/memory/snapshot", json={"label": "base"})
+    assert dup.status_code == 409
+    assert "already exists" in dup.json()["detail"]
+
+    forced = client.post("/admin/diagnostics/memory/snapshot",
+                         json={"label": "base", "replace": True})
+    assert forced.status_code == 200
+
+
+def test_memory_probe_stop_is_idempotent(client, probe_clean):
+    first = client.post("/admin/diagnostics/memory/stop").json()
+    assert first["was_tracing"] is False
+    second = client.post("/admin/diagnostics/memory/stop").json()
+    assert second["was_tracing"] is False
+    assert second["tracing"] is False
+
+
+def test_memory_probe_reports_session_age_and_ownership(client, probe_clean):
+    """A forgotten session is the failure mode the ceiling exists for, so its
+    age and the ceiling itself have to be visible."""
+    body = client.post("/admin/diagnostics/memory/start", json={}).json()
+    assert body["probe_owns_tracing"] is True
+    assert body["auto_stop_after_s"] > 0
+
+    status = client.get("/admin/diagnostics/memory").json()
+    assert status["tracing_for_s"] >= 0
+    assert status["auto_stop_after_s"] == body["auto_stop_after_s"]
+
+
+def test_memory_probe_leaves_foreign_tracing_alone(client, probe_clean):
+    """Tracing the probe did not start (PYTHONTRACEMALLOC, or another
+    component) is not ours to stop — snapshots are ours to drop, the global
+    tracer is not ours to claim."""
+    import tracemalloc
+
+    tracemalloc.start(4)                    # somebody else started it
+    try:
+        body = client.post("/admin/diagnostics/memory/stop").json()
+        assert body["was_tracing"] is True
+        assert body["stopped_tracing"] is False
+        assert tracemalloc.is_tracing(), "stopped tracing the probe did not own"
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+
+
+def test_memory_probe_autostop_fires(client, probe_clean, monkeypatch):
+    """The ceiling must actually stop a session, not merely be advertised."""
+    import asyncio as aio
+    from app import memory_probe as mp
+
+    monkeypatch.setattr(mp, "MAX_TRACE_SECONDS", 0)
+    client.post("/admin/diagnostics/memory/start", json={})
+
+    async def settle():
+        await aio.sleep(0.05)
+
+    aio.run(settle())
+    # The autostop task lives on the TestClient's portal loop; give it a beat by
+    # driving another request through the same app.
+    for _ in range(20):
+        if not client.get("/admin/diagnostics/memory").json()["tracing"]:
+            break
+    assert client.get("/admin/diagnostics/memory").json()["tracing"] is False

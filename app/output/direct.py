@@ -88,6 +88,10 @@ class DirectAudioBackend:
         self._device_id: str = "default"
         self._volume: float = 0.5
         self._pipeline = None
+        # Serializes the teardown claim below. Teardown is reachable from the
+        # GLib bus thread and the asyncio loop concurrently (radio's
+        # error->reconnect->teardown cycle does exactly that).
+        self._teardown_lock = threading.Lock()
         self._is_playing: bool = False
         self._advance_cb = advance_cb
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -645,11 +649,23 @@ class DirectAudioBackend:
         # concurrently; without the claim, one thread nulls self._pipeline
         # between the other's check and its set_state() call (AttributeError:
         # 'NoneType' has no attribute 'set_state' — rig-caught on a radio drop).
-        pipe = self._pipeline
-        self._pipeline = None
+        # The read-then-write is itself a check-then-act, so the claim only
+        # becomes a real claim under a lock: without it both callers can read
+        # the same pipeline before either nulls the field, and both then detach
+        # the same bus watch. The second remove_signal_watch() underflows
+        # GStreamer's watch refcount and emits a GLib warning from whichever
+        # caller loses — which a fatal-warnings build turns into an abort.
+        with self._teardown_lock:
+            pipe = self._pipeline
+            self._pipeline = None
         if pipe is not None:
-            bus = pipe.get_bus()
-            bus.remove_signal_watch()
+            try:
+                bus = pipe.get_bus()
+                bus.remove_signal_watch()
+            except Exception:
+                # Failing to detach must never strand a live pipeline —
+                # releasing it is the more important half of teardown.
+                _log.exception("direct: failed to remove bus signal watch")
             pipe.set_state(Gst.State.NULL)
         self._is_playing = False
 

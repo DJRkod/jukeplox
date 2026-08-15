@@ -44,3 +44,6 @@ secret.key
 *.db
 *.sqlite
 *.sqlite3
+
+# Soak run artifacts (logs are per-run, never committed)
+tools/soak/*.jsonl

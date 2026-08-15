@@ -929,3 +929,150 @@ async def test_first_stream_start_after_play_is_not_a_boundary(gst_mock, fresh_s
         assert qe.state.current.track_id == "t1"  # no advance
         assert qe.history == []
         rec.assert_not_called()
+
+
+# ── Pipeline teardown under concurrent callers (#35) ──────────────────────────
+#
+# Teardown is reachable from the GLib bus thread and the asyncio loop at the
+# same time — radio's error->reconnect->teardown cycle does exactly that. The
+# pipeline handoff was already guarded for that reason, but the bus watch beside
+# it was not, and detaching the same watch twice underflows GStreamer's watch
+# refcount and emits a GLib warning from whichever caller loses.
+
+
+class _GatedBackend:
+    """Mixin that widens the teardown claim's read->write window.
+
+    The real window is a couple of bytecodes wide. Left to chance, a
+    concurrent-teardown test passes against a broken implementation on almost
+    every run, so the interleave is forced: the first read of `_pipeline` on
+    each thread parks at a barrier, guaranteeing both callers have read before
+    either writes. A serialized (correctly locked) implementation never gets
+    two threads to the barrier at once, so it trips the timeout instead — which
+    is itself the proof that the claim held.
+    """
+
+    def __init_subclass__(cls, **kw):
+        super().__init_subclass__(**kw)
+
+    def _install_gate(self, timeout=0.3):
+        self._gate = threading.Barrier(2, timeout=timeout)
+        self._tls = threading.local()
+
+    @property
+    def _pipeline(self):
+        v = getattr(self, "_pipe_slot", None)
+        if v is not None and not getattr(self._tls, "gated", False):
+            self._tls.gated = True
+            try:
+                self._gate.wait()
+            except threading.BrokenBarrierError:
+                pass  # serialized — the other caller never reached the read
+        return v
+
+    @_pipeline.setter
+    def _pipeline(self, v):
+        self._pipe_slot = v
+
+
+def _gated_backend(gst_mock):
+    from app.output.direct import DirectAudioBackend
+
+    class _Backend(_GatedBackend, DirectAudioBackend):
+        pass
+
+    b = _Backend.__new__(_Backend)
+    b._install_gate()
+    DirectAudioBackend.__init__(b)
+    return b
+
+
+def test_teardown_detaches_watch_once_and_releases_pipeline(gst_mock):
+    """Happy path: a normal teardown detaches the bus watch exactly once and
+    drives the pipeline to NULL."""
+    from app.output.direct import DirectAudioBackend
+
+    mock_gst, mock_pipeline = gst_mock
+    backend = DirectAudioBackend()
+    backend._pipeline = mock_pipeline
+
+    backend._teardown_pipeline()
+
+    bus = mock_pipeline.get_bus.return_value
+    assert bus.remove_signal_watch.call_count == 1
+    mock_pipeline.set_state.assert_called_with("NULL")
+    assert backend._pipeline is None
+    assert backend._is_playing is False
+
+
+def test_teardown_with_no_pipeline_is_a_noop(gst_mock):
+    """Edge: tearing down when nothing is live must not raise."""
+    from app.output.direct import DirectAudioBackend
+
+    backend = DirectAudioBackend()
+    backend._teardown_pipeline()          # no exception
+    assert backend._pipeline is None
+
+
+def test_concurrent_teardowns_detach_the_watch_exactly_once(gst_mock):
+    """Edge: two callers tearing down at the same instant must produce exactly
+    one detach and one release, and neither may raise. A second
+    remove_signal_watch() on the same bus is the GLib warning that becomes an
+    abort under a fatal-warnings build."""
+    mock_gst, mock_pipeline = gst_mock
+    backend = _gated_backend(gst_mock)
+    backend._pipeline = mock_pipeline
+
+    errors = []
+
+    def tear():
+        try:
+            backend._teardown_pipeline()
+        except Exception as exc:      # noqa: BLE001 — the loser must not raise
+            errors.append(exc)
+
+    threads = [threading.Thread(target=tear) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    bus = mock_pipeline.get_bus.return_value
+    assert not errors, f"a concurrent teardown raised: {errors}"
+    assert bus.remove_signal_watch.call_count == 1, (
+        f"bus watch detached {bus.remove_signal_watch.call_count} times")
+    assert mock_pipeline.set_state.call_count == 1
+    assert backend._pipeline is None
+
+
+def test_teardown_releases_pipeline_even_if_detach_fails(gst_mock):
+    """Error path: a failure detaching the watch must not strand a live
+    pipeline — releasing it is the more important half of teardown."""
+    from app.output.direct import DirectAudioBackend
+
+    mock_gst, mock_pipeline = gst_mock
+    mock_pipeline.get_bus.return_value.remove_signal_watch.side_effect = \
+        RuntimeError("bus already disposed")
+
+    backend = DirectAudioBackend()
+    backend._pipeline = mock_pipeline
+    backend._teardown_pipeline()          # must not raise
+
+    mock_pipeline.set_state.assert_called_with("NULL")
+    assert backend._pipeline is None
+
+
+async def test_play_stop_play_cycle_still_works(gst_mock):
+    """Integration: the guard must not break ordinary operation."""
+    from app.output.direct import DirectAudioBackend
+
+    mock_gst, mock_pipeline = gst_mock
+    backend = DirectAudioBackend()
+
+    await backend.play("http://plex.local/a.flac", make_track("t1"))
+    assert backend._is_playing
+    await backend.stop()
+    assert backend._pipeline is None
+    await backend.play("http://plex.local/b.flac", make_track("t2"))
+    assert backend._is_playing
+    mock_pipeline.set_state.assert_called_with("PLAYING")
