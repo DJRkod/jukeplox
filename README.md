@@ -108,8 +108,25 @@ nothing runs until you enable it under **Setup → Optional integrations**:
   can also point it at an **external** snapserver by host/port. Group clients into
   zones and set per-client / per-zone volume from the admin panel.
 - **Sendspin** *(experimental — technical preview, protocol may change)* — an
-  in-process Sendspin server advertised over mDNS; pair ESPHome / browser / CLI
-  clients with a short PIN.
+  in-process Sendspin server advertised over mDNS, for ESPHome speakers and other
+  Sendspin receivers. Alongside audio it pushes the song title, artist, album and
+  cover art to speakers with a screen, and accepts play / pause / next / previous
+  / seek / volume back from them. Per-speaker volume, mute and a per-room delay
+  trim, same as Snapcast.
+
+  To add a speaker, open **Setup → Optional integrations → Sendspin**, pick it
+  from the discovered list, and enter the code the speaker gives you — a fixed
+  code printed on the device, a code it displays, or a pairing token supplied
+  with it. Jukeplox never shows you a code to type into the speaker; the standard
+  works the other way round.
+
+  **A paired speaker is fully trusted** and can control playback, regardless of
+  the guest permission toggles. The paired list in that panel is therefore the
+  place to revoke one — unpairing takes effect immediately.
+
+  Beat-synced lighting and colour output are not implemented (tracked in
+  [#31](https://github.com/DJRkod/jukeplox/issues/31)); a speaker with lights
+  connects and plays normally, its lights simply stay idle.
 
 Both stream the **single** playback queue (one stream, zoned across clients — not
 different songs per room). Enabling one does **not** change local output:

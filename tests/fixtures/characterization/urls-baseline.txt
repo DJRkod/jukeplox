@@ -10,8 +10,9 @@
 /admin/output/devices/
 /admin/output/integrations
 /admin/output/integrations/
-/admin/output/sendspin/pairing
-/admin/output/sendspin/pairing/rotate
+/admin/output/sendspin/client/
+/admin/output/sendspin/pair
+/admin/output/sendspin/speakers
 /admin/output/snapcast/group/
 /admin/pattern-rules
 /admin/playback/no-audio

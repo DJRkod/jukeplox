@@ -201,7 +201,15 @@ ADMIN_ALLOWED = {
     "_integrationsData", "_zoneVolTimers",
     "loadIntegrations", "renderMultiroomPanel", "toggleIntegration",
     "loadZones", "renderZoneTree", "renderZoneSlider",
-    "renderPairingPanel", "rotateSendspinPairing",
+    # renderPairingPanel is the speaker pair/unpair surface; SENDSPIN_PAIR_METHODS
+    # is its method dropdown (fixed device code / device-shown code / supplied
+    # token). Admin-only Setup chrome — a guest never pairs a speaker.
+    # rotateSendspinPairing is gone: the protocol has no long-term key to rotate.
+    # _pairingGen is the stale-response guard: pair and unpair each trigger a
+    # panel refresh, so two renders can be in flight and an older response must
+    # not paint over a newer one. (The pairing-method list is no longer declared
+    # here — it comes from the API so browser and API cannot disagree.)
+    "renderPairingPanel", "_pairingGen",
     # Full zoning control plane (U9 review follow-up): group header
     # (volume/mute/rename/dissolve), per-client mute + assign dropdown, the
     # POST helper, and the external-Snapcast config form. Same admin-only Setup

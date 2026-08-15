@@ -13,8 +13,15 @@ def tmp_settings(tmp_path, monkeypatch):
 
 @pytest.fixture
 async def db(tmp_settings):
+    # close_db() is mandatory, not tidiness: aiosqlite runs its connection on a
+    # NON-daemon thread, so leaving it open blocks threading._shutdown and hangs
+    # the pytest process AFTER the tests have passed. pytest-timeout cannot
+    # catch that — it is an interpreter-exit hang, not an in-test one.
     await database.init_db()
-    return tmp_settings
+    try:
+        yield tmp_settings
+    finally:
+        await database.close_db()
 
 
 # ── init ──────────────────────────────────────────────────────────────────────
@@ -859,10 +866,16 @@ async def test_guest_visibility_defaults_off(db):
 
 async def test_browse_facets_default_on(db):
     facets = await database.get_browse_facets()
-    assert set(facets) == {"genre", "years", "mostplayed", "recentlyadded", "highestrated"}
-    assert all(facets.values())                             # all on by default
+    assert set(facets) == {"genre", "years", "mostplayed", "recentlyadded",
+                           "highestrated", "radio"}
+    # The five catalogue facets are on by default; Radio is the exception — it
+    # is opt-in, so guests do not see it until an admin turns it on.
+    assert all(v for k, v in facets.items() if k != "radio")
+    assert facets["radio"] is False
     await database.set_setting("facet_years", "0")
     assert (await database.get_browse_facets())["years"] is False
+    await database.set_setting("facet_radio", "1")
+    assert (await database.get_browse_facets())["radio"] is True
 
 
 # ── U17: credential at-rest hardening (R24) ──────────────────────────────────
