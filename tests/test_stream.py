@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 from types import SimpleNamespace
 
 import httpx
@@ -716,7 +717,10 @@ class _SlowResp:
 
 
 class _DropResp:
-    """Upstream that genuinely fails mid-body — not a cancellation."""
+    """Upstream that drops mid-body with no content-length, so nothing can be
+    resumed from — not a cancellation."""
+
+    headers: dict = {}
 
     def __init__(self):
         self.closed = False
@@ -820,18 +824,151 @@ async def test_cancel_before_first_chunk_leaves_no_error(tmp_path, caplog):
 
 
 @pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
-async def test_genuine_upstream_drop_still_logs_error(caplog):
-    """Error path: an upstream that actually fails mid-body is NOT a teardown and
-    must keep its ERROR + traceback. Over-quietening this would hide real faults."""
+async def test_unresumable_upstream_drop_warns_without_a_traceback(caplog):
+    """A mid-body transport drop is a recoverable upstream condition, not a
+    fault in us. Measured on the rig at 4/2h of ordinary playback, so it must
+    not carry an ERROR traceback — that is what buried real signals. Without a
+    content-length there is nothing to resume from, so it warns and stops."""
     from app.api import stream as s
 
     caplog.set_level(logging.DEBUG)
-    with pytest.raises(RuntimeError):          # ffmpeg rejects the truncated input
+    with pytest.raises(RuntimeError):          # ffmpeg still rejects short input
         await s._transcode_to_flac_file(_DropResp())
 
+    assert not _errors(caplog), "a recoverable upstream drop must not log ERROR"
+    assert any("cannot resume" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_unexpected_feeder_exception_still_logs_error(caplog):
+    """The catch-all must survive: anything that is NOT a transport drop is
+    still an unexplained fault and keeps its ERROR + traceback."""
+    from app.api import stream as s
+
+    class _Exploding:
+        headers = {}
+
+        async def aiter_bytes(self, chunk_size=65536):
+            yield bytes(1024)
+            raise ValueError("something genuinely unexpected")
+
+        async def aclose(self):
+            pass
+
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(RuntimeError):
+        await s._transcode_to_flac_file(_Exploding())
+
     errs = _errors(caplog)
-    assert errs, "a genuine upstream drop must still be logged at ERROR"
+    assert errs, "an unexpected feeder exception must still be ERROR"
     assert any(r.exc_info for r in errs), "and must keep its traceback"
+
+
+class _TruncatingResp:
+    """Serves *data* but drops mid-body, exactly as Plex does when it decides a
+    connection is idle: content-length promises the whole object, the body stops
+    short, and httpx raises RemoteProtocolError."""
+
+    def __init__(self, data: bytes, cut: int, offset: int = 0, drop: bool = True):
+        self._data = data
+        self._cut = cut
+        self._offset = offset
+        self._drop = drop
+        self.headers = {"content-length": str(len(data) - offset)}
+        self.closed = False
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        body = self._data[self._offset:]
+        limit = self._cut if self._drop else len(body)
+        pos = 0
+        while pos < limit:
+            end = min(pos + 4096, limit)
+            yield body[pos:end]
+            pos = end
+        if self._drop:
+            raise httpx.RemoteProtocolError(
+                f"peer closed connection without sending complete message body "
+                f"(received {limit}, expected {len(body)})")
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_transcode_resumes_after_an_upstream_drop(tmp_path, caplog):
+    """Covers the real #38 defect. The upstream drops halfway; the feeder asks
+    for the rest with a Range and ffmpeg receives a complete stream, so the
+    transcode SUCCEEDS instead of failing on a short input."""
+    from app.api import stream as s
+
+    caplog.set_level(logging.DEBUG)
+    data = _make_ogg(tmp_path, 5).read_bytes()
+    first = _TruncatingResp(data, cut=len(data) // 2)
+    opened = []
+
+    async def reopen(offset):
+        opened.append(offset)
+        return _TruncatingResp(data, cut=0, offset=offset, drop=False)
+
+    out_path = await s._transcode_to_flac_file(first, reopen=reopen)
+    try:
+        assert opened == [len(data) // 2], f"resumed from the wrong byte: {opened}"
+        assert os.path.getsize(out_path) > 0
+        assert not _errors(caplog)
+        # The whole point: a real, playable duration, not a truncated stub.
+        dur = subprocess.check_output(
+            ["ffprobe", "-hide_banner", "-loglevel", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", out_path]).decode().strip()
+        assert abs(float(dur) - 5.0) < 0.6, f"resumed transcode is short: {dur}s"
+    finally:
+        os.unlink(out_path)
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_transcode_resume_is_bounded(tmp_path, caplog):
+    """An upstream that keeps dropping must not be retried forever."""
+    from app.api import stream as s
+
+    caplog.set_level(logging.DEBUG)
+    data = _make_ogg(tmp_path, 2).read_bytes()
+    attempts = []
+
+    async def reopen(offset):
+        attempts.append(offset)
+        # Never makes progress past the cut, so the budget must stop it.
+        return _TruncatingResp(data, cut=0, offset=offset)
+
+    with pytest.raises(RuntimeError):
+        await s._transcode_to_flac_file(
+            _TruncatingResp(data, cut=len(data) // 2), reopen=reopen)
+
+    assert len(attempts) <= s._STREAM_RESUME_MAX, f"unbounded retries: {attempts}"
+    assert any("giving up" in r.getMessage() for r in caplog.records)
+    assert not _errors(caplog)
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_transcode_does_not_resume_when_reopen_declines(tmp_path, caplog):
+    """reopen returning None (e.g. the source answered 200, ignoring Range) must
+    end the feed, never restart it — replaying bytes already handed to ffmpeg
+    would corrupt the output, which is worse than the truncation."""
+    from app.api import stream as s
+
+    caplog.set_level(logging.DEBUG)
+    data = _make_ogg(tmp_path, 2).read_bytes()
+    calls = []
+
+    async def reopen(offset):
+        calls.append(offset)
+        return None
+
+    with pytest.raises(RuntimeError):
+        await s._transcode_to_flac_file(
+            _TruncatingResp(data, cut=len(data) // 2), reopen=reopen)
+
+    assert calls == [len(data) // 2]
+    assert not _errors(caplog)
 
 
 @pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
@@ -905,3 +1042,30 @@ async def test_cancel_during_seektable_unlinks_temp_file(tmp_path, monkeypatch):
         await task
 
     assert not os.path.exists(seen["path"]), "temp FLAC stranded by cancellation"
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_truncated_upstream_never_yields_a_short_cached_transcode(tmp_path, caplog):
+    """The dangerous half of #38. ffmpeg exits ZERO on a truncated Ogg and
+    writes a short-but-valid FLAC — measured at 1.0s from a 5s track. Since
+    _get_or_transcode caches whatever returns, that stub became the cached
+    artifact and a Cast/DLNA device played one second of the track. An
+    incomplete feed must fail, not return."""
+    from app.api import stream as s
+
+    caplog.set_level(logging.DEBUG)
+    data = _make_ogg(tmp_path, 5).read_bytes()
+
+    def _stubs():
+        d = tempfile.gettempdir()
+        return {p for p in os.listdir(d) if p.startswith("jukeplox-cast-")}
+
+    before = _stubs()
+    with pytest.raises(RuntimeError, match="truncated"):
+        await s._transcode_to_flac_file(_TruncatingResp(data, cut=len(data) // 2))
+
+    # The rejected transcode must not leave its artifact behind for the cache
+    # (or a later run) to find. Scoped to this call: on Windows an unrelated
+    # killed-ffmpeg path can leave a zero-byte stub that the host cannot unlink
+    # while the handle is open — verified absent on Linux, where it ships.
+    assert not (_stubs() - before), "rejected transcode left its temp file behind"
