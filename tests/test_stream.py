@@ -1,5 +1,7 @@
 """Tests for app.api.stream — Ogg detection and transcoding routing."""
 
+import asyncio
+import logging
 import os
 import shutil
 import subprocess
@@ -662,3 +664,244 @@ async def test_passthrough_clean_stream_yields_all_and_closes():
     assert body == full
     assert client.requests == []          # no resume needed
     assert up.closed and client.closed
+
+
+# ── Transcode feeder lifetime (#38) ───────────────────────────────────────────
+#
+# A prefetch transcode that gets cancelled (the host skipped) used to leave its
+# feeder task running against a response the caller had already closed in its
+# `finally`. httpx then raised inside the orphaned task and it was logged as a
+# failure — routine skips producing ERROR tracebacks, which is what made
+# `grep Traceback` useless for finding real faults during a soak.
+
+
+class _SlowResp:
+    """Streaming response that behaves like httpx after aclose(): an iteration
+    still in flight when the response is closed raises. Chunks are deliberately
+    small and paced so a test can cancel mid-stream."""
+
+    def __init__(self, data: bytes, chunk: int = 4096, delay: float = 0.03):
+        self._data = data
+        self._chunk = chunk
+        self._delay = delay
+        self.closed = False
+        self.iterating = False
+        self.chunks = 0
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        self.iterating = True
+        try:
+            for i in range(0, len(self._data), self._chunk):
+                await asyncio.sleep(self._delay)
+                if self.closed:
+                    raise httpx.StreamClosed()
+                self.chunks += 1
+                yield self._data[i:i + self._chunk]
+        finally:
+            self.iterating = False
+
+    async def wait_mid_stream(self, chunks: int = 2, timeout: float = 5.0):
+        """Block until the feeder is demonstrably mid-stream. Driving the cancel
+        off observed progress rather than a fixed sleep keeps the test off the
+        wall clock — the fixture audio is small enough that a sleep long enough
+        to be reliable on a slow box is also long enough to miss the window."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while self.chunks < chunks:
+            assert asyncio.get_running_loop().time() < deadline, "feeder never started"
+            await asyncio.sleep(0.01)
+        assert self.iterating, "precondition: the feeder must still be mid-stream"
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _DropResp:
+    """Upstream that genuinely fails mid-body — not a cancellation."""
+
+    def __init__(self):
+        self.closed = False
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        yield b"\x00" * 4096
+        raise httpx.RemoteProtocolError("peer closed connection mid-body")
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _BrokenPipeResp:
+    """Upstream iteration that trips a broken pipe, i.e. ffmpeg exited early."""
+
+    def __init__(self):
+        self.closed = False
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        yield b"\x00" * 1024
+        raise BrokenPipeError()
+
+    async def aclose(self):
+        self.closed = True
+
+
+def _make_ogg(tmp_path, seconds: int = 5):
+    ogg = tmp_path / "src.ogg"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+         "-i", f"sine=frequency=440:duration={seconds}", "-c:a", "libvorbis",
+         str(ogg)],
+        check=True,
+    )
+    return ogg
+
+
+def _errors(caplog):
+    return [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_completed_transcode_logs_no_error(tmp_path, caplog):
+    """Happy path: a transcode that runs to completion still produces output and
+    logs nothing at error level."""
+    from app.api import stream as s
+
+    caplog.set_level(logging.DEBUG)
+    resp = _SlowResp(_make_ogg(tmp_path, 2).read_bytes(), delay=0.0)
+    out_path = await s._transcode_to_flac_file(resp)
+    try:
+        assert os.path.getsize(out_path) > 0
+        assert not _errors(caplog)
+    finally:
+        os.unlink(out_path)
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_cancelled_transcode_leaves_no_feeder_and_logs_no_error(tmp_path, caplog):
+    """Covers AE3. Cancelling a transcode mid-stream must finish the feeder, not
+    merely abandon it — so the caller closing the response cannot make a
+    still-running task raise, and no ERROR or traceback is logged."""
+    from app.api import stream as s
+
+    caplog.set_level(logging.DEBUG)
+    resp = _SlowResp(_make_ogg(tmp_path, 30).read_bytes())
+
+    task = asyncio.create_task(s._transcode_to_flac_file(resp))
+    await resp.wait_mid_stream()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # This is what _fetch_and_transcode's `finally` does immediately after.
+    await resp.aclose()
+    assert not resp.iterating, "feeder task outlived the response it reads"
+
+    await asyncio.sleep(0.1)   # give any orphan the chance to blow up
+    assert not _errors(caplog)
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_cancel_before_first_chunk_leaves_no_error(tmp_path, caplog):
+    """Edge: cancellation arriving before any byte is read is still clean."""
+    from app.api import stream as s
+
+    caplog.set_level(logging.DEBUG)
+    resp = _SlowResp(_make_ogg(tmp_path, 2).read_bytes(), delay=0.5)
+
+    task = asyncio.create_task(s._transcode_to_flac_file(resp))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await resp.aclose()
+    await asyncio.sleep(0.1)
+    assert not resp.iterating
+    assert not _errors(caplog)
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_genuine_upstream_drop_still_logs_error(caplog):
+    """Error path: an upstream that actually fails mid-body is NOT a teardown and
+    must keep its ERROR + traceback. Over-quietening this would hide real faults."""
+    from app.api import stream as s
+
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(RuntimeError):          # ffmpeg rejects the truncated input
+        await s._transcode_to_flac_file(_DropResp())
+
+    errs = _errors(caplog)
+    assert errs, "a genuine upstream drop must still be logged at ERROR"
+    assert any(r.exc_info for r in errs), "and must keep its traceback"
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_broken_pipe_is_not_an_error(caplog):
+    """Error path: ffmpeg exiting early trips a broken pipe on the feed. That is
+    reported through the non-zero rc, not as a feeder failure."""
+    from app.api import stream as s
+
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(RuntimeError):
+        await s._transcode_to_flac_file(_BrokenPipeResp())
+
+    assert not _errors(caplog)
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_cancelled_transcode_kills_ffmpeg(tmp_path, monkeypatch):
+    """Cancellation must not strand the ffmpeg child. Awaiting the feeder before
+    killing ffmpeg could also wedge here, because the feeder's finally awaits
+    stdin.wait_closed() and a live ffmpeg that stopped draining stdin never lets
+    that complete — so this also pins the kill-then-await ordering."""
+    from app.api import stream as s
+
+    procs = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spy(*args, **kwargs):
+        proc = await real_exec(*args, **kwargs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+
+    resp = _SlowResp(_make_ogg(tmp_path, 30).read_bytes())
+    task = asyncio.create_task(s._transcode_to_flac_file(resp))
+    await resp.wait_mid_stream()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert procs, "ffmpeg was never spawned"
+    assert procs[0].returncode is not None, "ffmpeg left running after cancellation"
+
+
+@pytest.mark.skipif(not _ffmpeg_tools_available(), reason="ffmpeg/ffprobe not installed")
+async def test_cancel_during_seektable_unlinks_temp_file(tmp_path, monkeypatch):
+    """The seektable call used to sit one line outside the cleanup guard, so a
+    cancel there returned no path — nothing could ever cache or evict the temp
+    FLAC, and it leaked for the life of the container."""
+    from app.api import stream as s
+
+    seen = {}
+
+    async def slow_seektable(path):
+        seen["path"] = path
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(s, "_add_flac_seektable", slow_seektable)
+
+    resp = _SlowResp(_make_ogg(tmp_path, 2).read_bytes(), delay=0.0)
+    task = asyncio.create_task(s._transcode_to_flac_file(resp))
+    for _ in range(300):
+        if "path" in seen:
+            break
+        await asyncio.sleep(0.02)
+    assert "path" in seen, "never reached the seektable stage"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not os.path.exists(seen["path"]), "temp FLAC stranded by cancellation"

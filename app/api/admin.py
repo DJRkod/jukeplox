@@ -29,6 +29,7 @@ from app.auth import plex_oauth
 # Snapshot building lives output-side since the live-discovery plan U5
 # (KTD11) — the device watcher's broadcast shares the exact serialization
 # without importing this module. Probe scheduling moved likewise (U4/KTD6).
+from app import memory_probe
 from app import playback_control
 from app.output import sendspin_adapter  # module-level is safe: no aiosendspin import
 from app.output.discovery import build_devices_snapshot, build_registry_snapshot
@@ -2551,6 +2552,89 @@ async def get_artist_exclusions_admin():
 async def set_artist_exclusions_admin(body: ArtistExclusionsRequest):
     await database.set_artist_exclusions(body.names)
     return {"ok": True}
+
+
+# ── Memory attribution probe (2026-08-15 observability unit, R3) ──────────────
+#
+# Admin-only diagnostic. Guests have no use for allocation traces and no route
+# here is mirrored on the guest surface; gating is the router-level
+# require_admin. Off by default — see app/memory_probe.py for why tracing is not
+# left running.
+#
+# take()/diff() are CPU-bound and scale with the number of live allocation
+# sites, so they run in a worker thread: the probe's whole purpose is to sample
+# DURING a live party, and blocking this loop would stall the audio stream it is
+# meant to be diagnosing.
+
+_PROBE_STATUS = {"not_found": 404, "bad_request": 400, "conflict": 409}
+
+
+def _probe_http_error(exc: "memory_probe.MemoryProbeError") -> HTTPException:
+    return HTTPException(status_code=_PROBE_STATUS.get(getattr(exc, "kind", "conflict"), 409),
+                         detail=str(exc))
+
+
+class MemoryProbeStartRequest(BaseModel):
+    frames: int = Field(default=memory_probe.DEFAULT_FRAMES, ge=1,
+                        le=memory_probe.MAX_FRAMES)
+
+
+class MemorySnapshotRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=64)
+    replace: bool = False
+
+
+@router.get("/diagnostics/memory")
+async def memory_probe_status():
+    """Whether tracing is on, and which snapshots are held."""
+    return memory_probe.status()
+
+
+@router.post("/diagnostics/memory/start")
+async def memory_probe_start(body: MemoryProbeStartRequest = MemoryProbeStartRequest()):
+    """Begin tracing. Reports already_tracing rather than silently restarting.
+
+    The body is optional — every field has a default, so requiring one would
+    422 the obvious `POST` with no body at all.
+    """
+    try:
+        out = memory_probe.start(body.frames)
+    except memory_probe.MemoryProbeError as exc:
+        raise _probe_http_error(exc)
+    # Arm the wall-clock ceiling so a forgotten session cannot cost memory on
+    # the box it is meant to be diagnosing.
+    await memory_probe.arm_autostop()
+    return out
+
+
+@router.post("/diagnostics/memory/stop")
+async def memory_probe_stop():
+    """Stop tracing and release every retained snapshot."""
+    memory_probe.cancel_autostop()
+    return memory_probe.stop()
+
+
+@router.post("/diagnostics/memory/snapshot")
+async def memory_probe_snapshot(body: MemorySnapshotRequest):
+    """Capture a labelled snapshot to diff against later."""
+    try:
+        return await asyncio.to_thread(memory_probe.take, body.label, body.replace)
+    except memory_probe.MemoryProbeError as exc:
+        raise _probe_http_error(exc)
+
+
+@router.get("/diagnostics/memory/diff")
+async def memory_probe_diff(
+    before: str = Query(min_length=1, max_length=64),
+    after: str = Query(min_length=1, max_length=64),
+    limit: int = Query(default=memory_probe.DEFAULT_ENTRIES, ge=1,
+                       le=memory_probe.MAX_ENTRIES),
+):
+    """Rank the allocation sites that grew between two snapshots."""
+    try:
+        return await asyncio.to_thread(memory_probe.diff, before, after, limit)
+    except memory_probe.MemoryProbeError as exc:
+        raise _probe_http_error(exc)
 
 
 # ── Admin WebSocket ───────────────────────────────────────────────────────────

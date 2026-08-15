@@ -253,6 +253,50 @@ def _unlink_quietly(path: str) -> None:
         pass
 
 
+_ABANDON_GRACE_S = 5.0
+
+
+async def _abandon_transcode(feeder_task, proc, tmp_path: str) -> None:
+    """Tear a transcode down on an early exit, leaving nothing running.
+
+    Order matters. ffmpeg is killed BEFORE the feeder is awaited: the feeder's
+    own ``finally`` awaits ``proc.stdin.wait_closed()``, which cannot complete
+    while a live ffmpeg has stopped draining stdin — so awaiting the feeder
+    first can wedge this coroutine, and with it the entry in the in-flight
+    transcode map, permanently poisoning that cache key.
+
+    Every await is bounded, so a wedged ffmpeg cannot hold the request — or a
+    graceful shutdown — open indefinitely. The waits are shielded so a second
+    cancellation delivered mid-cleanup cannot kill the child tasks outright,
+    though it can still interrupt this coroutine; that residual window is
+    accepted, since by then the feeder is already cancelled and ffmpeg already
+    killed, so both unwind on their own.
+    """
+    feeder_task.cancel()
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass  # already reaped
+        await _wait_bounded(proc.wait(), "ffmpeg did not exit within %.0fs of kill")
+    await _wait_bounded(
+        feeder_task,
+        "transcode feeder did not stop within %.0fs; it may still hold the "
+        "upstream response",
+    )
+    _unlink_quietly(tmp_path)
+
+
+async def _wait_bounded(awaitable, timeout_msg: str) -> None:
+    """Await *awaitable* with a grace period, never raising on failure."""
+    try:
+        await asyncio.wait_for(asyncio.shield(awaitable), _ABANDON_GRACE_S)
+    except asyncio.TimeoutError:
+        _log.warning("stream proxy: " + timeout_msg, _ABANDON_GRACE_S)
+    except Exception:
+        pass
+
+
 async def _transcode_to_flac_file(plex_resp) -> str:
     """Transcode the upstream Ogg response into a **seekable** temp FLAC file.
 
@@ -307,17 +351,37 @@ async def _transcode_to_flac_file(plex_resp) -> str:
                 pass
 
     feeder_task = asyncio.create_task(_feeder())
-    # stderr.read() drains until ffmpeg closes the pipe (i.e. exits); the feeder
-    # runs concurrently as a task, so stdin keeps flowing while we wait here.
-    stderr = await proc.stderr.read()
-    rc = await proc.wait()
-    await feeder_task
+    try:
+        # stderr.read() drains until ffmpeg closes the pipe (i.e. exits); the
+        # feeder runs concurrently as a task, so stdin keeps flowing while we
+        # wait here.
+        stderr = await proc.stderr.read()
+        rc = await proc.wait()
+        await feeder_task
+    except BaseException:
+        # Early exit — usually cancellation, when a skip supersedes the prefetch
+        # that started this transcode. The feeder must not outlive this call:
+        # our caller closes the upstream response in its own `finally`, so an
+        # abandoned feeder would be left reading a response that is closed out
+        # from under it. httpx raises on that and the feeder logged it as a
+        # failure, which is how routine skips came to emit ERROR tracebacks
+        # (2026-08-15). Finish the feeder here, and don't strand ffmpeg or its
+        # temp file either.
+        await _abandon_transcode(feeder_task, proc, tmp_path)
+        raise
     if rc != 0:
         _unlink_quietly(tmp_path)
         raise RuntimeError(
             f"ffmpeg exited {rc}: {stderr.decode('utf-8', errors='replace').strip()}"
         )
-    await _add_flac_seektable(tmp_path)
+    try:
+        await _add_flac_seektable(tmp_path)
+    except BaseException:
+        # One line outside the guard above used to be enough to strand the temp
+        # FLAC: a cancel here never returns tmp_path, so nothing ever caches or
+        # evicts it. _unlink_quietly is idempotent.
+        _unlink_quietly(tmp_path)
+        raise
     return tmp_path
 
 
