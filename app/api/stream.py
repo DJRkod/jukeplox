@@ -297,7 +297,7 @@ async def _wait_bounded(awaitable, timeout_msg: str) -> None:
         pass
 
 
-async def _transcode_to_flac_file(plex_resp) -> str:
+async def _transcode_to_flac_file(plex_resp, reopen=None) -> str:
     """Transcode the upstream Ogg response into a **seekable** temp FLAC file.
 
     Writing to a real file rather than ``pipe:1`` is the whole point: ffmpeg
@@ -311,6 +311,10 @@ async def _transcode_to_flac_file(plex_resp) -> str:
     ``-sample_fmt s16`` keeps the output to universally supported 16-bit FLAC:
     Vorbis decodes to float, which ffmpeg would otherwise encode as 24-bit
     FLAC ("considered experimental"), another constrained-decoder risk.
+
+    ``reopen(offset)`` is an optional coroutine returning a fresh upstream
+    response starting at *offset*, or None. Without it a mid-body upstream drop
+    truncates the transcode; with it the feed resumes. See ``_feeder`` below.
 
     Returns the temp file path; the caller owns deletion. Raises
     ``FileNotFoundError`` if ffmpeg is absent and ``RuntimeError`` on a
@@ -334,13 +338,75 @@ async def _transcode_to_flac_file(plex_resp) -> str:
         _unlink_quietly(tmp_path)
         raise
 
-    async def _feeder():
+    # Resume-on-truncation for the TRANSCODE path (2026-08-15, issue #38).
+    # The passthrough proxy got this in 2026-08-09; this path never did, and it
+    # is the same fault: Plex closes a connection it considers idle mid-body and
+    # httpx raises RemoteProtocolError ("received N bytes, expected M"). Measured
+    # on the rig at 4 occurrences in ~2 hours of ordinary playback. Untreated it
+    # feeds ffmpeg a short input, so the prefetch transcode fails and the ERROR
+    # + traceback lands in the log — which is what made `grep Traceback` useless
+    # during a soak. Resuming with a Range from the last byte fed hands ffmpeg a
+    # complete stream instead, so the failure stops happening rather than being
+    # logged more quietly.
+    total: int | None = None
+    cl = getattr(plex_resp, "headers", {}).get("content-length")
+    if cl is not None:
         try:
-            async for chunk in plex_resp.aiter_bytes(chunk_size=65536):
-                proc.stdin.write(chunk)
-                await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # ffmpeg exited early; its non-zero rc is handled below
+            total = int(cl)
+        except ValueError:
+            total = None
+    fed = 0
+
+    async def _feeder():
+        nonlocal fed
+        resp = plex_resp
+        attempts = 0
+        try:
+            while True:
+                dropped = False
+                try:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        if total is not None:
+                            room = total - fed
+                            if room <= 0:
+                                return              # full body already fed
+                            if len(chunk) > room:
+                                chunk = chunk[:room]
+                        proc.stdin.write(chunk)
+                        await proc.stdin.drain()
+                        fed += len(chunk)
+                        attempts = 0                # progress resets the budget
+                except (BrokenPipeError, ConnectionResetError):
+                    return  # ffmpeg exited early; its non-zero rc is handled below
+                except httpx.TransportError as exc:
+                    dropped = True
+                    _log.info("stream proxy: transcode upstream dropped at "
+                              "%d/%s bytes: %r", fed, total, exc)
+                if total is not None and fed >= total:
+                    return
+                if total is None or reopen is None:
+                    # Without a known length a byte-offset resume has no
+                    # reliable meaning, and without a reopen we have no way to
+                    # ask for one. ffmpeg sees a short input either way.
+                    if dropped:
+                        _log.warning("stream proxy: transcode upstream dropped "
+                                     "at %d bytes and cannot resume "
+                                     "(content-length %s)", fed, total)
+                    return
+                if attempts >= _STREAM_RESUME_MAX:
+                    _log.warning("stream proxy: transcode upstream truncated at "
+                                 "%d/%d bytes; giving up after %d resume "
+                                 "attempt(s)", fed, total, attempts)
+                    return
+                attempts += 1
+                _log.info("stream proxy: resuming transcode upstream from byte "
+                          "%d (attempt %d/%d)", fed, attempts, _STREAM_RESUME_MAX)
+                resumed = await reopen(fed)
+                if resumed is None:
+                    return
+                resp = resumed
         except Exception:
             _log.exception("stream proxy: upstream→ffmpeg feeder failed")
         finally:
@@ -373,6 +439,17 @@ async def _transcode_to_flac_file(plex_resp) -> str:
         _unlink_quietly(tmp_path)
         raise RuntimeError(
             f"ffmpeg exited {rc}: {stderr.decode('utf-8', errors='replace').strip()}"
+        )
+    if total is not None and fed < total:
+        # ffmpeg exits ZERO on a truncated Ogg and writes a short-but-valid
+        # FLAC — measured 2026-08-15: a mid-body drop turned a 5s track into a
+        # 1.0s file with rc=0. _get_or_transcode caches anything that returns,
+        # so that silently became the cached artifact and a device played one
+        # second of the track. A short input is a failed transcode, not a small
+        # one; fail it so the caller falls back instead of caching a stub.
+        _unlink_quietly(tmp_path)
+        raise RuntimeError(
+            f"upstream truncated: fed {fed} of {total} bytes to ffmpeg"
         )
     try:
         await _add_flac_seektable(tmp_path)
@@ -480,10 +557,46 @@ async def _fetch_and_transcode(plex_url: str, headers: dict | None = None) -> st
     except Exception:
         await http_client.aclose()
         raise HTTPException(status_code=502, detail="Stream source unavailable")
+    # The feeder may replace the response when it resumes, so the close below
+    # has to target whichever one is live, not the one we opened.
+    current = {"resp": plex_resp}
+
+    async def _reopen(offset: int):
+        """Re-open the upstream from *offset*, or return None if it can't be."""
+        try:
+            await current["resp"].aclose()
+        except Exception:
+            pass
+        hdrs = dict(headers or {})
+        hdrs["Range"] = f"bytes={offset}-"
+        try:
+            req = http_client.build_request("GET", plex_url, headers=hdrs)
+            resp = await http_client.send(req, stream=True)
+        except Exception as exc:
+            _log.warning("stream proxy: transcode resume request failed at byte "
+                         "%d: %r", offset, exc)
+            return None
+        if resp.status_code != 206:
+            # A 200 means the source ignored Range and restarted from zero.
+            # Feeding that on would duplicate everything already sent to ffmpeg
+            # and corrupt the output — worse than the truncation we're fixing.
+            _log.warning("stream proxy: transcode resume got HTTP %d (not 206) "
+                         "at byte %d; not resuming", resp.status_code, offset)
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            return None
+        current["resp"] = resp
+        return resp
+
     try:
-        return await _transcode_to_flac_file(plex_resp)
+        return await _transcode_to_flac_file(plex_resp, reopen=_reopen)
     finally:
-        await plex_resp.aclose()
+        try:
+            await current["resp"].aclose()
+        except Exception:
+            pass
         await http_client.aclose()
 
 
