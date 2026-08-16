@@ -2629,10 +2629,16 @@ async def memory_probe_diff(
     after: str = Query(min_length=1, max_length=64),
     limit: int = Query(default=memory_probe.DEFAULT_ENTRIES, ge=1,
                        le=memory_probe.MAX_ENTRIES),
+    group_by: str = Query(default=memory_probe.DEFAULT_GROUP_BY),
 ):
-    """Rank the allocation sites that grew between two snapshots."""
+    """Rank the allocation sites that grew between two snapshots.
+
+    group_by=traceback gives the full call chain and makes the process
+    unresponsive while it runs; the default line grouping does not.
+    """
     try:
-        return await asyncio.to_thread(memory_probe.diff, before, after, limit)
+        return await asyncio.to_thread(
+            memory_probe.diff, before, after, limit, group_by)
     except memory_probe.MemoryProbeError as exc:
         raise _probe_http_error(exc)
 

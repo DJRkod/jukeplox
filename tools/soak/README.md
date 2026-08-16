@@ -124,9 +124,18 @@ the image has no `ps`:
 
 ```sh
 # /root/jp-probe.sh — emits: rss_kb threads fds children media_procs
+#
+# Container PID 1 is the `sh -c` wrapper, because CMD is shell-form — reading
+# /proc/1 reports the shell and yields a flat ~1.4MB forever, which looks like
+# a perfectly stable process. Find the uvicorn process instead.
 CID=$(docker ps -qf name=jukeplox)
 docker exec "$CID" sh -c '
-  pid=1
+  pid=""
+  for p in /proc/[0-9]*; do
+    c=$(cat "$p/comm" 2>/dev/null)
+    case "$c" in uvicorn*|python*|gunicorn*) pid=${p#/proc/}; break;; esac
+  done
+  [ -z "$pid" ] && { echo "0 0 0 0 0"; exit 0; }
   rss=$(awk "/VmRSS/ {print \$2}" /proc/$pid/status)
   thr=$(awk "/Threads/ {print \$2}" /proc/$pid/status)
   fds=$(ls /proc/$pid/fd 2>/dev/null | wc -l)
@@ -135,6 +144,10 @@ docker exec "$CID" sh -c '
   echo "$rss $thr $fds $kids $media"
 '
 ```
+
+A run of `0 0 0 0 0` means the process match failed — fix that before trusting
+the resource trend, because `analyse.py` cannot tell a failed match from a
+genuinely flat process.
 
 Without `JP_RIG` set, the monitor still runs — it just records no container
 samples, and `analyse.py` says so rather than reporting a clean trend.

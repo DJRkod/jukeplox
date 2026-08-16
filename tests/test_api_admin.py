@@ -5341,3 +5341,96 @@ def test_memory_probe_autostop_fires(client, probe_clean, monkeypatch):
         if not client.get("/admin/diagnostics/memory").json()["tracing"]:
             break
     assert client.get("/admin/diagnostics/memory").json()["tracing"] is False
+
+
+def test_memory_probe_snapshot_does_not_filter_traces(client, probe_clean):
+    """Capture must never call Snapshot.filter_traces.
+
+    Measured on Pi-class hardware against a warm heap: take_snapshot costs
+    ~1.2s, filter_traces costs 23-62s depending on frame depth, because it runs
+    an fnmatch per frame per traced block. With it in the capture path a
+    snapshot never completed inside 15 minutes and degraded every request to
+    ~21s. Pinned structurally rather than by timing, which would be flaky.
+    """
+    import tracemalloc
+
+    calls = []
+    original = tracemalloc.Snapshot.filter_traces
+
+    def spy(self, filters):
+        calls.append(filters)
+        return original(self, filters)
+
+    client.post("/admin/diagnostics/memory/start", json={})
+    tracemalloc.Snapshot.filter_traces = spy
+    try:
+        resp = client.post("/admin/diagnostics/memory/snapshot",
+                           json={"label": "cheap"})
+    finally:
+        tracemalloc.Snapshot.filter_traces = original
+
+    assert resp.status_code == 200
+    assert not calls, "filter_traces in the capture path — see the docstring"
+
+
+def test_memory_probe_diff_omits_the_probes_own_frames(client, probe_clean):
+    """The probe still must not present itself as the leak — that filtering
+    just moved to the ranked result, where it is a few hundred string checks."""
+    client.post("/admin/diagnostics/memory/start", json={})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "a"})
+    _allocate_a_lot()
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "b"})
+
+    body = client.get(
+        "/admin/diagnostics/memory/diff?before=a&after=b&limit=40").json()
+    for entry in body["entries"]:
+        assert not all("memory_probe.py" in f for f in entry["traceback"]), \
+            f"probe reported itself: {entry['traceback']}"
+
+
+def test_memory_probe_diff_defaults_to_line_grouping(client, probe_clean):
+    """Traceback grouping starves the process — measured on the rig at ~2
+    minutes during which /api/version did not answer within 60s. The default
+    must be the cheap grouping; the expensive one is opt-in."""
+    from app import memory_probe
+
+    assert memory_probe.DEFAULT_GROUP_BY == "lineno"
+    client.post("/admin/diagnostics/memory/start", json={})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "a"})
+    _allocate_a_lot()
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "b"})
+
+    body = client.get("/admin/diagnostics/memory/diff?before=a&after=b").json()
+    assert body["group_by"] == "lineno"
+    assert body["entries"], "line grouping must still attribute something"
+    # Still names a real file:line, which is what the attribution is for.
+    assert any("test_api_admin" in f or "_allocate_a_lot" in f
+               for e in body["entries"][:5] for f in e["traceback"])
+
+
+def test_memory_probe_diff_rejects_an_unknown_grouping(client, probe_clean):
+    client.post("/admin/diagnostics/memory/start", json={})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "a"})
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "b"})
+    resp = client.get(
+        "/admin/diagnostics/memory/diff?before=a&after=b&group_by=nonsense")
+    assert resp.status_code == 400
+
+
+def test_memory_probe_default_frames_match_default_grouping(client, probe_clean):
+    """Tracing cost scales with frame depth — 16 frames measured a ~36x
+    slowdown on a real endpoint. The default grouping reads only the innermost
+    frame, so capturing more by default would be paid for and thrown away."""
+    from app import memory_probe
+
+    assert memory_probe.DEFAULT_FRAMES == 1
+    body = client.post("/admin/diagnostics/memory/start", json={}).json()
+    assert body["frames"] == 1
+
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "a"})
+    _allocate_a_lot()
+    client.post("/admin/diagnostics/memory/snapshot", json={"label": "b"})
+    diff = client.get("/admin/diagnostics/memory/diff?before=a&after=b").json()
+    # One frame is still enough to name the allocating line.
+    assert any("test_api_admin" in f
+               for e in diff["entries"][:5] for f in e["traceback"])
