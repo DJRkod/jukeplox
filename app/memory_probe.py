@@ -23,6 +23,7 @@ Pure of FastAPI so it can be exercised directly; the routes in
 from __future__ import annotations
 
 import asyncio
+import gc
 import heapq
 import logging
 import threading
@@ -219,8 +220,14 @@ async def _autostop() -> None:
         stop()
 
 
-def take(label: str, replace: bool = False) -> dict:
+def take(label: str, replace: bool = False, collect: bool = False) -> dict:
     """Capture a labelled snapshot.
+
+    ``collect`` runs a full ``gc.collect()`` first. Without it, cyclic garbage
+    that simply has not been collected yet is indistinguishable from a genuine
+    leak — both show up as retained bytes. Any attribution that matters should
+    be taken with it on; it is off by default only because a full collection
+    pauses the process briefly.
 
     Reusing a label is refused unless *replace* is set. A snapshot can take
     seconds on a large heap, which is long enough to trip a client timeout — and
@@ -240,6 +247,7 @@ def take(label: str, replace: bool = False) -> dict:
             raise MemoryProbeError(
                 f"snapshot limit reached ({MAX_SNAPSHOTS}); stop the probe to clear")
 
+    collected = gc.collect() if collect else None
     # Deliberately unfiltered — see _OWN_FRAME_MARKERS. This is the ~1s call.
     snap = tracemalloc.take_snapshot()
     current, peak = tracemalloc.get_traced_memory()
@@ -250,6 +258,7 @@ def take(label: str, replace: bool = False) -> dict:
     _log.info("memory probe: snapshot %r at %.1f KB traced", label, current / 1024)
     return {
         "label": label,
+        "gc_collected": collected,
         "traced_kb": round(current / 1024, 1),
         "peak_kb": round(peak / 1024, 1),
         "snapshots": labels,
