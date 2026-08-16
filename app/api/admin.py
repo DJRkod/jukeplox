@@ -2582,6 +2582,8 @@ class MemoryProbeStartRequest(BaseModel):
 class MemorySnapshotRequest(BaseModel):
     label: str = Field(min_length=1, max_length=64)
     replace: bool = False
+    # Collect cycles first, so uncollected garbage cannot masquerade as a leak.
+    collect: bool = False
 
 
 @router.get("/diagnostics/memory")
@@ -2618,7 +2620,7 @@ async def memory_probe_stop():
 async def memory_probe_snapshot(body: MemorySnapshotRequest):
     """Capture a labelled snapshot to diff against later."""
     try:
-        return await asyncio.to_thread(memory_probe.take, body.label, body.replace)
+        return await asyncio.to_thread(memory_probe.take, body.label, body.replace, body.collect)
     except memory_probe.MemoryProbeError as exc:
         raise _probe_http_error(exc)
 

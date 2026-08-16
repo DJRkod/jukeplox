@@ -73,6 +73,8 @@ TYPE_ARTIST = 8
 TYPE_ALBUM = 9
 TYPE_TRACK = 10
 
+from app.sources.ttl_cache import TTLCache  # noqa: E402
+
 _CACHE_TTL = 300  # 5 minutes
 
 # Per-hub result cap for /hubs/search (`limit` applies per hub). Results are
@@ -82,16 +84,6 @@ _CACHE_TTL = 300  # 5 minutes
 # title-substring matches — those are absent from hub ranking, not truncated;
 # the broad literal Tier 2 covers them instead. Cap kept at the baseline 30.)
 _SEARCH_HUB_LIMIT = 30
-
-
-@dataclass
-class _CacheEntry:
-    value: Any
-    expires_at: float = field(default_factory=lambda: time.monotonic() + _CACHE_TTL)
-
-    @property
-    def valid(self) -> bool:
-        return time.monotonic() < self.expires_at
 
 
 class PlexClient:
@@ -111,7 +103,7 @@ class PlexClient:
         self.machine_id = machine_id
         self.server_name = server_name
         self.owner = owner
-        self._cache: dict[str, _CacheEntry] = {}
+        self._cache = TTLCache()
         # Per-server concurrency ceiling (gentle-on-Plex, 2026-06-14 plan U1).
         # The semaphore is the ENFORCING cap — it lives in our code, so it is
         # deterministically testable and never lets more than `cap` requests
@@ -182,11 +174,10 @@ class PlexClient:
         return resp.content
 
     def _cached(self, key: str) -> Any | None:
-        entry = self._cache.get(key)
-        return entry.value if entry and entry.valid else None
+        return self._cache.get(key)
 
     def _store(self, key: str, value: Any) -> None:
-        self._cache[key] = _CacheEntry(value=value)
+        self._cache.set(key, value)
 
     def invalidate_cache(self) -> None:
         self._cache.clear()

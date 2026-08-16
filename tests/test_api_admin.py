@@ -5434,3 +5434,17 @@ def test_memory_probe_default_frames_match_default_grouping(client, probe_clean)
     # One frame is still enough to name the allocating line.
     assert any("test_api_admin" in f
                for e in diff["entries"][:5] for f in e["traceback"])
+
+
+def test_memory_probe_snapshot_can_collect_first(client, probe_clean):
+    """Cyclic garbage that has not been collected yet is indistinguishable from
+    a leak — both read as retained bytes. The probe has to be able to tell
+    them apart or its attribution cannot be trusted."""
+    client.post("/admin/diagnostics/memory/start", json={})
+    plain = client.post("/admin/diagnostics/memory/snapshot",
+                        json={"label": "plain"}).json()
+    assert plain["gc_collected"] is None
+
+    swept = client.post("/admin/diagnostics/memory/snapshot",
+                        json={"label": "swept", "collect": True}).json()
+    assert isinstance(swept["gc_collected"], int)

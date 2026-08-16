@@ -68,6 +68,8 @@ _log = logging.getLogger("jukeplox.subsonic")
 CLIENT_NAME = "Jukeplox"
 API_VERSION = "1.16.1"  # OpenSubsonic baseline (supports search3/getArtists/getAlbum)
 
+from app.sources.ttl_cache import TTLCache  # noqa: E402
+
 _CACHE_TTL = 300  # seconds — mirrors JellyfinSource / PlexClient
 
 _SUBSONIC_CAPS = Capabilities(native_search=True, genres=True)
@@ -166,16 +168,6 @@ def _decode_id(local_id: str) -> str:
         return local_id
 
 
-@dataclass
-class _CacheEntry:
-    value: Any
-    expires_at: float = field(default_factory=lambda: time.monotonic() + _CACHE_TTL)
-
-    @property
-    def valid(self) -> bool:
-        return time.monotonic() < self.expires_at
-
-
 class SubsonicSource(MusicSource):
     def __init__(
         self,
@@ -200,7 +192,7 @@ class SubsonicSource(MusicSource):
         self.username = username
         self._source_id = source_id or "subsonic"
         self.server_name = server_name
-        self._cache: dict[str, _CacheEntry] = {}
+        self._cache = TTLCache()
         # No reverse map: _safe_id is self-decodable (base64url behind a reserved
         # prefix), so a hashed id resolves back to its native id statelessly and
         # survives a registry rebuild / restart (P1).
@@ -311,11 +303,10 @@ class SubsonicSource(MusicSource):
         return body
 
     def _cached(self, key: str) -> Any | None:
-        entry = self._cache.get(key)
-        return entry.value if entry and entry.valid else None
+        return self._cache.get(key)
 
     def _store(self, key: str, value: Any) -> None:
-        self._cache[key] = _CacheEntry(value=value)
+        self._cache.set(key, value)
 
     # ── extension detection (capability probe, U2/U4) ─────────────────────────
 

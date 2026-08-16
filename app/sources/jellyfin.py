@@ -39,6 +39,8 @@ from app.sources.base import Capabilities, MusicSource, StreamTarget
 CLIENT_NAME = "Jukeplox"
 CLIENT_VERSION = "1.0"
 
+from app.sources.ttl_cache import TTLCache  # noqa: E402
+
 _CACHE_TTL = 300  # seconds — mirrors PlexClient
 
 _JELLYFIN_CAPS = Capabilities(native_search=True, genres=True)
@@ -86,16 +88,6 @@ def _mb_match_ids(provider_ids: dict | None, allowed: set[str]) -> dict[str, str
         if kl in allowed and v and str(v).strip():
             out[kl] = str(v).strip()
     return out
-
-
-@dataclass
-class _CacheEntry:
-    value: Any
-    expires_at: float = field(default_factory=lambda: time.monotonic() + _CACHE_TTL)
-
-    @property
-    def valid(self) -> bool:
-        return time.monotonic() < self.expires_at
 
 
 async def authenticate(
@@ -161,7 +153,7 @@ class JellyfinSource(MusicSource):
         self.server_name = server_name
         self.device_id = device_id or new_device_id()
         self._page_size = page_size
-        self._cache: dict[str, _CacheEntry] = {}
+        self._cache = TTLCache()
         if max_concurrency is None:
             from app.config import settings
             max_concurrency = settings.plex_max_concurrency
@@ -231,11 +223,10 @@ class JellyfinSource(MusicSource):
         return out
 
     def _cached(self, key: str) -> Any | None:
-        entry = self._cache.get(key)
-        return entry.value if entry and entry.valid else None
+        return self._cache.get(key)
 
     def _store(self, key: str, value: Any) -> None:
-        self._cache[key] = _CacheEntry(value=value)
+        self._cache.set(key, value)
 
     # ── key namespace ─────────────────────────────────────────────────────────
 
