@@ -33,10 +33,16 @@ from typing import Any
 
 _log = logging.getLogger(__name__)
 
-# Frames per traceback. Deep enough to place an allocation inside our own call
-# chain rather than at the library leaf that happened to allocate, shallow
-# enough that the per-block overhead stays sane on a Pi.
-DEFAULT_FRAMES = 12
+# Frames captured per allocation. Tracing cost scales directly with this, and
+# on a Pi it is brutal: measured 2026-08-15, /api/browse/albums took 7.3s
+# untraced, and 4m23s with tracing at 16 frames — a ~36x slowdown that makes
+# the app unusable while the probe is on.
+#
+# The default is 1 because the DEFAULT grouping is by line, which only ever
+# reads the innermost frame; capturing more would be paid for and discarded.
+# The retention this probe was built to find was attributed with exactly this.
+# Raise it only alongside group_by="traceback", and expect to pay for it.
+DEFAULT_FRAMES = 1
 MAX_FRAMES = 40
 
 # Snapshots retain memory in proportion to the number of live allocation sites.
@@ -46,6 +52,17 @@ MAX_SNAPSHOTS = 8
 
 DEFAULT_ENTRIES = 25
 MAX_ENTRIES = 200
+
+# How allocations are grouped when diffing.
+#
+# "lineno" is the default because "traceback" is not merely slower, it is
+# hostile: measured on the rig 2026-08-15, a traceback-keyed diff took ~2
+# minutes during which /api/version did not answer inside 60 seconds — the
+# whole app starved. Grouping by line still names the culprit (the retention
+# that motivated this probe was attributed to a single file:line), so the
+# expensive mode is opt-in and labelled.
+GROUP_KEYS = ("lineno", "traceback")
+DEFAULT_GROUP_BY = "lineno"
 
 # Wall-clock ceiling on a tracing session. The caps above bound the diagnostic's
 # own structures but not tracemalloc's per-live-block bookkeeping, which grows
@@ -86,16 +103,21 @@ class MemoryProbeError(Exception):
         self.kind = kind
 
 
-def _drop_own_frames(snapshot):
-    """Exclude tracemalloc's and this module's own allocations.
+# Frames belonging to the probe itself or to tracemalloc. Dropped from the
+# RANKED RESULT, never from the snapshot.
+#
+# The obvious implementation — Snapshot.filter_traces() at capture — is what
+# made this endpoint dangerous. Measured on the rig 2026-08-15 against a warm
+# heap: take_snapshot() costs 1.1-1.3s regardless of depth, but filter_traces()
+# costs 23s at 1 frame and 62s at 16, because it runs an fnmatch per frame per
+# traced block. A snapshot on a real instance never finished inside 15 minutes
+# and degraded every request to ~21s while it ran. Filtering the ranked entries
+# instead is at most a few hundred string checks and costs nothing.
+_OWN_FRAME_MARKERS = ("memory_probe.py", "tracemalloc.py")
 
-    Without this the probe shows up in its own results, which is noise at best
-    and misleading at worst when the question is 'what is holding memory'.
-    """
-    return snapshot.filter_traces((
-        tracemalloc.Filter(False, tracemalloc.__file__),
-        tracemalloc.Filter(False, __file__),
-    ))
+
+def _is_own_frame(frame: str) -> bool:
+    return any(m in frame for m in _OWN_FRAME_MARKERS)
 
 
 def _snapshot_labels() -> list:
@@ -218,7 +240,8 @@ def take(label: str, replace: bool = False) -> dict:
             raise MemoryProbeError(
                 f"snapshot limit reached ({MAX_SNAPSHOTS}); stop the probe to clear")
 
-    snap = _drop_own_frames(tracemalloc.take_snapshot())
+    # Deliberately unfiltered — see _OWN_FRAME_MARKERS. This is the ~1s call.
+    snap = tracemalloc.take_snapshot()
     current, peak = tracemalloc.get_traced_memory()
     with _lock:
         _snapshots[label] = (time.time(), snap)
@@ -233,8 +256,13 @@ def take(label: str, replace: bool = False) -> dict:
     }
 
 
-def diff(before: str, after: str, limit: int = DEFAULT_ENTRIES) -> dict:
+def diff(before: str, after: str, limit: int = DEFAULT_ENTRIES,
+         group_by: str = DEFAULT_GROUP_BY) -> dict:
     """Rank the allocation sites that grew between two snapshots.
+
+    ``group_by="traceback"`` gives the full call chain but starves the process
+    while it runs (see GROUP_KEYS). Prefer the default line grouping unless the
+    chain is genuinely needed, and expect the app to be unresponsive if not.
 
     ``limit`` is clamped rather than honoured blindly — a pathological
     allocation profile has tens of thousands of distinct sites and returning all
@@ -250,11 +278,14 @@ def diff(before: str, after: str, limit: int = DEFAULT_ENTRIES) -> dict:
         if before == after:
             raise MemoryProbeError(
                 "before and after must be different snapshots", "bad_request")
+        if group_by not in GROUP_KEYS:
+            raise MemoryProbeError(
+                f"group_by must be one of {GROUP_KEYS}", "bad_request")
         before_at, before_snap = _snapshots[before]
         after_at, after_snap = _snapshots[after]
 
     limit = max(1, min(int(limit), MAX_ENTRIES))
-    stats = after_snap.compare_to(before_snap, "traceback")
+    stats = after_snap.compare_to(before_snap, group_by)
     # compare_to already sorts, but by ABSOLUTE difference — the biggest
     # shrink outranks a smaller growth. We want growth first. nlargest rather
     # than a second full sort: on a process with tens of thousands of live
@@ -263,17 +294,21 @@ def diff(before: str, after: str, limit: int = DEFAULT_ENTRIES) -> dict:
 
     entries = []
     for stat in top:
+        frames = [str(f) for f in stat.traceback]
+        if frames and all(_is_own_frame(f) for f in frames):
+            continue            # an allocation wholly inside the probe itself
         entries.append({
             "size_diff_kb": round(stat.size_diff / 1024, 1),
             "size_kb": round(stat.size / 1024, 1),
             "count_diff": stat.count_diff,
             "count": stat.count,
-            "traceback": [str(frame) for frame in stat.traceback],
+            "traceback": [f for f in frames if not _is_own_frame(f)] or frames,
         })
 
     return {
         "before": before,
         "after": after,
+        "group_by": group_by,
         # Epochs let a caller see the window each side actually covers, so a
         # retried or stale snapshot is visible rather than silently assumed.
         "before_at": round(before_at, 3),
