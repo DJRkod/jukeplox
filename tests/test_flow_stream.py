@@ -1217,3 +1217,260 @@ async def test_flow_route_ended_drained_session_serves_empty_body():
             assert r.headers["accept-ranges"] == "none"
     finally:
         await flow.close_flow_session()
+
+
+# ── resume-on-truncation for the source feed (2026-08-21) ───────────────────
+#
+# Plex drops a connection it considers idle mid-body. The API proxy survives
+# this on both of its paths; this feeder fetches its own bytes and did not, so
+# one drop ended the track. A 90-minute Chromecast soak caught it live: 3.2 MB
+# of an expected 30.7 MB, ~4 minutes abandoned.
+
+
+class _ChunkedResp:
+    """A response that yields its chunks, then optionally drops mid-body."""
+
+    def __init__(self, body, status=200, total=None, drop_after=None):
+        self._body = body
+        self.status_code = status
+        self._drop_after = drop_after
+        self.headers = {} if total is None else {"content-length": str(total)}
+        self.closed = False
+
+    async def aiter_bytes(self, chunk_size=65536):
+        sent = 0
+        for c in self._body:
+            if self._drop_after is not None and sent >= self._drop_after:
+                raise httpx.RemoteProtocolError(
+                    f"peer closed connection without sending complete message "
+                    f"body (received {sent}, expected more)")
+            yield c
+            sent += len(c)
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _ResumeClient:
+    """Serves a body that truncates once, then honours Range."""
+
+    def __init__(self, *a, **kw):
+        self.requests = []
+
+    def build_request(self, method, url, headers=None, **kw):
+        self.requests.append(dict(headers or {}))
+        return SimpleNamespace(headers=dict(headers or {}))
+
+    async def send(self, request, **kw):
+        hdrs = request.headers
+        rng = hdrs.get("Range")
+        if rng is None:
+            # First fetch: 10 bytes promised, dies after 4.
+            return _ChunkedResp([b"AAAA", b"BBBB", b"CC"], total=10,
+                                drop_after=4)
+        assert rng == "bytes=4-", f"unexpected Range {rng!r}"
+        r = _ChunkedResp([b"BBBB", b"CC"], status=206, total=6)
+        # A real 206 says WHERE it resumed from; the feeder now checks it.
+        r.headers["content-range"] = "bytes 4-9/10"
+        return r
+
+    async def aclose(self):
+        pass
+
+
+def _collect_proc():
+    written = []
+    stdin = SimpleNamespace(
+        write=written.append,
+        drain=_noop_async,
+        close=lambda: None,
+        wait_closed=_noop_async,
+    )
+    return SimpleNamespace(stdin=stdin), written
+
+
+async def _noop_async(*a, **kw):
+    return None
+
+
+async def test_flow_source_resumes_after_a_midbody_drop(monkeypatch):
+    """*The soak's Chromecast defect.* A drop mid-body must be repaired, not
+    fatal — and the bytes handed to ffmpeg must be the WHOLE stream exactly
+    once. Asserting only "it retried" would pass an implementation that
+    replayed the first chunk and corrupted the audio."""
+    client = _ResumeClient()
+    monkeypatch.setattr(flow.httpx, "AsyncClient", lambda *a, **kw: client)
+
+    dec = flow.FFmpegPCMDecoder("http://plex:32400/f.flac?X-Plex-Token=S", None)
+    proc, written = _collect_proc()
+    await dec._feed_source(proc)
+
+    assert b"".join(written) == b"AAAABBBBCC", (
+        f"ffmpeg was fed {b''.join(written)!r}, not the intact stream")
+    assert dec._source_failed is False, "a repaired drop must not fail the track"
+    assert client.requests[1]["Range"] == "bytes=4-"
+
+
+async def test_flow_source_refuses_to_resume_on_a_200(monkeypatch):
+    """A source that ignores Range and restarts from zero must NOT be fed on:
+    replaying bytes ffmpeg already decoded corrupts the audio, which is worse
+    than the truncation. Fail the track instead."""
+    class _IgnoresRange(_ResumeClient):
+        async def send(self, request, **kw):
+            if request.headers.get("Range") is None:
+                return _ChunkedResp([b"AAAA", b"BBBB"], total=8, drop_after=4)
+            return _ChunkedResp([b"AAAA", b"BBBB"], status=200, total=8)
+
+    client = _IgnoresRange()
+    monkeypatch.setattr(flow.httpx, "AsyncClient", lambda *a, **kw: client)
+
+    dec = flow.FFmpegPCMDecoder("http://plex:32400/f.flac", None)
+    proc, written = _collect_proc()
+    await dec._feed_source(proc)
+
+    assert b"".join(written) == b"AAAA", "bytes were replayed after a 200"
+    assert dec._source_failed is True, (
+        "an unresumable truncation must still fail the track, not end it quietly")
+
+
+async def test_flow_source_resume_budget_is_bounded(monkeypatch):
+    """A source that drops forever must give up, not spin."""
+    class _AlwaysDrops(_ResumeClient):
+        async def send(self, request, **kw):
+            rng = request.headers.get("Range")
+            if rng is None:
+                return _ChunkedResp([b"AAAA", b"BBBB"], total=100, drop_after=0)
+            # Honest 206 at the requested offset, so the budget — not the
+            # Content-Range guard — is what stops this.
+            off = int(rng.split("=")[1].split("-")[0])
+            r = _ChunkedResp([b"AAAA", b"BBBB"], status=206, total=100,
+                             drop_after=0)
+            r.headers["content-range"] = f"bytes {off}-99/100"
+            return r
+
+    client = _AlwaysDrops()
+    monkeypatch.setattr(flow.httpx, "AsyncClient", lambda *a, **kw: client)
+
+    dec = flow.FFmpegPCMDecoder("http://plex:32400/f.flac", None)
+    proc, _ = _collect_proc()
+    await dec._feed_source(proc)
+
+    assert dec._source_failed is True
+    # one initial + at most the resume budget
+    assert len(client.requests) <= flow.FLOW_SOURCE_RESUME_MAX + 1, (
+        f"{len(client.requests)} requests — the budget did not bound it")
+
+
+async def test_flow_source_drop_without_content_length_still_fails_the_track(
+        monkeypatch):
+    """No declared length means a byte offset has no reliable meaning, so there
+    is nothing to resume from — but the track must still FAIL rather than end
+    quietly. This is the guarantee a09e0a8 added, and adding resume very nearly
+    removed it: the first draft returned cleanly whenever ``total`` was None,
+    which would have turned every unknown-length drop into a silently
+    truncated track."""
+    class _NoLength(_ResumeClient):
+        async def send(self, request, **kw):
+            # Two chunks: the drop fires on the second. With one chunk the
+            # generator just ends and nothing is exercised.
+            return _ChunkedResp([b"AAAA", b"BBBB"], total=None, drop_after=4)
+
+    monkeypatch.setattr(flow.httpx, "AsyncClient",
+                        lambda *a, **kw: _NoLength())
+    dec = flow.FFmpegPCMDecoder("http://plex:32400/f.flac", None)
+    proc, _ = _collect_proc()
+    await dec._feed_source(proc)
+    assert dec._source_failed is True, (
+        "an unresumable drop ended the track silently instead of failing it")
+
+
+async def test_flow_source_clean_end_without_content_length_is_not_a_failure(
+        monkeypatch):
+    """Scoping pin for the test above. A chunked source that simply ENDS is a
+    normal end of track; a guard that failed on every unknown-length body would
+    break ordinary playback while looking like it fixed something."""
+    class _CleanNoLength(_ResumeClient):
+        async def send(self, request, **kw):
+            return _ChunkedResp([b"AAAA", b"BBBB"], total=None)
+
+    monkeypatch.setattr(flow.httpx, "AsyncClient",
+                        lambda *a, **kw: _CleanNoLength())
+    dec = flow.FFmpegPCMDecoder("http://plex:32400/f.flac", None)
+    proc, written = _collect_proc()
+    await dec._feed_source(proc)
+    assert b"".join(written) == b"AAAABBBB"
+    assert dec._source_failed is False, "a clean end was reported as a failure"
+
+
+async def test_flow_source_refuses_a_206_from_the_wrong_offset(monkeypatch):
+    """*2026-08-22 review, P1.* A 206 proves partial-content semantics, NOT
+    that the offset we asked for was honoured.
+
+    A server answering 206 from byte 0 has its bytes appended at position
+    ``fed`` — the same replay corruption the status-code check exists to stop,
+    except silent: the body reaches its full promised length, ``_source_failed``
+    stays False, and a track of wrong audio is reported as played. Reproduced
+    at 458 KB of misaligned audio delivered as success.
+
+    Asserts the BYTES, not just the flag: a version that refused the resume but
+    still fed the duplicate prefix would pass a flag-only test."""
+    class _WrongOffset(_ResumeClient):
+        async def send(self, request, **kw):
+            if request.headers.get("Range") is None:
+                return _ChunkedResp([b"AAAA", b"BBBB"], total=8, drop_after=4)
+            r = _ChunkedResp([b"AAAA", b"BBBB"], status=206, total=8)
+            r.headers["content-range"] = "bytes 0-7/8"   # ignored the Range
+            return r
+
+    client = _WrongOffset()
+    monkeypatch.setattr(flow.httpx, "AsyncClient", lambda *a, **kw: client)
+    dec = flow.FFmpegPCMDecoder("http://plex:32400/f.flac", None)
+    proc, written = _collect_proc()
+    await dec._feed_source(proc)
+
+    assert b"".join(written) == b"AAAA", (
+        f"bytes were replayed from the wrong offset: {b''.join(written)!r}")
+    assert dec._source_failed is True, (
+        "a misaligned resume must fail the track, not deliver wrong audio")
+
+
+async def test_flow_source_accepts_a_206_at_the_requested_offset(monkeypatch):
+    """Scoping pin. A guard that rejected every resume would pass the test
+    above while silently disabling the repair this whole feature exists for."""
+    class _Honest(_ResumeClient):
+        async def send(self, request, **kw):
+            rng = request.headers.get("Range")
+            if rng is None:
+                return _ChunkedResp([b"AAAA", b"BBBB", b"CC"], total=10,
+                                    drop_after=4)
+            r = _ChunkedResp([b"BBBB", b"CC"], status=206, total=6)
+            r.headers["content-range"] = "bytes 4-9/10"
+            return r
+
+    monkeypatch.setattr(flow.httpx, "AsyncClient",
+                        lambda *a, **kw: _Honest())
+    dec = flow.FFmpegPCMDecoder("http://plex:32400/f.flac", None)
+    proc, written = _collect_proc()
+    await dec._feed_source(proc)
+
+    assert b"".join(written) == b"AAAABBBBCC"
+    assert dec._source_failed is False
+
+
+async def test_flow_source_refuses_a_206_with_no_content_range(monkeypatch):
+    """An unparseable/absent Content-Range cannot be checked against the
+    offset, so it must be declined rather than trusted."""
+    class _NoRangeHeader(_ResumeClient):
+        async def send(self, request, **kw):
+            if request.headers.get("Range") is None:
+                return _ChunkedResp([b"AAAA", b"BBBB"], total=8, drop_after=4)
+            return _ChunkedResp([b"BBBB"], status=206, total=4)   # no header
+
+    monkeypatch.setattr(flow.httpx, "AsyncClient",
+                        lambda *a, **kw: _NoRangeHeader())
+    dec = flow.FFmpegPCMDecoder("http://plex:32400/f.flac", None)
+    proc, written = _collect_proc()
+    await dec._feed_source(proc)
+
+    assert b"".join(written) == b"AAAA"
+    assert dec._source_failed is True

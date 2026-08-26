@@ -11,7 +11,10 @@ from xml.parsers.expat import ExpatError
 from datetime import timedelta
 from typing import Any
 
-from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
+from app.output.base import (
+    AdvanceCallback, AttachGeneration, AttachSuperseded, DeviceNotReadyError,
+    OutputDevice, release_in_background,
+)
 from app.output.radio_endless import (
     RadioFailedHook,
     ReconnectPolicy,
@@ -25,6 +28,18 @@ _DLNA_AVAILABLE = False
 
 import logging
 _log = logging.getLogger(__name__)
+
+# Budget for the WHOLE renderer-facing half of a DLNA teardown (2026-08-20
+# review F4). Deliberately under app.output.base.RELEASE_DRAIN_TIMEOUT so a
+# release started at shutdown finishes on its own rather than being cancelled
+# mid-teardown — and it bounds the phase, not one step of it, because the two
+# steps inside are both network work.
+#
+# Generous for a healthy renderer: async_upnp_client gathers the per-service
+# UNSUBSCRIBEs concurrently, so two services cost one round trip, not two. The
+# real consumer of this budget is the requester's retry-on-connection-error,
+# which is why it is not tighter.
+_TEARDOWN_TIMEOUT = 1.5
 
 try:
     import aiohttp
@@ -289,7 +304,133 @@ async def _fetch_device_description(
     return _child_text("deviceType"), _child_text("friendlyName")
 
 
-class DlnaBackend:
+async def _release_dlna_parts(dmr: Any, notify: Any, requester: Any,
+                              session: Any) -> None:
+    """Free the four things a DLNA attach builds. Never raises.
+
+    The one place these are let go, shared by ``release()`` (2026-08-20 plan
+    U2), the superseded-attach path in ``set_device`` (plan U3) and
+    ``set_device``'s teardown of the connection it replaces (2026-08-20 review
+    F3). All three hand it to ``release_in_background``: the GENA UNSUBSCRIBE
+    is a network round trip to a renderer that may be exactly the device we
+    are letting go of.
+
+    STRUCTURE (2026-08-20 review F4, corrected). The docstring has always
+    claimed "one unreachable renderer must not strand the local resources
+    behind it", and two successive versions of this body failed to keep it.
+
+    The first ran the unbounded UNSUBSCRIBE first, so a dead renderer held the
+    callback socket and the connection pool open behind it. The second tried to
+    fix that by stopping the notify server first, on the belief that it "only
+    ever RECEIVES" and is therefore local. That belief was WRONG, and the
+    library says so plainly — ``AiohttpNotifyServer.async_stop_server`` is::
+
+        await self.event_handler.async_unsubscribe_all()
+        await self._aiohttp_server.shutdown(10)
+
+    i.e. it performs GENA UNSUBSCRIBE round trips itself before it frees any
+    socket. So that version moved the unbounded network work to the FRONT and
+    left the timeout guarding a step which, by then, had nothing left to
+    unsubscribe. Read the dependency's source; do not reason about its name.
+
+    The shape that actually holds the claim is the obvious one: bound the whole
+    network phase together, and free the local resources in a ``finally`` so
+    they are freed on every exit — success, timeout, error or cancellation.
+
+    ``requester`` is deliberately not closed. ``AiohttpSessionRequester``
+    borrows the session rather than owning it and has no ``close`` at all
+    (verified: its only public member is ``async_http_request``). The previous
+    version called it anyway, so every DLNA release raised ``AttributeError``
+    into a handler that review F6 had just promoted to WARNING-with-traceback —
+    a 100%-false-positive alarm on the very signal operators are meant to act
+    on. It stays a parameter because the caller adopts four things and must
+    hand back all four; closing the session below is what frees it.
+
+    Cancellation is ABSORBED, not swallowed: the local closes run and then the
+    ``CancelledError`` is re-raised, so the task still ends cancelled and no
+    caller is told a cancel it asked for did not happen. Getting this wrong is
+    not academic — an earlier draft returned normally after absorbing it, and
+    the regression test that uses ``wait_for`` to prove this teardown never
+    blocks its caller therefore PASSED against a deliberately reintroduced
+    blocking version."""
+    cancelled = False
+    try:
+        await asyncio.wait_for(_release_dlna_remote(dmr, notify),
+                               timeout=_TEARDOWN_TIMEOUT)
+    except asyncio.CancelledError:
+        cancelled = True
+        _log.debug("DLNA release: teardown cancelled — freeing the local "
+                   "resources anyway")
+    except Exception:
+        # Stays DEBUG: an unreachable renderer failing to hear our goodbye is
+        # the expected case, not an operator-actionable one. Includes the
+        # TimeoutError from the bound above.
+        _log.debug("DLNA release: renderer teardown did not complete",
+                   exc_info=True)
+    finally:
+        # TWO things leak if we skip them, and an earlier version of this
+        # comment claimed there was only one (2026-08-21 review). The bound
+        # GENA callback socket is the other, and it is the one the bounded
+        # phase above CANNOT be relied on to free:
+        # ``AiohttpNotifyServer.async_stop_server`` closes ``self._server``
+        # LAST, behind ``async_unsubscribe_all()`` and a 10s server shutdown —
+        # so a timeout part-way through the unsubscribe cancels it before it
+        # ever reaches the close, on exactly the unreachable-renderer path this
+        # helper exists for. Freeing it here is purely local: ``close()`` on an
+        # asyncio Server is synchronous and does no I/O, which is why it can
+        # live in a finally that must never block.
+        # Only ``_server`` is closed here, and only because its ``close()`` is
+        # genuinely synchronous (asyncio's AbstractServer). Its sibling
+        # ``_aiohttp_server`` is an ``aiohttp.web.Server``, which has no
+        # ``close()`` at all — only an async ``shutdown()`` — so it is dropped
+        # rather than closed: shutdown exists to let in-flight GENA NOTIFY
+        # handlers finish, and we are abandoning this renderer. The socket is
+        # the resource; the handler factory is not. (Both facts read off the
+        # installed library, not inferred from the names — the previous two
+        # attempts at this function were both wrong for exactly that reason.)
+        if notify is not None:
+            try:
+                srv = getattr(notify, "_server", None)
+                if srv is not None:
+                    srv.close()
+                    notify._server = None
+                notify._aiohttp_server = None
+            except Exception:
+                _log.warning("DLNA release: notify socket close failed",
+                             exc_info=True)
+        # An aiohttp ClientSession is a connection pool, and we own it.
+        if session is not None:
+            try:
+                await session.close()
+            except Exception:
+                _log.warning("DLNA release: session close failed",
+                             exc_info=True)
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def _release_dlna_remote(dmr: Any, notify: Any) -> None:
+    """The half of the teardown that talks to the renderer. Never raises.
+
+    Both steps are network work — see ``_release_dlna_parts`` on why the
+    notify server is not the local one it looks like — so they are bounded
+    together by the caller rather than individually. Unsubscribing the DMR
+    first is the original order and the polite one; stopping the server also
+    unsubscribes whatever is left, so a failure here is not a leak."""
+    if dmr is not None:
+        try:
+            await dmr.async_unsubscribe_services()
+        except Exception:
+            _log.debug("DLNA release: unsubscribe failed", exc_info=True)
+    if notify is not None:
+        try:
+            await notify.async_stop_server()
+        except Exception:
+            _log.warning("DLNA release: notify-server stop failed",
+                         exc_info=True)
+
+
+class DlnaBackend(AttachGeneration):
     """Controls a DLNA MediaRenderer device via UPnP AVTransport."""
 
     def __init__(self, advance_cb: AdvanceCallback | None = None) -> None:
@@ -591,33 +732,39 @@ class DlnaBackend:
     async def set_device(self, device_id: str) -> None:
         if not _DLNA_AVAILABLE:
             return
+        # 2026-08-20 plan U3: claim this attach. Everything this method builds
+        # is held in LOCALS until the compare-and-swap below, so an attach that
+        # loses a race can release its four resources instead of storing them
+        # over the winner's.
+        token = self._begin_attach()
         self._cancel_poll()
-        if self._dmr:
-            try:
-                await self._dmr.async_unsubscribe_services()
-            except Exception:
-                pass
-        if self._notify_server:
-            try:
-                await self._notify_server.async_stop_server()
-            except Exception:
-                pass
-            self._notify_server = None
-        if self._requester:
-            try:
-                await self._requester.close()
-            except Exception:
-                pass
-        # Close the prior aiohttp.ClientSession before opening a new one.
-        # AiohttpSessionRequester doesn't own its session — we do — so a
-        # missed close here leaks an aiohttp connection pool per set_device
-        # call.
-        if self._dlna_session is not None:
-            try:
-                await self._dlna_session.close()
-            except Exception:
-                pass
-            self._dlna_session = None
+        # Take the outgoing renderer's four parts and drop the references
+        # SYNCHRONOUSLY, before the first await, then tear the captured locals
+        # down. Reading them back after an await would let a concurrent attach
+        # that has already adopted its own renderer have those references
+        # nulled out from under it — and would tear the same outgoing parts
+        # down twice. (The prior aiohttp.ClientSession in particular must be
+        # closed: AiohttpSessionRequester does not own its session, we do, so
+        # a missed close leaks a connection pool per set_device call.)
+        prior = (self._dmr, self._notify_server, self._requester,
+                 self._dlna_session)
+        self._dmr = None
+        self._notify_server = None
+        self._requester = None
+        self._dlna_session = None
+        if any(part is not None for part in prior):
+            # Deferred, not awaited (2026-08-20 review F3). This is the same
+            # coroutine ``release()`` hands to the background precisely
+            # because the GENA UNSUBSCRIBE is a network round trip to a
+            # renderer that may be unreachable — and awaiting it HERE is
+            # strictly worse than awaiting it there, because every caller of
+            # set_device holds the process-wide ``_attach_serial``. Switching
+            # away from a renderer that has gone dark would stall not just
+            # this attach but every backend's, including the admin's own
+            # escape hatch of applying a different output. Nothing in the new
+            # connect depends on the old renderer having heard our goodbye.
+            release_in_background(_release_dlna_parts(*prior),
+                                  label="DLNA outgoing renderer")
         # Restore persisted volume before connecting
         from app import database
         stored = await database.get_setting(f"vol:dlna:{device_id}")
@@ -632,43 +779,89 @@ class DlnaBackend:
         except Exception:
             _log.debug("DLNA set_device: gapless verdict hydration failed",
                        exc_info=True)
-        self._device_id = device_id
 
         location = self._device_locations.get(device_id, device_id)
-        self._dlna_session = aiohttp.ClientSession()
-        self._requester = AiohttpSessionRequester(session=self._dlna_session)
-        factory = UpnpFactory(self._requester)
-        # Bound timeout on the device-description fetch and GENA SUBSCRIBE so
-        # a slow renderer cannot block this task for the aiohttp 5-minute default.
-        upnp_device = await asyncio.wait_for(
-            factory.async_create_device(location), timeout=15.0,
-        )
-
-        # GENA event channel: per-backend NotifyServer (KTD2). Under host
-        # networking (TrueNAS), binding 0.0.0.0:0 lets the OS pick a free port
-        # and the library derives the callback URL from the bound socket.
-        # AiohttpNotifyServer creates its own UpnpEventHandler internally,
-        # exposed via .event_handler — pass that to DmrDevice so GENA NOTIFY
-        # POSTs from the renderer reach our _on_dlna_event callback.
-        # Symmetric error handling: if anything between async_start_server and
-        # async_subscribe_services raises, tear down the notify server so its
-        # bound socket is not left orphaned with self._dmr still None.
-        self._notify_server = AiohttpNotifyServer(
-            self._requester, source=("0.0.0.0", 0),
-        )
+        session = aiohttp.ClientSession()
+        requester = AiohttpSessionRequester(session=session)
+        factory = UpnpFactory(requester)
+        notify_server = None
+        dmr = None
         try:
-            await self._notify_server.async_start_server()
-            self._dmr = DmrDevice(upnp_device, event_handler=self._notify_server.event_handler)
-            self._dmr.on_event = self._on_dlna_event
-            await asyncio.wait_for(self._dmr.async_subscribe_services(), timeout=15.0)
-        except Exception:
-            try:
-                await self._notify_server.async_stop_server()
-            except Exception:
-                pass
-            self._notify_server = None
-            self._dmr = None
+            # Bound timeout on the device-description fetch and GENA SUBSCRIBE
+            # so a slow renderer cannot block this task for the aiohttp
+            # 5-minute default.
+            upnp_device = await asyncio.wait_for(
+                factory.async_create_device(location), timeout=15.0,
+            )
+
+            # GENA event channel: per-backend NotifyServer (KTD2). Under host
+            # networking (TrueNAS), binding 0.0.0.0:0 lets the OS pick a free
+            # port and the library derives the callback URL from the bound
+            # socket. AiohttpNotifyServer creates its own UpnpEventHandler
+            # internally, exposed via .event_handler — pass that to DmrDevice
+            # so GENA NOTIFY POSTs from the renderer reach our _on_dlna_event
+            # callback.
+            # Symmetric error handling: if anything between async_start_server
+            # and async_subscribe_services raises, tear down the notify server
+            # so its bound socket is not left orphaned with self._dmr None.
+            notify_server = AiohttpNotifyServer(
+                requester, source=("0.0.0.0", 0),
+            )
+            await notify_server.async_start_server()
+            dmr = DmrDevice(upnp_device,
+                            event_handler=notify_server.event_handler)
+            dmr.on_event = self._on_dlna_event
+            await asyncio.wait_for(dmr.async_subscribe_services(), timeout=15.0)
+        except BaseException:
+            # These parts were never stored on the backend, so nothing else
+            # will ever close them — this is the only chance.
+            #
+            # BaseException, not Exception (2026-08-20 review F6/ADV-5). U3
+            # moved all four from instance fields into locals, which removed
+            # the backstop that used to make this survivable: before, a later
+            # set_device would close whatever the instance still held. Now the
+            # locals are the ONLY referent, and ``asyncio.CancelledError`` is
+            # not an ``Exception`` — so a shutdown or a cancelled re-attach
+            # landing inside the create-device/subscribe awaits above skipped
+            # this handler entirely and leaked an open ClientSession and a
+            # bound notify socket with nothing left pointing at them.
+            #
+            # Routed through the shared helper rather than repeating a subset
+            # of it: the old inline version also skipped the GENA UNSUBSCRIBE,
+            # so a subscribe that failed PART-way left a live subscription
+            # aimed at the notify server it had just stopped. One helper, one
+            # definition of "all four", per its own docstring.
+            #
+            # Deferred rather than awaited, for the same reason as the
+            # outgoing teardown above — this path holds ``_attach_serial`` too
+            # — and because scheduling is synchronous, so it still works from
+            # a frame that is already unwinding a cancellation.
+            release_in_background(
+                _release_dlna_parts(dmr, notify_server, requester, session),
+                label="DLNA failed attach")
             raise
+
+        # ── U3: adopt by compare-and-swap ────────────────────────────────────
+        # As late as possible — the renderer is fully attached and subscribed,
+        # and the only thing a superseded attach skips is making it current.
+        if self._attach_superseded(token):
+            _log.info("DLNA: attach for %r was superseded while connecting; "
+                      "releasing its renderer instead of adopting it",
+                      device_id)
+            release_in_background(
+                _release_dlna_parts(dmr, notify_server, requester, session),
+                label="DLNA superseded attach")
+            raise AttachSuperseded(
+                f"DLNA attach for {device_id!r} was superseded")
+
+        self._dlna_session = session
+        self._requester = requester
+        self._notify_server = notify_server
+        self._dmr = dmr
+        # Claimed here, with the renderer, rather than before the connect:
+        # only the attach that adopts gets to say which device this backend is
+        # bound to (Cast and plexplayer already work this way).
+        self._device_id = device_id
         # Persist the renderer's LOCATION as output_addr:{device_id}
         # (supervisor plan U3): extends the mDNS-independent cached-address
         # reconnect Cast/AirPlay already have to DLNA, so the startup
@@ -682,6 +875,52 @@ class DlnaBackend:
         except Exception:
             _log.debug("DLNA set_device: output_addr persist failed",
                        exc_info=True)
+
+    # ── release (2026-08-20 plan U2) ──────────────────────────────────────────
+
+    def release(self) -> None:
+        """Let go of the adopted renderer connection. Non-blocking, never
+        raises, idempotent — see ``app.output.base`` for the contract.
+
+        DLNA's attach creates FOUR things and every one of them is a resource:
+        an ``aiohttp.ClientSession`` (a connection pool), the
+        ``AiohttpSessionRequester`` over it, an ``AiohttpNotifyServer`` holding
+        a bound socket for GENA callbacks, and the ``DmrDevice`` handle with a
+        live GENA subscription. Freeing one and leaking the other three was the
+        realistic mistake here, so the contract test names all four.
+
+        Note this is NOT what ``stop()`` does, and the asymmetry is deliberate:
+        ``stop()`` is documented non-destructive because the skip flow depends
+        on the renderer handle surviving a stop. Only a switch away or shutdown
+        ends ownership.
+
+        The teardown steps are coroutines, and one of them — the GENA
+        UNSUBSCRIBE in ``async_unsubscribe_services`` — is a network round trip
+        to a renderer that may be exactly the unplugged device we are releasing
+        because of. They are handed to a background task so the caller returns
+        immediately; the references are cleared here, synchronously, so the
+        backend reports no adopted connection the moment release returns.
+
+        Supersedes any in-flight attach first (2026-08-20 review F1) so an
+        attach still inside ``async_create_device``/``async_subscribe_services``
+        when this backend is retired releases its four parts instead of
+        adopting them onto a backend that has already let go."""
+        self._supersede_attaches()
+        self._cancel_poll()
+        dmr = self._dmr
+        requester = self._requester
+        session = self._dlna_session
+        notify = self._notify_server
+        self._dmr = None
+        self._requester = None
+        self._dlna_session = None
+        self._notify_server = None
+        self._is_playing = False
+        if dmr is None and requester is None and session is None and notify is None:
+            return
+        release_in_background(
+            _release_dlna_parts(dmr, notify, requester, session),
+            label="DLNA release")
 
     def _on_dlna_event(self, service: Any, state_variables: Any) -> None:
         """GENA NOTIFY callback — fires when subscribed services push state changes.
@@ -1077,7 +1316,7 @@ class DlnaBackend:
                     self._is_playing = False
                     self._poll_task = None
                     from app.output import session
-                    session.notify_outage("poll_errors")
+                    session.notify_outage("poll_errors", backend=self)  # R6
                     break
 
     def _cancel_poll(self) -> None:
@@ -1505,12 +1744,15 @@ class DlnaBackend:
         Earlier behavior cleared `_dmr=None`, which broke the skip flow
         at `admin.py:playback_skip` (router.stop() → router.play() raised
         RuntimeError because `_dmr` was None). The destructive cleanup
-        is now handled at the only place it's actually needed:
-        `set_device()` releases the prior `_dmr` / notify_server /
-        session before binding a new renderer (see `set_device()` lines
-        421-441). Backend switches via `OutputRouter.swap_pending()` go
-        through `set_device()` on the new active backend; the old DLNA
-        backend's resources idle until its next `set_device()` call.
+        belongs to the two places that genuinely end ownership, never to
+        a stop: `set_device()` releases the prior `_dmr` / notify_server /
+        session before binding a new renderer, and `release()` frees the
+        same four resources when this backend stops being the active
+        output (2026-08-20 plan U6 — the router's retire path calls it on
+        a switch away, and the lifespan calls it at shutdown). Before U6
+        a retired DLNA backend's resources simply idled until its next
+        `set_device()`, which for a backend the user had left meant
+        forever.
 
         Bypasses the library's ``DmrDevice.async_stop`` helper. The
         helper guards on ``_can_transport_action("stop")`` which reads

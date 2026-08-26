@@ -65,6 +65,7 @@ def is_authorized_stream_key(key: str) -> bool:
     return False
 
 
+from app.output import base as output_base
 from app.output.router import OutputRouter
 from app.output.direct import DirectAudioBackend
 from app.output.chromecast import ChromecastBackend
@@ -2724,9 +2725,81 @@ def trigger_artist_grouping_rebuild() -> None:
     task.add_done_callback(_log_task_exc)
 
 
+def _seed_startup_address(backend, device_id: str, addr: dict):
+    """Seed *backend*'s address cache from the persisted
+    ``output_addr:{device_id}`` blob so the boot attach needs no discovery
+    round (R3), and return a zero-arg **undo** callable that drops that seed
+    again — or ``None`` when this backend has no boot-seedable cache
+    (plexplayer reads its own persisted address inside ``set_device``).
+
+    2026-08-20 plan U1 / R5: every seedable backend consults its address
+    cache BEFORE falling through to discovery (Chromecast's ``_sync_connect``
+    is the diagnosed case), so a seed left behind by a FAILED boot attach
+    shadows anything discovery subsequently finds and makes the retry an
+    exact repeat of the failure. The undo is scoped to *our* value: an entry
+    a discovery arrival replaced while the attach ran is not ours to remove.
+
+    A malformed blob raises out of here (missing host/port/location) BEFORE
+    anything is written — the caller's except-and-fall-through to discovery
+    is unchanged, and there is no half-written seed to undo.
+    """
+    from app.output.chromecast import ChromecastBackend
+    from app.output.airplay import AirPlayBackend
+    from app.output.dlna import DlnaBackend
+    name = addr.get("name", device_id)
+    if isinstance(backend, ChromecastBackend):
+        cache = backend._dbus_index
+        value = (name, addr["host"], int(addr["port"]))
+    elif isinstance(backend, AirPlayBackend):
+        # Empty TXT dict on cached-reconnect path: cliap2 will then
+        # likely fail HAP pair-verify and surface a re-pair event on
+        # stderr, which the watcher converts to an OutputChangedEvent.
+        # That signals the user to rescan rather than silently using
+        # a stale cached address.
+        cache = backend._device_addr
+        value = (name, addr["host"], int(addr["port"]), {})
+    elif isinstance(backend, DlnaBackend):
+        # DLNA's address is its description LOCATION URL (persisted
+        # by DlnaBackend.set_device since supervisor plan U3).
+        cache = backend._device_locations
+        value = addr["location"]
+    else:
+        return None
+    cache[device_id] = value
+
+    def _undo() -> None:
+        if cache.get(device_id) == value:
+            del cache[device_id]
+
+    return _undo
+
+
 async def _startup_reconnect(backend, device_id: str) -> None:
-    """Reconnect to the last-used device. Fire-and-forget; never raises."""
+    """Reconnect to the last-used device. Fire-and-forget; never raises.
+
+    Runs under ``output_session._attach_serial`` across each ``set_device``
+    (2026-08-20 plan U1): this coroutine is spawned as a bare task from the
+    boot restore path, so an Apply pressed during startup used to interleave
+    two attaches on the same singleton backend. It follows the same
+    capture-epoch / re-validate-after-acquiring discipline as the
+    supervisor's ``_seed_and_set_device`` — a manual switch bumps the
+    attach-epoch before it queues for the lock, so a boot attach that lost
+    the race aborts WITHOUT calling set_device rather than committing the old
+    device's internals over the newly switched one's. Discovery itself stays
+    OUTSIDE the lock; only the attach is serialised.
+    """
     from app import database
+    from app.output import session as output_session
+
+    sup = output_session.get_supervisor()
+    epoch = sup.attach_epoch
+
+    def _superseded() -> bool:
+        if sup.attach_epoch == epoch:
+            return False
+        _log.info("startup reconnect for %r superseded by a manual switch "
+                  "— not attaching", device_id)
+        return True
 
     # plexplayer (2026-08-04-002 plan U3): its Companion client factory is
     # sync and reads the source-registry module global, so build the
@@ -2743,40 +2816,54 @@ async def _startup_reconnect(backend, device_id: str) -> None:
     # R3: Try cached address first — no mDNS, no D-Bus, no socket mount required.
     addr_raw = await database.get_setting(f"output_addr:{device_id}")
     if addr_raw:
+        undo_seed = None
         try:
             addr = json.loads(addr_raw)
-            from app.output.chromecast import ChromecastBackend
-            from app.output.airplay import AirPlayBackend
-            from app.output.dlna import DlnaBackend
-            if isinstance(backend, ChromecastBackend):
-                name = addr.get("name", device_id)
-                backend._dbus_index[device_id] = (name, addr["host"],
-                                                  int(addr["port"]))
-            elif isinstance(backend, AirPlayBackend):
-                # Empty TXT dict on cached-reconnect path: cliap2 will then
-                # likely fail HAP pair-verify and surface a re-pair event on
-                # stderr, which the watcher converts to an OutputChangedEvent.
-                # That signals the user to rescan rather than silently using
-                # a stale cached address.
-                name = addr.get("name", device_id)
-                backend._device_addr[device_id] = (name, addr["host"],
-                                                   int(addr["port"]), {})
-            elif isinstance(backend, DlnaBackend):
-                # DLNA's address is its description LOCATION URL (persisted
-                # by DlnaBackend.set_device since supervisor plan U3).
-                backend._device_locations[device_id] = addr["location"]
-            await backend.set_device(device_id)
+            async with output_session._attach_serial:
+                if _superseded():
+                    return
+                undo_seed = _seed_startup_address(backend, device_id, addr)
+                await backend.set_device(device_id)
             return  # R4: connected via cached address, no discovery needed
+        except output_base.AttachSuperseded:
+            # Something newer owns this backend — an admin Apply, or a retire.
+            # Stand down entirely (2026-08-20 re-review ADV-14): falling
+            # through to discovery would start ANOTHER attach and re-enter the
+            # race we just lost, and the seed must survive because the address
+            # was never the problem. This is the outcome that used to be
+            # indistinguishable from success.
+            _log.debug("startup reconnect for %r stood down: a newer attach "
+                       "owns the backend", device_id)
+            return
         except Exception:
-            pass  # R6: stale address — fall through silently to discover_devices
+            # R6: stale address — fall through silently to discover_devices.
+            # U1/R5: drop the seed first, or the cache-before-discovery
+            # lookup below re-dials the identical dead address.
+            if undo_seed is not None:
+                undo_seed()
 
     # R5/R6: Fall through to discovery (unchanged from original path).
+    if _superseded():
+        return
     try:
         await backend.discover_devices()
     except Exception:
         _log.warning("startup reconnect discover failed", exc_info=True)
     try:
-        await backend.set_device(device_id)
+        async with output_session._attach_serial:
+            if _superseded():
+                return
+            await backend.set_device(device_id)
+    except output_base.AttachSuperseded:
+        # Same stand-down as the cached-address branch above, which is where
+        # this handler was missing (2026-08-21 review). Without it a superseded
+        # boot attach fell into the generic handler below and told the admin
+        # "Device address may have changed — rescan" with a WARNING traceback:
+        # a false alarm about the wrong problem, for an attach that lost a race
+        # it was right to lose.
+        _log.info("startup reconnect for %r stood down after discovery: a "
+                  "newer attach owns the backend", device_id)
+        return
     except Exception:
         # R7: both cached address and discovery failed — emit specific actionable message.
         _log.warning("startup reconnect failed for device %r", device_id, exc_info=True)
@@ -2986,7 +3073,14 @@ async def setup() -> None:
             asyncio.create_task(_startup_reconnect(output_router.active, device_id))
         else:
             try:
-                await output_router.active.set_device(device_id)
+                # Under _attach_serial like every other attach (2026-08-20
+                # plan U1): uncontended here — setup() runs before the app
+                # serves, so no Apply can be in flight — but the invariant
+                # "no path reaches a backend's attach without the lock" is
+                # what stops the next caller being written without it.
+                from app.output import session as _output_session
+                async with _output_session._attach_serial:
+                    await output_router.active.set_device(device_id)
             except Exception:
                 pass
 
@@ -3173,6 +3267,31 @@ async def set_backend_enabled(backend_type: str, value: bool):
     await disable_server_fed_backend(backend_type)
     await database.set_backend_enabled(backend_type, False)
     return None
+
+
+EAGER_BACKEND_ATTRS: tuple[str, ...] = (
+    "direct_backend", "chromecast_backend", "dlna_backend", "airplay_backend",
+    "plexplayer_backend",
+)
+
+
+def all_output_backends() -> list:
+    """Every output backend instance this process has actually constructed.
+
+    The five eager singletons (None before ``setup()`` runs) plus whichever
+    server-fed backends an admin has enabled — the same two populations
+    ``_get_backend`` routes between, read as a list instead of by type.
+
+    Exists for shutdown (2026-08-20 plan U6): releasing only
+    ``output_router.active`` would leave every backend the user switched
+    AWAY from during the session holding its adopted connection at process
+    exit — and the switch-away release is best-effort, so "the router's
+    active one is the only one that can still be holding anything" is not a
+    safe assumption to build shutdown on."""
+    backends = [b for b in (globals().get(attr) for attr in EAGER_BACKEND_ATTRS)
+                if b is not None]
+    backends.extend(b for b in _server_fed_backends.values() if b is not None)
+    return backends
 
 
 def _get_backend(backend_type: str):
@@ -3373,26 +3492,63 @@ async def activate_backend(
             _log.warning("activate_backend: source-registry build failed "
                          "for plexplayer", exc_info=True)
     if new_backend:
-        prev_backend = output_router.active
-        output_router.set_backend(new_backend)
-        if device_id != "default":
-            try:
-                # Under the supervisor's attach-serial lock: an in-flight
-                # re-attach of the OLD device either finishes before this
-                # set_device starts, or acquires after it and aborts on the
-                # bumped epoch — its executor connect can never finish last
-                # and overwrite the new device's backend internals.
-                async with output_session._attach_serial:
-                    await new_backend.set_device(device_id)
-            except Exception:
-                output_router.set_backend(prev_backend)
-                if output_session.output_hold_active() and prev_outage is not None:
-                    # The switch failed while an outage held the queue:
-                    # notify_manual_switch retired the reconnect loop above,
-                    # so re-open it — the previous device is still the way
-                    # back (resume window keeps counting, R8).
-                    output_session.get_supervisor().reopen_outage(prev_outage)
-                raise
+        # Mark the intent now, commit the router later (2026-08-20 re-review
+        # ADV-13/CR-4; scoped 2026-08-21). This is what stops the backend being
+        # abandoned from holding outage authority, keeping a stale gapless arm,
+        # and deciding the immediate-vs-deferred branch, for the whole duration
+        # of an attach that can run ~30s.
+        #
+        # The `with` is load-bearing, not stylistic: the previous paired
+        # begin/end version cleared the intent in an `except Exception`, which
+        # does not catch CancelledError — so a cancelled Apply left the router
+        # believing a switch was permanently in flight and the live output
+        # could never open an outage hold again.
+        with output_router.switching_to(new_backend) as switch:
+            if device_id != "default":
+                try:
+                    # Under the supervisor's attach-serial lock: an in-flight
+                    # re-attach of the OLD device either finishes before this
+                    # set_device starts, or acquires after it and aborts on the
+                    # bumped epoch — its executor connect can never finish last
+                    # and overwrite the new device's backend internals.
+                    async with output_session._attach_serial:
+                        await new_backend.set_device(device_id)
+                except Exception:
+                    # No intent teardown here: leaving the `with` does it, on
+                    # this route and on the cancellation route the old
+                    # `except Exception` silently missed.
+                    if (output_session.output_hold_active()
+                            and prev_outage is not None):
+                        # The switch failed while an outage held the queue:
+                        # notify_manual_switch retired the reconnect loop
+                        # above, so re-open it — the previous device is still
+                        # the way back (resume window keeps counting, R8).
+                        output_session.get_supervisor().reopen_outage(prev_outage)
+                    raise
+            # Point the router at the new backend only once it is genuinely
+            # attached (2026-08-20 review F2). This used to run BEFORE the
+            # attach, with a set_backend(prev_backend) rollback in the except
+            # above, and that ordering turned a FAILED switch destructive:
+            # the immediate branch reassigns _active and spawns
+            # _stop_and_warn(old), whose release guard (``old is not
+            # self._active``) then reads true precisely because _active is
+            # already the incoming backend. The outgoing backend was released,
+            # the rollback restored the router POINTER but not the connection,
+            # and the user's previously-working output was left detached —
+            # worst on the paused path, where resume() no-ops on a null
+            # connection so the UI flips to playing with no audio, no
+            # exception and no outage hold to self-heal from.
+            #
+            # Attaching first also needs no rollback: nothing between here and
+            # the attach touches the router, no backend's set_device reads it,
+            # and a failure now leaves the old backend exactly as it was —
+            # which is the invariant admin.py has documented all along ("a
+            # failed switch leaves the old backend playing").
+            #
+            # commit() rather than set_backend(): the immediate-vs-deferred
+            # decision uses the playing state this intent captured when the
+            # admin asked, not what the attach has since done to it.
+            switch.commit()
     # Persist the selection AND update its in-memory mirror at the same point
     # (plan U4): output_requires_plex() / the source_lock broadcast key off
     # this persisted truth — never the router, whose swap defers mid-play. A

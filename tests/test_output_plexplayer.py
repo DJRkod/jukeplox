@@ -15,6 +15,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.models import Track
+from app.output.base import AttachSuperseded
 from app.plex.companion import (
     CompanionParseError,
     CompanionRequestError,
@@ -562,7 +563,10 @@ async def test_poll_three_unreachable_reports_outage_no_advance():
     with patch("asyncio.sleep", AsyncMock()), \
          patch("app.output.session.notify_outage") as notify:
         await backend._poll_timeline(sess)
-    notify.assert_called_once_with("poll_errors")
+    # Names its reporter (2026-08-20 review F5/R6): a poll strike from a
+    # backend that is no longer the active output must not open a hold
+    # against the one that is.
+    notify.assert_called_once_with("poll_errors", backend=backend)
     advance.assert_not_called()
     assert backend.is_playing is False
     assert sess.poll_task is None
@@ -585,7 +589,10 @@ async def test_poll_error_count_resets_on_successful_read():
     with patch("asyncio.sleep", AsyncMock()), \
          patch("app.output.session.notify_outage") as notify:
         await backend._poll_timeline(backend._session)
-    notify.assert_called_once_with("poll_errors")
+    # Names its reporter (2026-08-20 review F5/R6): a poll strike from a
+    # backend that is no longer the active output must not open a hold
+    # against the one that is.
+    notify.assert_called_once_with("poll_errors", backend=backend)
     advance.assert_not_called()
 
 
@@ -833,7 +840,7 @@ async def test_watchdog_unreachable_reports_outage_not_advance():
     with patch("asyncio.sleep", AsyncMock()), \
          patch("app.output.session.notify_outage") as notify:
         await backend._watchdog(sess, 5, 180000)
-    notify.assert_called_once_with("watchdog_unreachable")
+    notify.assert_called_once_with("watchdog_unreachable", backend=backend)
     advance.assert_not_called()
 
 
@@ -1908,3 +1915,121 @@ async def test_swap_pending_broadcasts_teardown_warning_notice():
         router2._pending = new
         await router2.swap_pending()
         notice.assert_not_called()
+
+
+# ── U3: adopt by compare-and-swap, plexplayer mechanics ──────────────────────
+# The race scenarios are cross-backend (tests/test_output_attach_ownership.py).
+# These pin what is specific here: the session a superseded attach abandons
+# must be marked self-stopped as well as closed, and the outgoing session's
+# reference must be dropped before the teardown's awaits.
+
+
+async def test_a_superseded_attach_closes_its_client_and_claims_nothing():
+    """A superseded attach owns a live Companion HTTP client by the time it
+    reaches the swap. Releasing it is the difference between a closed
+    transport and one leaked for the life of the process — and it must not
+    leave its device id behind as the backend's selection either, since the
+    device the user actually chose is the winner's."""
+    from app.output.plexplayer import PlexPlayerBackend
+    clients = []
+
+    backend = PlexPlayerBackend()
+    backend._device_id = "incumbent"
+
+    def factory(host, port, device_id):
+        client = MagicMock(aclose=AsyncMock())
+        clients.append(client)
+        # Another attach starts before this one can store its session.
+        backend._begin_attach()
+        return client
+
+    backend._client_factory = factory
+    backend._device_addresses["p1"] = {
+        "host": "192.168.1.30", "port": 32500, "name": "Living Room"}
+    set_setting = AsyncMock()
+    with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", set_setting):
+        with pytest.raises(AttachSuperseded):
+            await backend.set_device("p1")
+
+    assert backend._session is None, "a superseded attach must not adopt"
+    assert backend._device_id == "incumbent"
+    set_setting.assert_not_awaited()
+    for _ in range(6):
+        await asyncio.sleep(0)
+    clients[0].aclose.assert_awaited_once()
+
+
+async def test_a_superseded_session_is_marked_self_stopped():
+    """The abandoned session must classify any terminal read racing in from
+    its own poll loop as self-induced, exactly as ``release()`` does — an
+    orphan that advances the queue is the abandoned-listener fault in its
+    plexplayer shape."""
+    from app.output.plexplayer import PlexPlayerBackend, _PlayerSession
+    built = []
+    real_session_cls = _PlayerSession
+
+    def _capture(**kwargs):
+        sess = real_session_cls(**kwargs)
+        built.append(sess)
+        return sess
+
+    backend = PlexPlayerBackend()
+    backend._device_addresses["p1"] = {
+        "host": "192.168.1.30", "port": 32500, "name": "Living Room"}
+
+    def factory(host, port, device_id):
+        # Another attach starts before this one can store its session.
+        backend._begin_attach()
+        return MagicMock(aclose=AsyncMock())
+
+    backend._client_factory = factory
+    with patch("app.output.plexplayer._PlayerSession", _capture), \
+         patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", AsyncMock()):
+        with pytest.raises(AttachSuperseded):
+            await backend.set_device("p1")
+
+    assert len(built) == 1
+    assert built[0].self_stopped is True
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+
+async def test_set_device_drops_the_prior_session_before_its_first_await():
+    """The outgoing session reference is cleared SYNCHRONOUSLY and the
+    captured local is torn down after. Clearing it afterwards — which is what
+    the code did — meant an attach that had already adopted its own session
+    could have it nulled out from under it by a slower predecessor's
+    teardown."""
+    from app.output.plexplayer import PlexPlayerBackend, _PlayerSession
+    gate = asyncio.Event()
+
+    async def _slow_close():
+        await gate.wait()
+
+    prior_client = MagicMock(aclose=AsyncMock(side_effect=_slow_close))
+    backend = PlexPlayerBackend(
+        client_factory=lambda h, p, d: MagicMock(aclose=AsyncMock()))
+    backend._session = _PlayerSession(device_id="p0", client=prior_client,
+                                      name="Old")
+    backend._is_playing = True
+    backend._device_addresses["p1"] = {
+        "host": "192.168.1.30", "port": 32500, "name": "Living Room"}
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", AsyncMock()):
+        task = asyncio.get_running_loop().create_task(backend.set_device("p1"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert backend._session is None, (
+            "the outgoing session is still readable mid-teardown")
+        assert backend.is_playing is False
+
+        gate.set()
+        await task
+
+    prior_client.aclose.assert_awaited_once()
+    assert backend._session is not None
+    assert backend._session.device_id == "p1"

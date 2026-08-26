@@ -176,6 +176,23 @@ class DirectAudioBackend:
         self._volume = float(stored) if stored else 0.5
         self._device_id = device_id
 
+    # ── release (2026-08-20 plan U2) ──────────────────────────────────────────
+
+    def release(self) -> None:
+        """Nothing to release. An explicit, deliberate no-op.
+
+        Like AirPlay, ``set_device`` here is a cache write — the ALSA device
+        name plus the persisted volume. No connection is adopted at attach: the
+        GStreamer pipeline is playback state, built by ``play()`` and torn down
+        by ``stop()``, and stopping is not releasing.
+
+        Included in U2 even though the plan's file list names only the four
+        remote backends: the Protocol method is REQUIRED, this class is one the
+        router holds (it is the default local-output backend), and a required
+        method it did not implement would drop it out of ``isinstance`` and
+        AttributeError on the switch-away release path."""
+        return None
+
     # ── playback ──────────────────────────────────────────────────────────────
 
     def set_radio_failed_hook(self, hook: RadioFailedHook | None) -> None:
@@ -383,7 +400,12 @@ class DirectAudioBackend:
                 "outage-suspected (not advancing)", err,
             )
             from app.output import session
-            session.notify_outage_threadsafe(self._loop, "sink_error")
+            # R6: name the reporter. A deferred switch away from Direct leaves
+            # this GStreamer pipeline running until the next track boundary, so
+            # a sink error here could otherwise open a hold against whichever
+            # backend the router names by then.
+            session.notify_outage_threadsafe(self._loop, "sink_error",
+                                             backend=self)
             return
         # Track-level (source/decode chain): skip the dead media — the
         # advance-on-ERROR party-stall posture, preserved by R15.

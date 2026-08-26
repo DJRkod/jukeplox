@@ -112,10 +112,13 @@ from typing import Any, Awaitable, Callable
 from app.models import Track
 from app.output.base import (
     AdvanceCallback,
+    AttachGeneration,
+    AttachSuperseded,
     DeviceLostError,
     DeviceNotReadyError,
     OutputDevice,
     echo_guard_active,
+    release_in_background,
 )
 from app.plex.companion import (
     CompanionError,
@@ -265,7 +268,7 @@ class _PlayerSession:
     last_at: float = 0.0
 
 
-class PlexPlayerBackend:
+class PlexPlayerBackend(AttachGeneration):
     """AbstractOutputBackend implementation for Plex Companion receivers.
 
     Mirrors the DlnaBackend lifecycle: typed device errors, confirm-token
@@ -409,7 +412,15 @@ class PlexPlayerBackend:
         cancelled, client closed), build the per-player Companion client,
         restore the persisted volume, and persist ``output_addr:{device_id}``
         for the mDNS-free restart re-bind (supervisor U3 mechanic)."""
+        # 2026-08-20 plan U3: claim this attach; the swap below compares on it.
+        token = self._begin_attach()
+        # Drop the reference to the outgoing session SYNCHRONOUSLY, before the
+        # first await, and tear the captured local down after: clearing it
+        # afterwards would let a concurrent attach that has already adopted its
+        # own session have that session nulled out from under it.
         prior = self._session
+        self._session = None
+        self._is_playing = False
         if prior is not None:
             prior.self_stopped = True
             self._cancel_poll(prior)
@@ -419,8 +430,6 @@ class PlexPlayerBackend:
             except Exception:
                 _log.debug("PlexPlayer set_device: prior client close failed",
                            exc_info=True)
-        self._session = None
-        self._is_playing = False
 
         from app import database
         addr = self._device_addresses.get(device_id)
@@ -452,9 +461,34 @@ class PlexPlayerBackend:
 
         client = self._client_factory(addr["host"], int(addr["port"]),
                                       device_id)
-        self._session = _PlayerSession(
+        session = _PlayerSession(
             device_id=device_id, client=client,
             name=str(addr.get("name") or device_id))
+
+        # ── U3: adopt by compare-and-swap ────────────────────────────────────
+        # As late as possible — immediately before the assignment that makes
+        # this session current. A superseded attach owns a live Companion HTTP
+        # client either way; releasing it here is the difference between a
+        # closed transport and one leaked for the life of the process.
+        if self._attach_superseded(token):
+            _log.info("PlexPlayer: attach for %r was superseded while "
+                      "binding; releasing its client instead of adopting it",
+                      device_id)
+            session.self_stopped = True
+
+            async def _close() -> None:
+                try:
+                    await client.aclose()
+                except Exception:
+                    _log.debug("PlexPlayer superseded attach: client close "
+                               "failed", exc_info=True)
+
+            release_in_background(_close(),
+                                  label="PlexPlayer superseded attach")
+            raise AttachSuperseded(
+                f"PlexPlayer attach for {device_id!r} was superseded")
+
+        self._session = session
         self._device_id = device_id
 
         stored = await database.get_setting(f"vol:plexplayer:{device_id}")
@@ -482,9 +516,13 @@ class PlexPlayerBackend:
             try:
                 data = json.loads(raw_q)
                 qid = int(data["queue_id"])
-                self._session.current_queue_id = qid
-                self._session.owned_queue_ids = {qid}
-                self._session.server_machine_id = (
+                # Seeded onto THIS attach's session (the local), not
+                # ``self._session``: a later attach that adopted while this
+                # one was reading the DB owns that field now, and its player
+                # has nothing to do with our persisted queue id.
+                session.current_queue_id = qid
+                session.owned_queue_ids = {qid}
+                session.server_machine_id = (
                     str(data.get("server") or "") or None)
                 _log.info("PlexPlayer set_device: re-adopted persisted "
                           "playQueueID %s for %r", qid, device_id)
@@ -505,6 +543,53 @@ class PlexPlayerBackend:
         except Exception:
             _log.debug("PlexPlayer set_device: output_addr persist failed",
                        exc_info=True)
+
+    # ── release (2026-08-20 plan U2) ──────────────────────────────────────
+
+    def release(self) -> None:
+        """Let go of the adopted player session. Non-blocking, never raises,
+        idempotent — see ``app.output.base`` for the contract.
+
+        What this backend adopts is one ``_PlayerSession``: a Companion HTTP
+        client plus the poll and watchdog tasks that speak for it. Left
+        adopted after a switch away, the poll loop keeps reading a player this
+        backend no longer owns and its 3-strike can fire ``notify_outage``
+        into the session of whichever backend is active NOW — the abandoned-
+        listener fault, in its plexplayer shape.
+
+        ``self_stopped`` is set before anything else: a terminal read racing in
+        from the poll loop must classify as self-induced and never advance the
+        queue. The tasks are cancelled synchronously (``Task.cancel`` is a
+        signal, not a wait); only the client close is a coroutine, so it is
+        deferred to a background task.
+
+        Does NOT send a stop to the player — stopping is not releasing, and
+        the switch-away path calls ``stop()`` first.
+
+        Supersedes any in-flight attach first (2026-08-20 review F1): an
+        attach still building its Companion session when this backend is
+        retired must release that session rather than adopt it."""
+        self._supersede_attaches()
+        sess = self._session
+        self._session = None
+        self._is_playing = False
+        if sess is None:
+            return
+        sess.self_stopped = True
+        self._cancel_poll(sess)
+        self._cancel_watchdog(sess)
+        client = sess.client
+
+        async def _close() -> None:
+            try:
+                await client.aclose()
+            except Exception:
+                # WARNING (2026-08-20 review F6): a local resource we failed
+                # to free, not a remote device declining to listen.
+                _log.warning("PlexPlayer release: client close failed",
+                             exc_info=True)
+
+        release_in_background(_close(), label="PlexPlayer release")
 
     # ── dispatch ──────────────────────────────────────────────────────────
 
@@ -705,7 +790,7 @@ class PlexPlayerBackend:
                                  "reporting outage-suspected",
                                  _POLL_ERROR_STRIKES)
                     from app.output import session as output_session
-                    output_session.notify_outage("poll_errors")
+                    output_session.notify_outage("poll_errors", backend=self)
                     return
                 await asyncio.sleep(_POLL_ERROR_RETRY_S)
                 continue
@@ -1583,7 +1668,7 @@ class PlexPlayerBackend:
             _log.warning("PlexPlayer watchdog: no terminal timeline and "
                          "player unreachable — reporting outage-suspected")
             from app.output import session as output_session
-            output_session.notify_outage("watchdog_unreachable")
+            output_session.notify_outage("watchdog_unreachable", backend=self)
             return
         _log.warning("PlexPlayer watchdog: duration+grace expired with no "
                      "EOS — forcing a single advance")

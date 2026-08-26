@@ -265,14 +265,16 @@ async def test_play_spawns_feed_then_clean_eof_advances(monkeypatch):
 async def test_play_midtrack_death_holds_outage(monkeypatch):
     outages = []
     monkeypatch.setattr("app.output.session.notify_outage",
-                        lambda r: outages.append(r))
+                        lambda r, backend=None: outages.append((r, backend)))
     f1 = FakeFeed()
     b = make_backend(monkeypatch, feeds=[f1])
     await b.enable()
     await b.play("ignored", _track())
     f1.finish(1)  # crash mid-track (rc != 0)
     await _wait_until(lambda: outages)
-    assert outages == ["snapcast_feed_failed"]  # held via supervisor, not drained
+    # Held via supervisor, not drained — and naming the reporter (2026-08-20
+    # review F5/R6), so the hold can only ever land on the active output.
+    assert outages == [("snapcast_feed_failed", b)]
     b._t_advance.assert_not_awaited()            # NOT an advance
     assert not b.is_playing
     await b.stop()

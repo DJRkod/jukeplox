@@ -766,6 +766,202 @@ async def test_outage_report_retires_dispatch_and_cancels_timer(monkeypatch):
     rec.assert_not_called()
 
 
+# ── U5 (R3): an outage reporter must still be the active output ──────────────
+#
+# An outage is device-level, so the hold it opens captures
+# ``output_router.active`` — which is NOT necessarily the backend that
+# reported. A backend switched away from keeps its connection (release is a
+# separate edge) and keeps its listeners, so its device dropping later would
+# otherwise freeze a queue playing perfectly on the backend the user moved to.
+
+def _router_active(monkeypatch, active):
+    """Point app.state.output_router at a stub whose ``active`` is *active* —
+    the same attribute ``hold.enter_output_hold`` captures."""
+    import app.state as st
+    from types import SimpleNamespace as _NS
+    # Carries is_switching_away_from because the real router does: a double
+    # that omits it drove the gate's AttributeError handler, which fails open,
+    # so the guard silently stopped applying and four tests went green for the
+    # wrong reason (2026-08-20 re-review).
+    monkeypatch.setattr(st, "output_router",
+                        _NS(active=active,
+                            is_switching_away_from=lambda _b: False))
+
+
+async def test_outage_from_non_active_backend_is_ignored(monkeypatch):
+    """The plan's scenario: play on Cast, pause, switch output to Direct. The
+    abandoned Cast connection is still live, and when that speaker sleeps its
+    listener reports connection_lost. Direct is the active output, so the
+    report has no authority — nothing is emitted, and the live dispatch on the
+    healthy backend keeps its deadline."""
+    from app.output import session
+    sup, timers, rec = _fresh(monkeypatch)
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+    retired_cast, direct = object(), object()
+    _router_active(monkeypatch, direct)
+    token = sup.on_dispatched(make_track("t1"))
+
+    session.notify_outage("connection_lost", backend=retired_cast)
+
+    assert outages == []
+    assert sup.current_token() == token          # dispatch untouched
+    assert not timers.timers[0].cancelled        # its deadline still armed
+
+
+async def test_outage_from_active_backend_still_reports(monkeypatch):
+    """Scoping pin for the guard above: the SAME signal from the backend that
+    is actually the active output must still retire the dispatch and emit —
+    a guard that always dropped would pass the previous test."""
+    from app.output import session
+    sup, timers, rec = _fresh(monkeypatch)
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+    cast = object()
+    _router_active(monkeypatch, cast)
+    sup.on_dispatched(make_track("t1"))
+
+    session.notify_outage("connection_lost", backend=cast)
+
+    assert outages == ["connection_lost"]
+    assert timers.timers[0].cancelled
+    assert sup.current_token() is None
+
+
+async def test_outage_without_a_named_reporter_is_unguarded(monkeypatch):
+    """Back-compat pin for an UNNAMED report. Every backend in the tree now
+    names itself (2026-08-20 review F5 generalised DLNA, AirPlay, plexplayer
+    and multiroom to match Chromecast, closing R6), but the guard stays opt-in
+    per call site so a report from anywhere that has not been converted — a
+    future backend, or a caller reaching the supervisor directly — keeps the
+    pre-U5 behaviour rather than being silently swallowed."""
+    from app.output import session
+    sup, timers, rec = _fresh(monkeypatch)
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+    _router_active(monkeypatch, object())        # some other backend
+    sup.on_dispatched(make_track("t1"))
+
+    session.notify_outage("poll_errors")
+
+    assert outages == ["poll_errors"]
+
+
+async def test_outage_reporter_check_allows_unwired_router(monkeypatch):
+    """A router with no active backend cannot be damaged by a stale report —
+    there is nothing to hold the queue on. Degraded/boot wiring keeps the
+    pre-U5 behaviour rather than silently swallowing outages."""
+    from app.output import session
+    sup, timers, rec = _fresh(monkeypatch)
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+    _router_active(monkeypatch, None)
+    sup.on_dispatched(make_track("t1"))
+
+    session.notify_outage("connection_lost", backend=object())
+
+    assert outages == ["connection_lost"]
+
+
+async def _drive_reconnect_trigger(monkeypatch, sup, reporter):
+    """Fire notify_reconnect_trigger with an open hold; return the triggers
+    that reached ``_attempt_reattach``."""
+    import asyncio as _asyncio
+    from app.output import session, hold as hold_mod
+    seen: list[str] = []
+
+    async def _fake_reattach(ot, trigger):
+        seen.append(trigger)
+
+    sup._outage = object()          # an outage exists…
+    monkeypatch.setattr(hold_mod, "output_hold_active", lambda: True)
+    monkeypatch.setattr(sup, "_attempt_reattach", _fake_reattach)
+
+    session.notify_reconnect_trigger("cast_connected", backend=reporter)
+    for _ in range(6):
+        await _asyncio.sleep(0)
+    return seen
+
+
+async def test_reconnect_trigger_from_a_retired_backend_is_ignored(monkeypatch):
+    """*Covers R3/R6, 2026-08-20 review F5.* U5's premise is that a connection
+    which is not the adopted one has no authority — but only the OUTAGE
+    direction was wired for it. This entry took no reporter and made no check.
+
+    The damage was real, not theoretical: an abandoned Cast whose speaker is
+    powered off re-dials roughly every five seconds forever, and every
+    successful dial emitted CONNECTED. With a hold open on a DIFFERENT backend,
+    each one landed here and kicked off a re-attach for that backend's outage —
+    short-circuiting its backoff timer, incrementing its attempt counter and
+    broadcasting a session event. Single-flight kept it to one attempt at a
+    time, so the symptom was not a storm but something quieter and more
+    confusing: an exponential backoff that never actually backed off, driven
+    by a device that was not even the one being reconnected."""
+    sup, timers, rec = _fresh(monkeypatch)
+    _router_active(monkeypatch, object())        # some OTHER backend is active
+
+    seen = await _drive_reconnect_trigger(monkeypatch, sup, reporter=object())
+
+    assert seen == [], (
+        "a retired backend's reconnect drove another backend's re-attach")
+
+
+async def test_reconnect_trigger_from_the_active_backend_still_fires(
+        monkeypatch):
+    """Scoping pin for the guard above — a guard that always dropped would pass
+    the previous test while disabling Cast's only self-healing signal."""
+    sup, timers, rec = _fresh(monkeypatch)
+    cast = object()
+    _router_active(monkeypatch, cast)
+
+    seen = await _drive_reconnect_trigger(monkeypatch, sup, reporter=cast)
+
+    assert seen == ["cast_connected"]
+
+
+async def test_reconnect_trigger_without_a_reporter_still_fires(monkeypatch):
+    """Back-compat, matching ``notify_outage``: an unnamed trigger is unguarded
+    so no existing caller loses its reconnect."""
+    sup, timers, rec = _fresh(monkeypatch)
+    _router_active(monkeypatch, object())
+
+    seen = await _drive_reconnect_trigger(monkeypatch, sup, reporter=None)
+
+    assert seen == ["cast_connected"]
+
+
+async def test_outage_guard_cannot_be_bypassed_via_the_supervisor(monkeypatch):
+    """The check lives on ``on_outage_reported``, not on any one call site:
+    Cast alone reports from three places, and a caller reaching the
+    supervisor directly gets the same answer."""
+    sup, timers, rec = _fresh(monkeypatch)
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+    _router_active(monkeypatch, object())
+
+    sup.on_outage_reported("watchdog_unreachable", backend=object())
+
+    assert outages == []
+
+
+async def test_notify_outage_threadsafe_carries_the_reporter(monkeypatch):
+    """The thread-side hop must forward the reporter, or every marshalled
+    signal (Cast status thread, GStreamer bus) would arrive unguarded. The
+    active-output question is answered on the loop, at delivery."""
+    from app.output import session
+    sup, timers, rec = _fresh(monkeypatch)
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+    retired = object()
+    _router_active(monkeypatch, object())
+    loop = asyncio.get_running_loop()
+
+    session.notify_outage_threadsafe(loop, "connection_lost", retired)
+    await _drain()
+
+    assert outages == []
+
+
 async def test_get_supervisor_registers_classifier(monkeypatch):
     """Production wiring: the lazy singleton carries the U2 classifier as an
     outage listener."""
@@ -2206,6 +2402,97 @@ async def test_attach_queued_behind_switch_aborts_without_set_device(monkeypatch
         assert session.output_hold_active() is True  # switch owns the clear
 
 
+# ── U1 (2026-08-20): _attach_serial is the ONE seam every attach passes ───────
+
+
+def _attach_outage(backend, device_id, backend_type="dlna"):
+    """A minimal reconnect context for driving ``_seed_and_set_device``
+    directly — the attach seam under test, without the surrounding hold and
+    resume orchestration."""
+    from app.output import session
+    ot = session._Outage("connection_lost")
+    ot.backend = backend
+    ot.backend_type = backend_type
+    ot.device_id = device_id
+    return ot
+
+
+async def test_concurrent_attaches_on_one_backend_serialise(monkeypatch):
+    """AC1: two attaches driven concurrently against ONE backend serialise on
+    ``_attach_serial`` — they never overlap, and the second observes the
+    first's COMPLETED state, not the half-built window inside it. set_device
+    commits backend internals from an uncancellable executor thread, so an
+    interleaving is not merely untidy: the loser's commit can land last."""
+    from app.output import session
+    sup, timers, rec = make_supervisor()
+    monkeypatch.setattr(session, "_supervisor", sup)
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    backend = MagicMock()
+    backend._device_id = None
+    observed, inflight, peak = [], 0, 0
+
+    async def set_device(device_id):
+        nonlocal inflight, peak
+        observed.append(backend._device_id)   # what this attach walked in on
+        inflight += 1
+        peak = max(peak, inflight)
+        backend._device_id = None             # the half-built window…
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        backend._device_id = device_id        # …then the commit
+        inflight -= 1
+
+    backend.set_device = AsyncMock(side_effect=set_device)
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        results = await asyncio.gather(
+            sup._seed_and_set_device(_attach_outage(backend, "dev-a"),
+                                     sup.attach_epoch),
+            sup._seed_and_set_device(_attach_outage(backend, "dev-b"),
+                                     sup.attach_epoch),
+        )
+
+    assert results == [True, True]
+    assert peak == 1, "two attaches overlapped on one backend"
+    assert observed == [None, "dev-a"], (
+        "the second attach must observe the first's completed state")
+    assert backend._device_id == "dev-b"
+    assert session._attach_serial.locked() is False
+
+
+async def test_attach_that_raises_releases_the_lock_for_the_next_attach(
+        monkeypatch):
+    """U1: an attach whose set_device raises still releases ``_attach_serial``
+    — a boot or retry attach against a dead device must not wedge the seam
+    every later switch has to pass through."""
+    from app.output import session
+    sup, timers, rec = make_supervisor()
+    monkeypatch.setattr(session, "_supervisor", sup)
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    held = []
+    backend = MagicMock()
+
+    async def boom(device_id):
+        held.append(session._attach_serial.locked())
+        raise RuntimeError("unreachable")
+
+    backend.set_device = AsyncMock(side_effect=boom)
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        failed = await sup._seed_and_set_device(
+            _attach_outage(backend, "dev-a"), sup.attach_epoch)
+
+        assert failed is False
+        assert held == [True]                            # not vacuous
+        assert session._attach_serial.locked() is False  # released on the raise
+
+        backend.set_device = AsyncMock()                 # the seam still works
+        assert await sup._seed_and_set_device(
+            _attach_outage(backend, "dev-b"), sup.attach_epoch) is True
+
+
 # ── U4 WS-miss-then-snapshot-resync integration (plan requirement) ────────────
 # End-to-end over the app's REAL /admin/ws route (app/api/admin.py:
 # admin_websocket → events.bus manager) and the REAL admin now-playing GET —
@@ -2833,3 +3120,44 @@ async def test_hold_foreign_controller_manual_resume_reactivates(monkeypatch):
         # R19: confirming the resume dispatch must not re-count.
         sup.on_playback_confirmed(sup.current_token())
         rec.assert_called_once()
+
+
+async def test_the_outgoing_backend_loses_authority_when_the_switch_is_requested(
+        monkeypatch):
+    """*Covers ADV-13 (2026-08-20 re-review).* Authority moves at request time.
+
+    The router is deliberately not repointed until the incoming attach
+    succeeds, so a failed switch cannot strand the working output. The cost was
+    a window — up to ~30s on DLNA — in which the backend the user had ALREADY
+    decided to leave was still the router's active output, and therefore still
+    passed this gate.
+
+    That is not a theoretical inversion. The usual reason to switch outputs is
+    that the current one has stopped working, so its poll loop is racking up
+    strikes at exactly this moment. Accepting that report opens a hold: the
+    queue pauses and the current item is re-inserted, against a device the user
+    has abandoned, in the middle of a switch that is about to succeed."""
+    from app.output import session
+    sup, timers, rec = _fresh(monkeypatch)
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+
+    old, new = object(), object()
+    switching_away = {"value": True}
+    import app.state as st
+    from types import SimpleNamespace as _NS
+    monkeypatch.setattr(st, "output_router", _NS(
+        active=old,                      # the router has NOT moved yet…
+        is_switching_away_from=lambda b: switching_away["value"] and b is old))
+    sup.on_dispatched(make_track("t1"))
+
+    session.notify_outage("poll_errors", backend=old)
+    assert outages == [], (
+        "the backend being switched away from opened a hold during the switch")
+
+    # Scoping pin: once the switch settles (committed or abandoned), the same
+    # backend is authoritative again if it is still the active output.
+    switching_away["value"] = False
+    session.notify_outage("poll_errors", backend=old)
+    assert outages == ["poll_errors"], (
+        "authority was not restored after the switch resolved")
