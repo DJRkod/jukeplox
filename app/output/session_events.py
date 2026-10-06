@@ -89,6 +89,7 @@ async def session_snapshot_admin() -> dict:
         "was_paused": sup.was_paused,
         "flap_tripped": info.get("flap_tripped"),
         "idle_paused_reason": sup.idle_paused_reason or None,
+        "gapless_degraded_reason": gapless_degraded_reason(),
     })
     return snap
 
@@ -118,3 +119,52 @@ def _schedule_emit() -> None:
     the final truth, not the intermediate one."""
     from app.output import session
     session._spawn_supervised(emit_session_event())
+
+
+# ── gapless degradation notice (2026-10-05) ──────────────────────────────────
+#
+# Why this exists: gapless is a user-visible promise ("albums play as albums"),
+# and the Cast path can fail to keep it for a purely environmental reason — no
+# address a LAN device can reach — while the toggle still reads ON. Before
+# this, the only signal was a WARNING line in the container log, so the
+# observable symptom was an unexplained ~500 ms pause at every track boundary
+# (measured on the rig: 499 ms degraded vs 0 ms in flow mode). A promise the
+# product cannot keep has to say so where the person who set the toggle looks.
+#
+# Recorded at the point of truth rather than re-derived: the backend knows why
+# it degraded, and a second copy of that condition elsewhere would drift.
+
+#: (backend, reason) — the backend the notice BELONGS to, so it cannot outlive
+#: its subject. Keyed on instance identity, the same way state.py keys
+#: _armed_next_backend. Without this the notice is a free global: switch from
+#: Cast to Direct and a Cast-specific "set STREAM_BASE_URL" message keeps being
+#: reported for a session that has nothing to do with Cast.
+_gapless_degraded: tuple[object, str] | None = None
+
+
+def note_gapless_degraded(reason: str | None, backend: object = None) -> None:
+    """Record why gapless could not run on ``backend``, or clear it with None.
+
+    Call the clearing form only AFTER the healthy path has actually succeeded.
+    Clearing optimistically on entry means a failure later in the same dispatch
+    leaves a stale "healthy" reading, which is worse than no reading at all.
+    """
+    global _gapless_degraded
+    _gapless_degraded = None if reason is None else (backend, reason)
+
+
+def gapless_degraded_reason() -> str | None:
+    """Operator-facing reason gapless is not actually running, else None.
+
+    Two ways this returns None even with a notice recorded:
+    - the toggle is off, so nothing is being promised and a leftover notice
+      would be noise rather than news;
+    - the notice belongs to a backend that is no longer the active one.
+    """
+    from app import state
+    if not state.gapless_enabled() or _gapless_degraded is None:
+        return None
+    backend, reason = _gapless_degraded
+    if backend is not None and state.output_router.active is not backend:
+        return None
+    return reason

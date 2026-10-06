@@ -245,6 +245,11 @@ class OutputSessionEvent:
     was_paused: bool | None = None
     flap_tripped: bool | None = None
     idle_paused_reason: str | None = None
+    # Why gapless is not actually running despite the toggle being ON
+    # (2026-10-05) — e.g. the Cast flow stream has no device-reachable base
+    # URL and playback has degraded to per-track, which gaps audibly. None
+    # when gapless is off (nothing promised) or genuinely running.
+    gapless_degraded_reason: str | None = None
 
     def to_json(self) -> dict:
         return asdict(self)

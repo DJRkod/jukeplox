@@ -2399,6 +2399,99 @@ async def test_refresh_browse_index_counts_failure_degrades_gracefully():
     assert album_rows[0]["track_count"] is None
 
 
+# ── degraded grouping is visible (#61, plan U3) ──────────────────────────────
+#
+# The count-crawl failure above is deliberately excluded from the don't-wipe
+# gate, so before this the refresh reported success, refresh_failed stayed
+# false, and album dedup was silently off for an entire source. The only trace
+# was one WARNING in the container log.
+
+async def test_counts_failure_is_reported_and_names_the_library():
+    import app.state as st
+    st._browse_counts_degraded = {}
+    await _run_refresh(
+        [_mk_lib("A:1", "ServerA")],
+        {"A:1": [_mk_artist("A:1", "Van She")]},
+        {"A:1": [_mk_album("A:album", "Idea of Happiness", "Van She")]},
+        counts_by_key={"A:1": RuntimeError("count query timeout")},
+    )
+    assert st.grouping_degraded_libraries() == ["ServerA: Lib A:1"]
+
+
+async def test_counts_failure_does_not_claim_the_refresh_failed():
+    """Severity matters: the index is complete, only the grouping signal is
+    missing. Conflating them sends an admin hunting for music that is present."""
+    import app.state as st
+    st._browse_counts_degraded = {}
+    st._browse_refresh_failed = False
+    await _run_refresh(
+        [_mk_lib("A:1", "ServerA")],
+        {"A:1": [_mk_artist("A:1", "Van She")]},
+        {"A:1": [_mk_album("A:album", "Idea", "Van She")]},
+        counts_by_key={"A:1": RuntimeError("timeout")},
+    )
+    assert st._browse_refresh_failed is False
+    assert st._browse_counts_degraded
+
+
+async def test_a_later_successful_crawl_clears_the_degraded_signal():
+    import app.state as st
+    st._browse_counts_degraded = {"A:1": "ServerA: Lib A:1"}
+    await _run_refresh(
+        [_mk_lib("A:1", "ServerA")],
+        {"A:1": [_mk_artist("A:1", "Van She")]},
+        {"A:1": [_mk_album("A:album", "Idea", "Van She")]},
+        counts_by_key={"A:1": {"A:album": 12}},
+    )
+    assert st.grouping_degraded_libraries() == []
+
+
+async def test_every_failing_library_is_reported_not_just_the_last():
+    import app.state as st
+    st._browse_counts_degraded = {}
+    libs = [_mk_lib("A:1", "ServerA"), _mk_lib("B:1", "ServerB")]
+    await _run_refresh(
+        libs,
+        {"A:1": [_mk_artist("A:1", "X")], "B:1": [_mk_artist("B:1", "Y")]},
+        {"A:1": [_mk_album("A:a", "T", "X")], "B:1": [_mk_album("B:a", "T", "Y")]},
+        counts_by_key={"A:1": RuntimeError("t"), "B:1": RuntimeError("t")},
+    )
+    assert st.grouping_degraded_libraries() == ["ServerA: Lib A:1", "ServerB: Lib B:1"]
+
+
+async def test_a_refresh_that_bailed_leaves_the_previous_verdict_standing():
+    """The don't-wipe gate returns without installing an index; grouping did not
+    change, so the signal must not be rewritten to describe a crawl that never
+    reached the replace."""
+    import app.state as st
+    st._browse_counts_degraded = {"A:1": "ServerA: Lib A:1"}
+    await _run_refresh(
+        [_mk_lib("A:1", "ServerA")],
+        {"A:1": RuntimeError("artists down")},
+        {"A:1": RuntimeError("albums down")},
+        counts_by_key={"A:1": {}},
+    )
+    assert st.grouping_degraded_libraries() == ["ServerA: Lib A:1"]
+
+
+async def test_guest_scan_status_reports_degradation_without_naming_anything(
+        tmp_path, monkeypatch):
+    """The guest payload is publicly reachable and contractually limited to
+    boolean sentinels — library and server names belong to the admin route."""
+    import app.state as st
+    st._browse_counts_degraded = {"A:1": "ServerA: Lib A:1"}
+    try:
+        with patch("app.state.get_plex_client", AsyncMock(return_value=None)), \
+             patch("app.catalog.store.is_empty", AsyncMock(return_value=True)), \
+             patch("app.database.get_setting", AsyncMock(return_value=None)):
+            status = await st.scan_status()
+        assert status["grouping_degraded"] is True
+        blob = repr(status)
+        assert "ServerA" not in blob and "Lib A:1" not in blob
+    finally:
+        st._browse_counts_degraded = {}
+
+
 async def test_refresh_browse_index_all_failed_does_not_wipe():
     err = RuntimeError("plex down")
     libs = [_mk_lib("A:1", "ServerA")]
@@ -2906,6 +2999,7 @@ async def _u15_status_db(tmp_path, monkeypatch, scanning):
     # so cross-test pollution can't flip the refresh_failed payload field.
     monkeypatch.setattr(st, "_catalog_refresh_failed", False)
     monkeypatch.setattr(st, "_browse_refresh_failed", False)
+    monkeypatch.setattr(st, "_browse_counts_degraded", {})
     await database.init_db()
     return st, database
 
@@ -2916,7 +3010,7 @@ async def test_scan_status_zero_sources(tmp_path, monkeypatch):
         with patch.object(st, "get_plex_client", AsyncMock(return_value=None)):
             status = await st.scan_status()
         assert status == {"sources": 0, "scanning": False, "scanned": False, "empty": True,
-                          "refresh_failed": False}
+                          "refresh_failed": False, "grouping_degraded": False}
     finally:
         await database.close_db()
 
@@ -2929,7 +3023,7 @@ async def test_scan_status_first_scan_building(tmp_path, monkeypatch):
             status = await st.scan_status()
         # First scan: a source connected, crawl in flight, nothing stamped/stored.
         assert status == {"sources": 1, "scanning": True, "scanned": False, "empty": True,
-                          "refresh_failed": False}
+                          "refresh_failed": False, "grouping_degraded": False}
     finally:
         await database.close_db()
 
@@ -2949,7 +3043,7 @@ async def test_scan_status_scanned_with_content(tmp_path, monkeypatch):
         with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
             status = await st.scan_status()
         assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": False,
-                          "refresh_failed": False}
+                          "refresh_failed": False, "grouping_degraded": False}
     finally:
         await database.close_db()
 
@@ -2963,7 +3057,7 @@ async def test_scan_status_scanned_but_empty(tmp_path, monkeypatch):
             status = await st.scan_status()
         # Distinct from zero-source: a finished scan that found nothing.
         assert status == {"sources": 1, "scanning": False, "scanned": True, "empty": True,
-                          "refresh_failed": False}
+                          "refresh_failed": False, "grouping_degraded": False}
     finally:
         await database.close_db()
 

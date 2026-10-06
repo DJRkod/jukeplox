@@ -7,6 +7,7 @@ import errno
 import json
 import ipaddress
 import logging
+import os
 import random
 import socket
 import urllib.parse
@@ -1588,17 +1589,40 @@ async def _warm_next_transcode(track) -> str | None:
         return None
 
 
+def listen_port() -> str:
+    """The port this process actually serves on.
+
+    The container entrypoint is ``uvicorn --port ${PORT:-80}``, so PORT is the
+    truth and 80 is only its default. Any base we DERIVE (rather than take
+    verbatim from STREAM_BASE_URL) has to carry it: a portless base on a
+    PORT=8096 install names an address nothing is listening on, and a device
+    told to fetch it simply fails.
+    """
+    return (os.environ.get("PORT") or "80").strip() or "80"
+
+
+def _host_to_base(host: str) -> str:
+    """``http://host`` with the real listen port appended unless it is 80."""
+    port = listen_port()
+    return f"http://{host}" if port == "80" else f"http://{host}:{port}"
+
+
 def _stream_url_base() -> str:
     """The device-reachable base URL for server-proxied streams: explicit
     STREAM_BASE_URL, else a specific (non-0.0.0.0) BIND_HOST. "" when neither
     is configured — the per-track dispatch then falls back to the source's
     direct URL; the Cast flow stream (U10) has no such fallback and degrades
     to per-track playback instead. Single-sourced here so the two URL
-    builders can never disagree about what "reachable base" means."""
+    builders can never disagree about what "reachable base" means.
+
+    STREAM_BASE_URL is taken verbatim (the admin supplied a complete base,
+    port included). The BIND_HOST leg is DERIVED, so it gains the real listen
+    port — it previously emitted a portless base that was simply wrong on any
+    install not serving on 80."""
     from app.config import settings
     base = settings.stream_base_url
     if not base and settings.bind_host and settings.bind_host != "0.0.0.0":
-        base = f"http://{settings.bind_host}"
+        base = _host_to_base(settings.bind_host)
     return base.rstrip("/") if base else ""
 
 
@@ -1669,28 +1693,77 @@ def _is_bridge_ip(ip: str) -> bool:
         return False
 
 
-def resolved_proxy_base_for_url_auth() -> str:
-    """The device-reachable proxy base a URL-auth source must stream through.
+def resolved_device_base(context: str, *, reject_bridge: bool = False) -> str:
+    """The device-reachable absolute base for anything this server streams to
+    a LAN device.
 
     ``STREAM_BASE_URL`` when set (always wins), else a specific (non-0.0.0.0)
-    ``BIND_HOST`` — both via ``_stream_url_base()`` so this can never disagree
-    with the header-auth path about what a "reachable base" is — otherwise the
-    auto-detected primary LAN IP as ``http://<ip>``. **Fail loud, never leak:**
-    - if no base can be established at all (detection raises), raise
-      ``RuntimeError`` naming ``STREAM_BASE_URL`` — the caller must refuse rather
-      than emit a raw credentialed URL;
-    - if the detected IP is on a container/bridge subnet (Docker-bridge case,
-      likely unreachable by a LAN device), emit a loud WARNING recommending
-      ``STREAM_BASE_URL`` (the U7 connect-time surface shows the resolved base so
-      the admin can catch an unreachable value before a silent no-audio cast).
+    ``BIND_HOST`` — both via ``_stream_url_base()`` so the URL builders can
+    never disagree about what a "reachable base" is — otherwise the
+    auto-detected primary LAN IP as ``http://<ip>``. Raises ``RuntimeError``
+    when none of the three can be established.
 
-    Exposed (not just internal) so the admin connect endpoint / UI (U7) can read
-    the resolved base to display it."""
+    ``context`` names the caller in the warning text only; it has no effect on
+    resolution. Single-sourced deliberately: a second copy of this ladder is
+    how two callers start disagreeing about reachability, and the Cast flow
+    stream needs exactly the same answer the per-track proxy path gets.
+
+    ``reject_bridge`` raises instead of returning an auto-detected
+    container/bridge IP. Callers differ in what a wrong base costs them. A
+    Cast flow stream is served only by this server and the device commits the
+    whole queue to it, so an unreachable base means no audio and a frozen
+    queue — worse than the gap that motivated auto-detection at all; that
+    caller passes True and takes the visible per-track degrade.
+
+    The URL-auth (Subsonic) caller keeps the permissive default, but NOT
+    because it has a better fallback — it does not; refusing there means that
+    source cannot play. It keeps the old behaviour because changing it would
+    silently convert a warn-and-proxy case into a hard failure in an unrelated
+    feature. If that caller's bridge-IP posture should change, it deserves its
+    own decision rather than inheriting this one.
+    """
     base = _stream_url_base()  # STREAM_BASE_URL, else a specific (non-0.0.0.0) BIND_HOST
     if base:
         return base
+    ip = _detect_primary_lan_ip()  # raises RuntimeError when undetectable
+    # STREAM_BASE_URL is unset and we are serving via an AUTO-DETECTED base,
+    # which a LAN Cast/DLNA device may not be able to reach (a bridge/container
+    # IP is the worst case, but any auto-detected interface can be wrong on a
+    # multi-homed host). Always recommend STREAM_BASE_URL; call out the bridge
+    # case explicitly.
+    if _is_bridge_ip(ip):
+        if reject_bridge:
+            raise RuntimeError(
+                f"auto-detected a container/bridge IP ({ip}) for {context}; a "
+                "LAN device almost certainly cannot reach it. Set "
+                "STREAM_BASE_URL to this server's LAN address.")
+        _log.warning(
+            "Stream base auto-detected a container/bridge IP %s for %s — a LAN "
+            "Cast/DLNA device likely cannot reach it. Set STREAM_BASE_URL to "
+            "this server's LAN address to guarantee playback.", ip, context,
+        )
+    else:
+        _log.warning(
+            "STREAM_BASE_URL is not set — auto-detected stream base http://%s "
+            "for %s. If a LAN Cast/DLNA device can't reach this address, set "
+            "STREAM_BASE_URL to this server's LAN address to guarantee "
+            "playback.", ip, context,
+        )
+    return _host_to_base(ip)
+
+
+def resolved_proxy_base_for_url_auth() -> str:
+    """The device-reachable proxy base a URL-auth source must stream through.
+
+    Thin wrapper over ``resolved_device_base`` that keeps the **fail loud,
+    never leak** contract specific to credentialed URLs: when no base can be
+    established at all the caller must refuse rather than emit a raw
+    credentialed URL, so the RuntimeError names ``STREAM_BASE_URL`` directly.
+
+    Exposed (not just internal) so the admin connect endpoint / UI (U7) can read
+    the resolved base to display it."""
     try:
-        ip = _detect_primary_lan_ip()
+        return resolved_device_base("a URL-auth (Subsonic) source")
     except RuntimeError as exc:
         raise RuntimeError(
             "Cannot determine a device-reachable stream base for a URL-auth "
@@ -1698,26 +1771,6 @@ def resolved_proxy_base_for_url_auth() -> str:
             "proxied. Set STREAM_BASE_URL to this server's LAN address "
             f"(e.g. http://192.168.1.10). ({exc})"
         ) from exc
-    # Broadened warning (was 172.16/12-only): STREAM_BASE_URL is unset and we are
-    # serving a URL-auth source via an AUTO-DETECTED base, which a LAN Cast/DLNA
-    # device may not be able to reach (a bridge/container IP is the worst case,
-    # but any auto-detected interface can be wrong on a multi-homed host). Always
-    # recommend STREAM_BASE_URL; call out the bridge case explicitly.
-    if _is_bridge_ip(ip):
-        _log.warning(
-            "Stream base auto-detected a container/bridge IP %s for a URL-auth "
-            "(Subsonic) source — a LAN Cast/DLNA device likely cannot reach it. "
-            "Set STREAM_BASE_URL to this server's LAN address to guarantee "
-            "playback.", ip,
-        )
-    else:
-        _log.warning(
-            "STREAM_BASE_URL is not set — auto-detected stream base http://%s for "
-            "a URL-auth (Subsonic) source. If a LAN Cast/DLNA device can't reach "
-            "this address, set STREAM_BASE_URL to this server's LAN address to "
-            "guarantee playback.", ip,
-        )
-    return f"http://{ip}"
 
 
 def _make_stream_url(stream_key: str, client) -> str:
@@ -2460,6 +2513,7 @@ async def _refresh_browse_index() -> None:
     refresh shape, including the 'all libraries failed → don't wipe a good
     index' guard."""
     global _browse_index_refresh_running, _browse_index_gen, _browse_refresh_failed
+    global _browse_counts_degraded
     from app import database
     try:
         client = await get_plex_client()
@@ -2475,6 +2529,7 @@ async def _refresh_browse_index() -> None:
             _browse_index_gen += 1
             await _rebuild_artist_grouping()
             _browse_refresh_failed = False  # intentional clear = success (audit F2)
+            _browse_counts_degraded = {}  # nothing enabled → nothing to group
             return
         all_libs = await client.get_libraries()
         libs = [l for l in all_libs if l.key in enabled_keys]
@@ -2494,16 +2549,25 @@ async def _refresh_browse_index() -> None:
         # synchronously in a bare comprehension and would bypass gather's
         # return_exceptions, failing the WHOLE refresh) — degrades to {} and never
         # blocks the index replace. It is NOT part of the don't-wipe gate below.
-        async def _safe_album_counts(key):
+        degraded: dict[str, str] = {}
+
+        async def _safe_album_counts(lib):
             try:
-                return await client.get_album_track_counts(key)
+                return await client.get_album_track_counts(lib.key)
             except Exception:
                 _log.warning(
                     "album track-count crawl failed for %s — same-title grouping "
-                    "degrades to title-only until the next scan", key, exc_info=True,
+                    "degrades to title-only until the next scan", lib.key, exc_info=True,
+                )
+                # Record WHICH library, so the admin sees more than a boolean.
+                # This failure used to be invisible outside this log line: the
+                # refresh reports success, refresh_failed stays false, and album
+                # dedup is silently off for that whole source (#61).
+                degraded[lib.key] = (
+                    f"{lib.server_name}: {lib.title}" if lib.server_name else lib.title
                 )
                 return {}
-        count_results = await asyncio.gather(*[_safe_album_counts(l.key) for l in libs])
+        count_results = await asyncio.gather(*[_safe_album_counts(l) for l in libs])
         # Require BOTH an artist call AND an album call to have succeeded before
         # the atomic replace — never install a PARTIAL index. An asymmetric
         # failure (e.g. every section-wide album query times out while the artist
@@ -2536,9 +2600,16 @@ async def _refresh_browse_index() -> None:
         # the new generation; both are in-memory, off-request.
         _browse_index_gen += 1
         await _rebuild_artist_grouping()
+        # Published only once the index is actually installed, so a refresh that
+        # bailed at the don't-wipe gate leaves the previous verdict standing
+        # rather than reporting on grouping that never changed.
+        _browse_counts_degraded = degraded
         _log.info(
-            "Browse index refreshed: %d artists, %d albums",
+            "Browse index refreshed: %d artists, %d albums%s",
             len(artist_rows), len(album_rows),
+            f" — track counts unavailable for {len(degraded)} librar"
+            f"{'y' if len(degraded) == 1 else 'ies'}, album grouping degraded"
+            if degraded else "",
         )
         _browse_refresh_failed = False  # own success clears own flag only (audit F2)
     except Exception:
@@ -2584,6 +2655,13 @@ _catalog_refresh_running = False
 # (raw exceptions stay in the ERROR log).
 _catalog_refresh_failed = False
 _browse_refresh_failed = False
+# {section key -> human label} for libraries whose album track-count crawl failed
+# on the most recent installed browse index. Non-empty means album grouping for
+# those libraries is running on carried-forward or absent counts, so same-title
+# releases may render as separate rows (#61). Deliberately NOT folded into
+# _browse_refresh_failed: the index itself is fine, and conflating the two would
+# tell an admin their library is stale when it is merely grouped coarsely.
+_browse_counts_degraded: dict[str, str] = {}
 
 
 async def _refresh_catalog() -> None:
@@ -2680,7 +2758,21 @@ async def scan_status() -> dict:
         "scanned": bool(await database.get_setting("catalog_computed_at")),
         "empty": await store.is_empty(),
         "refresh_failed": _catalog_refresh_failed or _browse_refresh_failed,
+        # Boolean ONLY — this payload is guest-reachable, so it carries no
+        # library or server names (see the docstring's sentinel rule). The
+        # admin route adds the affected libraries on its own side.
+        "grouping_degraded": bool(_browse_counts_degraded),
     }
+
+
+def grouping_degraded_libraries() -> list[str]:
+    """Human labels for libraries whose album track-count crawl failed.
+
+    ADMIN-ONLY. These are library and server names; they must never be added to
+    :func:`scan_status`, which is guest-reachable and contractually limited to
+    boolean sentinels.
+    """
+    return sorted(_browse_counts_degraded.values())
 
 
 # ── artist grouping map (rule-norm → base_keys; 2026-06-22 plan U1) ──────────

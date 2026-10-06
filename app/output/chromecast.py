@@ -141,13 +141,60 @@ class _PendingCount(NamedTuple):
 
 
 def _flow_base_url() -> str | None:
-    """Device-reachable absolute base for the flow route — the SAME base
-    logic per-track dispatch uses (``state._stream_url_base``). None when
-    neither STREAM_BASE_URL nor a specific BIND_HOST is configured: the
-    per-track path has a source-direct fallback there, but a flow stream is
-    served only by this server, so the caller degrades to per-track."""
+    """Device-reachable absolute base for the flow route — the SAME resolution
+    the per-track proxy path uses (``state.resolved_device_base``):
+    STREAM_BASE_URL, else a specific BIND_HOST, else the auto-detected primary
+    LAN IP.
+
+    The auto-detect leg matters more here than anywhere else. ``BIND_HOST``
+    defaults to ``0.0.0.0``, so a default install that merely turns gapless ON
+    used to resolve no base at all and degrade silently to per-track dispatch —
+    which on Cast means a real, audible gap at every single boundary (measured
+    at 499 ms on the rig, against 0 ms in flow mode) with nothing but a log
+    line to explain it. Reusing the proxy path's ladder means gapless works out
+    of the box wherever the per-track proxy already does.
+
+    None only when no base can be established at all; the caller then degrades
+    to per-track AND records why, so the degrade is visible to an operator
+    rather than buried in container logs."""
     from app import state
-    return state._stream_url_base() or None
+    try:
+        return state.resolved_device_base("the Cast gapless flow stream",
+                                          reject_bridge=True) or None
+    except RuntimeError:
+        return None
+
+
+#: Verified-reachable results for DERIVED flow bases, keyed by base string.
+#: Process-lifetime, like state._detect_primary_lan_ip's own cache: a base
+#: that answers once will answer again, and a base that cannot be served is
+#: not going to start being served without a config change (which changes the
+#: key) or a restart.
+_flow_base_reachable: dict[str, bool] = {}
+
+
+async def _probe_base(base: str) -> bool:
+    """Can this server actually be fetched at ``base``?
+
+    A derived base is a GUESS at our own address, and a wrong guess is far
+    worse for flow than the gap it was meant to fix: the device LOADs a URL
+    that answers nothing, the supervisor reads that as a device outage, and
+    the queue freezes. Per-track dispatch merely gapped.
+
+    This proves the address is bound and serving HERE. It cannot prove the
+    Cast device can route to it, so it is a filter for the cases we can
+    detect (wrong port, wrong interface, container-only address), not a
+    guarantee.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(base + "/api/version")
+        return r.status_code < 500
+    except Exception as exc:
+        _log.warning("Cast flow: base %s did not answer a self-probe (%s)",
+                     base, exc)
+        return False
 
 
 def _log_flow_task_exc(task: Any) -> None:
@@ -1251,15 +1298,27 @@ class ChromecastBackend(AttachGeneration):
         self._flow_resume_offset_ms = 0
         self._flow_held_capture_ms = None
         from app import state as app_state
+        from app.output import session_events
         if app_state.gapless_enabled():
-            base = _flow_base_url()
+            base = await self._reachable_flow_base()
             if base is not None:
                 await self._play_flow(metadata, base, resume_offset_ms)
+                # Cleared only AFTER the flow dispatch actually succeeded.
+                # Clearing before it would leave a stale "healthy" reading
+                # whenever _play_flow raised, which is worse than no reading.
+                session_events.note_gapless_degraded(None)
                 return
-            _log.warning(
-                "Cast gapless flow mode needs STREAM_BASE_URL or a specific "
-                "BIND_HOST to build a device-reachable flow URL — falling "
-                "back to per-track playback")
+            reason = ("No address a LAN device can reach could be determined "
+                      "for this server, so the gapless flow stream cannot be "
+                      "served. Set STREAM_BASE_URL to this server's LAN "
+                      "address. Playback has degraded to per-track, which gaps "
+                      "audibly between tracks.")
+            _log.warning("Cast gapless flow mode unavailable: %s", reason)
+            session_events.note_gapless_degraded(reason, self)
+            # Tell an open admin page now rather than on its next incidental
+            # poll — a degrade the operator learns about minutes later is the
+            # log line this notice was meant to replace.
+            session_events._schedule_emit()
         # Per-track dispatch while a flow session lingers (toggle just went
         # off, or the flow degraded): the stitcher must not keep emitting
         # boundaries against a replaced media session. No-op in plain
@@ -1421,8 +1480,16 @@ class ChromecastBackend(AttachGeneration):
         self._pos_snapshot_at = 0.0
         try:
             mc = self._cast.media_controller
-            _log.info("Cast flow LOAD: url=%s content_type=%s stream_type=%s",
-                      stream_url, content_type, FLOW_STREAM_TYPE)
+            # The flow URL carries the session id, which IS the route's
+            # capability credential (app/api/stream.py serves it with no
+            # is_authorized_stream_key check). Log the base and a short handle
+            # instead of the whole URL — previously this printed the full
+            # credential at INFO on every dispatch, and the auto-detect fix
+            # makes flow mode engage on far more installs than before.
+            _log.info("Cast flow LOAD: base=%s session=%s… content_type=%s "
+                      "stream_type=%s", stream_url.rsplit("/", 1)[0],
+                      stream_url.rsplit("/", 1)[-1][:4], content_type,
+                      FLOW_STREAM_TYPE)
             if self._listener is None:
                 self._listener = _AdvanceListener(self)
                 mc.register_status_listener(self._listener)
@@ -1442,6 +1509,27 @@ class ChromecastBackend(AttachGeneration):
             raise RuntimeError(f"Cast flow play failed: {exc}") from exc
 
     # ── radio endless mode (radio plan U4) ────────────────────────────────────
+
+    async def _reachable_flow_base(self) -> str | None:
+        """The flow base to LOAD, or None to degrade to per-track.
+
+        An explicit STREAM_BASE_URL is taken on trust — the admin may have
+        given a name only the device resolves, which we could not verify even
+        in principle. A DERIVED base (BIND_HOST or auto-detected LAN IP) is
+        verified once before the queue is committed to it.
+        """
+        from app import state as app_state
+        base = _flow_base_url()
+        if base is None:
+            return None
+        from app.config import settings
+        if settings.stream_base_url:
+            return base
+        cached = _flow_base_reachable.get(base)
+        if cached is None:
+            cached = await _probe_base(base)
+            _flow_base_reachable[base] = cached
+        return base if cached else None
 
     async def _play_radio(self, stream_url: str, metadata: Track) -> None:
         """RADIO dispatch — endless stream, no queue, no boundaries (U4).

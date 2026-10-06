@@ -85,8 +85,14 @@ async def radio_proxy_url(final_url: str) -> tuple[str, str] | None:
       else a specific BIND_HOST);
     - returns ``(device_url, content_type)`` where ``content_type`` is the transcode
       OUTPUT type (authoritative), or **None** when no device-reachable base is
-      configured — the caller then degrades to the direct ``final_url`` (mirrors the
-      Cast flow ``_flow_base_url() is None`` fallback).
+      configured — the caller then degrades to the direct ``final_url``.
+
+    NOTE (2026-10-05): this deliberately does NOT mirror the Cast flow base any
+    more. ``_flow_base_url()`` gained an auto-detected-LAN-IP leg plus a
+    reachability probe, because a flow stream has no fallback and an
+    unreachable base freezes the queue. Radio keeps the conservative
+    configured-base-only rule precisely because it DOES have a fallback: the
+    station's direct URL. The two paths now resolve differently on purpose.
     """
     from app import state
     from app.radio import stream as radio_stream

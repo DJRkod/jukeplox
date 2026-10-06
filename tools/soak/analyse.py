@@ -211,3 +211,36 @@ if rss_grew:
     print("    POST /admin/diagnostics/memory/snapshot   {\"label\": \"after\"}")
     print("    GET  /admin/diagnostics/memory/diff?before=base&after=after")
     print("  Then POST /admin/diagnostics/memory/stop - tracing is not free.")
+
+
+# ── instrument health + corrected trend reading (2026-09-23) ─────────────────
+# A soak that finds nothing has two possible meanings -- nothing broke, or
+# nobody was looking. These checks exist so the report can tell them apart.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import verdict as _v  # noqa: E402
+
+_flat = _v.flatten_container(polls)
+
+print()
+print("=" * 66)
+print("INSTRUMENT HEALTH")
+print("=" * 66)
+_sampler = _v.sampler_health(_flat)
+_harness = _v.harness_health(party)
+print(f"  container sampler : {_sampler or 'ok'}")
+print(f"  guest harness     : {_harness or 'ok'}")
+if _sampler or _harness:
+    print()
+    print("  A run with a broken instrument has NOT been shown to be clean.")
+    print("  Treat every 'no incidents' below as unproven until this is fixed.")
+
+print()
+print("=" * 66)
+print("TREND NOTES")
+print("=" * 66)
+print("  " + _v.memory_note(_v.trend(_flat, "rss_kb")))
+print()
+_backend = _os.environ.get("JP_BACKEND")
+print("  " + _v.subprocess_note(_v.trend(_flat, "media_procs"), backend=_backend))
