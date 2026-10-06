@@ -3161,3 +3161,182 @@ async def test_the_outgoing_backend_loses_authority_when_the_switch_is_requested
     session.notify_outage("poll_errors", backend=old)
     assert outages == ["poll_errors"], (
         "authority was not restored after the switch resolved")
+
+
+# ── U4 (2026-09-01): the attach primitives, driven without an outage ─────────
+#
+# _AttachTarget exists so an idle caller can reuse the epoch revalidation,
+# _attach_serial serialisation, address seeding and register_resolved
+# write-back WITHOUT entering the outage state machine — which would set the
+# queue hold and gate guest enqueue for a device that is merely asleep.
+#
+# It is shape-compatible with _Outage on purpose. These tests pin that: the
+# same primitive, driven by either context, must behave identically. That is
+# what makes the extraction provably behaviour-preserving rather than
+# hopefully so.
+
+
+async def test_attach_target_and_outage_drive_the_primitive_identically(
+        monkeypatch):
+    """Characterization. Same backend, same device, same seam — one call driven
+    by an _Outage and one by an _AttachTarget must be indistinguishable."""
+    from app.output import session
+    sup, timers, rec = make_supervisor()
+    monkeypatch.setattr(session, "_supervisor", sup)
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    seen = []
+
+    def _backend():
+        b = MagicMock()
+        b.set_device = AsyncMock(side_effect=lambda d: seen.append(d))
+        return b
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        via_outage = await sup._seed_and_set_device(
+            _attach_outage(_backend(), "dev-x"), sup.attach_epoch)
+        via_target = await sup._seed_and_set_device(
+            session._AttachTarget(_backend(), "dlna", "dev-x"),
+            sup.attach_epoch)
+
+    assert via_outage is via_target is True
+    assert seen == ["dev-x", "dev-x"]
+
+
+async def test_attach_target_seeds_the_persisted_address_like_an_outage(
+        monkeypatch):
+    """The seeding half of the same equivalence: an idle attach gets the
+    output_addr:{device_id} seed, which is what lets it reconnect without
+    waiting on discovery."""
+    from app.output import session
+    sup, timers, rec = make_supervisor()
+    monkeypatch.setattr(session, "_supervisor", sup)
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    seeded = []
+    monkeypatch.setattr(
+        session, "_seed_backend_cache",
+        lambda b, bt, did, addr: seeded.append((bt, did, addr)))
+
+    backend = MagicMock()
+    backend.set_device = AsyncMock()
+    with patch("app.database.get_setting",
+               AsyncMock(return_value='{"host": "192.0.2.7", "port": 8009}')):
+        ok = await sup._seed_and_set_device(
+            session._AttachTarget(backend, "dlna", "dev-y"), sup.attach_epoch)
+
+    assert ok is True
+    assert seeded == [("dlna", "dev-y", {"host": "192.0.2.7", "port": 8009})]
+
+
+async def test_idle_attach_aborts_when_a_manual_switch_bumped_the_epoch(
+        monkeypatch):
+    """The reason the idle caller must go through this seam at all. An idle
+    attach that queued behind a manual Apply has to abort WITHOUT calling
+    set_device — its executor connect could otherwise finish last and commit
+    the sleeping device's internals over the newly-applied one's.
+
+    Verified to FAIL when attach_without_outage captures the epoch AFTER the
+    attach instead of before."""
+    from app.output import session
+    sup, timers, rec = make_supervisor()
+    monkeypatch.setattr(session, "_supervisor", sup)
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    backend = MagicMock()
+    backend.set_device = AsyncMock()
+    stale = sup.attach_epoch
+    sup.on_manual_switch()              # the admin applied something else
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        ok = await sup._seed_and_set_device(
+            session._AttachTarget(backend, "dlna", "dev-z"), stale)
+
+    assert ok is False
+    backend.set_device.assert_not_awaited()
+
+
+async def test_attach_without_outage_never_sets_the_queue_hold(monkeypatch):
+    """The whole point of not reusing begin_outage. A sleeping device between
+    parties must not gate guest enqueue or suppress auto-start — the host has
+    not lost playback, they have not started it yet."""
+    from app.output import session
+    sup, timers, rec = make_supervisor()
+    monkeypatch.setattr(session, "_supervisor", sup)
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+    monkeypatch.setattr(hold, "_output_hold", False)
+
+    backend = MagicMock()
+    backend.set_device = AsyncMock()
+    backend._resolved_host = None
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        ok = await session.attach_without_outage(backend, "dlna", "dev-q")
+
+    assert ok is True
+    assert session.output_hold_active() is False
+
+
+async def test_attach_without_outage_absorbs_attach_superseded(monkeypatch):
+    """A newer attach winning the backend is a correct outcome for an
+    unattended caller, not an error to report. It comes back as False so the
+    coordinator retries, and nothing propagates."""
+    from app.output import session
+    from app.output import base
+    sup, timers, rec = make_supervisor()
+    monkeypatch.setattr(session, "_supervisor", sup)
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    backend = MagicMock()
+    backend.set_device = AsyncMock(
+        side_effect=base.AttachSuperseded("a newer attach owns the backend"))
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        ok = await session.attach_without_outage(backend, "dlna", "dev-r")
+
+    assert ok is False
+
+
+async def test_attach_without_outage_writes_the_address_back(monkeypatch):
+    """Registry/cache convergence on success: a resolved address goes back
+    through register_resolved so the watcher registry and backend caches
+    agree — the same guarantee the outage path gives."""
+    from app.output import session
+    sup, timers, rec = make_supervisor()
+    monkeypatch.setattr(session, "_supervisor", sup)
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    registered = []
+    backend = MagicMock()
+    backend.set_device = AsyncMock()
+    backend._resolved_host = "192.0.2.55"
+    backend._resolved_port = 8009
+    backend._resolved_name = "Kitchen"
+    backend.register_resolved = lambda n, h, p, u, t: registered.append(
+        (n, h, p, u))
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        ok = await session.attach_without_outage(backend, "dlna", "dev-s")
+
+    assert ok is True
+    assert registered == [("Kitchen", "192.0.2.55", 8009, None)]
+
+
+async def test_attach_without_outage_skips_write_back_on_failure(monkeypatch):
+    """A failed attach must not write an address back — that would teach the
+    registry a location for a device we never reached."""
+    from app.output import session
+    sup, timers, rec = make_supervisor()
+    monkeypatch.setattr(session, "_supervisor", sup)
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    registered = []
+    backend = MagicMock()
+    backend.set_device = AsyncMock(side_effect=RuntimeError("unreachable"))
+    backend._resolved_host = "192.0.2.55"
+    backend._resolved_port = 8009
+    backend.register_resolved = lambda *a: registered.append(a)
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        ok = await session.attach_without_outage(backend, "dlna", "dev-t")
+
+    assert ok is False
+    assert registered == []

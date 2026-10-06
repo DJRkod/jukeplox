@@ -121,6 +121,17 @@ def clear_output_hold() -> None:
     except Exception:
         _log.warning("Output session: outage retirement failed", exc_info=True)
     _log.info("Output session: outage hold cleared")
+    # R10, "the supervisor resolves or the hold clears" edge (2026-09-01 plan
+    # U5). Ownership returns to the idle coordinator ONLY IF the device is
+    # still detached — which is not decided here. This just re-derives; the
+    # predicate answers it, so a hold that cleared because the device attached
+    # and started playing correctly leaves the coordinator standing down.
+    try:
+        from app.output import idle_reattach
+        idle_reattach.reconcile()
+    except Exception:
+        _log.debug("idle re-attach reconcile after hold clear failed",
+                   exc_info=True)
     # U4 (R20): every hold exit is observable — resume orchestration (auto or
     # manual), confirmed start on a manual skip/switch, queue-cleared landing.
     # Scheduled (sync context): the emitted payload reads the SETTLED state

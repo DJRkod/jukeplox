@@ -144,6 +144,7 @@ class DeviceWatcher:
         purge_s: float = PURGE_S,
         active_purge_s: float = ACTIVE_PURGE_S,
         active_key_for: Callable[[], tuple[str, str] | None] | None = None,
+        selected_key_for: Callable[[], tuple[str, str] | None] | None = None,
         rand: Callable[[float, float], float] = random.uniform,
         ssdp_listen: Callable[..., Awaitable[Any]] | None = None,
         dbus_available: Callable[[], Awaitable[bool]] | None = None,
@@ -166,6 +167,7 @@ class DeviceWatcher:
         self._purge_s = purge_s
         self._active_purge_s = active_purge_s
         self._active_key_for = active_key_for or self._default_active_key
+        self._selected_key_for = selected_key_for or self._default_selected_key
         self._rand = rand
         self._ssdp_listen_fn = ssdp_listen or self._default_ssdp_listen
         self._dbus_available_fn = dbus_available or self._default_dbus_available
@@ -435,6 +437,8 @@ class DeviceWatcher:
                 entry = self.registry[key]
                 if entry.online:
                     continue  # live view trumps a missed one-shot window
+                if self._is_selected_key(key):
+                    continue  # R8: the admin's choice survives a Scan too
                 self._cancel_grace(key)
                 self._cancel_purge(key)  # U4: evicting now — retire its timer
                 del self.registry[key]
@@ -574,15 +578,40 @@ class DeviceWatcher:
         entry.offline_since = self._wall_clock()  # wall time: rendered in UI
         self._schedule_broadcast()
         self._arm_purge(key)
+        # The offline transition is a reconcile trigger for idle re-attach
+        # (2026-09-01 plan U5). Without it the coordinator's predicate becomes
+        # true — the selection is now away — with nothing to notice, and the
+        # feature never starts watching the very device it exists for.
+        #
+        # NOT the same thing as the abandoned attempt's edge-arming. That
+        # STORED "armed" here and then had to remember five places to clear
+        # it. This stores nothing: it asks the coordinator to re-derive, and a
+        # missed call costs one delayed reconciliation rather than a stranded
+        # watcher. Fail-soft — a device going offline must not break the
+        # registry state machine.
+        try:
+            from app.output import idle_reattach
+            idle_reattach.reconcile()
+        except Exception:
+            _log.debug("device watcher: idle re-attach reconcile on offline "
+                       "edge failed", exc_info=True)
 
     def _arm_purge(self, key: tuple[str, str]) -> None:
         """Start the auto-remove timer for an entry that just went offline.
+
+        The SELECTED output is never armed at all (2026-09-01 idle re-attach
+        plan U2, origin R8): the admin chose it, so it stays in the picker
+        however long it sleeps. Deliberately no timer rather than a very long
+        one — an overnight sleep already exceeds every TTL this class has, and
+        a "long enough" value is still a value that expires.
 
         The active output gets the longer ACTIVE_PURGE_S so a brief drop of
         the device you're playing to is not evicted mid-use before its window
         (AE4); idle entries get PURGE_S. One timer per key — a re-arm is a
         no-op so consecutive offline transitions can't stack timers."""
         if key in self._purge_timers:
+            return
+        if self._is_selected_key(key):
             return
         ttl = self._active_purge_s if self._is_active_key(key) else self._purge_s
         self._purge_timers[key] = self._timer(
@@ -610,6 +639,44 @@ class DeviceWatcher:
         except Exception:
             _log.warning("device watcher: active_key_for failed", exc_info=True)
             return False
+
+    def _is_selected_key(self, key: tuple[str, str]) -> bool:
+        """True when *key* is the output the admin SELECTED — which is not the
+        same question as ``_is_active_key``, and the difference is the whole
+        point: the device this exemption protects is selected and *not*
+        attached, because it is asleep.
+
+        Fail-soft in the direction of the pre-existing behaviour: a broken
+        lookup means no exemption, so the entry follows the normal TTL rather
+        than becoming immortal."""
+        try:
+            return self._selected_key_for() == key
+        except Exception:
+            _log.warning("device watcher: selected_key_for failed",
+                         exc_info=True)
+            return False
+
+    def refresh_purge_exemption(self) -> None:
+        """Re-derive every offline entry's purge arming against the CURRENT
+        selection. Idempotent; safe to call from anywhere.
+
+        Called when the selection changes, which is the one event that can
+        make a previously-exempt entry evictable (and vice versa). Two halves:
+
+        - the newly-selected key loses any pending timer, so selecting a
+          sleeping device rescues it from an eviction already counting down;
+        - a no-longer-selected offline key gets a timer armed FROM NOW.
+
+        That second half answers a question the origin document left open
+        (plan KTD6): the deselected device gets a fresh full window rather
+        than one back-dated to when it went offline. Back-dating would evict
+        it the instant the admin switched away — which is precisely the moment
+        they are most likely to switch back."""
+        for key, entry in list(self.registry.items()):
+            if self._is_selected_key(key):
+                self._cancel_purge(key)
+            elif not entry.online:
+                self._arm_purge(key)
 
     def _on_status(self, backend: str, payload: Any) -> None:
         """Source 'down'/'up' → mdns_status flip + broadcast.
@@ -743,7 +810,12 @@ class DeviceWatcher:
                 # branch on _mdns_port_unavailable and could start the
                 # in-process CastBrowser (5s wait). We only reach here in
                 # sweep mode, where D-Bus is the only path.
-                found = await backend._dbus_discover()
+                #
+                # RAISING variant (2026-09-04 plan U1): _dbus_discover's
+                # fail-soft [] is indistinguishable from an empty network, so
+                # a failed browse used to grace-flip and evict every known
+                # Cast device. Same rule the plexplayer branch below states.
+                found = await backend.sweep_devices()
             elif backend_name == "plexplayer":
                 # RAISING variant on purpose (2026-08-04-002 plan U3): a
                 # total /clients failure (every Plex server unreachable)
@@ -752,13 +824,49 @@ class DeviceWatcher:
                 # (push-discovery write-through lesson). discover_devices'
                 # fail-soft [] would grace-flip every known player instead.
                 found = await backend.sweep_devices()
+            elif backend_name == "airplay":
+                # RAISING variant for the same reason as chromecast above.
+                found = await backend.sweep_devices()
             else:
                 found = await backend.discover_devices()
         except Exception:
             _log.warning("device watcher: %s sweep discover failed",
                          backend_name, exc_info=True)
+            self._set_sweep_status(backend_name, "unavailable")
             return
+        self._set_sweep_status(backend_name, "ok")
         self._sweep_merge(backend_name, found)
+
+    def _set_sweep_status(self, backend_name: str, status: str) -> None:
+        """Report this backend's discovery health from the SWEEP path
+        (2026-09-04 plan U2).
+
+        Until now ``_mdns_status`` was written only from the subscription
+        paths — ``start()`` and ``_on_status``. On a host where the sweep is
+        the ONLY discovery mechanism (a host avahi owns 5353, so nothing
+        subscribes) the map therefore reported "ok" for as long as the process
+        lived, no matter how comprehensively discovery was failing. An admin
+        watched an empty picker for 11 hours with a healthy banner.
+
+        This also repairs the forced Scan without touching it. Scan already
+        refuses to reconcile the mDNS backends when this map is not "ok"
+        ("an empty one-shot is not evidence") — the guard was simply never
+        given a degraded value to act on.
+
+        No conflict with the subscription writers: the mDNS backends are swept
+        only while ``_mdns_sweep_active``, which is precisely when no
+        subscription exists. DLNA always sweeps and has no subscription
+        writer. ``plexplayer`` is deliberately absent from the map (its
+        liveness rides authenticated PMS polling, not mDNS) and stays absent —
+        the frontend treats a missing key as fine and an "unavailable" value
+        as degraded.
+        """
+        if backend_name not in self._mdns_status:
+            return
+        if self._mdns_status[backend_name] == status:
+            return
+        self._mdns_status[backend_name] = status
+        self._schedule_broadcast()
 
     def _sweep_merge(self, backend_name: str, found: list[OutputDevice]) -> None:
         """Merge one backend's discover results into the registry via the
@@ -1068,6 +1176,28 @@ class DeviceWatcher:
         if name is None or not device_id:
             return None
         return (name, device_id)
+
+    def _default_selected_key(self) -> tuple[str, str] | None:
+        """The output the admin SELECTED as a ``(backend, device_id)`` key, or
+        None when nothing meaningful is selected.
+
+        Reads ``state.selected_output_key()`` — the persisted-selection
+        mirror — and NOT the router, for the reason spelled out at that
+        mirror's definition: the device the purge exemption protects is
+        selected and not attached. ``_default_active_key`` above answers the
+        other question and is not a substitute.
+
+        Direct's pseudo-device never enters the registry, so a Direct
+        selection has nothing to exempt and returns None rather than a key
+        that can never match."""
+        from app import state
+        try:
+            backend_type, device_id = state.selected_output_key()
+        except Exception:
+            return None
+        if not device_id or backend_type == "direct":
+            return None
+        return (backend_type, device_id)
 
     def _default_backend_for(self, backend: str):
         from app import state

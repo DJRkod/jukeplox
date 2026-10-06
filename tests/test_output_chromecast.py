@@ -4070,3 +4070,59 @@ async def test_a_failed_attach_still_freed_the_outgoing_cast(cast_mock):
     prior.socket_client.disconnect.assert_called_once_with()
     assert backend._cast is None, (
         "a failed attach must not leave the outgoing cast adopted")
+
+
+# ── U1: the sweep variant's failure contract ────────────────────────────────
+#
+# mdns_dbus.discover already distinguishes a FAILED browse (None) from a
+# successful empty one ([]). The information existed and was thrown away one
+# layer up, which is what let a timed-out browse evict every known device.
+
+
+async def test_sweep_devices_raises_when_the_browse_fails(dlna_mock=None):
+    """Verified to FAIL when the None check returns [] instead of raising."""
+    from unittest.mock import AsyncMock, patch
+    from app.output.base import DiscoveryUnavailable
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+    with patch("app.output.mdns_dbus.discover", AsyncMock(return_value=None)):
+        with pytest.raises(DiscoveryUnavailable):
+            await backend.sweep_devices()
+
+
+async def test_sweep_devices_returns_empty_on_a_genuine_empty_result():
+    """The distinction that makes the raise meaningful: an empty network is
+    NOT a failure, and must still allow eviction downstream."""
+    from unittest.mock import AsyncMock, patch
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+    with patch("app.output.mdns_dbus.discover", AsyncMock(return_value=[])):
+        assert await backend.sweep_devices() == []
+
+
+async def test_dbus_discover_stays_fail_soft_for_its_other_callers():
+    """The forced Scan's one-shot, the legacy pull flow and startup reconnect
+    all call this and expect [] on failure. Changing that would have been a
+    five-caller behaviour change; the sweep got its own contract instead."""
+    from unittest.mock import AsyncMock, patch
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+    with patch("app.output.mdns_dbus.discover", AsyncMock(return_value=None)):
+        assert await backend._dbus_discover() == []
+
+
+async def test_one_browse_per_sweep_call():
+    """The obvious implementation — sweep_devices probing for failure and then
+    delegating to _dbus_discover — costs TWO browses of up to 15s each per
+    sweep. Pins that it is one."""
+    from unittest.mock import AsyncMock, patch
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+    browse = AsyncMock(return_value=[])
+    with patch("app.output.mdns_dbus.discover", browse):
+        await backend.sweep_devices()
+    assert browse.await_count == 1

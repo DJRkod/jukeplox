@@ -39,6 +39,26 @@ class DeviceNotReadyError(RuntimeError):
     """
 
 
+class DiscoveryUnavailable(RuntimeError):
+    """The discovery substrate failed, so this pass produced NO SCAN DATA.
+
+    Distinct from a successful scan that found nothing, and the distinction is
+    load-bearing: the watcher's sweep treats an empty result as authoritative
+    evidence of absence, so it grace-flips and then evicts every known device
+    of that backend. Raising instead means "we learned nothing this cycle" and
+    the registry is left exactly as it was (2026-09-04 plan U1).
+
+    That difference is not hypothetical. An admin's picker emptied itself over
+    11 hours because a timed-out avahi browse returned ``[]`` and every sweep
+    read it as an empty network — while the discovery banner still reported
+    healthy, because nothing on the sweep path ever degrades that signal.
+
+    The rule this restores is already stated in
+    ``PlexPlayerBackend.sweep_devices``: no scan data is never an
+    eviction or grace source. Only the mDNS backends lacked a way to say it.
+    """
+
+
 class DeviceLostError(DeviceNotReadyError):
     """Device-level playback failure (2026-07-11 supervisor plan U2, R15).
 

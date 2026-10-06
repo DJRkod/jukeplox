@@ -355,6 +355,7 @@ async def build_devices_snapshot(
     *,
     availability: AvailabilityMap | None = None,
     backend_for: Callable[[str], Any] | None = None,
+    host_overrides: dict[tuple[str, str], str] | None = None,
 ) -> tuple[list[dict], list[AggregatedDevice]]:
     """Aggregate + serialize the GET /admin/output/devices ``devices``
     payload (the loop lifted from admin.py per KTD11).
@@ -394,9 +395,15 @@ async def build_devices_snapshot(
                      "entries read the static capability", exc_info=True)
         device_gapless = {}
 
+    # host_overrides supplies an address for a device NO backend cache knows
+    # (2026-09-04 plan U4). host_for returns None for those and the aggregator
+    # drops them for want of a bucket key — which would silently discard the
+    # cold-start listing of a selection that has never been discovered, the
+    # exact case that listing exists for.
+    _overrides = host_overrides or {}
     aggregated = aggregate_devices(
         per_backend,
-        lambda d, b: host_for(d, b, backend_for),
+        lambda d, b: _overrides.get((b, d.id)) or host_for(d, b, backend_for),
         verdicts,
         availability=availability,
     )
@@ -463,5 +470,100 @@ async def build_registry_snapshot(
             _log.warning("Registry snapshot: Direct discover failed",
                          exc_info=True)
 
-    return await build_devices_snapshot(
-        per_backend, availability=availability, backend_for=backend_for)
+    overrides = await _append_selection_placeholder(
+        registry, per_backend, availability, backend_for)
+
+    payload, aggregated = await build_devices_snapshot(
+        per_backend, availability=availability, backend_for=backend_for,
+        host_overrides=overrides)
+
+    # Keep the placeholder OUT of the probe queue. schedule_probes probes any
+    # entry with no cached verdict, every backend returns False for a
+    # device_id it has never discovered, and that verdict is persisted — after
+    # which the admin UI filters the row out ("No working protocols found")
+    # and the poisoned (host, backend) verdict also hides the REAL entry when
+    # the speaker comes back. Probing a device we are only remembering is
+    # meaningless, and here it was worse than meaningless.
+    if overrides:
+        placeholder_hosts = set(overrides.values())
+        aggregated = [a for a in aggregated
+                      if a.host not in placeholder_hosts]
+    return payload, aggregated
+
+
+async def _append_selection_placeholder(
+    registry: dict,
+    per_backend: dict[str, list[OutputDevice]],
+    availability: AvailabilityMap,
+    backend_for: Callable[[str], Any] | None = None,
+) -> dict[tuple[str, str], str]:
+    """Render the admin's persisted selection even when nothing has
+    discovered it this run (2026-09-04 plan U4).
+
+    The registry is rebuilt from live discovery on every start, so a speaker
+    switched off at boot is not in it — and the purge exemption cannot help,
+    because it protects an entry that exists rather than creating one. The
+    admin's chosen device was therefore simply absent from the picker with no
+    sign it had ever been configured.
+
+    PRESENTATIONAL ONLY, and that is load-bearing. Nothing is written to the
+    registry: a registry entry is treated throughout as evidence the device
+    exists — the identity gate reads ``entry.device`` — so a synthetic entry
+    would let a device that has never been seen confirm its own identity and
+    be attached. That is the defect the retry fix exists to close; recreating
+    it here to save a few lines would be a poor trade.
+
+    Follows the Direct pseudo-device immediately above: a device in the
+    payload that is not a registry entry is an established shape in this
+    function, and both reach the live-updating admin page and the HTTP
+    response through the one render path this builder is.
+
+    Returns the host override the aggregator needs, since no backend cache
+    knows a device that was never discovered.
+    """
+    from app import state
+    try:
+        backend_type, device_id = state.selected_output_key()
+        name = state.selected_output_name()
+    except Exception:
+        return {}
+    # Direct's pseudo-device is appended unconditionally above, so a Direct
+    # selection needs nothing here.
+    if not device_id or backend_type == "direct":
+        return {}
+    if (backend_type, device_id) in registry:
+        return {}       # the real entry wins; never render both
+
+    try:
+        from app import database
+        host = await database.get_setting("output_host")
+    except Exception:
+        host = None
+    if not host:
+        # Without an address the aggregator has no key to bucket on, and a
+        # junk key would be worse than the omission.
+        return {}
+
+    # output_host is pinned at Apply time and never re-validated, so the
+    # address may since have been taken by a different device. Aggregation
+    # merges purely on host, so emitting anyway would fold the selection's
+    # device_id into the OTHER device's row: the admin taps a row labelled
+    # with the neighbour's name and Apply attaches the selected device.
+    # A real entry at that address always wins.
+    for (r_backend, r_device), r_entry in registry.items():
+        if (r_backend, r_device) == (backend_type, device_id):
+            continue
+        if host_for(r_entry.device, r_backend, backend_for) == host:
+            return {}
+
+    per_backend.setdefault(backend_type, []).append(OutputDevice(
+        id=device_id,
+        # The remembered name, else a neutral label. Never the raw id: a
+        # selection persisted before device names were stored has no name
+        # until the next Apply, and a uuid in the picker is worse than a
+        # generic word.
+        name=name or "Selected output",
+        backend_type=backend_type,
+    ))
+    availability[(backend_type, device_id)] = (False, None)
+    return {(backend_type, device_id): host}

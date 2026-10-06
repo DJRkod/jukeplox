@@ -5039,3 +5039,123 @@ async def test_a_mid_playback_device_change_stays_deferred_even_if_the_attach_cl
             "a mid-playback device change took the immediate branch because "
             "the attach itself had cleared is_playing — the boundary stop, "
             "the stale-key clear and the arm revocation are all skipped")
+
+
+# ── U1: the full persisted-selection mirror (2026-09-01 idle re-attach) ───────
+#
+# The backend-type third of this mirror predates these tests; U1 adds the
+# device id and the display name, which the watcher's purge exemption and the
+# re-attach ownership predicate read SYNCHRONOUSLY. Every test here asserts on
+# the mirror accessors rather than the module globals, so a future rename of
+# the storage cannot quietly pass.
+
+
+def _mirror(st):
+    return (st.selected_output_key(), st.selected_output_name())
+
+
+async def test_selection_mirror_updates_id_and_name_together(monkeypatch):
+    """Happy path: an Apply moves all three thirds of the mirror at once, and
+    persists the name alongside the id."""
+    from app import state as st
+
+    settings: dict[str, str] = {}
+
+    async def fake_set(key, value):
+        settings[key] = value
+
+    monkeypatch.setattr(st, "_selected_output_backend", "direct")
+    monkeypatch.setattr(st, "_selected_output_device", "default")
+    monkeypatch.setattr(st, "_selected_output_device_name", "")
+    monkeypatch.setattr(st, "_resolve_device_name",
+                        lambda b, d: "Kitchen Speaker")
+
+    with patch("app.state._get_backend", return_value=None), \
+         patch("app.database.set_setting", side_effect=fake_set):
+        await st.activate_backend("chromecast", "uuid-77")
+
+    assert _mirror(st) == (("chromecast", "uuid-77"), "Kitchen Speaker")
+    assert settings["output_device_id"] == "uuid-77"
+    assert settings["output_device_name"] == "Kitchen Speaker"
+
+
+async def test_selection_mirror_stores_empty_name_when_unresolvable(monkeypatch):
+    """A backend that supplies no label stores "" and does NOT raise. Empty is
+    a real state (the identity predicate reads it as unverifiable), not an
+    error and not a wildcard."""
+    from app import state as st
+
+    settings: dict[str, str] = {}
+
+    async def fake_set(key, value):
+        settings[key] = value
+
+    monkeypatch.setattr(st, "_resolve_device_name", lambda b, d: "")
+
+    with patch("app.state._get_backend", return_value=None), \
+         patch("app.database.set_setting", side_effect=fake_set):
+        await st.activate_backend("dlna", "uuid:abc")
+
+    assert st.selected_output_name() == ""
+    assert settings["output_device_name"] == ""
+
+
+async def test_failed_apply_leaves_the_whole_mirror_untouched(monkeypatch):
+    """AE7, mirror half. activate_backend raises BEFORE it writes any third of
+    the mirror, so a failed Apply of device B leaves the selection reading
+    device A. This is what lets the re-attach coordinator keep watching A
+    without a single line of rollback code — the predicate simply never saw B.
+
+    Verified to FAIL when the mirror assignments are moved above the raise."""
+    from app import state as st
+
+    monkeypatch.setattr(st, "_selected_output_backend", "airplay")
+    monkeypatch.setattr(st, "_selected_output_device", "10.0.0.5:7000")
+    monkeypatch.setattr(st, "_selected_output_device_name", "Patio")
+
+    def _boom(backend_type):
+        raise RuntimeError("device B is unreachable")
+
+    with patch("app.state._get_backend", side_effect=_boom), \
+         patch("app.database.set_setting", AsyncMock()):
+        with pytest.raises(RuntimeError):
+            await st.activate_backend("chromecast", "uuid-B")
+
+    assert _mirror(st) == (("airplay", "10.0.0.5:7000"), "Patio")
+
+
+async def test_resolve_device_name_reads_the_watcher_registry(monkeypatch):
+    """The name comes from the registry the picker itself was built from, so
+    the stored label is exactly what the admin saw when they chose."""
+    from app import state as st
+    from app.output import watcher as watcher_mod
+    from app.output.base import OutputDevice
+
+    entry = MagicMock()
+    entry.device = OutputDevice(id="uuid-1", name="Living Room",
+                                backend_type="chromecast")
+    fake = MagicMock()
+    fake.registry = {("chromecast", "uuid-1"): entry}
+    monkeypatch.setattr(watcher_mod, "get_watcher", lambda: fake)
+
+    assert st._resolve_device_name("chromecast", "uuid-1") == "Living Room"
+
+
+async def test_resolve_device_name_is_fail_soft(monkeypatch):
+    """Three ways it can come up empty — no watcher, device absent, and a
+    raising watcher — none of which may break an Apply."""
+    from app import state as st
+    from app.output import watcher as watcher_mod
+
+    monkeypatch.setattr(watcher_mod, "get_watcher", lambda: None)
+    assert st._resolve_device_name("chromecast", "uuid-1") == ""
+
+    empty = MagicMock()
+    empty.registry = {}
+    monkeypatch.setattr(watcher_mod, "get_watcher", lambda: empty)
+    assert st._resolve_device_name("chromecast", "uuid-1") == ""
+
+    def _raise():
+        raise RuntimeError("watcher exploded")
+    monkeypatch.setattr(watcher_mod, "get_watcher", _raise)
+    assert st._resolve_device_name("chromecast", "uuid-1") == ""

@@ -2878,3 +2878,49 @@ async def test_probe_liveness_no_cached_address_is_unreachable(
     backend = airplay_module.AirPlayBackend()
     backend._device_id = None
     assert await backend.probe_liveness() == (False, None)
+
+
+# ── U1: AirPlay's sweep variant, and why "both transports" matters ──────────
+
+
+async def test_airplay_sweep_raises_only_when_every_transport_failed():
+    """In-process zeroconf is tried first and D-Bus second. A working
+    zeroconf path is not a failure even when D-Bus is dead — which is why
+    per-backend status is sufficient and no partial-availability state is
+    needed.
+
+    Verified to FAIL when the raise is hoisted above the zeroconf attempt."""
+    from unittest.mock import AsyncMock, patch
+    from app.output.base import DiscoveryUnavailable
+    from app.output.airplay import AirPlayBackend
+
+    backend = AirPlayBackend()
+    with patch("app.output.airplay._binaries_available", lambda: True),          patch("app.output.mdns_zeroconf.discover", AsyncMock(return_value=None)),          patch("app.output.mdns_dbus.discover", AsyncMock(return_value=None)):
+        with pytest.raises(DiscoveryUnavailable):
+            await backend.sweep_devices()
+
+    # zeroconf works, D-Bus is irrelevant -> not a failure
+    with patch("app.output.airplay._binaries_available", lambda: True),          patch("app.output.mdns_zeroconf.discover", AsyncMock(return_value=[])),          patch("app.output.mdns_dbus.discover", AsyncMock(return_value=None)):
+        assert await backend.sweep_devices() == []
+
+
+async def test_airplay_discover_devices_stays_fail_soft():
+    from unittest.mock import AsyncMock, patch
+    from app.output.airplay import AirPlayBackend
+
+    backend = AirPlayBackend()
+    with patch("app.output.airplay._binaries_available", lambda: True),          patch("app.output.mdns_zeroconf.discover", AsyncMock(return_value=None)),          patch("app.output.mdns_dbus.discover", AsyncMock(return_value=None)):
+        assert await backend.discover_devices() == []
+
+
+async def test_missing_binaries_is_not_a_discovery_outage():
+    """A host without cliap2 has no AirPlay backend, not a broken one. Raising
+    here would light a permanent outage banner for people who never use
+    AirPlay, so both paths keep returning []."""
+    from unittest.mock import patch
+    from app.output.airplay import AirPlayBackend
+
+    backend = AirPlayBackend()
+    with patch("app.output.airplay._binaries_available", lambda: False):
+        assert await backend.sweep_devices() == []
+        assert await backend.discover_devices() == []

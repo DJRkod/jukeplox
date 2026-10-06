@@ -14,7 +14,7 @@ import logging
 import random
 
 from app.output.airplay import AirPlayBackend
-from app.output.base import OutputDevice
+from app.output.base import DiscoveryUnavailable, OutputDevice
 from app.output.chromecast import ChromecastBackend
 from app.output.watcher import (
     ACTIVE_PURGE_S,
@@ -237,7 +237,7 @@ class Harness:
 
     def __init__(self, supported=True, snapshot=None, probe=None,
                  rand=None, ssdp_fail=False, active_key_for=None,
-                 dbus_available=False):
+                 selected_key_for=None, dbus_available=False):
         self.timers = FakeTimers()
         self.mdns = FakeMdns(supported)
         self._dbus_available = dbus_available
@@ -281,6 +281,10 @@ class Harness:
             # U4 auto-remove: default to "no active device" so purge tests use
             # the idle PURGE_S window; tests asserting AE4 inject their own.
             active_key_for=active_key_for or (lambda: None),
+            # 2026-09-01 plan U2: default to "nothing selected" so the
+            # pre-existing purge tests keep exercising the normal TTL path;
+            # the R8 exemption tests inject their own.
+            selected_key_for=selected_key_for or (lambda: None),
             dbus_available=_dbus_avail,
         )
 
@@ -1215,15 +1219,15 @@ async def test_mdns_sweep_discovers_cast_and_airplay_in_sweep_mode(monkeypatch):
     monkeypatch.setattr(st, "shared_aiozc", None)  # 5353 bind failed
     h = Harness(dbus_available=True)
     # Startup immediate sweep must be inert — empty discovers before scripting.
-    h.airplay_backend.discover_devices = _areturn([])
-    h.cast_backend._dbus_discover = _areturn([])
+    h.airplay_backend.sweep_devices = _areturn([])
+    h.cast_backend.sweep_devices = _areturn([])
     await h.start()
     assert h.watcher._mdns_sweep_active is True
 
     # Script the avahi/D-Bus one-shots + seed the address caches the watcher
     # derives probe hosts from (what the real discovers populate).
-    h.airplay_backend.discover_devices = _areturn([_air_dev()])
-    h.cast_backend._dbus_discover = _areturn([_cast_dev_uuid()])
+    h.airplay_backend.sweep_devices = _areturn([_air_dev()])
+    h.cast_backend.sweep_devices = _areturn([_cast_dev_uuid()])
     h.airplay_backend._device_addr[f"{AIR_HOST}:{AIR_PORT}"] = (
         AIR_NAME, AIR_HOST, AIR_PORT, AIR_TXT)
     h.cast_backend._dbus_index[CAST_UUID] = ("JBL Charge 5", CAST_HOST, CAST_PORT)
@@ -1282,11 +1286,11 @@ async def test_mdns_sweep_miss_starts_grace_offline_retained(monkeypatch):
     import app.state as st
     monkeypatch.setattr(st, "shared_aiozc", None)
     h = Harness(dbus_available=True)
-    h.airplay_backend.discover_devices = _areturn([])
-    h.cast_backend._dbus_discover = _areturn([])
+    h.airplay_backend.sweep_devices = _areturn([])
+    h.cast_backend.sweep_devices = _areturn([])
     await h.start()
 
-    h.cast_backend._dbus_discover = _areturn([_cast_dev_uuid()])
+    h.cast_backend.sweep_devices = _areturn([_cast_dev_uuid()])
     h.cast_backend._dbus_index[CAST_UUID] = ("JBL Charge 5", CAST_HOST, CAST_PORT)
     await h.run_sweep()
     await h.fire_debounce()
@@ -1294,7 +1298,7 @@ async def test_mdns_sweep_miss_starts_grace_offline_retained(monkeypatch):
     assert h.watcher.registry[cast_key].online is True
 
     # Renderer gone: next sweep misses it → grace timer, still online.
-    h.cast_backend._dbus_discover = _areturn([])
+    h.cast_backend.sweep_devices = _areturn([])
     await h.run_sweep()
     assert h.watcher.registry[cast_key].online is True
     assert [t.delay for t in h.pending] == [GRACE_S]
@@ -1616,3 +1620,333 @@ async def test_mdns_status_carries_no_plexplayer_key():
     assert "plexplayer" not in h.watcher.mdns_status()
     h2 = await Harness(supported=False).start()
     assert "plexplayer" not in h2.watcher.mdns_status()
+
+
+# ── U2: the selected output is never purged (2026-09-01 idle re-attach) ───────
+#
+# Origin R8/AE5. The active-output exemption above (AE4) grants a LONGER
+# window; this grants no window at all, and to a different device: the one the
+# admin selected, which is by definition not attached while it sleeps.
+
+
+async def test_selected_output_is_never_armed_for_purge():
+    """AE5: the selected device goes offline and stays offline past every TTL
+    this class has — it is still in the registry, still marked offline.
+
+    Asserts on the ABSENCE of a timer as well as on survival: a very long
+    window would satisfy a survival-only assertion and still lose the device
+    on a long enough sleep, which is the actual reported bug."""
+    selected = ("chromecast", CAST_UUID)
+    h = await Harness(selected_key_for=lambda: selected).start()
+    h.emit(CAST, "new", cast_new())
+    h.emit(RAOP, "new", air_new())
+    await h.fire_debounce()
+
+    h.emit(CAST, "remove", (CAST_NAME, CAST))
+    h.emit(RAOP, "remove", (AIR_NAME, RAOP))
+    h.timers.fire(GRACE_S)
+    await h.fire_debounce()
+
+    # The unselected AirPlay entry armed; the selected Cast entry did not.
+    assert sorted(t.delay for t in h.pending) == [PURGE_S]
+    h.timers.fire(PURGE_S)
+    h.timers.fire(ACTIVE_PURGE_S)
+    assert selected in h.watcher.registry
+    assert h.watcher.registry[selected].online is False
+    assert ("airplay", f"{AIR_HOST}:{AIR_PORT}") not in h.watcher.registry
+
+
+async def test_unselected_device_still_evicts_on_the_normal_timeout():
+    """AE8/R11: the menu stays self-maintaining. Only the one chosen entry is
+    exempt — everything else purges exactly as before."""
+    h = await Harness(selected_key_for=lambda: ("chromecast", "some-other")).start()
+    h.emit(CAST, "new", cast_new())
+    await h.fire_debounce()
+
+    h.emit(CAST, "remove", (CAST_NAME, CAST))
+    h.timers.fire(GRACE_S)
+    h.timers.fire(PURGE_S)
+    assert ("chromecast", CAST_UUID) not in h.watcher.registry
+
+
+async def test_selected_output_survives_a_forced_scan_reconcile():
+    """R8 on the OTHER eviction path. reconcile() drops offline entries absent
+    from the scan; the admin's choice is exempt there too, or a Scan run while
+    the speaker sleeps would undo the retention this unit exists to provide."""
+    selected = ("chromecast", CAST_UUID)
+    h = await Harness(selected_key_for=lambda: selected).start()
+    h.emit(CAST, "new", cast_new())
+    await h.fire_debounce()
+    h.emit(CAST, "remove", (CAST_NAME, CAST))
+    h.timers.fire(GRACE_S)
+    await h.fire_debounce()
+
+    # A Scan that finds nothing on this backend.
+    h.watcher.reconcile({"chromecast": []})
+    assert selected in h.watcher.registry
+
+
+async def test_deselection_arms_a_fresh_window_from_that_moment():
+    """KTD6, resolving an origin open question. When the selection moves away
+    from a sleeping device it becomes evictable again — but with a FULL window
+    starting now, not one back-dated to when it went offline.
+
+    Back-dating would evict it the instant the admin switched away, which is
+    exactly when they are most likely to switch back."""
+    selected = ("chromecast", CAST_UUID)
+    current = {"key": selected}
+    h = await Harness(selected_key_for=lambda: current["key"]).start()
+    h.emit(CAST, "new", cast_new())
+    await h.fire_debounce()
+    h.emit(CAST, "remove", (CAST_NAME, CAST))
+    h.timers.fire(GRACE_S)
+    await h.fire_debounce()
+    assert not h.pending  # exempt: nothing armed
+
+    # The admin applies something else.
+    current["key"] = ("airplay", "10.0.0.9:7000")
+    h.watcher.refresh_purge_exemption()
+
+    armed = [t for t in h.pending if t.delay == PURGE_S]
+    assert len(armed) == 1, "a full fresh window, armed from deselection"
+    h.timers.fire(PURGE_S)
+    assert selected not in h.watcher.registry
+
+
+async def test_selecting_a_sleeping_device_rescues_it_from_eviction():
+    """The other half of refresh_purge_exemption: selecting a device whose
+    purge is already counting down cancels it, so an Apply during the window
+    does not lose the device moments later."""
+    key = ("chromecast", CAST_UUID)
+    current = {"key": None}
+    h = await Harness(selected_key_for=lambda: current["key"]).start()
+    h.emit(CAST, "new", cast_new())
+    await h.fire_debounce()
+    h.emit(CAST, "remove", (CAST_NAME, CAST))
+    h.timers.fire(GRACE_S)
+    await h.fire_debounce()
+    assert [t.delay for t in h.pending] == [PURGE_S]
+
+    current["key"] = key
+    h.watcher.refresh_purge_exemption()
+    assert not h.pending
+    h.timers.fire(ACTIVE_PURGE_S)
+    assert key in h.watcher.registry
+
+
+async def test_refresh_purge_exemption_is_idempotent():
+    """U5 calls this liberally from several trigger sites; two calls in a row
+    must not stack timers."""
+    h = await Harness(selected_key_for=lambda: None).start()
+    h.emit(CAST, "new", cast_new())
+    await h.fire_debounce()
+    h.emit(CAST, "remove", (CAST_NAME, CAST))
+    h.timers.fire(GRACE_S)
+    await h.fire_debounce()
+
+    before = len(h.pending)
+    h.watcher.refresh_purge_exemption()
+    h.watcher.refresh_purge_exemption()
+    assert len(h.pending) == before
+
+
+async def test_selected_key_lookup_failure_falls_back_to_normal_ttl():
+    """Fail-soft, and fail-soft in the SAFE direction: a broken lookup means
+    no exemption, so the entry follows the pre-existing TTL rather than
+    becoming immortal and leaking a registry entry forever."""
+    def _boom():
+        raise RuntimeError("state not initialized")
+
+    h = await Harness(selected_key_for=_boom).start()
+    h.emit(CAST, "new", cast_new())
+    await h.fire_debounce()
+    h.emit(CAST, "remove", (CAST_NAME, CAST))
+    h.timers.fire(GRACE_S)
+    await h.fire_debounce()
+
+    assert [t.delay for t in h.pending] == [PURGE_S]
+    h.timers.fire(PURGE_S)
+    assert ("chromecast", CAST_UUID) not in h.watcher.registry
+
+
+async def test_direct_selection_exempts_nothing():
+    """Direct's pseudo-device never enters the registry, so a Direct selection
+    must not produce a key that accidentally matches a real entry."""
+    from app import state as st
+    import app.output.watcher as wmod
+    w = wmod.DeviceWatcher()
+    orig = st._selected_output_backend, st._selected_output_device
+    try:
+        st._selected_output_backend, st._selected_output_device = "direct", "default"
+        assert w._default_selected_key() is None
+        st._selected_output_backend, st._selected_output_device = "chromecast", "uuid-9"
+        assert w._default_selected_key() == ("chromecast", "uuid-9")
+        st._selected_output_device = ""
+        assert w._default_selected_key() is None
+    finally:
+        st._selected_output_backend, st._selected_output_device = orig
+
+# ── U1/U2: a failed discovery is not an empty network ───────────────────────
+#
+# An admin's picker emptied itself over 11 hours because a timed-out avahi
+# browse returned [] and every sweep read it as evidence the network was
+# empty — grace, offline, evict — while the discovery banner still said "ok",
+# because nothing on the sweep path ever wrote that map.
+#
+# These pin both halves: the registry is untouched on failure, and the status
+# tells the truth. The pairing matters — a test that only checks retention
+# would pass against a build that silently degrades nothing.
+
+
+def _boom(exc=None):
+    async def _raise(*a, **k):
+        raise (exc or DiscoveryUnavailable("no scan data"))
+    return _raise
+
+
+async def test_failed_cast_sweep_leaves_the_registry_untouched(monkeypatch):
+    """Covers AE1. A raised browse must not grace-flip or evict anything.
+
+    Verified to FAIL when sweep_devices returns [] instead of raising."""
+    import app.state as st
+    monkeypatch.setattr(st, "shared_aiozc", None)
+    h = Harness(dbus_available=True)
+    h.airplay_backend.sweep_devices = _areturn([])
+    h.cast_backend.sweep_devices = _areturn([])
+    await h.start()
+
+    h.cast_backend.sweep_devices = _areturn([_cast_dev_uuid()])
+    h.cast_backend._dbus_index[CAST_UUID] = ("JBL Charge 5", CAST_HOST, CAST_PORT)
+    await h.run_sweep()
+    await h.fire_debounce()
+    cast_key = ("chromecast", CAST_UUID)
+    assert h.watcher.registry[cast_key].online is True
+
+    # The substrate dies. Not "the network went quiet" — the browse failed.
+    h.cast_backend.sweep_devices = _boom()
+    await h.run_sweep()
+
+    assert h.watcher.registry[cast_key].online is True, (
+        "a failed browse is not evidence the device left")
+    assert not [t for t in h.pending if t.delay == GRACE_S], (
+        "no grace timer may be armed off a failed browse")
+
+
+async def test_failed_cast_sweep_degrades_the_status(monkeypatch):
+    """Covers AE1, second half. The banner must stop claiming health.
+
+    Verified to FAIL when the status write is removed from the sweep."""
+    import app.state as st
+    monkeypatch.setattr(st, "shared_aiozc", None)
+    h = Harness(dbus_available=True)
+    h.airplay_backend.sweep_devices = _areturn([])
+    h.cast_backend.sweep_devices = _areturn([])
+    await h.start()
+    assert h.watcher.mdns_status()["chromecast"] == "ok"
+
+    h.cast_backend.sweep_devices = _boom()
+    await h.run_sweep()
+    assert h.watcher.mdns_status()["chromecast"] == "unavailable"
+
+
+async def test_status_recovers_on_the_next_successful_sweep(monkeypatch):
+    import app.state as st
+    monkeypatch.setattr(st, "shared_aiozc", None)
+    h = Harness(dbus_available=True)
+    h.airplay_backend.sweep_devices = _areturn([])
+    h.cast_backend.sweep_devices = _boom()
+    await h.start()
+    await h.run_sweep()
+    assert h.watcher.mdns_status()["chromecast"] == "unavailable"
+
+    h.cast_backend.sweep_devices = _areturn([])
+    await h.run_sweep()
+    assert h.watcher.mdns_status()["chromecast"] == "ok"
+
+
+async def test_a_successful_empty_sweep_still_starts_grace(monkeypatch):
+    """The other side of the distinction, and the reason this cannot be fixed
+    by simply never evicting: failure and emptiness must produce OPPOSITE
+    outcomes from the same entry point.
+
+    Verified to FAIL if the failure path is widened to swallow empty results."""
+    import app.state as st
+    monkeypatch.setattr(st, "shared_aiozc", None)
+    h = Harness(dbus_available=True)
+    h.airplay_backend.sweep_devices = _areturn([])
+    h.cast_backend.sweep_devices = _areturn([_cast_dev_uuid()])
+    h.cast_backend._dbus_index[CAST_UUID] = ("JBL Charge 5", CAST_HOST, CAST_PORT)
+    await h.start()
+    await h.run_sweep()
+    cast_key = ("chromecast", CAST_UUID)
+    assert h.watcher.registry[cast_key].online is True
+
+    await h.fire_debounce()
+    h.cast_backend.sweep_devices = _areturn([])   # succeeded, found nothing
+    await h.run_sweep()
+    assert [t.delay for t in h.pending] == [GRACE_S]
+    assert h.watcher.mdns_status()["chromecast"] == "ok"
+
+
+async def test_failed_airplay_sweep_degrades_only_airplay(monkeypatch):
+    """Backends fail independently; one outage must not blank the others."""
+    import app.state as st
+    monkeypatch.setattr(st, "shared_aiozc", None)
+    h = Harness(dbus_available=True)
+    h.cast_backend.sweep_devices = _areturn([])
+    h.airplay_backend.sweep_devices = _boom()
+    await h.start()
+    await h.run_sweep()
+
+    st_map = h.watcher.mdns_status()
+    assert st_map["airplay"] == "unavailable"
+    assert st_map["chromecast"] == "ok"
+
+
+async def test_failed_dlna_sweep_degrades_dlna(monkeypatch):
+    """DLNA always sweeps, in both modes, and has no subscription writer —
+    so the sweep is the ONLY thing that can report its health."""
+    h = Harness()
+    await h.start()
+    assert h.watcher.mdns_status()["dlna"] == "ok"
+
+    h.dlna_backend.discover_devices = _boom(RuntimeError("ssdp socket gone"))
+    await h.run_sweep()
+    assert h.watcher.mdns_status()["dlna"] == "unavailable"
+
+
+async def test_plexplayer_failure_adds_no_status_key(monkeypatch):
+    """plexplayer is deliberately absent from the map — its liveness rides
+    authenticated PMS polling, not mDNS. The frontend treats a missing key as
+    fine and an 'unavailable' value as degraded, so adding one would render
+    the backend permanently broken in the banner."""
+    h = Harness()
+    await h.start()
+    h.plexplayer_backend.sweep_devices = _boom(RuntimeError("all servers down"))
+    await h.run_sweep()
+    assert "plexplayer" not in h.watcher.mdns_status()
+
+
+async def test_the_sweep_uses_the_raising_variant(monkeypatch):
+    """Pins the wiring itself. The fail-soft discover must NOT be what the
+    sweep calls — that was the defect, and it is invisible to any test that
+    stubs both methods identically."""
+    import app.state as st
+    monkeypatch.setattr(st, "shared_aiozc", None)
+    h = Harness(dbus_available=True)
+    called = []
+    h.cast_backend.sweep_devices = _areturn([])
+    h.airplay_backend.sweep_devices = _areturn([])
+
+    async def _must_not_run(*a, **k):
+        called.append("fail-soft")
+        return []
+    h.cast_backend._dbus_discover = _must_not_run
+    h.airplay_backend.discover_devices = _must_not_run
+
+    await h.start()
+    await h.run_sweep()
+    assert called == [], (
+        "the sweep called the fail-soft discover; a failed browse would then "
+        "look like an empty network again")
+

@@ -365,6 +365,65 @@ invalidate_source_registry = invalidate_plex_client
 # ``session_snapshot()`` — can read the selection truth without a DB round-trip.
 _selected_output_backend: str = "direct"
 
+# The other two thirds of the same mirror (2026-09-01 plan U1). Same seeding
+# point, same update point, same reason: the idle re-attach coordinator's
+# ownership predicate and the watcher's purge exemption are both SYNC and both
+# need "which device did the admin choose, and what was it called".
+#
+# LOUD WARNING, and it is a DIFFERENT warning from output_requires_plex()'s:
+# the watcher already has ``_default_active_key``, which reads
+# ``output_router.active`` — the device currently ATTACHED. That is the wrong
+# signal for anything this mirror serves, by definition: the device the idle
+# re-attach feature cares about is selected and NOT attached (it is asleep).
+# Do not "simplify" these away by pointing them at the router.
+#
+# The NAME is persisted because AirPlay identity is name-based — its device_id
+# is ``host:port``, so the id alone cannot survive a DHCP lease change. Without
+# a stored name there is nothing to verify a returning AirPlay device against.
+_selected_output_device: str = "default"
+_selected_output_device_name: str = ""
+
+
+def selected_output_key() -> tuple[str, str]:
+    """The admin's chosen output as a ``(backend_type, device_id)`` key.
+
+    Sync by design — the watcher's purge-arming path cannot await a DB read.
+    See the mirror's warning above for why this is not the router's active
+    device."""
+    return (_selected_output_backend, _selected_output_device)
+
+
+def selected_output_name() -> str:
+    """Display name of the chosen output, or "" when the backend supplied
+    none. Empty is never a wildcard: the identity predicate treats it as
+    unverifiable rather than as "matches anything"."""
+    return _selected_output_device_name
+
+
+def _resolve_device_name(backend_type: str, device_id: str) -> str:
+    """Best-effort display name for a device being selected, read from the
+    watcher registry (where discovery just put it).
+
+    Resolved at Apply time rather than taken as a parameter because the admin
+    API sends only backend + id, and the registry is the one place that
+    already holds the label the picker showed. Returns "" when the watcher is
+    absent or the device is not in the registry — a selection with no
+    resolvable name simply cannot use name-based identity verification, which
+    is the correct degradation rather than an error."""
+    try:
+        from app.output import watcher as watcher_mod
+        w = watcher_mod.get_watcher()
+        if w is None:
+            return ""
+        entry = w.registry.get((backend_type, device_id))
+        if entry is None:
+            return ""
+        return getattr(entry.device, "name", "") or ""
+    except Exception:
+        _log.debug("could not resolve display name for %s/%s",
+                   backend_type, device_id, exc_info=True)
+        return ""
+
 
 def output_requires_plex() -> bool:
     """Gate truth for every playability-dependent gate (plan U4; U5 enqueue
@@ -2775,7 +2834,37 @@ def _seed_startup_address(backend, device_id: str, addr: dict):
 
 
 async def _startup_reconnect(backend, device_id: str) -> None:
-    """Reconnect to the last-used device. Fire-and-forget; never raises.
+    """Reconnect to the last-used device, then hand the device to the idle
+    re-attach coordinator. Fire-and-forget; never raises.
+
+    The reconcile lives HERE, wrapping every exit, rather than in a `finally`
+    inside the body. It was in the body and that was wrong: the
+    cached-address branch returns early on success, which is the NORMAL path
+    once ``output_addr:{device_id}`` has been persisted, so the common case
+    never reconciled. A restart with a sleeping speaker then left the
+    coordinator unarmed forever — the device is absent from the rebuilt
+    registry, so no offline edge fires either, and boot is the only trigger
+    there is. Found on the validation rig 2026-09-03; the unit test that
+    claimed to cover "every path" had stubbed the address lookup to None and
+    only ever exercised the discovery branch.
+    """
+    try:
+        await _startup_reconnect_attach(backend, device_id)
+    finally:
+        # A boot-time miss is not terminal: the device may simply be asleep,
+        # and a restart between parties is a normal thing to do. On a
+        # SUCCESSFUL attach this is a cheap no-op (the predicate goes false),
+        # which is why it can sit on every exit unconditionally.
+        try:
+            from app.output import idle_reattach
+            idle_reattach.reconcile()
+        except Exception:
+            _log.debug("idle re-attach reconcile after startup reconnect "
+                       "failed", exc_info=True)
+
+
+async def _startup_reconnect_attach(backend, device_id: str) -> None:
+    """The attach itself. Fire-and-forget; never raises.
 
     Runs under ``output_session._attach_serial`` across each ``set_device``
     (2026-08-20 plan U1): this coroutine is spawned as a bare task from the
@@ -3039,12 +3128,18 @@ async def setup() -> None:
 
     # Restore last active backend from DB
     global _selected_output_backend, _disabled_sources_sync, _plex_lock_notice_sent
+    global _selected_output_device, _selected_output_device_name
     backend_type = await database.get_setting("output_backend_type") or "direct"
     device_id = await database.get_setting("output_device_id") or "default"
     # Seed the persisted-selection mirror (plan U4): output_requires_plex()
     # and _holder_keys read it sync; from here on activate_backend keeps it
     # aligned with the setting it writes.
     _selected_output_backend = backend_type
+    # …and the device id + name thirds (2026-09-01 plan U1), which the purge
+    # exemption and the re-attach ownership predicate read sync.
+    _selected_output_device = device_id
+    _selected_output_device_name = (
+        await database.get_setting("output_device_name") or "")
     _plex_lock_notice_sent = False  # U8: a boot starts a fresh notice session
     try:
         _disabled_sources_sync = set(await database.get_disabled_sources())
@@ -3461,6 +3556,7 @@ async def activate_backend(
         click.
     """
     global _auto_advance_pending, _selected_output_backend, _plex_lock_notice_sent
+    global _selected_output_device, _selected_output_device_name
     from app import database
     from app.config import settings
     from app.output import session as output_session
@@ -3554,11 +3650,19 @@ async def activate_backend(
     # this persisted truth — never the router, whose swap defers mid-play. A
     # failed switch raised above, so neither changes on failure.
     _selected_output_backend = backend_type
+    # The device id + name thirds of the same mirror (2026-09-01 plan U1),
+    # updated at the same point and for the same reason. The name is resolved
+    # HERE, while the device is definitionally in the registry (the admin just
+    # picked it from the list the registry produced) — a lookup deferred to
+    # first use would run after an eviction could have removed it.
+    _selected_output_device = device_id
+    _selected_output_device_name = _resolve_device_name(backend_type, device_id)
     # U8: every committed selection starts a fresh lock session — re-arm the
     # one-shot auto-selection give-up notice.
     _plex_lock_notice_sent = False
     await database.set_setting("output_backend_type", backend_type)
     await database.set_setting("output_device_id", device_id)
+    await database.set_setting("output_device_name", _selected_output_device_name)
     if host:
         await database.set_setting("output_host", host)
         await database.set_setting(f"device_via:{host}", backend_type)

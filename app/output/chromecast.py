@@ -54,6 +54,7 @@ from app.output.base import (
     AttachGeneration,
     AttachSuperseded,
     DeviceNotReadyError,
+    DiscoveryUnavailable,
     OutputDevice,
 )
 from app.output.radio_endless import (
@@ -673,11 +674,38 @@ class ChromecastBackend(AttachGeneration):
         — the SAME keying the live D-Bus subscription produces, so a Scan
         racing a live arrival reconciles to one entry. Merges into the cache
         (never clears) so retained/live entries keep their addresses."""
+        results = await self._dbus_browse()
+        return [] if results is None else results
+
+    async def sweep_devices(self) -> list[OutputDevice]:
+        """RAISING discover for the watcher sweep (2026-09-04 plan U1).
+
+        Same browse as ``_dbus_discover``, different failure contract: a
+        failed browse raises instead of flattening to ``[]``, so the sweep
+        leaves the registry untouched rather than grace-flipping and then
+        evicting every known Cast device over a D-Bus outage.
+
+        ``_dbus_discover`` keeps its fail-soft ``[]`` for its other callers
+        (the forced Scan's one-shot, the legacy pull flow); only the sweep
+        needs the two outcomes told apart, which is exactly how
+        ``PlexPlayerBackend.sweep_devices`` relates to its own
+        ``discover_devices``.
+        """
+        results = await self._dbus_browse()
+        if results is None:
+            raise DiscoveryUnavailable(
+                "chromecast: avahi D-Bus browse reported no scan data")
+        return results
+
+    async def _dbus_browse(self) -> list[OutputDevice] | None:
+        """The shared body: ``None`` when the browse FAILED, a list (possibly
+        empty) when it succeeded. One browse per call — the two public
+        wrappers above differ only in how they report failure."""
         from app.output import mdns_dbus
         async with self._dbus_discover_lock:
             found = await mdns_dbus.discover("_googlecast._tcp.local")
             if found is None:
-                return []  # D-Bus socket absent — nothing to report
+                return None  # browse failed — NOT an empty network
             fresh: dict[str, tuple[str, str, int]] = {}
             results: list[OutputDevice] = []
             seen_ids: set[str] = set()
