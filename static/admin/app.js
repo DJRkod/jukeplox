@@ -325,8 +325,26 @@ document.getElementById('btn-skip').addEventListener('click', async () => {
 function renderOutputSessionBanner(data) {
   const banner = document.getElementById('output-outage-banner');
   const msgEl = document.getElementById('output-outage-msg');
+  const resumeBtn = document.getElementById('btn-outage-resume');
   if (!banner || !msgEl || !data) return;
-  if (!data.held) { banner.style.display = 'none'; return; }
+  if (!data.held) {
+    // A gapless degrade is not an outage: nothing is held and there is
+    // nothing to resume, so the old `!data.held` early return hid it
+    // completely. It still has to surface, because it is the one state where
+    // the product is quietly not doing what the toggle says it is doing —
+    // the operator turned gapless on and is hearing a gap at every track.
+    // Same banner, Resume hidden (there is nothing for it to resume).
+    if (data.gapless_degraded_reason) {
+      msgEl.textContent = '⚠ Gapless is on but not running — '
+        + data.gapless_degraded_reason;
+      if (resumeBtn) resumeBtn.style.display = 'none';
+      banner.style.display = 'flex';
+      return;
+    }
+    banner.style.display = 'none';
+    return;
+  }
+  if (resumeBtn) resumeBtn.style.display = '';
   const device = data.device_name || data.device_id || 'The output device';
   let msg;
   if (data.state === 'reconnecting') {

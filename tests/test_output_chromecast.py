@@ -3385,11 +3385,16 @@ async def test_flow_skip_listener_pops_failed_front_and_emits_skip(
         assert skipped.await_args.args[0] is t2
 
 
-async def test_flow_degrades_to_per_track_without_stream_base(
+async def test_flow_degrades_to_per_track_when_no_base_is_resolvable(
         cast_mock, fresh_supervisor, monkeypatch):
-    """Gapless on but no STREAM_BASE_URL/BIND_HOST → no device-reachable flow
-    URL exists: degrade to per-track dispatch (today's behavior) instead of
-    dead air."""
+    """Gapless on and NO base can be resolved at all — not even by LAN-IP
+    auto-detection → degrade to per-track dispatch instead of dead air.
+
+    Note what changed (2026-10-05): an unset STREAM_BASE_URL with the default
+    0.0.0.0 BIND_HOST is no longer sufficient to degrade, because the flow URL
+    now falls back to the same auto-detected LAN IP the per-track proxy path
+    uses. Degrading requires detection itself to fail.
+    """
     import app.state as st
     from app.config import settings
     from app.output.chromecast import ChromecastBackend
@@ -3397,6 +3402,8 @@ async def test_flow_degrades_to_per_track_without_stream_base(
     monkeypatch.setattr(st, "_gapless_enabled", True)
     monkeypatch.setattr(settings, "stream_base_url", "")
     monkeypatch.setattr(settings, "bind_host", "0.0.0.0")
+    monkeypatch.setattr(st, "_detect_primary_lan_ip",
+                        MagicMock(side_effect=RuntimeError("no route")))
     cc = _make_cc()
     backend = ChromecastBackend()
     backend._cast = cc
@@ -3409,6 +3416,268 @@ async def test_flow_degrades_to_per_track_without_stream_base(
     assert args[0][0] == "http://plex.local/file.flac"   # per-track LOAD
     assert "stream_type" not in args[1]
     assert backend._watchdog_task is not None            # per-track watchdog
+
+
+async def test_flow_engages_on_a_default_install_via_lan_ip_autodetect(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """The regression this fix exists for.
+
+    BIND_HOST defaults to 0.0.0.0, so a default install that merely switched
+    gapless ON resolved no flow base and silently fell back to per-track
+    dispatch — an audible gap at every boundary (measured 499 ms on the rig vs
+    0 ms in flow mode) explained only by a container log line. Flow must now
+    engage off the auto-detected LAN IP, exactly as the per-track proxy path
+    already does.
+    """
+    import app.state as st
+    from app.config import settings
+    from app.output import chromecast as cc_mod
+    monkeypatch.setattr(st, "_gapless_enabled", True)
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(settings, "bind_host", "0.0.0.0")
+    monkeypatch.setattr(st, "_detect_primary_lan_ip",
+                        MagicMock(return_value="192.168.4.21"))
+
+    assert cc_mod._flow_base_url() == "http://192.168.4.21"
+
+
+async def test_derived_flow_base_carries_the_real_listen_port(monkeypatch):
+    """A portless base on a non-80 install names an address nothing is
+    listening on. The device LOADs it, gets nothing, the supervisor reads that
+    as a device outage and the queue freezes — strictly worse than the gap
+    this fix was for. PORT is the truth; 80 is only its default."""
+    import app.state as st
+    from app.config import settings
+    from app.output import chromecast as cc_mod
+    monkeypatch.setenv("PORT", "8096")
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(settings, "bind_host", "0.0.0.0")
+    monkeypatch.setattr(st, "_detect_primary_lan_ip",
+                        MagicMock(return_value="192.168.4.21"))
+
+    assert cc_mod._flow_base_url() == "http://192.168.4.21:8096"
+
+
+async def test_port_80_is_left_implicit(monkeypatch):
+    import app.state as st
+    from app.config import settings
+    from app.output import chromecast as cc_mod
+    monkeypatch.setenv("PORT", "80")
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(settings, "bind_host", "0.0.0.0")
+    monkeypatch.setattr(st, "_detect_primary_lan_ip",
+                        MagicMock(return_value="192.168.4.21"))
+
+    assert cc_mod._flow_base_url() == "http://192.168.4.21"
+
+
+async def test_bind_host_leg_also_carries_the_port(monkeypatch):
+    from app.config import settings
+    from app.output import chromecast as cc_mod
+    monkeypatch.setenv("PORT", "8096")
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(settings, "bind_host", "192.168.4.30")
+
+    assert cc_mod._flow_base_url() == "http://192.168.4.30:8096"
+
+
+async def test_a_derived_base_that_fails_its_self_probe_degrades(monkeypatch):
+    """The probe is what turns an unverifiable guess into a safe one: a
+    derived base we cannot fetch ourselves is one the device certainly
+    cannot, so take the visible per-track degrade instead of freezing."""
+    from app.config import settings
+    from app.output import chromecast as cc_mod
+    from app.output.chromecast import ChromecastBackend
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(cc_mod, "_flow_base_url",
+                        MagicMock(return_value="http://192.168.4.21:8096"))
+    monkeypatch.setattr(cc_mod, "_flow_base_reachable", {})
+
+    async def _fail(base):
+        return False
+    monkeypatch.setattr(cc_mod, "_probe_base", _fail)
+
+    assert await ChromecastBackend()._reachable_flow_base() is None
+
+
+async def test_a_derived_base_that_answers_is_used_and_cached(monkeypatch):
+    from app.config import settings
+    from app.output import chromecast as cc_mod
+    from app.output.chromecast import ChromecastBackend
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(cc_mod, "_flow_base_url",
+                        MagicMock(return_value="http://192.168.4.21"))
+    cache = {}
+    monkeypatch.setattr(cc_mod, "_flow_base_reachable", cache)
+    calls = []
+
+    async def _ok(base):
+        calls.append(base)
+        return True
+    monkeypatch.setattr(cc_mod, "_probe_base", _ok)
+
+    backend = ChromecastBackend()
+    assert await backend._reachable_flow_base() == "http://192.168.4.21"
+    assert await backend._reachable_flow_base() == "http://192.168.4.21"
+    assert len(calls) == 1          # probed once, not once per track
+
+
+async def test_an_explicit_stream_base_url_is_trusted_without_probing(monkeypatch):
+    """An admin may give a name only the device can resolve. We could not
+    verify that even in principle, so do not pretend to."""
+    from app.config import settings
+    from app.output import chromecast as cc_mod
+    from app.output.chromecast import ChromecastBackend
+    monkeypatch.setattr(settings, "stream_base_url", "http://jukebox.lan:8096")
+    monkeypatch.setattr(cc_mod, "_flow_base_url",
+                        MagicMock(return_value="http://jukebox.lan:8096"))
+    monkeypatch.setattr(cc_mod, "_flow_base_reachable", {})
+
+    async def _boom(base):
+        raise AssertionError("an explicit base must not be probed")
+    monkeypatch.setattr(cc_mod, "_probe_base", _boom)
+
+    assert (await ChromecastBackend()._reachable_flow_base()
+            == "http://jukebox.lan:8096")
+
+
+async def test_flow_refuses_an_autodetected_container_bridge_ip(monkeypatch):
+    """A wrong base is worse for flow than the gap it was meant to fix.
+
+    The per-track proxy path tolerates an optimistic auto-detected base because
+    it can still fall back to the source's direct URL. A flow stream is served
+    only by this server, so a base the Cast device cannot reach means no audio
+    at all. Degrade visibly instead.
+    """
+    import app.state as st
+    from app.config import settings
+    from app.output import chromecast as cc_mod
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(settings, "bind_host", "0.0.0.0")
+    monkeypatch.setattr(st, "_detect_primary_lan_ip",
+                        MagicMock(return_value="172.17.0.2"))
+
+    assert cc_mod._flow_base_url() is None
+
+
+async def test_url_auth_path_still_accepts_a_bridge_ip_with_a_warning(monkeypatch):
+    """The bridge rejection is scoped to flow. The URL-auth proxy path keeps
+    its previous optimistic behaviour, because it has a source-direct
+    fallback that flow does not."""
+    import app.state as st
+    from app.config import settings
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(settings, "bind_host", "0.0.0.0")
+    monkeypatch.setattr(st, "_detect_primary_lan_ip",
+                        MagicMock(return_value="172.17.0.2"))
+
+    assert st.resolved_proxy_base_for_url_auth() == "http://172.17.0.2"
+
+
+async def test_explicit_stream_base_url_still_wins_over_autodetect(monkeypatch):
+    """STREAM_BASE_URL always wins — the auto-detect leg is a fallback, not a
+    replacement, so an admin who pinned an address keeps it."""
+    import app.state as st
+    from app.config import settings
+    from app.output import chromecast as cc_mod
+    monkeypatch.setattr(settings, "stream_base_url", "http://pinned.local")
+    monkeypatch.setattr(settings, "bind_host", "0.0.0.0")
+    monkeypatch.setattr(st, "_detect_primary_lan_ip",
+                        MagicMock(return_value="192.168.4.21"))
+
+    assert cc_mod._flow_base_url() == "http://pinned.local"
+
+
+async def test_degrading_records_an_operator_visible_reason(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """R7: the degrade must be visible without reading container logs.
+
+    Before this, gapless read ON, playback gapped ~500 ms every boundary, and
+    the only explanation lived in the container log — so the admin surface
+    actively misreported what the product was doing.
+    """
+    from types import SimpleNamespace
+    import app.state as st
+    from app.config import settings
+    from app.output import session_events
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    session_events.note_gapless_degraded(None)
+    monkeypatch.setattr(st, "_gapless_enabled", True)
+    monkeypatch.setattr(settings, "stream_base_url", "")
+    monkeypatch.setattr(settings, "bind_host", "0.0.0.0")
+    monkeypatch.setattr(st, "_detect_primary_lan_ip",
+                        MagicMock(side_effect=RuntimeError("no route")))
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+
+    await _flow_play(sup, backend, _ftrack("t1"), url="http://plex.local/f.flac")
+
+    monkeypatch.setattr(st, "output_router",
+                        SimpleNamespace(active=backend, has_pending=False))
+    reason = session_events.gapless_degraded_reason()
+    assert reason and "STREAM_BASE_URL" in reason
+    snap = await session_events.session_snapshot_admin()
+    assert snap["gapless_degraded_reason"] == reason
+    session_events.note_gapless_degraded(None)
+
+
+async def test_degrade_notice_does_not_outlive_a_switch_away_from_cast(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """A Cast-specific 'set STREAM_BASE_URL' message reported while Direct is
+    playing is actively misleading — the notice must not outlive its subject."""
+    from types import SimpleNamespace
+    import app.state as st
+    from app.output import session_events
+    from app.output.chromecast import ChromecastBackend
+    monkeypatch.setattr(st, "_gapless_enabled", True)
+    cast_backend = ChromecastBackend()
+    session_events.note_gapless_degraded("cast could not serve flow", cast_backend)
+
+    monkeypatch.setattr(st, "output_router",
+                        SimpleNamespace(active=cast_backend, has_pending=False))
+    assert session_events.gapless_degraded_reason() is not None
+
+    other = object()          # stand-in for a different active backend
+    monkeypatch.setattr(st, "output_router",
+                        SimpleNamespace(active=other, has_pending=False))
+    assert session_events.gapless_degraded_reason() is None
+    session_events.note_gapless_degraded(None)
+
+
+async def test_a_stale_degrade_notice_clears_once_flow_runs(
+        cast_mock, fresh_supervisor, monkeypatch, flow_env):
+    """A fixed condition must stop being reported, or the admin surface grows
+    a permanent warning about a problem that no longer exists."""
+    from types import SimpleNamespace
+    import app.state as st
+    from app.output import session_events
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    session_events.note_gapless_degraded("stale reason from an earlier dispatch")
+    monkeypatch.setattr(st, "_gapless_enabled", True)
+    cc = _make_cc()
+    backend = ChromecastBackend()
+    backend._cast = cc
+
+    await _flow_play(sup, backend, _ftrack("t1"), url="http://plex.local/f.flac")
+
+    assert backend._flow_session is not None       # flow actually engaged
+    monkeypatch.setattr(st, "output_router",
+                        SimpleNamespace(active=backend, has_pending=False))
+    assert session_events.gapless_degraded_reason() is None
+
+
+async def test_no_degrade_reason_is_reported_while_gapless_is_off(monkeypatch):
+    """Nothing is promised with the toggle off, so a leftover notice would be
+    noise rather than news."""
+    import app.state as st
+    from app.output import session_events
+    session_events.note_gapless_degraded("left over from a gapless-on session")
+    monkeypatch.setattr(st, "_gapless_enabled", False)
+    assert session_events.gapless_degraded_reason() is None
+    session_events.note_gapless_degraded(None)
 
 
 async def test_backend_exposes_no_arm_next(cast_mock):

@@ -193,3 +193,218 @@ A run is only meaningful if the guests actually did something: check
 `tracks added via search` is in the hundreds before trusting anything else. A
 soak where the selectors silently matched nothing looks exactly like a soak
 where everything worked.
+
+## Acoustic arm
+
+`capture_check.py` runs **on the rig** (it needs `arecord` and `ffmpeg`) and
+answers one question: is audio actually reaching the loopback right now?
+
+```sh
+JP_ALSA_CAPTURE=default python3 capture_check.py            # assert audio present
+JP_ALSA_CAPTURE=default python3 capture_check.py --floor    # measure the silence floor
+```
+
+Exit 0 = audio present, 1 = silent, 2 = the capture itself failed. The three are
+deliberately distinct: a failed capture reported as silence would read downstream
+as a dropout.
+
+Measured on the validation rig 2026-09-23, and reproduced to the decimal hours
+apart:
+
+| Condition | mean | max |
+|---|---|---|
+| Silence floor (paused) | -90.3 dB | -76.3 dB |
+| Live Direct playback | -21.4 dB | -8.4 dB |
+
+Two things this interface will bite you with. It accepts **only** `S24_3LE` —
+asking for the obvious `S16_LE` fails with "Sample format non available", which
+reads like a broken device rather than a wrong argument. And `arecord -d` takes
+whole seconds; `5.0` is rejected outright.
+
+**A silent capture is not a defect on its own.** It is equally consistent with
+the wrong backend owning the device, an unplugged cable, and a real fault.
+Separating those needs the device's own session state — see
+`docs/solutions/developer-experience/2026-09-05-acoustic-arm-must-assert-the-session.md`.
+On 2026-09-23 this exact reading turned out to be a three-day-old sessionless
+wedge (issue #57), and only the receiver's own `status: none` distinguished it
+from a cabling fault.
+
+**`media_procs` is not a liveness signal for the Direct backend.** Direct's
+GStreamer pipeline runs in-process, so it never appears as an ffmpeg/gst
+subprocess and the probe's fifth field stays at 0 while audio plays perfectly.
+The signal that the card is held is the container's `/dev/snd` descriptor count.
+`media_procs` counts flow-mode ffmpeg, which is a Cast concern.
+
+### Rig-side capture (`tools/soak/rig/`)
+
+Both run ON the rig, on one clock, because joining an audio timeline recorded
+here against a state timeline recorded on the driving machine means joining
+across two unsynchronised clocks — and a boundary gap is tens of milliseconds.
+
+| File | Role |
+|---|---|
+| `record.sh` | Segmented lossless capture of the loopback |
+| `state_sampler.py` | ~1 Hz playback-state timeline on the same clock |
+
+```sh
+JP_CAP_DIR=/root/soak/cap JP_CAP_HOURS=6 sh rig/record.sh
+JP_BASE="http://$(hostname -I | awk '{print $1}')" JP_MINUTES=360 python3 rig/state_sampler.py
+```
+
+**Use the host's own address, not loopback.** uvicorn binds to the LAN address
+rather than `0.0.0.0`, so `http://127.0.0.1` fails with a URLError even from the
+rig itself.
+
+Measured 2026-09-23: FLAC capture is ~342 MB/hour, so a 12-hour run is ~4.1 GB.
+`record.sh` refuses to start when the disk cannot hold `JP_CAP_HOURS` of it,
+rather than discovering the problem at hour nine.
+
+**Position comes from `/api/playback/position`, not `/api/now-playing`** — the
+latter carries no position field at all, so reading one from it returns null
+forever and looks like a lost session. The position endpoint asks the output
+router for the backend's own position, so a value that ADVANCES across samples
+is evidence the device is really playing. A static position while `is_playing`
+is true is the signal worth catching; paired with the `/dev/snd` descriptor
+count it gives two independent views of whether anything is rendering.
+
+### Features and classification
+
+| File | Role |
+|---|---|
+| `rig/features.py` | Segments -> silent intervals, levels, per-channel RMS |
+| `rig/classify.py` | Joins audio against state; labels every silence; measures boundary gaps |
+| `boundary_probe.py` | Measures ONE track boundary to within ~100 ms (see below) |
+
+```sh
+python3 rig/features.py /root/soak/cap     # -> features.jsonl
+```
+
+Thresholds are the ones proven on this rig (`silencedetect=noise=-55dB:d=0.4`),
+which sits between the measured -90.3 dB floor and roughly -21 dB of live
+playback rather than being a guess.
+
+**Silence is not a defect.** The classifier subtracts the explainable cases in
+order — nothing playing, an operator action, the post-dispatch settle window, a
+track boundary — and only what survives is an incident. Incidents are split in
+two because they point at different layers: `incident_no_pipeline` (reported
+playing, nothing holds the sound card) and `incident_silent_while_playing`
+(pipeline live, no audio). Anything that cannot be placed is `unknown`, never
+silently clean.
+
+**A boundary is not only a track_id change.** A queue can hold the same track
+twice running, and then `track_id` never changes across a real boundary — on
+2026-09-23 a capture spanning one reported zero boundaries for exactly that
+reason. Position dropping from near the end of a track to near zero is the
+second detector. A backward seek is excluded by requiring the landing point to
+be near zero, and operator actions are attributed before boundaries are
+considered at all.
+
+First end-to-end run against real audio (2026-09-23, Direct, gapless enabled):
+one boundary found via position reset, both channels alive at -21.2/-22.4 dB,
+measured gap **5.582 s**. Recorded here as a single observation, not a verdict —
+prior rig figures put an unarmed boundary at 9.2 s and an armed one at zero
+silence >=0.4 s, so this wants a distribution behind it before it means anything.
+
+### Gapless A/B, 2026-09-23 (Direct backend)
+
+Same 43.5 s track queued repeatedly so its intrinsic silence is identical at
+every boundary and cancels between arms. 11 boundaries per arm.
+
+| | total silence per boundary | mean |
+|---|---|---|
+| Gapless ON | 0.885 s at **every** boundary | 0.885 s |
+| Gapless OFF | 0.507 - 1.222 s | 0.898 s |
+
+**Gapless works on Direct.** The means are indistinguishable because this
+track's own ~0.9 s of silence dominates both. The signal is the VARIANCE: with
+gapless on, every boundary measured identically to the millisecond — a pipeline
+that never stops, so the capture contains the file's encoded silence and nothing
+else. With it off, the same transition scattered, sometimes shorter than the
+content (teardown clipping the fade) and sometimes longer (rebuild delay).
+
+Two traps this run walked into, both worth avoiding next time:
+
+**Total silence at a boundary is mostly the track, not the player.** A first
+measurement on a different track read 5.582 s and looked alarming; 5.449 s of it
+was the outgoing track's fade-out. Never read boundary silence as a system gap
+without a control arm on the same audio.
+
+**The pre/post split is limited by the sampling rate.** The boundary timestamp
+comes from the state timeline, so at the default 1 Hz it carries ~1 s of
+uncertainty — coarser than the sub-second gaps it is splitting. Above, total was
+constant to the millisecond while post ranged 0.000-0.885 s purely from sampler
+jitter. For a run that needs the split to mean anything, set
+`JP_STATE_INTERVAL` well below the gaps of interest (0.1 is ~65 MB of JSONL over
+12 hours) — or treat the total as the only reliable figure.
+
+### Arm orchestration, peaks and the verdict
+
+| File | Role |
+|---|---|
+| `arm.py` | One arm end to end: set up, verify it took, recover, hand over |
+| `probe_window.py` | Scheduled load peaks + the latency contract a probe reports against |
+| `verdict.py` | Trends, instrument health, incident ranking (used by `analyse.py`) |
+
+**Everything the arm sets, it reads back.** A write that returns 200 and does not
+take is what produces a confidently-wrong arm, so the mode, the pinned output and
+the queue-end behaviour are each verified after being set, and again after every
+recovery.
+
+Recovery is `docker stop -t 30` then start — **never `rm -f`**. A SIGKILL restart
+once left the database locked while search kept answering from cache, so nothing
+looked broken and the rest of the run was silently degraded. After every restart
+the arm re-checks health (`refresh_failed`) and re-asserts its own mode before
+continuing. Recoveries are bounded so a permanently broken instance cannot spend
+six hours restarting.
+
+**The verdict can tell "nothing broke" from "nobody was looking."** `analyse.py`
+now reports instrument health before anything else: an all-zero container sample
+run is a broken sampler, not a stable system; a perfectly flat RSS suggests the
+probe is reading PID 1 (a shell wrapper that reports ~1.4 MB forever); a party
+that added almost nothing is a broken harness, because a soak where the selectors
+matched nothing looks exactly like a soak where everything worked.
+
+Two reporting rules that exist to stop the report overclaiming:
+
+- **Rising RSS is not a leak.** Freed objects return to allocator arenas rather
+  than the OS, so churn and a leak look identical here. The note says what would
+  settle it (an idle tail, and two workload cycles compared) rather than asserting.
+- **`media_procs` means nothing on Direct.** Its GStreamer pipeline runs
+  in-process, so the count sits at 0 while audio plays perfectly. Set
+  `JP_BACKEND=direct` and the report says so instead of reporting reassuring
+  flatness. Use the `/dev/snd` descriptor count from the rig-local timeline.
+
+Browser teardown was already correct and is left alone: `cdp.mjs` kills the
+process tree, keys every sweep on a run-unique profile tag so it can never touch
+your own Chrome, and verifies with `Get-CimInstance` rather than `wmic | grep` —
+which returns nothing on a UTF-16 stream and once reported zero leftovers while
+there were dozens.
+
+## Measuring a single track boundary — `boundary_probe.py`
+
+The soak arm answers "did anything break over hours". `boundary_probe.py`
+answers "is THIS boundary clean, to within 100 ms", which the soak instrument
+cannot: `rig/features.py` runs `silencedetect` with `d=0.4`, and that is
+ffmpeg's **minimum duration**, not a threshold — below it a gap is not
+measured-and-passed, it is never emitted at all, so a gapping build and a
+fixed build both report zero silences.
+
+Three prerequisites, all enforced by the module rather than left to the caller:
+
+- `JP_SILENCE_MIN_S` is lowered to 0.02 for every probe run.
+- The boundary timestamp comes from an HTTP-only poller, and the **achieved**
+  sample interval is recorded and checked — `rig/state_sampler.py` shells out
+  to `docker` twice per sample, so it runs near 1 Hz whatever it is asked for.
+- A measured noise floor is required; without it the quiet-audio filter is
+  silently off, which had a measured 17-in-18 false-positive rate.
+
+Anything it cannot trust raises `ProbeRefusal` rather than returning an
+optimistic number, and a pass additionally requires a positive control
+recovered in the same session.
+
+```bash
+JP_BASE="http://<rig-lan-ip>" JP_ADMIN_PW=...   python3 boundary_probe.py --capture cap.wav --poll poll.jsonl     --cap-t0-ms <epoch-ms-of-capture-start> --measure-floor
+```
+
+Exit 3 means refused (the reason is printed as JSON); exit 0 means a verdict
+was produced.
