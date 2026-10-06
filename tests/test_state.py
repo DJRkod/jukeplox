@@ -336,6 +336,285 @@ async def test_startup_reconnect_no_cache_does_not_set_dbus_index():
     assert "some-uuid" not in backend._dbus_index
 
 
+# ── U1 (2026-08-20): the boot attach is serialised, and a failed boot attach
+#    does not poison its own retry ─────────────────────────────────────────────
+
+
+async def test_startup_reconnect_attaches_under_attach_serial():
+    """U1/R1: the boot reconnect is the caller that used to escape the
+    attach-serial lock. BOTH of its set_device legs — the cached-address
+    attach and the post-discovery retry — must hold it, or an Apply pressed
+    during startup can interleave two attaches on one singleton backend."""
+    import json
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output import session
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+    held = []
+
+    async def set_device(device_id):
+        held.append(session._attach_serial.locked())
+        if len(held) == 1:
+            raise RuntimeError("stale address")
+
+    backend.set_device = AsyncMock(side_effect=set_device)
+    backend.discover_devices = AsyncMock()
+
+    cached = json.dumps({"name": "TV", "host": "10.0.0.1", "port": 8009})
+    with patch.object(db, "get_setting", AsyncMock(return_value=cached)):
+        await _startup_reconnect(backend, "some-uuid")
+
+    assert held == [True, True], "both attach legs must hold _attach_serial"
+    assert session._attach_serial.locked() is False
+
+
+async def test_startup_reconnect_releases_attach_serial_when_set_device_raises():
+    """U1: an attach that RAISES still releases the lock — a boot attach
+    against a dead device must not wedge every later switch."""
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output import session
+
+    held = []
+    backend = MagicMock()
+    backend.discover_devices = AsyncMock()
+
+    async def set_device(device_id):
+        held.append(session._attach_serial.locked())
+        raise RuntimeError("unreachable")
+
+    backend.set_device = AsyncMock(side_effect=set_device)
+
+    with patch.object(db, "get_setting", AsyncMock(return_value=None)), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()):
+        await _startup_reconnect(backend, "dev-123")
+
+    assert held == [True]                            # not vacuous: it was held
+    assert session._attach_serial.locked() is False  # …and released on the raise
+
+
+async def test_startup_reconnect_queued_behind_switch_aborts_without_set_device(
+        fresh_supervisor, monkeypatch):
+    """U1/R1: a boot attach parked on the attach-serial lock behind a manual
+    Apply observes the bumped attach-epoch after acquiring and aborts WITHOUT
+    calling set_device — the later-committed switch wins, and the boot attach
+    never resumes into the backend the switch already replaced."""
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output import session
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    backend = MagicMock()
+    backend.discover_devices = AsyncMock()
+    backend.set_device = AsyncMock()
+
+    with patch.object(db, "get_setting", AsyncMock(return_value=None)):
+        await session._attach_serial.acquire()       # the Apply owns the seam
+        try:
+            boot = asyncio.create_task(_startup_reconnect(backend, "dev-boot"))
+            for _ in range(20):                      # let it park on the lock
+                if session._attach_serial._waiters:
+                    break
+                await asyncio.sleep(0)
+            backend.set_device.assert_not_awaited()  # queued, not attaching
+            session.notify_manual_switch()           # the Apply bumps the epoch…
+        finally:
+            session._attach_serial.release()         # …and commits its own attach
+        await boot
+
+    backend.set_device.assert_not_awaited()          # stale epoch → never attached
+
+
+async def test_startup_reconnect_and_manual_apply_do_not_interleave(
+        fresh_supervisor, monkeypatch):
+    """U1/R1: boot reconnect and a manual Apply issued together serialise on
+    one backend — never overlapping, and the later-committed one (the Apply)
+    is what the backend ends up bound to. Without the lock the boot attach's
+    uncancellable commit could land last and re-bind the singleton to the old
+    device."""
+    import app.state as st
+    import app.database as db
+    from app.output import session
+    sup, timers, rec = fresh_supervisor
+    monkeypatch.setattr(session, "_attach_serial", asyncio.Lock())
+
+    events = []
+    inflight = 0
+    peak = 0
+    bound = None
+
+    backend = MagicMock()
+
+    async def set_device(device_id):
+        nonlocal inflight, peak, bound
+        inflight += 1
+        peak = max(peak, inflight)
+        events.append(("enter", device_id))
+        bound = None                      # the half-built window
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        bound = device_id                 # …committed
+        events.append(("exit", device_id))
+        inflight -= 1
+
+    backend.set_device = AsyncMock(side_effect=set_device)
+    backend.discover_devices = AsyncMock()
+
+    fake_qe = MagicMock()
+    fake_qe.state.is_playing = True
+    fake_qe.queue = []
+    with patch.object(st, "_get_backend", lambda t: backend), \
+         patch.object(st, "output_router", MagicMock()), \
+         patch.object(st, "queue_engine", fake_qe), \
+         patch.object(db, "get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", AsyncMock()):
+        boot = asyncio.create_task(st._startup_reconnect(backend, "dev-boot"))
+        for _ in range(20):                      # boot gets in first
+            if session._attach_serial.locked():
+                break
+            await asyncio.sleep(0)
+        assert session._attach_serial.locked(), "boot attach should hold the lock"
+        await st.activate_backend("dlna", "dev-apply")
+        await boot
+
+    assert peak == 1, f"attaches overlapped: {events}"
+    assert events == [("enter", "dev-boot"), ("exit", "dev-boot"),
+                      ("enter", "dev-apply"), ("exit", "dev-apply")]
+    assert bound == "dev-apply", "the later-committed attach must win"
+
+
+async def test_startup_reconnect_failed_cached_attach_drops_the_seed():
+    """U1/R5: Chromecast's _sync_connect consults _dbus_index BEFORE falling
+    through to discovery, so a seed left behind by a FAILED boot attach
+    shadows whatever discovery finds and makes the retry an exact repeat of
+    the failure. The failure path must remove it — and the retry must then
+    dial the freshly discovered address."""
+    import json
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+    dialled = []
+    seed_at_discovery = []
+
+    async def set_device(device_id):
+        dialled.append(backend._dbus_index.get(device_id))
+        if len(dialled) == 1:
+            raise RuntimeError("no route to 10.0.0.1")
+
+    async def discover():
+        seed_at_discovery.append(backend._dbus_index.get("some-uuid"))
+        backend._dbus_index["some-uuid"] = ("TV", "10.0.0.7", 8009)
+
+    backend.set_device = AsyncMock(side_effect=set_device)
+    backend.discover_devices = AsyncMock(side_effect=discover)
+
+    cached = json.dumps({"name": "TV", "host": "10.0.0.1", "port": 8009})
+    with patch.object(db, "get_setting", AsyncMock(return_value=cached)):
+        await _startup_reconnect(backend, "some-uuid")
+
+    assert seed_at_discovery == [None], "the dead seed must be gone by discovery"
+    assert dialled == [("TV", "10.0.0.1", 8009), ("TV", "10.0.0.7", 8009)], (
+        "the retry must dial the discovered address, not repeat the failure")
+
+
+async def test_startup_reconnect_failed_cached_attach_drops_the_seed_airplay():
+    """U1/R5, AirPlay's cache: same rule, different dict."""
+    import json
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output.airplay import AirPlayBackend
+
+    backend = AirPlayBackend()
+    backend.set_device = AsyncMock(side_effect=RuntimeError("pair-verify failed"))
+    seed_at_discovery = []
+    backend.discover_devices = AsyncMock(side_effect=lambda: seed_at_discovery.append(
+        backend._device_addr.get("ap-host:7000")))
+
+    cached = json.dumps({"name": "Bedroom", "host": "192.168.1.20", "port": 7000})
+    with patch.object(db, "get_setting", AsyncMock(return_value=cached)), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()):
+        await _startup_reconnect(backend, "ap-host:7000")
+
+    assert seed_at_discovery == [None]
+    assert "ap-host:7000" not in backend._device_addr
+
+
+async def test_startup_reconnect_failed_cached_attach_drops_the_seed_dlna():
+    """U1/R5, DLNA's LOCATION cache: same rule, different dict."""
+    import json
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output.dlna import DlnaBackend
+
+    backend = DlnaBackend()
+    backend.set_device = AsyncMock(side_effect=RuntimeError("410 Gone"))
+    seed_at_discovery = []
+    backend.discover_devices = AsyncMock(side_effect=lambda: seed_at_discovery.append(
+        backend._device_locations.get("uuid:wiim-1")))
+
+    cached = json.dumps({"location": "http://192.168.1.60:49152/desc.xml"})
+    with patch.object(db, "get_setting", AsyncMock(return_value=cached)), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()):
+        await _startup_reconnect(backend, "uuid:wiim-1")
+
+    assert seed_at_discovery == [None]
+    assert "uuid:wiim-1" not in backend._device_locations
+
+
+async def test_startup_reconnect_successful_attach_keeps_the_seed():
+    """U1/R5 scoping: the invalidation belongs to the FAILURE path only. A
+    boot attach that SUCCEEDS leaves its address cache intact — dropping it
+    would force the next attach to re-discover an address that just worked."""
+    import json
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+    backend.set_device = AsyncMock()
+    backend.discover_devices = AsyncMock()
+
+    cached = json.dumps({"name": "Kitchen", "host": "10.0.0.5", "port": 8009})
+    with patch.object(db, "get_setting", AsyncMock(return_value=cached)):
+        await _startup_reconnect(backend, "some-uuid")
+
+    assert backend._dbus_index["some-uuid"] == ("Kitchen", "10.0.0.5", 8009)
+    backend.discover_devices.assert_not_awaited()
+
+
+async def test_startup_reconnect_failed_attach_keeps_a_fresher_address():
+    """U1/R5 scoping, the other edge: the invalidation removes OUR seed, not
+    whatever replaced it. A discovery arrival that registered a fresh address
+    while the boot attach was in flight must survive the failure — that entry
+    is exactly what the retry should dial."""
+    import json
+    import app.database as db
+    from app.state import _startup_reconnect
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+
+    async def set_device(device_id):
+        # a discovery arrival lands mid-attach, replacing the stale seed
+        backend._dbus_index[device_id] = ("TV", "10.0.0.9", 8009)
+        raise RuntimeError("no route to 10.0.0.1")
+
+    backend.set_device = AsyncMock(side_effect=set_device)
+    backend.discover_devices = AsyncMock()
+
+    cached = json.dumps({"name": "TV", "host": "10.0.0.1", "port": 8009})
+    with patch.object(db, "get_setting", AsyncMock(return_value=cached)), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()):
+        await _startup_reconnect(backend, "some-uuid")
+
+    assert backend._dbus_index["some-uuid"] == ("TV", "10.0.0.9", 8009)
+
+
 # ── advance lock (#9 skip/EOS race) ──────────────────────────────────────────
 
 async def test_do_advance_bails_when_advance_lock_held():
@@ -4522,3 +4801,241 @@ def test_detect_primary_lan_ip_failure_is_not_cached_permanently():
         # ...network comes up; a subsequent call must re-detect and succeed.
         with patch.object(st.socket, "socket", _LiveSock):
             assert st._detect_primary_lan_ip() == "192.168.7.7"
+
+
+# ── U6: a switch releases the backend it leaves (2026-08-20 plan U6, R3) ─────
+#
+# The router unit tests live in tests/test_output_attach_ownership.py. These
+# two drive the real ``activate_backend`` — the path an admin Apply actually
+# takes — because that is where the two branches are chosen: an idle switch
+# retires the outgoing backend at once, and a mid-playback device change on the
+# SAME backend defers to the boundary and must not be released there at all.
+
+
+class _SwitchProbe:
+    """An output backend that records whether it was released."""
+
+    def __init__(self, *, is_playing: bool = False) -> None:
+        self.released = 0
+        self.stopped = 0
+        self._is_playing = is_playing
+        self.set_device = AsyncMock()
+
+    @property
+    def is_playing(self) -> bool:
+        return self._is_playing
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+    def release(self) -> None:
+        self.released += 1
+
+
+def _switch_env(stack, state, router):
+    """The patch set ``activate_backend`` needs to run end-to-end offline."""
+    fake_qe = MagicMock()
+    fake_qe.state.is_playing = False
+    fake_qe.queue = []
+    stack.enter_context(patch.object(state, "output_router", router))
+    stack.enter_context(patch.object(state, "queue_engine", fake_qe))
+    stack.enter_context(patch.object(state, "trigger_arming_eval", MagicMock()))
+    stack.enter_context(patch("app.database.set_setting", AsyncMock()))
+
+
+async def test_activate_backend_releases_the_backend_it_switches_away_from(
+        fresh_supervisor):
+    """*Covers AC3* at the level the user drives it: Apply a different output
+    while nothing is playing, and the backend being left behind lets go of its
+    connection instead of keeping a socket, a session and a live listener
+    against a device that is no longer this jukebox's."""
+    import app.state as state
+    from app.output.router import OutputRouter
+    old, new = _SwitchProbe(), _SwitchProbe()
+    router = OutputRouter()
+    router._active = old
+
+    with contextlib.ExitStack() as stack:
+        _switch_env(stack, state, router)
+        stack.enter_context(patch.object(state, "_get_backend", lambda t: new))
+        await state.activate_backend("chromecast", "dev-1")
+        for _ in range(10):
+            await asyncio.sleep(0)      # the immediate branch retires on a task
+
+    assert router.active is new
+    new.set_device.assert_awaited_once_with("dev-1")
+    assert old.released == 1, "the outgoing backend kept its connection"
+    assert new.released == 0, "the incoming backend was released"
+
+
+async def test_a_failed_switch_leaves_the_previous_backend_attached(
+        fresh_supervisor):
+    """*Covers F2 (2026-08-20 review).* Apply an output that is asleep, and the
+    output you were already using must survive untouched.
+
+    The regression this pins was subtle and severe. ``activate_backend`` used
+    to point the router at the incoming backend BEFORE awaiting its attach,
+    with a rollback in the except. But pointing the router is what spawns the
+    retire task, and the retire's release guard is ``old is not self._active``
+    — which read true precisely BECAUSE the router had already been moved. So
+    a switch that then failed rolled the pointer back onto a backend whose
+    connection had been dropped in the meantime.
+
+    The user-visible shape was worst from paused: ``resume()`` no-ops on a null
+    connection, so the UI flipped to playing with no audio, no exception, and
+    no outage hold for the supervisor to recover from. Only a fresh Apply got
+    the sound back.
+
+    Note both assertions. Not-released is the bug; not-STOPPED is the older
+    invariant ``app/admin.py`` has documented all along — a failed switch
+    leaves the old backend playing."""
+    import app.state as state
+    from app.output.router import OutputRouter
+    old, new = _SwitchProbe(), _SwitchProbe()
+
+    async def _failing_attach(device_id):
+        # The yield is load-bearing, and a review caught its absence. With a
+        # bare AsyncMock the coroutine raises WITHOUT ever handing control back
+        # to the loop, so the pre-fix rollback restored _active = old before
+        # the spawned _stop_and_warn task could evaluate its
+        # `old is not self._active` release guard. Measured against the
+        # unfixed code: no-yield gives released=0, one yield gives released=1.
+        # So the no-yield fixture made the test pass on `old.stopped == 0` —
+        # the older invariant — while the assertion this test is NAMED for
+        # never fired. Every real attach awaits something.
+        await asyncio.sleep(0)
+        raise RuntimeError("did not connect")
+
+    new.set_device = _failing_attach
+    router = OutputRouter()
+    router._active = old
+
+    with contextlib.ExitStack() as stack:
+        _switch_env(stack, state, router)
+        stack.enter_context(patch.object(state, "_get_backend",
+                                         lambda t: new))
+        with pytest.raises(RuntimeError, match="did not connect"):
+            await state.activate_backend("dlna", "dev-asleep")
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    assert router.active is old, "the router did not stay on the old backend"
+    assert old.released == 0, (
+        "a FAILED switch released the previously-working output — the next "
+        "play/resume on it has no connection to use")
+    assert old.stopped == 0, "a FAILED switch stopped the old backend"
+
+
+async def test_a_superseded_apply_does_not_report_success(fresh_supervisor):
+    """*Covers ADV-8/ADV-14 (2026-08-20 re-review).* An Apply that lost the
+    backend must not look like one that won it.
+
+    ``set_device`` used to have two outcomes and every caller read "did not
+    raise" as "attached". A superseded attach satisfied that while adopting
+    nothing, so ``activate_backend`` moved the router, persisted the selection,
+    cleared the outage hold and broadcast success — onto a backend holding no
+    connection. The admin saw the switch take; the next play failed with a
+    device error; the only cure was pressing Apply again.
+
+    Nothing here is about the connection failing. The attach connected fine —
+    it just wasn't the owner any more by the time it finished."""
+    import app.state as state
+    from app.output.base import AttachSuperseded
+    from app.output.router import OutputRouter
+    old, new = _SwitchProbe(), _SwitchProbe()
+    new.set_device = AsyncMock(side_effect=AttachSuperseded("newer attach won"))
+    router = OutputRouter()
+    router._active = old
+
+    with contextlib.ExitStack() as stack:
+        _switch_env(stack, state, router)
+        persisted = {}
+        stack.enter_context(patch("app.database.set_setting",
+                                  AsyncMock(side_effect=lambda k, v:
+                                            persisted.__setitem__(k, v))))
+        stack.enter_context(patch.object(state, "_get_backend",
+                                         lambda t: new))
+        with pytest.raises(AttachSuperseded):
+            await state.activate_backend("dlna", "dev-1")
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    assert router.active is old, (
+        "a superseded attach moved the router onto a backend holding nothing")
+    assert "output_backend_type" not in persisted, (
+        "a superseded attach persisted the selection, so the next boot would "
+        "restore an output the user never successfully applied")
+
+
+async def test_a_mid_playback_device_change_does_not_release_the_backend(
+        fresh_supervisor):
+    """The counter-case that a naive wiring breaks. Moving from Cast speaker A
+    to speaker B mid-track re-selects the SAME backend, so the switch defers to
+    the track boundary with pending IS active. ``set_device`` has already
+    attached B by then; releasing at the boundary would throw that connection
+    away immediately before the play that needs it."""
+    import app.state as state
+    from app.output.router import OutputRouter
+    backend = _SwitchProbe(is_playing=True)
+    router = OutputRouter()
+    router._active = backend
+
+    with contextlib.ExitStack() as stack:
+        _switch_env(stack, state, router)
+        stack.enter_context(patch.object(state, "_get_backend",
+                                         lambda t: backend))
+        await state.activate_backend("chromecast", "dev-B")
+        assert router.has_pending is True        # deferred to the boundary
+        await router.swap_pending()              # …which then arrives
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    assert router.active is backend
+    backend.set_device.assert_awaited_once_with("dev-B")
+    assert backend.released == 0, "a same-backend device change released it"
+
+
+async def test_a_mid_playback_device_change_stays_deferred_even_if_the_attach_clears_is_playing(
+        fresh_supervisor):
+    """*Covers CR-4 (2026-08-20 re-review).* The immediate-vs-deferred decision
+    must read the state at REQUEST time.
+
+    ``set_backend`` branches on ``is_playing``, and once the router stopped
+    moving until after the attach, that read happened after the attach too —
+    where, for a same-instance device change, it can be the incoming attach's
+    own doing. plexplayer's ``set_device`` sets ``_is_playing = False`` as its
+    third statement and AirPlay's tears the process down; both clear the very
+    flag the branch turns on.
+
+    So a mid-track device change on those backends silently flipped from
+    deferred to immediate: ``_pending`` was never set, the boundary's
+    ``stop()`` and stale-dispatch-key clear never ran, and
+    ``_reconcile_armed_next`` — which keys off ``has_pending`` — left a gapless
+    arm pointing at a session that no longer exists.
+
+    The existing sibling test cannot see this: its probe's ``set_device`` is a
+    bare AsyncMock that touches nothing."""
+    import app.state as state
+    from app.output.router import OutputRouter
+    backend = _SwitchProbe(is_playing=True)
+
+    async def _attach_that_stops_playback(device_id):
+        # Exactly what plexplayer and AirPlay do inside set_device.
+        backend._is_playing = False
+
+    backend.set_device = _attach_that_stops_playback
+    router = OutputRouter()
+    router._active = backend
+
+    with contextlib.ExitStack() as stack:
+        _switch_env(stack, state, router)
+        stack.enter_context(patch.object(state, "_get_backend",
+                                         lambda t: backend))
+        await state.activate_backend("plexplayer", "dev-B")
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        assert router.has_pending is True, (
+            "a mid-playback device change took the immediate branch because "
+            "the attach itself had cleared is_playing — the boundary stop, "
+            "the stale-key clear and the arm revocation are all skipped")

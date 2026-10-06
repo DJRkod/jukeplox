@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 from uuid import UUID
 
 from app.output import hold  # the hold flag's home since the session decomposition
+from app.output.base import AttachSuperseded
 from app.plex.models import Track
 
 
@@ -30,6 +31,15 @@ def _make_cc(name="Living Room", uuid="abc-123"):
     cc.set_volume = MagicMock()
     cc.wait = MagicMock()
     return cc
+
+
+def _connect_result(cc, name="Living Room", host="192.0.2.10", port=8009):
+    """What ``_sync_connect`` hands back since the 2026-08-20 plan's U4: the
+    cast AND the address THIS attach resolved, so ``set_device`` persists a
+    value from its own scope instead of reading it off the instance across the
+    executor await."""
+    from app.output.chromecast import _ResolvedAddr
+    return cc, _ResolvedAddr(name, host, port)
 
 
 def _make_cast_info(friendly_name="Living Room", uuid_str="abc-123", host="192.168.1.10", port=8009):
@@ -1279,7 +1289,7 @@ async def test_sync_connect_uuid_in_degraded_mode_does_not_scan(cast_mock):
     backend._dbus_index[uuid_str] = ("Living Room TV", "192.168.1.10", 8009)
 
     with patch("app.state._mdns_port_unavailable", True):
-        result = backend._sync_connect(uuid_str)
+        result, resolved = backend._sync_connect(uuid_str)
 
     cast_mock["pcc"].get_chromecasts.assert_not_called()
     cast_mock["pcc"].Chromecast.assert_called_once()
@@ -1288,6 +1298,8 @@ async def test_sync_connect_uuid_in_degraded_mode_does_not_scan(cast_mock):
     # cast_type forced to CHROMECAST, not auto-detected 'audio' (2026-08-04 fix)
     assert _ci.args[6] == cast_mock["pcc"].const.CAST_TYPE_CHROMECAST
     assert result is cc
+    # U4: the address travels back with the connection, not via instance state.
+    assert resolved == ("Living Room TV", "192.168.1.10", 8009)
 
 
 async def test_sync_connect_uses_dbus_index(cast_mock):
@@ -1306,7 +1318,7 @@ async def test_sync_connect_uses_dbus_index(cast_mock):
     backend = ChromecastBackend()
     backend._dbus_index[uuid_str] = ("Living Room TV", "192.168.1.10", 8009)
 
-    result = backend._sync_connect(uuid_str)
+    result, resolved = backend._sync_connect(uuid_str)
 
     cast_mock["pcc"].Chromecast.assert_called_once()
     _ci = cast_mock["pcc"].models.CastInfo.call_args
@@ -1315,6 +1327,7 @@ async def test_sync_connect_uses_dbus_index(cast_mock):
     assert _ci.args[1] == UUID(uuid_str)
     assert _ci.args[6] == cast_mock["pcc"].const.CAST_TYPE_CHROMECAST
     assert result is cc
+    assert resolved == ("Living Room TV", "192.168.1.10", 8009)
 
 
 async def test_sync_connect_dbus_index_raises_on_timeout(cast_mock):
@@ -1349,7 +1362,7 @@ async def test_sync_connect_uses_dbus_device(cast_mock):
     backend = ChromecastBackend()
     backend._dbus_index["192.168.1.10:8009"] = ("Living Room", "192.168.1.10", 8009)
 
-    result = backend._sync_connect("192.168.1.10:8009")
+    result, resolved = backend._sync_connect("192.168.1.10:8009")
 
     cast_mock["pcc"].Chromecast.assert_called_once()
     _ci = cast_mock["pcc"].models.CastInfo.call_args
@@ -1358,6 +1371,7 @@ async def test_sync_connect_uses_dbus_device(cast_mock):
     assert _ci.args[4] == "192.168.1.10" and _ci.args[5] == 8009
     assert _ci.args[6] == cast_mock["pcc"].const.CAST_TYPE_CHROMECAST
     assert result is cc
+    assert resolved == ("Living Room", "192.168.1.10", 8009)
 
 
 async def test_sync_connect_dbus_raises_on_timeout(cast_mock):
@@ -1392,7 +1406,7 @@ async def test_sync_connect_dbus_succeeds_when_wait_returns_none(cast_mock):
     backend = ChromecastBackend()
     backend._dbus_index["192.168.1.10:8009"] = ("Living Room", "192.168.1.10", 8009)
 
-    result = backend._sync_connect("192.168.1.10:8009")
+    result, _resolved = backend._sync_connect("192.168.1.10:8009")
     assert result is cc  # should succeed, not raise
 
 
@@ -1499,6 +1513,165 @@ async def test_set_device_updates_cache_on_reconnect(cast_mock):
     assert addr_second["host"] == "192.168.1.55", "cache must be updated with new IP on reconnect"
 
 
+# ── U4: the resolved address travels with the attach (AC2) ───────────────────
+#
+# ``_sync_connect`` used to park what it resolved in ``self._resolved_*`` and
+# ``set_device`` read those fields back after the executor await. One slot, two
+# attaches: whichever connect finished last owned the value everyone else read,
+# so device X's stored address could be device Y's — and since a stored address
+# is loaded into the cache on the next boot and consulted BEFORE discovery, it
+# shadowed the correct entry and selecting X went on playing on Y across
+# restarts (issue #49). The address now comes back FROM the connect.
+
+_RACE_WINNER = "00000000-0000-0000-0000-0000000000a1"   # Kitchen, 192.0.2.10
+_RACE_LOSER = "00000000-0000-0000-0000-0000000000b2"    # Bedroom, 192.0.2.20
+
+
+async def _drive_address_race(backend, saved: dict) -> dict:
+    """Two REAL concurrent attaches on one backend, interleaved the way the
+    fault needs: the winner's connect resolves FIRST and is still inside the
+    executor when the loser's connect resolves, so the loser's address is the
+    last one written to any shared state before the winner resumes and
+    persists. Both connects run the real ``_sync_connect`` on real executor
+    threads; only the cast objects it would build are faked.
+
+    Returns the cast object faked for each host."""
+    import threading
+
+    backend._dbus_index[_RACE_WINNER] = ("Kitchen", "192.0.2.10", 8009)
+    backend._dbus_index[_RACE_LOSER] = ("Bedroom", "192.0.2.20", 8009)
+    casts = {"192.0.2.10": _make_cc("Kitchen", _RACE_WINNER),
+             "192.0.2.20": _make_cc("Bedroom", _RACE_LOSER)}
+    for cc in casts.values():
+        cc.wait.return_value = None
+
+    winner_resolved = threading.Event()
+    loser_resolved = threading.Event()
+    real_connect = backend._sync_connect
+
+    def _interleaved(device_id: str):
+        if device_id == _RACE_WINNER:
+            produced = real_connect(device_id)
+            winner_resolved.set()
+            # Still holding the executor thread while the other attach lands.
+            assert loser_resolved.wait(10), "the loser's connect never ran"
+            return produced
+        assert winner_resolved.wait(10), "the winner's connect never ran"
+        produced = real_connect(device_id)
+        loser_resolved.set()
+        return produced
+
+    backend._sync_connect = _interleaved
+
+    async def fake_set_setting(key, value):
+        saved[key] = value
+
+    with patch("app.output.chromecast._media_chromecast_from_host",
+               lambda host, port, uuid, name: casts[host]), \
+         patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", fake_set_setting):
+        # The loser claims its attach first, so the winner — started second —
+        # is the one the compare-and-swap lets through.
+        loser = asyncio.get_running_loop().create_task(
+            backend.set_device(_RACE_LOSER))
+        await asyncio.sleep(0)
+        winner = asyncio.get_running_loop().create_task(
+            backend.set_device(_RACE_WINNER))
+        # The loser now REPORTS being superseded rather than returning
+        # quietly (2026-08-20 re-review ADV-8), so this gather must expect it.
+        # Asserting the type rather than swallowing everything: a loser that
+        # failed for some other reason would mean the race never ran.
+        results = await asyncio.gather(loser, winner, return_exceptions=True)
+        assert isinstance(results[0], AttachSuperseded), (
+            f"the losing attach should report itself superseded, got "
+            f"{results[0]!r}")
+        assert not isinstance(results[1], BaseException), results[1]
+
+    return casts
+
+
+async def test_a_concurrent_attach_cannot_store_its_address_under_another_device(
+        cast_mock):
+    """*Covers AC2.* Under a forced race the address stored for a device is
+    that device's own.
+
+    The headline test for this unit, and the one wrong-speaker-after-reboot
+    depends on: ``output_addr:{winner}`` is what the winner's connect
+    resolved, never the address the losing attach happened to resolve last."""
+    import json
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+    saved: dict = {}
+    casts = await _drive_address_race(backend, saved)
+
+    stored = json.loads(saved[f"output_addr:{_RACE_WINNER}"])
+    assert stored["host"] == "192.0.2.10", (
+        "the winner's device id was stored with the loser's address — this is "
+        "the value the next boot dials before discovery (issue #49 AC2)")
+    assert stored["name"] == "Kitchen"
+    assert stored["port"] == 8009
+    # The loser never adopted, so it has no business persisting anything.
+    assert f"output_addr:{_RACE_LOSER}" not in saved
+    assert backend._cast is casts["192.0.2.10"]
+    casts["192.0.2.20"].socket_client.disconnect.assert_called_once_with()
+
+
+async def test_the_race_also_leaves_the_supervisors_write_back_on_the_winner(
+        cast_mock):
+    """The same poison by its second route. ``_write_back_address`` in
+    app/output/session.py reads ``backend._resolved_*`` straight after
+    set_device returns and calls ``register_resolved`` with the CURRENT
+    device's id — so a losing attach leaving its address on the instance maps
+    the winner's device to the loser's host in the live address cache, which
+    the next connect reads first and then persists. The fields describe the
+    ADOPTED connection, so only the attach that adopts writes them."""
+    from app.output.chromecast import ChromecastBackend
+
+    backend = ChromecastBackend()
+    await _drive_address_race(backend, {})
+
+    assert (backend._resolved_name, backend._resolved_host,
+            backend._resolved_port) == ("Kitchen", "192.0.2.10", 8009)
+
+
+async def test_an_uncontended_attach_persists_exactly_what_its_connect_resolved(
+        cast_mock):
+    """The uncontended half of AC2: what lands in the DB is what THIS connect
+    came back with, even when the instance is carrying another device's
+    resolution from an earlier attach. Pre-poisoning the fields is the
+    single-attach form of the race — any value sitting in them could reach the
+    DB while the persist read them back."""
+    import json
+    from app.output.chromecast import ChromecastBackend
+
+    uuid_str = "00000000-0000-0000-0000-0000000000c3"
+    cc = _make_cc("Study", uuid_str)
+    cc.wait.return_value = None
+
+    backend = ChromecastBackend()
+    backend._dbus_index[uuid_str] = ("Study", "192.0.2.31", 8009)
+    backend._resolved_name = "Somewhere Else"
+    backend._resolved_host = "203.0.113.9"
+    backend._resolved_port = 8009
+
+    saved: dict = {}
+
+    async def fake_set_setting(key, value):
+        saved[key] = value
+
+    with patch("app.output.chromecast._media_chromecast_from_host",
+               lambda host, port, uuid, name: cc), \
+         patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", fake_set_setting):
+        await backend.set_device(uuid_str)
+
+    stored = json.loads(saved[f"output_addr:{uuid_str}"])
+    assert (stored["name"], stored["host"], stored["port"]) == (
+        "Study", "192.0.2.31", 8009)
+    assert backend._resolved_host == "192.0.2.31"
+
+
 # ── _VolumeListener volume_changed broadcast (U2) ──────────────────────────────
 
 class _StatusStub:
@@ -1512,7 +1685,7 @@ def test_volume_listener_ignores_none_status():
     """Defensive: a None status (some pychromecast edge cases) must not raise."""
     from app.output.chromecast import _VolumeListener, ChromecastBackend
     backend = ChromecastBackend()
-    listener = _VolumeListener(backend)
+    listener = _VolumeListener(backend, backend._cast)
     listener.new_cast_status(None)  # must not raise
     # Volume unchanged from default
     assert backend._volume == 0.5
@@ -1523,7 +1696,7 @@ def test_volume_listener_ignores_status_without_volume_level():
     from app.output.chromecast import _VolumeListener, ChromecastBackend
     backend = ChromecastBackend()
     backend._loop = MagicMock()  # would broadcast if not for the None gate
-    listener = _VolumeListener(backend)
+    listener = _VolumeListener(backend, backend._cast)
     listener.new_cast_status(_StatusStub(volume_level=None))  # ValueError → early return
     # No broadcast attempt because we never got past the float() conversion
     backend._loop.call_soon_threadsafe.assert_not_called()
@@ -1542,7 +1715,7 @@ def test_volume_listener_echo_guard_suppresses_within_2s():
     backend._volume = 0.5
     backend._vol_last_set = time.monotonic()  # just set
     backend._loop = MagicMock()
-    listener = _VolumeListener(backend)
+    listener = _VolumeListener(backend, backend._cast)
     listener.new_cast_status(_StatusStub(volume_level=0.6))
     assert backend._volume == 0.5  # unchanged
     backend._loop.call_soon_threadsafe.assert_not_called()
@@ -1560,7 +1733,7 @@ def test_volume_listener_broadcasts_when_guard_expired():
     backend._volume = 0.5
     backend._vol_last_set = time.monotonic() - 3.0  # outside the 2s window
     backend._loop = MagicMock()
-    listener = _VolumeListener(backend)
+    listener = _VolumeListener(backend, backend._cast)
 
     # Patch run_coroutine_threadsafe so we don't need a real loop; capture call args.
     with _patch("app.output.chromecast.asyncio.run_coroutine_threadsafe") as rcs:
@@ -1589,7 +1762,7 @@ def test_volume_listener_skips_broadcast_when_loop_unset():
     backend._volume = 0.5
     backend._vol_last_set = time.monotonic() - 3.0
     backend._loop = None  # play() hasn't run yet
-    listener = _VolumeListener(backend)
+    listener = _VolumeListener(backend, backend._cast)
 
     with _patch("app.output.chromecast.asyncio.run_coroutine_threadsafe") as rcs:
         listener.new_cast_status(_StatusStub(volume_level=0.7))
@@ -1625,7 +1798,7 @@ async def test_probe_device_returns_true_on_successful_wait(cast_mock):
 
     assert result is True
     cast_mock["pcc"].get_chromecast_from_host.assert_called_once()
-    cc.disconnect.assert_called_once()
+    cc.socket_client.disconnect.assert_called_once()
 
 
 async def test_probe_device_returns_false_on_wait_timeout(cast_mock):
@@ -1645,7 +1818,7 @@ async def test_probe_device_returns_false_on_wait_timeout(cast_mock):
         result = await backend.probe_device("uuid-1")
 
     assert result is False
-    cc.disconnect.assert_called_once()
+    cc.socket_client.disconnect.assert_called_once()
 
 
 async def test_probe_device_returns_false_on_get_chromecast_exception(cast_mock):
@@ -1695,7 +1868,7 @@ async def test_probe_device_uses_cast_info_when_dbus_index_empty(cast_mock):
     backend._cast_infos["uuid-2"] = info
 
     assert await backend.probe_device("uuid-2") is True
-    cc.disconnect.assert_called_once()
+    cc.socket_client.disconnect.assert_called_once()
 
 
 async def test_probe_device_returns_false_when_unavailable():
@@ -1922,7 +2095,7 @@ async def test_connection_restored_during_hold_triggers_reattach(
     monkeypatch.setattr(hold, "_output_hold", True)
     triggers = []
     monkeypatch.setattr(session, "notify_reconnect_trigger",
-                        lambda t: triggers.append(t))
+                        lambda t, backend=None: triggers.append((t, backend)))
 
     backend = ChromecastBackend()
     cc = _make_cc()
@@ -1933,7 +2106,9 @@ async def test_connection_restored_during_hold_triggers_reattach(
     status.status = "CONNECTED"
     _ConnectionListener(backend, cc).new_connection_status(status)
     await _asyncio.sleep(0)
-    assert triggers == ["cast_connected"]
+    # The reporter must be named (2026-08-20 review F5): an abandoned
+    # connection's re-dial must not drive a different backend's reconnect.
+    assert triggers == [("cast_connected", backend)]
 
 
 async def test_connection_restored_without_hold_is_noop(
@@ -1946,7 +2121,7 @@ async def test_connection_restored_without_hold_is_noop(
     monkeypatch.setattr(hold, "_output_hold", False)
     triggers = []
     monkeypatch.setattr(session, "notify_reconnect_trigger",
-                        lambda t: triggers.append(t))
+                        lambda t, backend=None: triggers.append((t, backend)))
 
     backend = ChromecastBackend()
     cc = _make_cc()
@@ -1970,7 +2145,7 @@ async def test_connection_restored_from_stale_cast_ignored(
     monkeypatch.setattr(hold, "_output_hold", True)
     triggers = []
     monkeypatch.setattr(session, "notify_reconnect_trigger",
-                        lambda t: triggers.append(t))
+                        lambda t, backend=None: triggers.append((t, backend)))
 
     backend = ChromecastBackend()
     old_cc = _make_cc("Old", "abc-001")
@@ -2004,6 +2179,188 @@ async def test_set_device_registers_connection_listener(cast_mock):
     cc.register_connection_listener.assert_called_once()
     listener = cc.register_connection_listener.call_args.args[0]
     assert isinstance(listener, _ConnectionListener)
+
+
+# ── U5: a non-current connection has no authority ────────────────────────────
+
+async def test_set_device_binds_volume_listener_to_the_adopted_cast(cast_mock):
+    """U5 structural pin: the volume listener is bound to the cast it is
+    registered on, the same as the connection listener. Without the binding
+    it has no way to tell a superseded connection's signal from the current
+    one's."""
+    from app.output.chromecast import ChromecastBackend, _VolumeListener
+    cc = _make_cc("Device", "abc-001")
+    info = _make_cast_info("Device", "00000000-0000-0000-0000-000000000001")
+    cast_mock["pcc"].get_chromecast_from_cast_info.return_value = cc
+
+    backend = ChromecastBackend()
+    backend._cast_infos["00000000-0000-0000-0000-000000000001"] = info
+    backend._browser = MagicMock()
+    backend._zconf = MagicMock()
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", AsyncMock()):
+        await backend.set_device("00000000-0000-0000-0000-000000000001")
+
+    vol_listener = cc.register_status_listener.call_args.args[0]
+    assert isinstance(vol_listener, _VolumeListener)
+    assert vol_listener._cast is cc is backend._cast
+
+
+def test_volume_listener_from_superseded_cast_ignored():
+    """U5: a volume signal from a connection the backend no longer holds must
+    not write backend._volume and must broadcast nothing — the admin slider
+    jumping to an abandoned speaker's level is the user-visible symptom."""
+    import time
+    from unittest.mock import patch as _patch
+    from app.output.chromecast import _VolumeListener, ChromecastBackend
+    backend = ChromecastBackend()
+    backend._volume = 0.5
+    backend._vol_last_set = time.monotonic() - 3.0   # echo guard expired
+    backend._loop = MagicMock()
+    old_cc = _make_cc("Old", "abc-001")
+    backend._cast = _make_cc("New", "abc-002")       # a different, current cast
+    listener = _VolumeListener(backend, old_cc)      # survived on the orphan
+
+    with _patch("app.output.chromecast.asyncio.run_coroutine_threadsafe") as rcs:
+        listener.new_cast_status(_StatusStub(volume_level=0.9))
+
+    assert backend._volume == 0.5                    # untouched
+    rcs.assert_not_called()
+
+
+def test_volume_listener_on_current_cast_still_updates_and_broadcasts():
+    """Scoping pin for the guard above: the listener bound to the cast the
+    backend currently holds keeps working. A guard that always returned would
+    pass the superseded test on its own."""
+    import time
+    from unittest.mock import patch as _patch
+    from app.output.chromecast import _VolumeListener, ChromecastBackend
+    backend = ChromecastBackend()
+    backend._volume = 0.5
+    backend._vol_last_set = time.monotonic() - 3.0
+    backend._loop = MagicMock()
+    cc = _make_cc("Kitchen", "abc-001")
+    backend._cast = cc
+    listener = _VolumeListener(backend, cc)
+
+    with _patch("app.output.chromecast.asyncio.run_coroutine_threadsafe") as rcs:
+        listener.new_cast_status(_StatusStub(volume_level=0.9))
+
+    assert backend._volume == 0.9
+    rcs.assert_called_once()
+    rcs.call_args.args[0].close()                    # don't leak the coroutine
+
+
+def test_volume_listener_inert_after_release():
+    """release() (U2) clears ``_cast``, so the listener it detached is inert
+    even if the socket thread delivers one last status on its way out."""
+    import time
+    from unittest.mock import patch as _patch
+    from app.output.chromecast import _VolumeListener, ChromecastBackend
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    backend._cast = cc
+    backend._volume = 0.4
+    backend._vol_last_set = time.monotonic() - 3.0
+    backend._loop = MagicMock()
+    listener = _VolumeListener(backend, cc)
+    backend._vol_listener = listener
+    backend.release()
+
+    with _patch("app.output.chromecast.asyncio.run_coroutine_threadsafe") as rcs:
+        listener.new_cast_status(_StatusStub(volume_level=0.9))
+
+    assert backend._volume == 0.4
+    rcs.assert_not_called()
+
+
+async def test_connection_lost_from_non_active_backend_opens_no_hold(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """U5/R3, the plan's scenario end to end: Cast played, the user paused and
+    switched output to Direct. The abandoned Cast connection stays live, and
+    when the speaker later sleeps its listener fires. The outage must not be
+    reported — the hold it opens captures ``output_router.active``, which is
+    the healthy Direct backend."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    from types import SimpleNamespace
+    import asyncio as _asyncio
+    import app.state as st
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    backend._cast = cc
+    backend._is_playing = True
+    backend._loop = _asyncio.get_running_loop()
+    # Switched away: Direct is the active output now.
+    monkeypatch.setattr(st, "output_router", SimpleNamespace(active=object()))
+
+    status = MagicMock()
+    status.status = "LOST"
+    _ConnectionListener(backend, cc).new_connection_status(status)
+    await _asyncio.sleep(0)
+
+    assert outages == []
+
+
+async def test_connection_lost_from_active_backend_still_reports(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """Scoping pin: the identical signal from the Cast backend that IS the
+    active output still reports outage-suspected."""
+    from app.output.chromecast import ChromecastBackend, _ConnectionListener
+    from types import SimpleNamespace
+    import asyncio as _asyncio
+    import app.state as st
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+
+    backend = ChromecastBackend()
+    cc = _make_cc()
+    backend._cast = cc
+    backend._is_playing = True
+    backend._loop = _asyncio.get_running_loop()
+    monkeypatch.setattr(st, "output_router", SimpleNamespace(active=backend))
+
+    status = MagicMock()
+    status.status = "LOST"
+    _ConnectionListener(backend, cc).new_connection_status(status)
+    await _asyncio.sleep(0)
+
+    assert outages == ["connection_lost"]
+
+
+async def test_watchdog_outage_from_non_active_backend_is_ignored(
+        cast_mock, fresh_supervisor, monkeypatch):
+    """The guard covers every Cast reporter, not just the connection listener:
+    the duration watchdog's unreachable-device report goes through the same
+    check."""
+    from unittest.mock import patch as _patch
+    from app.output.chromecast import ChromecastBackend
+    from types import SimpleNamespace
+    import app.state as st
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda *a: outages.append(a))
+    advance_called = []
+
+    async def advance():
+        advance_called.append(True)
+
+    backend = ChromecastBackend(advance_cb=advance)
+    backend._is_playing = True
+    backend._play_token = 7
+    backend._cast = None                       # probe → unreachable
+    monkeypatch.setattr(st, "output_router", SimpleNamespace(active=object()))
+
+    with _patch("app.output.chromecast.asyncio.sleep", AsyncMock(return_value=None)):
+        await backend._watchdog(7, 1000)
+
+    assert outages == []
+    assert not advance_called                  # still not an advance
 
 
 async def test_probe_liveness_reachable_with_connected_socket(cast_mock):
@@ -3277,3 +3634,439 @@ def test_fake_flow_session_covers_backend_consumed_flow_surface():
         f"FakeFlowSession lacks backend-consumed attrs: {missing_on_fake}")
     assert missing_on_real == [], (
         f"FlowSession lacks backend-consumed attrs: {missing_on_real}")
+
+
+# ── #48: a timed-out connect must not leak the cast object ───────────────────
+# pychromecast's SocketClient runs its own thread and keeps re-dialling the dead
+# host every ~5s. Abandoning a cast object without disconnect() leaks that
+# thread and its fd for the life of the process. probe_device already documents
+# and implements the rule ("disconnect() is called in a finally block on every
+# path ... even on the timeout path"); _sync_connect never got it.
+#
+# These assert on disconnect() rather than on a live thread count: the suite
+# mocks pychromecast entirely, so there is no real socket to count. A real-
+# thread test would need genuine pychromecast against an unreachable host —
+# 10s per attempt and network-dependent. The structural assertion is
+# deterministic and pins the same defect.
+
+
+class _FakeCastTimeout(Exception):
+    """Stand-in for pychromecast's _RequestTimeout."""
+
+
+def _timing_out_cc(name="Living Room"):
+    cc = _make_cc(name)
+    cc.wait.side_effect = _FakeCastTimeout("timed out")
+    return cc
+
+
+async def test_dbus_path_disconnects_the_cast_object_on_timeout(cast_mock):
+    from app.output.chromecast import ChromecastBackend
+
+    uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
+    cc = _timing_out_cc()
+    cast_mock["pcc"].Chromecast.return_value = cc
+
+    backend = ChromecastBackend()
+    backend._dbus_index[uuid_str] = ("Living Room TV", "192.0.2.10", 8009)
+
+    with patch("app.output.chromecast._RequestTimeout", _FakeCastTimeout):
+        # Match the operator hint unique to this site, not the generic phrase
+        # all three share — otherwise a refactor collapsing the three messages
+        # into one would go unnoticed.
+        with pytest.raises(RuntimeError, match="rescan in output settings"):
+            backend._sync_connect(uuid_str)
+
+    cc.socket_client.disconnect.assert_called_once()
+
+
+async def test_cached_castinfo_path_disconnects_on_timeout(cast_mock):
+    from app.output.chromecast import ChromecastBackend
+
+    uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
+    cc = _timing_out_cc()
+    cast_mock["pcc"].get_chromecast_from_cast_info.return_value = cc
+
+    backend = ChromecastBackend()
+    info = MagicMock()
+    info.friendly_name = "Living Room TV"
+    info.host = "192.0.2.10"
+    info.port = 8009
+    backend._cast_infos[uuid_str] = info
+    backend._zconf = MagicMock()
+
+    with patch("app.output.chromecast._RequestTimeout", _FakeCastTimeout):
+        with pytest.raises(RuntimeError, match="did not connect"):
+            backend._sync_connect(uuid_str)
+
+    cc.socket_client.disconnect.assert_called_once()
+
+
+async def test_one_shot_scan_path_disconnects_on_timeout(cast_mock, monkeypatch):
+    """The fallback path: no cached info, so a scan finds the device and we
+    connect by host. Same leak, third site."""
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+
+    monkeypatch.setattr(st, "_mdns_port_unavailable", False, raising=False)
+
+    uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
+    scanned = _make_cc("Living Room TV", uuid=uuid_str)
+    scanned.cast_info = MagicMock(host="192.0.2.10", port=8009,
+                                  friendly_name="Living Room TV",
+                                  uuid=uuid_str)
+    cast_mock["pcc"].get_chromecasts.return_value = ([scanned], MagicMock())
+
+    cc = _timing_out_cc()
+    cast_mock["pcc"].Chromecast.return_value = cc
+
+    backend = ChromecastBackend()
+
+    with patch("app.output.chromecast._RequestTimeout", _FakeCastTimeout):
+        with pytest.raises(RuntimeError, match="did not connect"):
+            backend._sync_connect(uuid_str)
+
+    cc.socket_client.disconnect.assert_called_once()
+
+
+async def test_successful_connect_is_not_disconnected(cast_mock):
+    """The half that matters just as much: the caller KEEPS the live object and
+    owns it from here. A finally that disconnects unconditionally would break
+    every attach instead of leaking on failure."""
+    from app.output.chromecast import ChromecastBackend
+
+    uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
+    cc = _make_cc("Living Room TV")
+    cc.wait.return_value = None
+    cast_mock["pcc"].Chromecast.return_value = cc
+
+    backend = ChromecastBackend()
+    backend._dbus_index[uuid_str] = ("Living Room TV", "192.0.2.10", 8009)
+
+    result, _resolved = backend._sync_connect(uuid_str)
+
+    assert result is cc
+    cc.socket_client.disconnect.assert_not_called()
+
+
+async def test_every_connect_path_releases_on_repeated_failures(cast_mock,
+                                                                monkeypatch):
+    """The per-site discrimination test.
+
+    An earlier version of this looped 50x on the D-Bus path alone, which meant
+    a partial fix — wrapping only that site and leaving the other two bare —
+    would still have passed 50/50 clean. Rotating the three paths is what
+    actually pins "all three sites release", which is the claim the fix makes.
+    """
+    import app.state as st
+    from app.output.chromecast import ChromecastBackend
+
+    monkeypatch.setattr(st, "_mdns_port_unavailable", False, raising=False)
+    uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
+    abandoned = []
+
+    def _new_cc(*_a, **_kw):
+        cc = _timing_out_cc()
+        abandoned.append(cc)
+        return cc
+
+    cast_mock["pcc"].Chromecast.side_effect = _new_cc
+    cast_mock["pcc"].get_chromecast_from_cast_info.side_effect = _new_cc
+
+    info = MagicMock(friendly_name="Living Room TV", host="192.0.2.10",
+                     port=8009, uuid=uuid_str)
+    scanned = _make_cc("Living Room TV", uuid=uuid_str)
+    scanned.cast_info = info
+    cast_mock["pcc"].get_chromecasts.return_value = ([scanned], MagicMock())
+
+    def _dbus_backend():
+        b = ChromecastBackend()
+        b._dbus_index[uuid_str] = ("Living Room TV", "192.0.2.10", 8009)
+        return b
+
+    def _castinfo_backend():
+        b = ChromecastBackend()
+        b._cast_infos[uuid_str] = info
+        b._zconf = MagicMock()
+        return b
+
+    def _scan_backend():
+        return ChromecastBackend()          # neither cache populated
+
+    builders = [_dbus_backend, _castinfo_backend, _scan_backend]
+
+    with patch("app.output.chromecast._RequestTimeout", _FakeCastTimeout):
+        for i in range(51):                 # 17 passes through each path
+            backend = builders[i % 3]()
+            with pytest.raises(RuntimeError):
+                backend._sync_connect(uuid_str)
+
+    assert len(abandoned) == 51
+    undisconnected = [c for c in abandoned if not c.socket_client.disconnect.called]
+    assert not undisconnected, (
+        f"{len(undisconnected)} of 51 failed connects across the three paths "
+        f"leaked a live cast object"
+    )
+    # Exactly once, not merely at-least-once: this is an ownership assertion,
+    # and "released twice" would mean the object was handed somewhere else too.
+    multi = [c for c in abandoned if c.socket_client.disconnect.call_count != 1]
+    assert not multi, f"{len(multi)} objects released more than once"
+
+
+async def test_release_never_blocks_on_the_worker_thread(cast_mock):
+    """Cleanup must go through SocketClient.disconnect(), not
+    Chromecast.disconnect().
+
+    Chromecast.disconnect() is socket_client.disconnect() followed by a join
+    that RAISES TimeoutError when the worker has not exited. Measured on the
+    arm64 rig against an unroutable host, the default blocked 25.0s — held
+    under _attach_serial, that stalls output switching for every backend. And
+    disconnect(timeout=0) is not a fix: the join raises immediately instead,
+    so cleanup runs down the exception path every time. A MagicMock never
+    raises, which is exactly why the mocked suite could not see it and the rig
+    could.
+
+    socket_client.disconnect() is the whole stop signal — stop event plus a
+    socketpair write that interrupts the blocked worker — with no join.
+    """
+    from app.output.chromecast import ChromecastBackend
+
+    uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
+    cc = _timing_out_cc()
+    cast_mock["pcc"].Chromecast.return_value = cc
+
+    backend = ChromecastBackend()
+    backend._dbus_index[uuid_str] = ("Living Room TV", "192.0.2.10", 8009)
+
+    with patch("app.output.chromecast._RequestTimeout", _FakeCastTimeout):
+        with pytest.raises(RuntimeError):
+            backend._sync_connect(uuid_str)
+
+    cc.socket_client.disconnect.assert_called_once_with()
+
+
+async def test_non_timeout_failure_also_releases_and_propagates(cast_mock):
+    """The second branch of _connect_or_release, which had no coverage at all:
+    anything other than a timeout out of wait() abandons the object just as
+    completely, so it must release too — while propagating the ORIGINAL
+    exception rather than a synthesized RuntimeError, because admin.py maps
+    RuntimeError to 409 and everything else to 502."""
+    from app.output.chromecast import ChromecastBackend
+
+    uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
+    cc = _make_cc("Living Room TV")
+    cc.wait.side_effect = OSError("connection reset by peer")
+    cast_mock["pcc"].Chromecast.return_value = cc
+
+    backend = ChromecastBackend()
+    backend._dbus_index[uuid_str] = ("Living Room TV", "192.0.2.10", 8009)
+
+    with patch("app.output.chromecast._RequestTimeout", _FakeCastTimeout):
+        with pytest.raises(OSError, match="connection reset"):
+            backend._sync_connect(uuid_str)
+
+    cc.socket_client.disconnect.assert_called_once_with()
+
+
+async def test_a_failing_disconnect_does_not_mask_the_connect_error(cast_mock):
+    """Cleanup is best-effort. If disconnect() itself throws, the caller must
+    still see the RuntimeError explaining the device did not connect — not a
+    confusing secondary error from the cleanup path."""
+    from app.output.chromecast import ChromecastBackend
+
+    uuid_str = "308c00d1-117f-a74c-600c-b4c97d433fd4"
+    cc = _timing_out_cc()
+    cc.socket_client.disconnect.side_effect = OSError("socket already gone")
+    cast_mock["pcc"].Chromecast.return_value = cc
+
+    backend = ChromecastBackend()
+    backend._dbus_index[uuid_str] = ("Living Room TV", "192.0.2.10", 8009)
+
+    with patch("app.output.chromecast._RequestTimeout", _FakeCastTimeout):
+        with pytest.raises(RuntimeError, match="did not connect"):
+            backend._sync_connect(uuid_str)
+
+
+# ── the SUCCESS-path counterpart (2026-08-20 plan U2) ────────────────────────
+# #48 above fixed the FAILURE path. The same unbounded convenience method was
+# still in use on the success path of every device switch, tearing down the
+# OUTGOING cast — so a healthy reconnect could stall for the OS connect timeout
+# on a device that had since gone unreachable, with the attach lock held.
+# The cross-backend contract for release lives in
+# tests/test_output_attach_ownership.py; this pins the set_device site.
+
+
+async def test_set_device_releases_the_outgoing_cast_without_blocking(cast_mock):
+    """Switching device must deliver the stop signal to the old cast and NOT
+    call the blocking convenience disconnect (measured 25.0s on the rig)."""
+    from app.output.chromecast import ChromecastBackend
+
+    old = _make_cc("Old Device", "abc-001")
+    new = _make_cc("New Device", "abc-002")
+    info = _make_cast_info("New Device", "00000000-0000-0000-0000-000000000002")
+    cast_mock["pcc"].get_chromecast_from_cast_info.return_value = new
+
+    backend = ChromecastBackend()
+    backend._cast = old
+    backend._cast_infos["00000000-0000-0000-0000-000000000002"] = info
+    backend._browser = MagicMock()
+    backend._zconf = MagicMock()
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+            patch("app.database.set_setting", AsyncMock()):
+        await backend.set_device("00000000-0000-0000-0000-000000000002")
+
+    old.socket_client.disconnect.assert_called_once_with()
+    old.disconnect.assert_not_called()
+    assert backend._cast is new
+
+
+async def test_set_device_with_no_outgoing_cast_releases_nothing(cast_mock):
+    """First attach after boot: there is no outgoing connection, so no release
+    is attempted — the teardown must be scoped to an actual prior adoption."""
+    from app.output.chromecast import ChromecastBackend
+
+    new = _make_cc("New Device", "abc-002")
+    info = _make_cast_info("New Device", "00000000-0000-0000-0000-000000000001")
+    cast_mock["pcc"].get_chromecast_from_cast_info.return_value = new
+
+    backend = ChromecastBackend()
+    backend._cast_infos["00000000-0000-0000-0000-000000000001"] = info
+    backend._browser = MagicMock()
+    backend._zconf = MagicMock()
+
+    with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+            patch("app.database.set_setting", AsyncMock()):
+        await backend.set_device("00000000-0000-0000-0000-000000000001")
+
+    new.socket_client.disconnect.assert_not_called()
+
+
+# ── U3: adopt by compare-and-swap, Cast mechanics ────────────────────────────
+# The cross-backend scenarios (race, winner unaffected, scoping pin) live in
+# tests/test_output_attach_ownership.py. These pin the two things that are
+# specific to THIS backend's swap: the route the superseded release takes, and
+# the fact that the outgoing cast is read at the swap rather than at entry.
+
+
+async def test_a_superseded_attach_releases_via_socket_client_not_disconnect(
+        cast_mock):
+    """#48's measured finding on one more path. A superseded attach lets go of
+    a cast it just built, and that release must be the stop signal alone —
+    ``Chromecast.disconnect()`` blocks for the OS connect timeout (25.0s on the
+    rig) and this runs with the attach lock held."""
+    from app.output.chromecast import ChromecastBackend
+    backend = ChromecastBackend()
+    cc = _make_cc("Superseded", "abc-009")
+
+    def _connect(device_id):
+        # Another attach starts while this one is inside the (uninterruptible)
+        # connect — the interleaving U1's lock is supposed to prevent.
+        backend._begin_attach()
+        return _connect_result(cc, "Superseded", "192.0.2.9", 8009)
+
+    backend._sync_connect = _connect
+    with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+            patch("app.database.set_setting", AsyncMock()):
+        with pytest.raises(AttachSuperseded):
+            await backend.set_device("00000000-0000-0000-0000-000000000009")
+
+    assert backend._cast is None, "a superseded attach must not adopt"
+    cc.socket_client.disconnect.assert_called_once_with()
+    cc.disconnect.assert_not_called()
+
+
+async def test_a_superseded_attach_registers_no_listeners_and_claims_no_device(
+        cast_mock):
+    """Everything after the swap belongs to the winner. A superseded attach
+    must not wire a connection listener onto the cast it is about to drop (an
+    orphan listener reporting outages for a device nobody owns), and must not
+    leave its device id behind as the backend's selection."""
+    from app.output.chromecast import ChromecastBackend
+    backend = ChromecastBackend()
+    backend._device_id = "incumbent"
+    cc = _make_cc("Superseded", "abc-010")
+
+    def _connect(device_id):
+        backend._begin_attach()
+        return _connect_result(cc, "Superseded", "192.0.2.9", 8009)
+
+    backend._sync_connect = _connect
+    set_setting = AsyncMock()
+    with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+            patch("app.database.set_setting", set_setting):
+        with pytest.raises(AttachSuperseded):
+            await backend.set_device("00000000-0000-0000-0000-000000000010")
+
+    cc.register_connection_listener.assert_not_called()
+    cc.register_status_listener.assert_not_called()
+    assert backend._device_id == "incumbent"
+    assert backend._vol_listener is None
+    set_setting.assert_not_awaited()
+
+
+async def test_the_outgoing_cast_is_freed_at_entry_not_at_the_swap(cast_mock):
+    """*2026-08-22 review.* The outgoing cast is released when the attach
+    STARTS, matching DLNA and PlexPlayer.
+
+    This inverts the test that stood here before, which pinned a swap-time
+    teardown on the grounds that reading at entry "would orphan any connection
+    adopted while this attach was still connecting". That scenario is not
+    reachable: the only production writes to ``self._cast`` are the
+    compare-and-swap — which only the current generation may reach — and
+    ``release()``, which bumps the generation first. The old test manufactured
+    it by assigning ``backend._cast`` directly from inside the connect, without
+    claiming a generation, which no caller does.
+
+    The placement is load-bearing for the router. Its retire stands down when a
+    newer attach has started, on the premise that the newer attach frees what
+    it replaced. Freeing at the swap made that false for an attach that failed,
+    which is what forced a second counter — and that counter then killed live
+    re-Applies."""
+    from app.output.chromecast import ChromecastBackend
+    backend = ChromecastBackend()
+    prior = _make_cc("Prior", "abc-011")
+    incoming = _make_cc("Incoming", "abc-013")
+    backend._cast = prior
+    freed_before_connect = {}
+
+    def _connect(device_id):
+        # Sampled INSIDE the connect: the prior cast must already be gone.
+        freed_before_connect["disconnected"] =             prior.socket_client.disconnect.called
+        freed_before_connect["cast_attr"] = backend._cast
+        return _connect_result(incoming, "Incoming", "192.0.2.13", 8009)
+
+    backend._sync_connect = _connect
+    with patch("app.database.get_setting", AsyncMock(return_value=None)),             patch("app.database.set_setting", AsyncMock()):
+        await backend.set_device("00000000-0000-0000-0000-000000000013")
+
+    assert freed_before_connect["disconnected"] is True, (
+        "the outgoing cast was still held while the new one connected")
+    assert freed_before_connect["cast_attr"] is None
+    assert backend._cast is incoming
+
+
+async def test_a_failed_attach_still_freed_the_outgoing_cast(cast_mock):
+    """*The property that lets ONE generation counter be correct.*
+
+    The router's retire stands down as soon as a newer attach starts, without
+    waiting to see whether it succeeds. That is only safe if a failed attach
+    has already freed the connection it was replacing — otherwise the retire
+    stays its hand and nothing else ever frees it, which is exactly the live
+    SocketClient leak the retire path exists to prevent."""
+    from app.output.chromecast import ChromecastBackend
+    backend = ChromecastBackend()
+    prior = _make_cc("Prior", "abc-014")
+    backend._cast = prior
+
+    def _connect(device_id):
+        raise RuntimeError("did not connect within 10s")
+
+    backend._sync_connect = _connect
+    with patch("app.database.get_setting", AsyncMock(return_value=None)),             patch("app.database.set_setting", AsyncMock()):
+        with pytest.raises(RuntimeError, match="did not connect"):
+            await backend.set_device("00000000-0000-0000-0000-000000000014")
+
+    prior.socket_client.disconnect.assert_called_once_with()
+    assert backend._cast is None, (
+        "a failed attach must not leave the outgoing cast adopted")

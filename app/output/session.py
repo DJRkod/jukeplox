@@ -46,7 +46,7 @@ import re
 import time
 from typing import Any, Awaitable, Callable
 
-from app.output import hold, session_events
+from app.output import base, hold, session_events
 # Facade re-exports (see the decomposition note above): FUNCTIONS only —
 # never the mutable ``hold._output_hold`` flag itself (a from-import would
 # snapshot the bool; readers go through ``hold.output_hold_active()``).
@@ -173,13 +173,31 @@ STATE_OUTAGE_PAUSED = "outage_paused"
 STATE_RECONNECTING = "reconnecting"
 STATE_IDLE_PAUSED = "idle_paused"
 
-# Serializes every set_device-bearing attach: the supervisor's re-attach
-# seeding AND state.activate_backend's manual switch. set_device commits
-# backend internals (_cast/_device_id) from an uncancellable executor thread
-# on a shared singleton, so without ordering a stale attach can finish LAST
-# and overwrite the freshly switched device's state. With the lock, the old
-# attach either completes before the switch's attach starts, or acquires
-# after it, observes the bumped attach-epoch, and never calls set_device.
+# Serializes every set_device-bearing attach. THREE callers hold it, and a
+# new attach path written without it re-opens the race the lock exists to
+# close:
+#   1. this module's ``_seed_and_set_device`` — the supervisor's re-attach
+#      seeding (backoff tick / discovery arrival / manual resume);
+#   2. ``state.activate_backend`` — the admin's manual Apply;
+#   3. ``state._startup_reconnect`` — the boot reconnect, spawned as a bare
+#      task from the boot restore path (2026-08-20 plan U1 brought it under
+#      the lock; before that it was the caller that escaped serialisation,
+#      and it is the one that races an Apply pressed during startup). Its
+#      sibling in ``state.setup`` — the inline attach for the non-discovery
+#      backend types — takes the lock too; it is uncontended there (setup
+#      runs before the app serves) and holds it only to keep the invariant
+#      "no path reaches a backend's attach without the lock" literally true.
+# set_device commits backend internals (_cast/_device_id) from an
+# uncancellable executor thread on a shared singleton, so without ordering a
+# stale attach can finish LAST and overwrite the freshly switched device's
+# state. With the lock, the old attach either completes before the switch's
+# attach starts, or acquires after it, observes the bumped attach-epoch, and
+# never calls set_device.
+#
+# The contract every holder follows: capture ``attach_epoch`` BEFORE
+# acquiring, re-validate it immediately AFTER acquiring, and abort without
+# calling set_device when it moved — a manual switch bumps the epoch before
+# it queues for the lock, so the later-committed switch always wins.
 _attach_serial = asyncio.Lock()
 
 _UUID_RE = re.compile(
@@ -524,14 +542,30 @@ class OutputSessionSupervisor:
             _log.warning("record_play failed for %r", _title(d.track),
                          exc_info=True)
 
-    def on_outage_reported(self, reason: str) -> None:
+    def on_outage_reported(self, reason: str, backend: Any = None) -> None:
         """A backend advance-authority path re-pointed here (U2, R16): Cast
         connection LOST / watchdog-with-unreachable-device, DLNA 3x poll
         errors, Direct sink error, AirPlay crash. Emits outage-suspected for
         the current dispatch (retiring it — a late confirmation must not
         count); with no live dispatch (e.g. the deadline already retired it)
         the listeners still hear the signal so the classifier can hold
-        whatever the queue is playing."""
+        whatever the queue is playing.
+
+        ``backend`` names the instance REPORTING the outage (2026-08-20 plan
+        U5, R3). An outage is device-level, so the hold it opens captures
+        ``output_router.active`` — which is not necessarily the reporter. A
+        backend the user switched away from (its connection still live until
+        release, and its listeners still firing) would otherwise hold the
+        queue on the healthy backend they switched TO. The check lives here,
+        at the one point every reporter reaches, rather than at any single
+        call site: Cast alone reaches it from three (connection lost, flow
+        outage, watchdog). A reporter that names itself and is not the active
+        output has no authority; ``None`` (backends not yet passing one) and
+        an unwired router keep the previous behaviour exactly."""
+        if backend is not None and not _reporter_is_active(backend):
+            _log.info("Output session: outage (%s) ignored — reported by a "
+                      "backend that is no longer the active output", reason)
+            return
         d = self._current
         if d is not None:
             self._cancel_timer()
@@ -1133,6 +1167,16 @@ class OutputSessionSupervisor:
             try:
                 await ot.backend.set_device(ot.device_id)
                 return True
+            except base.AttachSuperseded:
+                # Not a failure of the device, and not an attach we may report
+                # as successful (2026-08-20 re-review ADV-14). Returning False
+                # keeps the backoff loop alive, which is what we want: whatever
+                # superseded us either settles as the new output — in which
+                # case notify_manual_switch has already retired this outage —
+                # or it does not, and we try again.
+                _log.debug("Output session: re-attach for %r stood down; a "
+                           "newer attach owns the backend", ot.device_id)
+                return False
             except Exception as exc:
                 _log.info("Output session: re-attach attempt %d for %r "
                           "failed: %s", ot.attempts, ot.device_id, exc)
@@ -1407,14 +1451,29 @@ def notify_manual_switch() -> None:
     get_supervisor().on_manual_switch()
 
 
-def notify_reconnect_trigger(trigger: str) -> None:
+def notify_reconnect_trigger(trigger: str, backend: Any = None) -> None:
     """Loop-side re-attach trigger for backend connection listeners (U3): the
     Cast ConnectionStatusListener's CONNECTED lands here (LOST→CONNECTED
     destroyed the media session, so the re-attach rebuilds + resumes).
-    Funnels into the single-flight entry; no-op without an active outage."""
+    Funnels into the single-flight entry; no-op without an active outage.
+
+    Gated by the same reporter check as ``notify_outage`` (2026-08-20 review
+    F5/ADV-4). U5's premise is that a connection which is not the adopted one
+    has no authority, but only the outage DIRECTION was wired for it — this
+    one took no reporter and did no check. An abandoned Cast re-dialling its
+    powered-off speaker every ~5s therefore fired a re-attach trigger on each
+    successful dial, and because a hold was open on a DIFFERENT backend, each
+    one short-circuited that backend's backoff timer, incremented its attempt
+    counter and broadcast a session event. Single-flight bounded the damage to
+    one concurrent attempt, so the symptom was a runaway attempt count and an
+    exponential backoff that never actually backed off."""
     sup = get_supervisor()
     ot = sup._outage
     if ot is None or not hold.output_hold_active():
+        return
+    if backend is not None and not _reporter_is_active(backend):
+        _log.debug("reconnect trigger %r from a backend that is not the "
+                   "active output — ignoring", trigger)
         return
     _spawn_supervised(sup._attempt_reattach(ot, trigger))
 
@@ -1674,11 +1733,53 @@ def notify_confirmed(token: int) -> None:
     get_supervisor().on_playback_confirmed(token)
 
 
-def notify_outage(reason: str) -> None:
+def _reporter_is_active(backend: Any) -> bool:
+    """Is ``backend`` the output an outage may still speak for? (U5, R3.)
+
+    True when the router's active backend IS the reporter. An active backend
+    of ``None`` also reads True: nothing has been switched to, so there is no
+    healthy output for a stale report to damage, and degraded/unwired setups
+    (and every test that never builds a router) stay byte-identical. Late
+    import of ``app.state`` — the repo's cycle convention, matching
+    ``app.output.hold``, which reads the same attribute to capture the backend
+    the hold is opened against."""
+    from app import state
+    router = getattr(state, "output_router", None)
+    if router is None:
+        return True
+    # A switch the admin has already committed to takes authority away from the
+    # outgoing backend IMMEDIATELY, not when the incoming attach finishes
+    # (2026-08-20 re-review ADV-13). Otherwise a renderer that is dying — often
+    # the very reason for the switch — spends the whole attach still able to
+    # pause the queue and re-insert the current item.
+    #
+    # Probed rather than called directly, and in its OWN try: folding it in
+    # with the ``active`` read below made a router without the method (a test
+    # double, a partially-built one) raise AttributeError into the shared
+    # handler, which fails OPEN — so the entire gate silently stopped applying.
+    switching = getattr(router, "is_switching_away_from", None)
+    if callable(switching):
+        try:
+            if switching(backend):
+                return False
+        except Exception:  # pragma: no cover
+            pass
+    try:
+        active = router.active
+    except Exception:  # pragma: no cover — a router that cannot answer
+        return True
+    return active is None or active is backend
+
+
+def notify_outage(reason: str, backend: Any = None) -> None:
     """Backend-facing outage-suspected entry (U2) for the re-pointed
     advance-authority paths. MUST run on the event loop — backend threads
-    marshal here via ``call_soon_threadsafe`` exactly like notify_confirmed."""
-    get_supervisor().on_outage_reported(reason)
+    marshal here via ``call_soon_threadsafe`` exactly like notify_confirmed.
+
+    ``backend`` is the reporting instance (U5): pass ``self`` so a report from
+    a backend that is no longer the active output is dropped instead of
+    opening a hold against the backend that is."""
+    get_supervisor().on_outage_reported(reason, backend=backend)
 
 
 async def notify_gapless_boundary(track: Any) -> None:
@@ -1718,15 +1819,20 @@ def notify_confirmed_threadsafe(loop: Any, token: int) -> None:
         pass  # asyncio loop already closed — nowhere to deliver
 
 
-def notify_outage_threadsafe(loop: Any, reason: str) -> None:
+def notify_outage_threadsafe(loop: Any, reason: str,
+                             backend: Any = None) -> None:
     """Thread-side outage-suspected entry: marshal ``notify_outage`` onto
     ``loop`` — the shared hop for backends whose outage signal fires on a
     foreign thread (Cast status thread, GStreamer GLib bus), exactly like
     their EOS paths. A missing or already-closed loop drops the signal —
-    there is nowhere left to deliver it."""
+    there is nowhere left to deliver it.
+
+    ``backend`` carries the reporter through to ``notify_outage``'s U5 check;
+    the active-output question is answered on the LOOP, when the report is
+    delivered, not on the reporting thread."""
     if loop is None:
         return
     try:
-        loop.call_soon_threadsafe(notify_outage, reason)
+        loop.call_soon_threadsafe(notify_outage, reason, backend)
     except RuntimeError:
         pass  # asyncio loop already closed — nowhere to deliver

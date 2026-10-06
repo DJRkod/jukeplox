@@ -123,6 +123,37 @@ FLOW_DECODE_STALL_S = 30.0
 # judged by the watchdog, not severed here.
 FLOW_SOURCE_READ_TIMEOUT_S = FLOW_DECODE_STALL_S + 15.0
 
+# Resume-on-truncation budget for the source feed below (2026-08-21).
+#
+# Plex closes a connection it considers idle mid-body and httpx raises
+# RemoteProtocolError ("received N bytes, expected M"). The API proxy learned
+# to survive this twice — the passthrough path in 2026-08-09, the transcode
+# path in 2026-08-15 (issue #38) — but THIS feeder fetches its own bytes and
+# never did, so one drop cost the whole track: the decode failed and the
+# supervisor skipped. A 90-minute Chromecast soak on 2026-08-21 caught it once
+# (3.2 MB of an expected 30.7 MB, ~4 minutes of the track abandoned).
+#
+# Matches ``app/api/stream.py::_STREAM_RESUME_MAX`` deliberately: same fault,
+# same source, same remedy — differing numbers here would only be a puzzle for
+# whoever reads both next.
+FLOW_SOURCE_RESUME_MAX = 3
+
+
+def _content_range_start(value: str) -> int:
+    """Absolute start byte from ``Content-Range: bytes START-END/TOTAL``.
+
+    Returns -1 when absent or unparseable, so a caller comparing against a
+    requested offset treats "no usable Content-Range" as a mismatch and
+    declines to resume. (``app/api/stream.py`` has the same parser returning 0
+    for absent, because there it means "a plain 200 full body" — a benign
+    default in that context and the wrong one here. Duplicated rather than
+    imported: this module must never import from ``app/api/*`` — the layering
+    rule in this file's own docstring, api→output is the allowed direction.)"""
+    try:
+        return int(value.split()[1].split("-", 1)[0])
+    except (IndexError, ValueError, AttributeError):
+        return -1
+
 # The encode-format knob (see module docstring). "flac" | "wav".
 FLOW_ENCODE_FORMAT_DEFAULT = "flac"
 
@@ -412,28 +443,143 @@ class FFmpegPCMDecoder:
             raise FlowDecodeError("source fetch failed mid-stream")
         return b""
 
+    async def _reopen_source(self, client: Any, offset: int) -> Any:
+        """Re-request the source from *offset*, or None if it cannot resume.
+
+        A 206 is required. A 200 means the source ignored ``Range`` and started
+        over, and feeding that on would replay bytes ffmpeg has already decoded
+        — corrupting the audio rather than repairing it, which is worse than
+        the truncation being recovered from."""
+        hdrs = dict(self._headers or {})
+        hdrs["Range"] = f"bytes={offset}-"
+        try:
+            resp = await client.send(
+                client.build_request("GET", self._source, headers=hdrs),
+                stream=True)
+        except Exception as exc:
+            _log.warning("Flow decode: resume request failed at byte %d: %r",
+                         offset, exc)
+            return None
+        if resp.status_code != 206:
+            _log.warning("Flow decode: resume got HTTP %d (not 206) at byte "
+                         "%d; not resuming", resp.status_code, offset)
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            return None
+        # 206 proves partial-content semantics — NOT that the offset we asked
+        # for was honoured (2026-08-22 review). A server answering 206 from
+        # byte 0 would have its bytes appended at position ``offset``, which is
+        # the same replay corruption the status check above exists to stop,
+        # except silent: the body reaches full length and the track is reported
+        # as played. Reproduced at 458 KB of wrong audio delivered as success.
+        start = _content_range_start(resp.headers.get("content-range", ""))
+        if start != offset:
+            _log.warning("Flow decode: resume answered from byte %d, not the "
+                         "%d requested; not resuming", start, offset)
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            return None
+        return resp
+
     async def _feed_source(self, proc: Any) -> None:
         """Stream the http(s) source into ffmpeg stdin in bounded chunks —
         credentials ride the httpx REQUEST, never argv. EOF closes stdin so
         ffmpeg drains and exits; ffmpeg dying early (BrokenPipe) just ends
-        the feed — its exit code surfaces through ``read``."""
+        the feed — its exit code surfaces through ``read``.
+
+        Survives a mid-body upstream drop by re-requesting with a ``Range``
+        from the last byte fed (see ``FLOW_SOURCE_RESUME_MAX``). ffmpeg is
+        reading one continuous stream on stdin and cannot tell that the socket
+        underneath changed, so a resumed fetch repairs the track instead of
+        ending it."""
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0,
                                   read=FLOW_SOURCE_READ_TIMEOUT_S,
                                   write=None, pool=None),
             follow_redirects=True,
         )
+        resp = None
+        fed = 0
         try:
             resp = await client.send(
                 client.build_request("GET", self._source,
                                      headers=self._headers),
                 stream=True)
-            try:
-                async for chunk in resp.aiter_bytes(chunk_size=65536):
-                    proc.stdin.write(chunk)
-                    await proc.stdin.drain()
-            finally:
-                await resp.aclose()
+            # Without a declared length a byte-offset resume has no reliable
+            # meaning, so the fallback stays exactly as it was: fail the track.
+            total: int | None = None
+            cl = resp.headers.get("content-length")
+            if cl is not None:
+                try:
+                    total = int(cl)
+                except ValueError:
+                    total = None
+            attempts = 0
+
+            while True:
+                dropped = False
+                try:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        if total is not None:
+                            room = total - fed
+                            if room <= 0:
+                                return          # promised body fully fed
+                            if len(chunk) > room:
+                                chunk = chunk[:room]
+                        proc.stdin.write(chunk)
+                        await proc.stdin.drain()
+                        fed += len(chunk)
+                        attempts = 0            # progress resets the budget
+                except (BrokenPipeError, ConnectionResetError):
+                    return  # ffmpeg exited early; rc is handled by read()
+                except httpx.TransportError as exc:
+                    dropped = True
+                    _log.info("Flow decode: source dropped at %d/%s bytes: %r",
+                              fed, total, exc)
+
+                # Reached by a drop OR by a body that simply ended. Both are
+                # judged the same way — did we get everything? — so a
+                # short-but-clean end cannot slip through as a silent
+                # truncation either.
+                if total is not None and fed >= total:
+                    return                      # complete
+                if total is None:
+                    # No declared length: a byte offset has no reliable meaning
+                    # here, so there is nothing to resume from. A clean end is
+                    # a legitimate end; a DROP is the silent-truncation case
+                    # that a09e0a8 exists to prevent and must still fail loudly.
+                    if dropped:
+                        self._source_failed = True
+                        _log.warning("Flow decode: source dropped at %d bytes "
+                                     "for %s and cannot resume (no "
+                                     "content-length)", fed,
+                                     _redact(self._source))
+                    return
+                if attempts >= FLOW_SOURCE_RESUME_MAX:
+                    self._source_failed = True
+                    _log.warning("Flow decode: source truncated at %d/%d bytes "
+                                 "for %s; giving up after %d resume attempt(s)",
+                                 fed, total, _redact(self._source), attempts)
+                    return
+                attempts += 1
+                _log.info("Flow decode: resuming source from byte %d "
+                          "(attempt %d/%d)", fed, attempts,
+                          FLOW_SOURCE_RESUME_MAX)
+                resumed = await self._reopen_source(client, fed)
+                if resumed is None:
+                    self._source_failed = True
+                    return
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+                resp = resumed
         except asyncio.CancelledError:
             raise
         except (BrokenPipeError, ConnectionResetError):
@@ -446,6 +592,11 @@ class FFmpegPCMDecoder:
             _log.warning("Flow decode: source fetch failed for %s",
                          _redact(self._source), exc_info=True)
         finally:
+            if resp is not None:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
             try:
                 await client.aclose()
             except Exception:

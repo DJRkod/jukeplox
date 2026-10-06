@@ -803,13 +803,16 @@ async def test_a_speaker_connecting_mid_track_starts_hearing_it(monkeypatch):
 async def test_feed_stall_holds_outage(monkeypatch):
     outages = []
     monkeypatch.setattr("app.output.session.notify_outage",
-                        lambda r: outages.append(r))
+                        lambda r, backend=None: outages.append((r, backend)))
     stalling = FakeFeed([], stall=True)
     b = make_backend(monkeypatch, feeds=[stalling])
     await b.enable()
     await b.play("ignored", _track())
     await _wait_until(lambda: outages)
-    assert outages == ["sendspin_feed_stalled"]  # held, not a silent dead-stall
+    # Held, not a silent dead-stall — and naming the reporter (2026-08-20
+    # review F5/R6) so a stall on a backend that is no longer the active
+    # output cannot hold the queue on the one that is.
+    assert outages == [("sendspin_feed_stalled", b)]
     assert not b.is_playing
     await b.stop()
 

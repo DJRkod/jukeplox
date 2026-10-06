@@ -68,7 +68,45 @@ async def lifespan(app: FastAPI):
     except Exception:
         logging.getLogger("app.main").warning(
             "device watcher shutdown failed", exc_info=True)
+    await _release_output_backends()
     await close_db()
+
+
+async def _release_output_backends() -> None:
+    """Shutdown is the second edge where output ownership ends (2026-08-20
+    plan U6, R3/R6). Until now a backend holding a live connection at process
+    exit was simply abandoned: a Cast SocketClient thread still re-dialling,
+    an aiohttp session and a bound GENA callback socket, a Companion client.
+
+    EVERY constructed backend, not just the router's active one. A backend the
+    user switched away from should already have been released on the switch,
+    but that release is best-effort by contract — building shutdown on the
+    assumption it succeeded would leave exactly the connections most likely to
+    be stuck. Release is idempotent, so releasing an already-released backend
+    costs a null check.
+
+    Runs AFTER the watcher stops: discovery is quiet first, so nothing can
+    hand a backend a freshly-resolved address while it is being let go. And
+    BEFORE ``close_db()``, because it is still on a live event loop here —
+    which is the whole reason the drain below can work at all.
+
+    The drain is the counterpart to release's sync signature: the teardown
+    steps that are genuinely coroutines were handed to background tasks that
+    would otherwise never be scheduled before the loop closes. It is bounded,
+    so an unreachable renderer delays exit by seconds, not indefinitely."""
+    log = logging.getLogger("app.main")
+    try:
+        from app import state
+        from app.output.base import drain_release_tasks
+        for backend in state.all_output_backends():
+            try:
+                backend.release()
+            except Exception:
+                log.warning("shutdown: %s release() failed",
+                            type(backend).__name__, exc_info=True)
+        await drain_release_tasks()
+    except Exception:
+        log.warning("shutdown: output backend release failed", exc_info=True)
 
 
 app = FastAPI(title="Jukeplox", lifespan=lifespan)

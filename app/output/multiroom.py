@@ -463,6 +463,31 @@ class MultiroomBackendBase:
         # and healthy server-fed playback is misclassified as an outage.
         self._confirm_token: int | None = None
 
+    # ── attach ownership (2026-08-20 plan U2) ───────────────────────────────
+
+    def release(self) -> None:
+        """Nothing to release. An explicit, deliberate no-op, and — unlike the
+        plan's assumption — a VERIFIED one.
+
+        The plan deferred auditing the server-fed backends on the expectation
+        that they would be no-ops. The audit is one line each: ``set_device``
+        on both ``SnapcastBackend`` and ``SendspinBackend`` is literally
+        ``return None`` (server-fed means "device" selection is the backend
+        itself, and per-client targeting is zoning, not an attach). An attach
+        that adopts nothing has nothing to release.
+
+        What these backends DO hold — the control connection, the embedded
+        server, the PCM feed — is adopted by the ACTIVATION lifecycle (the
+        Admin→Setup enable toggle), not by an attach, and is released by that
+        lifecycle's own teardown. Releasing it from here would tear down a
+        running multi-room server because the user switched output away from
+        it, which is not what switch-away means.
+
+        Implemented on the shared base so both concrete backends answer the
+        contract identically and a third server-fed backend inherits the
+        already-audited answer rather than an unexamined default."""
+        return None
+
     # ── output-session supervisor integration (shared) ──────────────────────
 
     def _capture_confirm_token(self) -> None:
@@ -493,7 +518,7 @@ class MultiroomBackendBase:
         ``DeviceLostError`` from a detached task, which nobody awaits so the
         hold never runs."""
         from app.output import session
-        session.notify_outage(reason)
+        session.notify_outage(reason, backend=self)  # R6
 
     def _spawn_advance(self) -> None:
         """Fire the queue advance on a FRESH loop task, never inline from the

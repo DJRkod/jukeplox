@@ -1757,6 +1757,12 @@ async def test_set_device_cleans_up_notify_server_on_subscribe_failure(dlna_mock
         with pytest.raises(RuntimeError, match="subscribe failed"):
             await backend.set_device("dev-1")
 
+    # The failed attach's cleanup is deferred, not awaited (2026-08-20 review
+    # F3/F6): this path holds the process-wide attach lock, and the teardown
+    # includes a GENA round trip. Drain it the way shutdown does.
+    from app.output.base import drain_release_tasks
+    await drain_release_tasks()
+
     notify.async_stop_server.assert_awaited_once()
     assert backend._notify_server is None
     assert backend._dmr is None
@@ -2920,3 +2926,454 @@ async def test_set_device_hydrates_gapless_verdict(dlna_mock):
         await backend.set_device("dev-1")
 
     assert backend._gapless_verdicts["dev-1"] == "unsupported"
+
+
+# ── U3: adopt by compare-and-swap, DLNA mechanics ────────────────────────────
+# The race scenarios themselves are cross-backend and live in
+# tests/test_output_attach_ownership.py. What is specific to DLNA is that its
+# attach builds FOUR resources, and that they are now held in locals until the
+# swap commits — which moves the ownership of a failed attach's parts onto the
+# failure path itself.
+
+
+async def test_set_device_failure_closes_the_session_and_requester_it_opened(
+        dlna_mock):
+    """An attach's parts are its own until the swap stores them. Nothing else
+    can clean up after a failed attach any more — the next set_device tears
+    down what was STORED, and a failed attach stores nothing — so the failure
+    path must close the aiohttp session and requester it opened or they leak a
+    connection pool per attempt (and the retry loop attempts repeatedly)."""
+    from app.output.dlna import DlnaBackend
+    backend = DlnaBackend()
+    backend._device_locations["dev-1"] = "http://192.168.1.50:8000/desc.xml"
+
+    session = _NoopSession()
+    aiohttp_mock = MagicMock()
+    aiohttp_mock.ClientSession = MagicMock(return_value=session)
+    requester = MagicMock(close=AsyncMock())
+    notify = MagicMock(async_start_server=AsyncMock(),
+                       async_stop_server=AsyncMock(),
+                       event_handler=MagicMock())
+    dmr = MagicMock(async_subscribe_services=AsyncMock(
+        side_effect=RuntimeError("subscribe failed")))
+    fake_upnp_factory = MagicMock()
+    fake_upnp_factory.async_create_device = AsyncMock(return_value=MagicMock())
+
+    with patch("app.output.dlna.aiohttp", aiohttp_mock, create=True), \
+         patch("app.output.dlna.AiohttpSessionRequester",
+               MagicMock(return_value=requester), create=True), \
+         patch("app.output.dlna.UpnpFactory",
+               MagicMock(return_value=fake_upnp_factory), create=True), \
+         patch("app.output.dlna.AiohttpNotifyServer",
+               MagicMock(return_value=notify), create=True), \
+         patch("app.output.dlna.DmrDevice", MagicMock(return_value=dmr),
+               create=True), \
+         patch("app.database.get_setting", AsyncMock(return_value=None)):
+        with pytest.raises(RuntimeError, match="subscribe failed"):
+            await backend.set_device("dev-1")
+
+    # Deferred cleanup (2026-08-20 review F3/F6) — drain it as shutdown does.
+    from app.output.base import drain_release_tasks
+    await drain_release_tasks()
+
+    notify.async_stop_server.assert_awaited_once()
+    # NOT requester.close(): AiohttpSessionRequester borrows the session
+    # rather than owning it and has no close() at all (2026-08-20 review
+    # R3) — calling it raised AttributeError on every release.
+    assert session.closed, "the aiohttp session this attach opened leaked"
+    # And nothing half-built was left adopted.
+    assert backend._dmr is None
+    assert backend._notify_server is None
+    assert backend._requester is None
+    assert backend._dlna_session is None
+
+
+async def test_set_device_drops_the_outgoing_refs_before_its_first_await(
+        dlna_mock):
+    """The outgoing renderer's four parts are taken and cleared SYNCHRONOUSLY,
+    then torn down from the captured locals.
+
+    Reading them back after the teardown's awaits — which is what the code did
+    — meant a concurrent attach that had already adopted its own renderer
+    could have those references nulled out from under it, and meant the same
+    outgoing parts were torn down twice. Asserted by observing the backend
+    mid-teardown: the refs must be gone before the unsubscribe completes."""
+    from app.output.dlna import DlnaBackend
+    backend = DlnaBackend()
+    backend._device_locations["dev-2"] = "http://192.168.1.51:8000/desc.xml"
+
+    gate = asyncio.Event()
+
+    async def _slow_unsubscribe():
+        await gate.wait()
+
+    old_dmr = MagicMock(async_unsubscribe_services=AsyncMock(
+        side_effect=_slow_unsubscribe))
+    old_notify = MagicMock(async_stop_server=AsyncMock())
+    old_requester = MagicMock(close=AsyncMock())
+    old_session = _NoopSession()
+    backend._dmr = old_dmr
+    backend._notify_server = old_notify
+    backend._requester = old_requester
+    backend._dlna_session = old_session
+
+    notify = MagicMock(async_start_server=AsyncMock(),
+                       async_stop_server=AsyncMock(),
+                       event_handler=MagicMock())
+    dmr = make_dmr()
+    fake_upnp_factory = MagicMock()
+    fake_upnp_factory.async_create_device = AsyncMock(return_value=MagicMock())
+
+    with patch("app.output.dlna.AiohttpSessionRequester", MagicMock(),
+               create=True), \
+         patch("app.output.dlna.UpnpFactory",
+               MagicMock(return_value=fake_upnp_factory), create=True), \
+         patch("app.output.dlna.AiohttpNotifyServer",
+               MagicMock(return_value=notify), create=True), \
+         patch("app.output.dlna.DmrDevice", MagicMock(return_value=dmr),
+               create=True), \
+         patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", AsyncMock()):
+        task = asyncio.get_running_loop().create_task(
+            backend.set_device("dev-2"))
+        for _ in range(4):
+            await asyncio.sleep(0)
+
+        assert backend._dmr is None, "outgoing ref still readable mid-teardown"
+        assert backend._notify_server is None
+        assert backend._requester is None
+        assert backend._dlna_session is None
+
+        gate.set()
+        await task
+
+    # The captured locals were still torn down, all four of them.
+    old_dmr.async_unsubscribe_services.assert_awaited_once()
+    old_notify.async_stop_server.assert_awaited_once()
+    # NOT requester.close(): AiohttpSessionRequester borrows the session
+    # rather than owning it and has no close() at all (2026-08-20 review
+    # R3) — calling it raised AttributeError on every release.
+    assert old_session.closed
+    assert backend._dmr is dmr
+
+
+# ── 2026-08-20 review: teardown must not block, and must finish ─────────────
+#
+# These pin the corrected shape of _release_dlna_parts. Two earlier versions
+# failed the very claim its docstring makes, and the second failed it because
+# of a WRONG BELIEF ABOUT THE LIBRARY: AiohttpNotifyServer.async_stop_server
+# looks like a local socket close and is actually
+# `await event_handler.async_unsubscribe_all()` followed by a server shutdown.
+# So both inner steps are network work, and each test below is parametrized
+# over WHICH of them is the unreachable one. A fixture that only ever hangs
+# the DMR call cannot see the real hazard.
+
+_TEARDOWN_STEPS = ["dmr_unsubscribe", "notify_stop"]
+
+
+def _teardown_fakes(hang_step: str, gate: asyncio.Event):
+    """dmr / notify / requester / session, with exactly one step parked."""
+    async def _never(*_a, **_k):
+        await gate.wait()
+
+    dmr = MagicMock()
+    dmr.async_unsubscribe_services = AsyncMock(
+        side_effect=_never if hang_step == "dmr_unsubscribe" else None)
+    notify = MagicMock()
+    notify.async_stop_server = AsyncMock(
+        side_effect=_never if hang_step == "notify_stop" else None)
+    # The real AiohttpSessionRequester has no close() — see review R3 — so the
+    # fake deliberately does not offer one either. If the helper ever calls it
+    # again, this raises instead of quietly passing.
+    requester = MagicMock(spec=[])
+    session = MagicMock(close=AsyncMock())
+    return dmr, notify, requester, session
+
+
+@pytest.mark.parametrize("hang_step", _TEARDOWN_STEPS)
+async def test_release_parts_frees_the_session_whichever_step_hangs(hang_step):
+    """*Covers R4/R1.* The docstring's promise, tested against both halves.
+
+    The session is an aiohttp connection pool and we own it, so it is the
+    thing that actually leaks. Whichever renderer-facing step goes unreachable,
+    the bound must expire and the session must still be closed."""
+    from app.output.dlna import _release_dlna_parts
+    gate = asyncio.Event()
+    dmr, notify, requester, session = _teardown_fakes(hang_step, gate)
+
+    try:
+        with patch("app.output.dlna._TEARDOWN_TIMEOUT", 0.05):
+            await asyncio.wait_for(
+                _release_dlna_parts(dmr, notify, requester, session),
+                timeout=3.0)
+    finally:
+        gate.set()
+
+    session.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("hang_step", _TEARDOWN_STEPS)
+async def test_release_parts_still_closes_the_session_when_cancelled(hang_step):
+    """*Covers R2.* ``drain_release_tasks`` cancels whatever is still running
+    at its deadline, and the step that will be running is the unreachable one —
+    either of them. An earlier version guarded only the DMR call, so a cancel
+    landing in the notify stop propagated straight out and the session was
+    never closed: the exact "Unclosed client session" the drain exists to
+    prevent, produced by the drain."""
+    from app.output.dlna import _release_dlna_parts
+    gate = asyncio.Event()
+    dmr, notify, requester, session = _teardown_fakes(hang_step, gate)
+
+    with patch("app.output.dlna._TEARDOWN_TIMEOUT", 30.0):
+        task = asyncio.get_running_loop().create_task(
+            _release_dlna_parts(dmr, notify, requester, session))
+        for _ in range(6):           # let it park in the hanging step
+            await asyncio.sleep(0)
+        task.cancel()
+        for _ in range(10):
+            await asyncio.sleep(0)
+    gate.set()
+
+    assert session.close.await_count == 1, (
+        f"a cancel during {hang_step} left the aiohttp session open")
+    # The cancel must still be OBSERVABLE. Absorbing it to run the closes and
+    # then returning normally is not the same thing, and the difference is
+    # load-bearing: `asyncio.wait_for` only raises TimeoutError if the inner
+    # coroutine actually ends cancelled, so a swallowed cancel silently turns
+    # every wait_for-based non-blocking assertion in this file into a test that
+    # merely proves "it returned eventually". Review T1 mutation-proved that
+    # deleting the re-raise failed ZERO tests before this line existed.
+    assert task.cancelled(), (
+        "the teardown absorbed the cancellation and returned normally")
+
+
+@pytest.mark.parametrize("hang_step", _TEARDOWN_STEPS)
+async def test_set_device_does_not_await_the_outgoing_renderers_teardown(
+        dlna_mock, hang_step):
+    """*Covers R4, review F3.* Switching away from a renderer that has gone
+    dark must not stall the attach — and this path is worse than any other
+    teardown here, because EVERY caller of ``set_device`` holds the
+    process-wide ``_attach_serial``. A stall blocks not just this backend's
+    attach but every backend's, including the admin's own escape hatch of
+    applying a different output, and it repeats on each supervisor backoff
+    tick.
+
+    The teardown budget is raised far above this test's own deadline on
+    purpose. Without that the test is a FALSE WITNESS: mutation-checking it
+    against the pre-fix awaited version showed it PASSING, because the ordinary
+    bound let even a blocking teardown finish inside the window."""
+    from app.output.dlna import DlnaBackend
+    from app.output.base import drain_release_tasks
+    backend = DlnaBackend()
+    backend._device_locations["dev-1"] = "http://192.0.2.50:8000/desc.xml"
+
+    gate = asyncio.Event()
+    prior_dmr, prior_notify, prior_req, prior_session = _teardown_fakes(
+        hang_step, gate)
+    backend._dmr = prior_dmr
+    backend._notify_server = prior_notify
+    backend._requester = prior_req
+    backend._dlna_session = prior_session
+
+    session = _NoopSession()
+    aiohttp_mock = MagicMock()
+    aiohttp_mock.ClientSession = MagicMock(return_value=session)
+    requester = MagicMock(spec=[])
+    notify = MagicMock(async_start_server=AsyncMock(),
+                       async_stop_server=AsyncMock(),
+                       event_handler=MagicMock())
+    dmr = MagicMock(async_subscribe_services=AsyncMock())
+    fake_upnp_factory = MagicMock()
+    fake_upnp_factory.async_create_device = AsyncMock(return_value=MagicMock())
+
+    try:
+        with patch("app.output.dlna.aiohttp", aiohttp_mock, create=True), \
+             patch("app.output.dlna.AiohttpSessionRequester",
+                   MagicMock(return_value=requester), create=True), \
+             patch("app.output.dlna.UpnpFactory",
+                   MagicMock(return_value=fake_upnp_factory), create=True), \
+             patch("app.output.dlna.AiohttpNotifyServer",
+                   MagicMock(return_value=notify), create=True), \
+             patch("app.output.dlna.DmrDevice", MagicMock(return_value=dmr),
+                   create=True), \
+             patch("app.database.get_setting", AsyncMock(return_value=None)), \
+             patch("app.output.dlna._TEARDOWN_TIMEOUT", 30.0):
+            await asyncio.wait_for(backend.set_device("dev-1"), timeout=3.0)
+
+        assert backend._dmr is dmr, "the new renderer must be adopted"
+        # POSITIVE evidence, independent of cancellation semantics (review T1).
+        # The wait_for above is only a safety net so a regression FAILS rather
+        # than hangs; on its own it asserts "set_device eventually returned",
+        # which an inline await also satisfies the moment the teardown absorbs
+        # the timeout's cancel. What actually distinguishes deferred from
+        # inline is that the teardown is still in flight right now.
+        from app.output import base
+        assert any(not t.done() for t in base._release_tasks), (
+            "no teardown was in flight when set_device returned — the "
+            "outgoing renderer was torn down inline, under the attach lock")
+    finally:
+        gate.set()
+        with patch("app.output.dlna._TEARDOWN_TIMEOUT", 0.05):
+            await drain_release_tasks()
+
+    # Deferred, not skipped: the outgoing session is closed once the deferred
+    # teardown actually runs.
+    prior_session.close.assert_awaited_once()
+
+
+async def test_release_parts_is_quiet_against_the_real_requester_type(caplog):
+    """*Covers R3.* The teardown must not cry wolf.
+
+    ``AiohttpSessionRequester`` borrows the session and has no ``close()`` —
+    verified against the installed library, whose only public member on that
+    class is ``async_http_request``. An earlier version called ``close()``
+    anyway, so every DLNA release raised ``AttributeError`` into a handler that
+    review F6 had just promoted to WARNING-with-traceback. That is a 100%
+    false-positive alarm on precisely the signal operators are being asked to
+    treat as real (\"this IS the leak #48 was about\"), which trains them to
+    filter it — including on the day the session close genuinely fails.
+
+    Uses the REAL class rather than a mock on purpose: a ``MagicMock`` grows a
+    ``close`` attribute on demand, so every mock-based test in this file was
+    structurally incapable of seeing this."""
+    from app.output.dlna import _release_dlna_parts
+    try:
+        from async_upnp_client.aiohttp import AiohttpSessionRequester
+    except Exception:                      # pragma: no cover
+        pytest.skip("async_upnp_client not installed")
+
+    session = MagicMock(close=AsyncMock())
+    requester = AiohttpSessionRequester(session=session)
+    dmr = MagicMock(async_unsubscribe_services=AsyncMock())
+    notify = MagicMock(async_stop_server=AsyncMock())
+
+    with caplog.at_level(logging.WARNING, logger="app.output.dlna"):
+        await _release_dlna_parts(dmr, notify, requester, session)
+
+    session.close.assert_awaited_once()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "a clean teardown logged a warning: "
+        + "; ".join(r.getMessage() for r in caplog.records))
+
+
+async def test_a_cancelled_attach_still_frees_the_parts_it_built(dlna_mock):
+    """*Covers ADV-5 / review T3.* The reason the failure handler catches
+    ``BaseException`` and not ``Exception``.
+
+    U3 moved all four resources out of instance fields and into locals, which
+    removed the backstop that used to make a mid-attach death survivable: a
+    later ``set_device`` would close whatever the instance still held. Now the
+    locals are the only referent, and ``asyncio.CancelledError`` is not an
+    ``Exception`` — so a shutdown, or a re-attach cancelled by the supervisor,
+    landing inside the create-device/subscribe awaits skipped the handler
+    entirely and stranded an open ClientSession and a bound notify socket with
+    nothing pointing at them.
+
+    Review T3 mutation-proved this was untested: reverting to
+    ``except Exception`` failed zero tests, because the only tests on this path
+    raise ``RuntimeError`` — an ordinary Exception the pre-fix code already
+    caught. The cancellation case, which is the entire reason for the change,
+    was never exercised."""
+    from app.output.dlna import DlnaBackend
+    from app.output.base import drain_release_tasks
+    backend = DlnaBackend()
+    backend._device_locations["dev-1"] = "http://192.0.2.50:8000/desc.xml"
+
+    parked = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _park(*_a, **_k):
+        parked.set()
+        await gate.wait()
+
+    session = _NoopSession()
+    aiohttp_mock = MagicMock()
+    aiohttp_mock.ClientSession = MagicMock(return_value=session)
+    requester = MagicMock(spec=[])
+    notify = MagicMock(async_start_server=AsyncMock(),
+                       async_stop_server=AsyncMock(),
+                       event_handler=MagicMock())
+    dmr = MagicMock(async_subscribe_services=AsyncMock(side_effect=_park),
+                    async_unsubscribe_services=AsyncMock())
+    fake_upnp_factory = MagicMock()
+    fake_upnp_factory.async_create_device = AsyncMock(return_value=MagicMock())
+
+    try:
+        with patch("app.output.dlna.aiohttp", aiohttp_mock, create=True), \
+             patch("app.output.dlna.AiohttpSessionRequester",
+                   MagicMock(return_value=requester), create=True), \
+             patch("app.output.dlna.UpnpFactory",
+                   MagicMock(return_value=fake_upnp_factory), create=True), \
+             patch("app.output.dlna.AiohttpNotifyServer",
+                   MagicMock(return_value=notify), create=True), \
+             patch("app.output.dlna.DmrDevice", MagicMock(return_value=dmr),
+                   create=True), \
+             patch("app.database.get_setting", AsyncMock(return_value=None)):
+            task = asyncio.get_running_loop().create_task(
+                backend.set_device("dev-1"))
+            await asyncio.wait_for(parked.wait(), timeout=3.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await drain_release_tasks()
+    finally:
+        gate.set()
+
+    assert session.closed, (
+        "a cancelled attach leaked the aiohttp ClientSession it opened — "
+        "nothing else references it")
+    notify.async_stop_server.assert_awaited_once()
+    assert backend._dmr is None and backend._dlna_session is None
+
+
+async def test_the_notify_sockets_are_freed_when_the_teardown_times_out():
+    """*Covers the 2026-08-21 P1.* The bound GENA callback socket, not just the
+    session.
+
+    Uses a REAL ``AiohttpNotifyServer`` on purpose. The mocked fixtures could
+    never have caught this: ``AiohttpNotifyServer.async_stop_server`` closes
+    ``self._server`` LAST, behind ``async_unsubscribe_all()`` and a 10s server
+    shutdown, so when the teardown budget expires part-way through the
+    unsubscribe the coroutine is cancelled before it ever reaches the close.
+    The socket then stays bound for the life of the process — on exactly the
+    unreachable-renderer path this helper exists for.
+
+    The rig check missed it too, because it asserted only ``session.closed``.
+    An instrument that checks one of the two resources cannot report on the
+    other."""
+    from app.output.dlna import _release_dlna_parts
+    try:
+        import aiohttp
+        from async_upnp_client.aiohttp import (
+            AiohttpNotifyServer, AiohttpSessionRequester,
+        )
+    except Exception:                      # pragma: no cover
+        pytest.skip("async_upnp_client not installed")
+
+    session = aiohttp.ClientSession()
+    requester = AiohttpSessionRequester(session=session)
+    notify = AiohttpNotifyServer(requester, source=("127.0.0.1", 0))
+    await notify.async_start_server()
+    assert notify._server is not None, "precondition: the socket is bound"
+    sockets = list(getattr(notify._server, "sockets", []) or [])
+    assert sockets, "precondition: the server exposes a bound socket"
+
+    gate = asyncio.Event()
+
+    class _DeadDmr:
+        async def async_unsubscribe_services(self):
+            await gate.wait()              # a renderer that never answers
+
+    try:
+        with patch("app.output.dlna._TEARDOWN_TIMEOUT", 0.05):
+            await _release_dlna_parts(_DeadDmr(), notify, requester, session)
+    finally:
+        gate.set()
+
+    assert session.closed, "the aiohttp session leaked"
+    assert notify._server is None, (
+        "the notify server handle survived the teardown")
+    assert all(s.fileno() == -1 for s in sockets), (
+        "the bound GENA callback socket was never closed — it stays bound for "
+        "the life of the process, on the unreachable-renderer path this "
+        "teardown exists for")

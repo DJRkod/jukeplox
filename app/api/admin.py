@@ -32,6 +32,7 @@ from app.auth import plex_oauth
 from app import memory_probe
 from app import playback_control
 from app.output import sendspin_adapter  # module-level is safe: no aiosendspin import
+from app.output.base import AttachSuperseded
 from app.output.discovery import build_devices_snapshot, build_registry_snapshot
 from app.output.probe_runner import schedule_probes
 from app.queue.models import QueueEndBehavior
@@ -1238,6 +1239,17 @@ async def set_output_active(body: SetOutputRequest):
                              "activate_backend error", exc_info=True)
         if isinstance(exc, HTTPException):
             raise
+        # A lost race is a conflict, not a device failure (2026-08-21 review).
+        # AttachSuperseded is a plain Exception, so it fell to the 502 below and
+        # arrived looking identical to "the speaker did not answer" — the one
+        # outcome where retrying is guaranteed to be the right move was the one
+        # the client could not identify. Deliberately explicit rather than
+        # reparenting the exception to RuntimeError: several backends catch
+        # RuntimeError internally, and inheritance would change who swallows it.
+        if isinstance(exc, AttachSuperseded):
+            raise HTTPException(
+                status_code=409,
+                detail="Another output switch took over — try again.")
         if isinstance(exc, RuntimeError):
             raise HTTPException(status_code=409, detail=str(exc))
         raise HTTPException(status_code=502, detail=str(exc))

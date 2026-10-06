@@ -1061,6 +1061,28 @@ class AirPlayBackend:
         except Exception:
             _log.warning("AirPlay: set_setting(output_addr) failed", exc_info=True)
 
+    # ── release (2026-08-20 plan U2) ──────────────────────────────────────────
+
+    def release(self) -> None:
+        """Nothing to release. An explicit, deliberate no-op.
+
+        AirPlay's ``set_device`` adopts NO connection — it is effectively a
+        cache write: record the selected id, restore the persisted volume,
+        persist the resolved address. There is no socket, session or handle
+        held open between attach and ``play()``.
+
+        The cliap2/ffmpeg processes, the command FIFO and the DACP listener
+        are PLAYBACK-session state, created by ``play()`` and owned by
+        ``_teardown()`` (via ``stop()``). Reaching into them from here would
+        break the rule that stopping and releasing are different things — a
+        release on switch-away would be indistinguishable from a stop, and a
+        release for any other reason would silently kill live audio.
+
+        Written out rather than inherited from a default: the contract is a
+        REQUIRED Protocol method precisely so a backend with nothing to free
+        has to say so, instead of skipping the obligation by omission."""
+        return None
+
     # ── playback (U4) ─────────────────────────────────────────────────────────
 
     async def play(
@@ -1523,7 +1545,7 @@ class AirPlayBackend:
         # exit 0 stays the natural end-of-stream advance.
         if returncode != 0:
             from app.output import session
-            session.notify_outage("process_crash")
+            session.notify_outage("process_crash", backend=self)  # R6
             return
 
         if self._advance_cb is not None:

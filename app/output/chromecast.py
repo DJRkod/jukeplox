@@ -49,7 +49,13 @@ def _clean_chromecast_dbus_name(avahi_label: str, txt: dict[str, str]) -> str:
         return avahi_label
     return stripped.replace("-", " ")
 
-from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
+from app.output.base import (
+    AdvanceCallback,
+    AttachGeneration,
+    AttachSuperseded,
+    DeviceNotReadyError,
+    OutputDevice,
+)
 from app.output.radio_endless import (
     RadioFailedHook,
     ReconnectPolicy,
@@ -191,6 +197,28 @@ def _force_media_cast_type(cast_info: Any) -> Any:
         return cast_info
 
 
+class _ResolvedAddr(NamedTuple):
+    """The address one attach resolved, travelling WITH the connection it
+    produced (2026-08-20 plan U4).
+
+    ``_sync_connect`` used to record its resolution in ``self._resolved_*`` and
+    ``set_device`` read those fields back after the executor await to persist
+    ``output_addr:{device_id}``. Two attaches share one set of fields and the
+    connect runs on an executor thread, so a second attach could overwrite them
+    before the first resumed — and device X's stored address became device Y's.
+    That value is loaded into the address cache on the next boot and consulted
+    BEFORE discovery, so it shadowed the right entry and selecting X played on
+    Y, across restarts, with nothing to correct it (issue #49).
+
+    Returning the address alongside the cast makes the value local to the
+    attach that produced it: the general rule the ownership contract states as
+    "what an attach persists must come from that attach"."""
+
+    name: str
+    host: str
+    port: int
+
+
 def _media_chromecast_from_host(host: str, port: int, uuid: Any, name: str | None) -> Any:
     """Connect-by-host for media playback, forcing cast_type='cast'.
 
@@ -205,6 +233,117 @@ def _media_chromecast_from_host(host: str, port: int, uuid: Any, name: str | Non
         pychromecast.const.CAST_TYPE_CHROMECAST, None,
     )
     return pychromecast.Chromecast(cast_info=cast_info)
+
+
+def _release_cast(cc: Any) -> None:
+    """Best-effort, NON-BLOCKING release of a cast object we are abandoning.
+
+    Goes one level below ``Chromecast.disconnect()`` on purpose. In pychromecast
+    14 that method is exactly two statements::
+
+        self.socket_client.disconnect()   # deliver the stop signal
+        self.join(timeout=timeout)        # wait for the worker, then RAISE
+                                          # TimeoutError if it is still alive
+
+    Only the first line does any work we want. The second is a wait, and waiting
+    is precisely what we must not do here: this runs on the failure path of an
+    attach against a host that is by definition not answering, so its worker can
+    sit in a blocking connect() for the OS timeout. Measured on the arm64 rig
+    against an unroutable address, the default ``disconnect()`` blocked for
+    **25.0 seconds** — and it blocks the executor thread while ``_attach_serial``
+    is still held, which would stall output switching for every backend.
+
+    ``disconnect(timeout=0)`` is NOT the fix either, though it looks like one:
+    ``join()`` re-raises ``TimeoutError`` whenever the thread has not exited,
+    which at timeout=0 is always. That version "worked" only because this
+    function swallows exceptions — it took the error path on every single
+    cleanup. Mocked tests could not see it (a MagicMock never raises); the rig
+    did, immediately.
+
+    ``SocketClient.disconnect()`` is the whole stop signal and nothing else: it
+    sets the stop event AND writes a byte to a socketpair to interrupt the
+    blocked worker. No join, no wait, no exception.
+
+    What this does NOT do is make the worker die sooner. Rig measurements
+    against an unroutable host, arm64, real pychromecast 14.0.10:
+
+        no release at all      worker still alive after 60s (never exits)
+        socket_client.disconnect()  caller 0.0001s, worker reaped 25.3s later
+        Chromecast.disconnect()     caller blocked 25.0s, worker reaped
+
+    The worker cannot observe the stop signal until its in-flight blocking
+    ``connect()`` returns, so ~25s is the platform's floor either way. The fix
+    moves that wait OFF the caller — the thread unwinds on its own while the
+    executor slot and ``_attach_serial`` are already free. Bounded cleanup,
+    unblocked caller; the leak is that without any release the worker retries
+    forever ("retrying in 5.0s") and never exits at all.
+
+    Never raises: the caller already has a real error to report and a cleanup
+    problem must not mask it."""
+    try:
+        cc.socket_client.disconnect()
+    except Exception:
+        # WARNING, not DEBUG (2026-08-20 review F6). Every step of every
+        # release swallows its own failure so the switch always completes —
+        # which meant the outer catches in the router's retire path and in
+        # main's shutdown sweep could never fire, and the only record that a
+        # socket thread had been left running was invisible at default log
+        # level. This IS the leak #48 was about; it is operator-actionable.
+        _log.warning("Chromecast: release during cleanup failed", exc_info=True)
+
+
+def _detach_cast(cc: Any, listener: Any = None, vol_listener: Any = None) -> None:
+    """Unregister our listeners from *cc* and release it. Never raises.
+
+    The one place a cast object is let go, shared by ``set_device``'s
+    outgoing-connection teardown and ``release()`` (2026-08-20 plan U2) so the
+    two cannot drift. Both were previously separate, and only one of them was
+    non-blocking: ``set_device`` used ``_cc.disconnect()`` — the convenience
+    method #48 measured blocking 25.0s against an unreachable host — on the
+    SUCCESS path of every device switch, so a healthy reconnect could stall on
+    an outgoing device that had since gone away.
+
+    Unregistering is a local dict operation in pychromecast (no network), so
+    the whole function is non-blocking and needs no executor hop."""
+    if listener is not None:
+        try:
+            cc.media_controller.unregister_status_listener(listener)
+        except Exception:
+            _log.debug("Chromecast: media-status unregister failed",
+                       exc_info=True)
+    if vol_listener is not None:
+        try:
+            cc.unregister_status_listener(vol_listener)
+        except Exception:
+            _log.debug("Chromecast: cast-status unregister failed",
+                       exc_info=True)
+    _release_cast(cc)
+
+
+def _connect_or_release(cc: Any, timeout_message: str) -> None:
+    """``cc.wait()`` with guaranteed cleanup on failure (issue #48).
+
+    pychromecast's ``SocketClient`` runs on its own thread and keeps re-dialling
+    a dead host roughly every 5 seconds. Abandoning a cast object without
+    disconnecting it therefore leaks that thread and its fd for the life of the
+    process — one per failed attach. ``probe_device`` already documents and
+    implements this rule; the three connect sites in ``_sync_connect`` did not,
+    which mattered once idle re-attach (#47) started retrying a sleeping device
+    indefinitely and unattended.
+
+    The SUCCESS path deliberately does NOT disconnect: the caller keeps the live
+    object and owns it from there. An unconditional ``finally: disconnect()``
+    would turn a leak-on-failure into a broken-on-success.
+    """
+    try:
+        cc.wait(timeout=10)
+    except _RequestTimeout:
+        _release_cast(cc)
+        raise RuntimeError(timeout_message)
+    except Exception:
+        # Anything else out of wait() abandons the object just as completely.
+        _release_cast(cc)
+        raise
 
 
 class _AdvanceListener:
@@ -302,14 +441,25 @@ class _ConnectionListener:
 
 
 class _VolumeListener:
-    """Updates backend._volume when the device changes volume externally."""
+    """Updates backend._volume when the device changes volume externally.
 
-    def __init__(self, backend: "ChromecastBackend") -> None:
+    Bound to the cast object it was registered on, exactly like
+    ``_ConnectionListener`` (2026-08-20 plan U5): a non-current connection has
+    no authority. Without the binding an orphaned connection — one superseded
+    by a later ``set_device``, or released on a switch away — kept writing
+    ``backend._volume`` and broadcasting ``VolumeChangedEvent`` from a device
+    the user had already left, so the admin slider jumped to an abandoned
+    speaker's level."""
+
+    def __init__(self, backend: "ChromecastBackend", cast: Any) -> None:
         self._backend = backend
+        self._cast = cast
 
     def new_cast_status(self, status: Any) -> None:
         if status is None:
             return
+        if self._backend._cast is not self._cast:
+            return  # stale listener from a superseded set_device
         try:
             vol = float(status.volume_level)
         except (AttributeError, TypeError, ValueError):
@@ -369,7 +519,7 @@ class _CastSubscription:
             pass  # asyncio loop already closed — nowhere to deliver
 
 
-class ChromecastBackend:
+class ChromecastBackend(AttachGeneration):
     """Plays audio via pychromecast by handing Plex stream URLs to the Cast device.
 
     Discovery uses CastBrowser (persistent mDNS listener) patterned after
@@ -472,7 +622,12 @@ class ChromecastBackend:
         self._dbus_index: dict[str, tuple[str, str, int]] = {}
         self._discover_lock = threading.Lock()
         self._dbus_discover_lock = asyncio.Lock()  # serializes D-Bus one-shots
-        # Set in _sync_connect; read by set_device to persist the resolved address (R1/R2).
+        # The address of the ADOPTED connection. Written at set_device's swap
+        # point from the ``_ResolvedAddr`` its own connect returned — never by
+        # ``_sync_connect`` itself (2026-08-20 plan U4), so an attach that lost
+        # the race cannot leave its address here for the supervisor's
+        # ``_write_back_address`` to register against the winner's device id.
+        # Read by app/output/session.py, session_events.py, playback_control.py.
         self._resolved_host: str | None = None
         self._resolved_port: int | None = None
         self._resolved_name: str | None = None
@@ -642,13 +797,15 @@ class ChromecastBackend:
                 return False
             finally:
                 if cc is not None:
-                    try:
-                        cc.disconnect()
-                    except Exception:
-                        # Disconnect itself failing is non-fatal — the OS
-                        # will reclaim the socket when the probe-local
-                        # cast object is GC'd shortly.
-                        pass
+                    # Shares the one helper that knows how to abandon a cast
+                    # object safely (#48). Beyond the dedup this buys the probe
+                    # two things it lacked: DEBUG logging when the disconnect
+                    # itself fails, and — the important one — a non-blocking
+                    # join. The probe runs against devices that may be
+                    # unreachable (that is what it is testing), so an unbounded
+                    # disconnect here could park one of the six probe-runner
+                    # slots for the OS connect timeout.
+                    _release_cast(cc)
 
         try:
             return await asyncio.get_running_loop().run_in_executor(None, _probe_sync)
@@ -793,6 +950,43 @@ class ChromecastBackend:
     async def set_device(self, device_id: str) -> None:
         if not _CAST_AVAILABLE:
             return
+        # 2026-08-20 plan U3: claim this attach. The token is what the swap
+        # below compares on — see ``AttachGeneration`` for why it is not a
+        # comparison against ``self._device_id``, which this method writes.
+        token = self._begin_attach()
+        # Take the OUTGOING connection here, at entry, and free it — matching
+        # DLNA and PlexPlayer, which have always worked this way (2026-08-22
+        # review).
+        #
+        # This used to happen at the swap, justified by "the swap must replace
+        # whatever is current when it COMMITS, otherwise a connection adopted
+        # since entry is the one left orphaned". That scenario cannot occur.
+        # The only production writes to ``self._cast`` are the compare-and-swap
+        # below — which only the current generation may reach — and
+        # ``release()``, which bumps the generation first. So for the attach
+        # that wins, ``self._cast`` at the swap is necessarily what it was at
+        # entry; anything that changed it has already superseded us. The test
+        # that pinned the old placement simulated a "concurrent attach" by
+        # assigning ``backend._cast`` directly, without claiming a generation,
+        # which no real caller does.
+        #
+        # Moving it matters because the router's retire stands down when a
+        # newer attach has taken over, on the premise that the newer attach
+        # frees whatever it replaced. Freeing at the SWAP made that false for
+        # an attach that started and then failed — it freed nothing — which is
+        # what forced a second "did anyone actually adopt?" counter, and that
+        # counter in turn killed live re-Applies. Freeing at ENTRY makes the
+        # premise true unconditionally and lets one generation answer both
+        # questions again.
+        prior_cast = self._cast
+        prior_listener = self._listener
+        prior_vol_listener = self._vol_listener
+        self._cast = None
+        self._listener = None
+        self._vol_listener = None
+        self._is_playing = False
+        if prior_cast is not None:
+            _detach_cast(prior_cast, prior_listener, prior_vol_listener)
         # U10: a device switch tears the flow session down IMMEDIATELY — the
         # stitcher and its capability URL belong to the OLD device's media
         # session (router.stop() covers cross-backend switches; this covers
@@ -805,16 +999,43 @@ class ChromecastBackend:
         stored = await database.get_setting(f"vol:chromecast:{device_id}")
         fallback = float(stored) if stored else 0.5
 
-        old_listener = self._listener
-        old_vol_listener = self._vol_listener
-        old_cast = self._cast
-
-        cast = await asyncio.get_running_loop().run_in_executor(
+        # U4: the address comes BACK from the connect, in this coroutine's own
+        # scope. Nothing about it is read off the instance after this await.
+        cast, resolved = await asyncio.get_running_loop().run_in_executor(
             None, self._sync_connect, device_id
         )
+
+        # ── U3: adopt by compare-and-swap ────────────────────────────────────
+        # Deliberately AFTER the connect, not before it: ``_sync_connect`` runs
+        # in an executor thread and cannot be cancelled or short-circuited, so
+        # a superseded attach owns a live SocketClient thread by the time it
+        # gets here whatever we do. Returning early would abandon it — the leak
+        # this exists to prevent. Only the adoption is skipped.
+        if self._attach_superseded(token):
+            _log.info("Chromecast: attach for %r was superseded while "
+                      "connecting; releasing its connection instead of "
+                      "adopting it", device_id)
+            # No listener has been registered on this cast yet, and the
+            # backend's own listeners belong to whichever attach won.
+            _detach_cast(cast)
+            raise AttachSuperseded(
+                f"Chromecast attach for {device_id!r} was superseded")
+
+        # The outgoing connection was already taken and freed at entry, so
+        # there is nothing to displace here — only the adoption itself.
         self._cast = cast
         self._device_id = device_id
         self._listener = None
+        # U4: the resolved-address fields describe the ADOPTED connection, so
+        # they are written here with the rest of the swap and only by the
+        # attach that won. The supervisor reads them straight after set_device
+        # returns (``_write_back_address``) and registers them against this
+        # device id — a losing attach writing them from its executor thread
+        # would map the winner's device to the loser's host, which is the same
+        # wrong-speaker poison by a second route.
+        self._resolved_name = resolved.name
+        self._resolved_host = resolved.host
+        self._resolved_port = resolved.port
 
         # U2: route a mid-playback socket loss to the supervisor's outage
         # classifier (device-level → hold). Registered per cast object; the
@@ -825,16 +1046,19 @@ class ChromecastBackend:
             _log.debug("Cast connection-listener registration failed",
                        exc_info=True)
 
-        # R1/R2: persist the resolved address so startup reconnect can bypass mDNS.
-        if self._resolved_host and self._resolved_port is not None:
+        # R1/R2: persist the resolved address so startup reconnect can bypass
+        # mDNS. Every value here is local to this attach (U4) — reading
+        # ``self._resolved_*`` instead is what stored device Y's address under
+        # device X's id and survived the reboot.
+        if resolved.host and resolved.port is not None:
             try:
                 from app import database
                 await database.set_setting(
                     f"output_addr:{device_id}",
                     json.dumps({
-                        "name": self._resolved_name or device_id,
-                        "host": str(self._resolved_host),
-                        "port": int(self._resolved_port),
+                        "name": resolved.name or device_id,
+                        "host": str(resolved.host),
+                        "port": int(resolved.port),
                     }),
                 )
             except Exception:
@@ -846,39 +1070,66 @@ class ChromecastBackend:
         except Exception:
             self._volume = fallback
 
-        self._vol_listener = _VolumeListener(self)
+        # U5: bound to THIS cast, so a volume signal arriving from a
+        # superseded or released connection is inert (the same guard
+        # _ConnectionListener carries).
+        self._vol_listener = _VolumeListener(self, cast)
         try:
             cast.register_status_listener(self._vol_listener)
         except Exception:
             pass
 
-        if old_cast:
-            _lst = old_listener
-            _vlst = old_vol_listener
-            _cc = old_cast
+        # The outgoing connection is freed at ENTRY now (see the top of this
+        # method), through the same non-blocking ``_detach_cast`` helper
+        # release() uses — never ``_cc.disconnect()``, the unbounded
+        # convenience method that stalled a switch for 25.0s against an
+        # unreachable device with the attach lock held (#48).
 
-            def _teardown():
-                if _lst:
-                    try:
-                        _cc.media_controller.unregister_status_listener(_lst)
-                    except Exception:
-                        pass
-                if _vlst:
-                    try:
-                        _cc.unregister_status_listener(_vlst)
-                    except Exception:
-                        pass
-                try:
-                    _cc.disconnect()
-                except Exception:
-                    pass
+    # ── release (2026-08-20 plan U2) ──────────────────────────────────────────
 
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, _teardown)
-            except Exception:
-                pass
+    def release(self) -> None:
+        """Let go of the adopted Chromecast connection. Non-blocking, never
+        raises, idempotent — see ``app.output.base`` for the contract.
 
-    def _sync_connect(self, device_id: str) -> Any:
+        What Cast adopts is one ``pychromecast.Chromecast`` whose SocketClient
+        is a live thread that re-dials its host roughly every 5s forever. That
+        is the resource: abandoning the object without releasing it leaks the
+        thread and its fd for the life of the process, and leaves listeners
+        wired to a device this backend no longer owns.
+
+        Deliberately does NOT tear the flow session down or send a Cast stop:
+        stopping is not releasing (a stop keeps the connection so playback can
+        resume without a reconnect), and the switch-away path calls ``stop()``
+        before this anyway. Nor does it clear ``_device_id`` — the device is
+        still the user's selection; only the connection to it ends here.
+
+        Supersedes any in-flight attach first (2026-08-20 review F1): a
+        ``set_device`` parked in its executor connect when the router retires
+        this backend would otherwise pass the compare-and-swap on the way out
+        and adopt a live SocketClient onto a backend nobody owns."""
+        self._supersede_attaches()
+        cast = self._cast
+        listener = self._listener
+        vol_listener = self._vol_listener
+        # Detach FIRST so a listener callback racing in on the socket thread
+        # sees ``backend._cast is not self._cast`` and no-ops (the staleness
+        # guard the abandoned-connection bug could never reach).
+        self._cast = None
+        self._listener = None
+        self._vol_listener = None
+        self._is_playing = False
+        if cast is None:
+            return
+        _detach_cast(cast, listener, vol_listener)
+
+    def _sync_connect(self, device_id: str) -> tuple[Any, _ResolvedAddr]:
+        """Connect to *device_id* and return ``(cast, resolved_address)``.
+
+        Runs on an executor thread. It deliberately records NOTHING on the
+        instance: the address it resolved is returned with the connection it
+        produced, so the caller persists the value THIS attach came up with
+        rather than whatever the last thread to finish happened to leave
+        behind (2026-08-20 plan U4 — see ``_ResolvedAddr``)."""
         # D-Bus path — device_id is "{host}:{port}" (legacy) or UUID (preferred).
         with self._discover_lock:
             dbus_info = self._dbus_index.get(device_id)
@@ -891,15 +1142,12 @@ class ChromecastBackend:
             except (ValueError, TypeError, AttributeError):
                 _uid = None
             cc = _media_chromecast_from_host(host, port, _uid, name)
-            try:
-                cc.wait(timeout=10)
-            except _RequestTimeout:
-                raise RuntimeError(
-                    f"Chromecast D-Bus device {device_id!r} did not connect within 10s "
-                    f"(if its IP changed, rescan in output settings)"
-                )
-            self._resolved_name, self._resolved_host, self._resolved_port = name, host, port
-            return cc
+            _connect_or_release(
+                cc,
+                f"Chromecast D-Bus device {device_id!r} did not connect within 10s "
+                f"(if its IP changed, rescan in output settings)",
+            )
+            return cc, _ResolvedAddr(name, host, port)
 
         # Fast path: use cached CastInfo from persistent browser (no new scan).
         with self._discover_lock:
@@ -909,14 +1157,10 @@ class ChromecastBackend:
             _log.info("Chromecast: connecting to %r via cached CastInfo", device_id)
             cc = pychromecast.get_chromecast_from_cast_info(
                 _force_media_cast_type(cast_info), self._zconf)
-            try:
-                cc.wait(timeout=10)
-            except _RequestTimeout:
-                raise RuntimeError(f"Chromecast device {device_id!r} did not connect within 10s")
-            self._resolved_name = cast_info.friendly_name
-            self._resolved_host = cast_info.host
-            self._resolved_port = cast_info.port
-            return cc
+            _connect_or_release(
+                cc, f"Chromecast device {device_id!r} did not connect within 10s")
+            return cc, _ResolvedAddr(cast_info.friendly_name, cast_info.host,
+                                     cast_info.port)
 
         # Fallback: one-shot scan (browser not yet started or device not seen).
         # Skip when mDNS port 5353 is unavailable — creating a bare Zeroconf()
@@ -945,14 +1189,9 @@ class ChromecastBackend:
         fname = info.friendly_name or device_id
         pychromecast.discovery.stop_discovery(browser)
         cc = _media_chromecast_from_host(host, port, info.uuid, fname)
-        try:
-            cc.wait(timeout=10)
-        except _RequestTimeout:
-            raise RuntimeError(f"Chromecast device {device_id!r} did not connect within 10s")
-        self._resolved_name = fname
-        self._resolved_host = host
-        self._resolved_port = port
-        return cc
+        _connect_or_release(
+            cc, f"Chromecast device {device_id!r} did not connect within 10s")
+        return cc, _ResolvedAddr(fname, host, port)
 
     # ── playback ──────────────────────────────────────────────────────────────
 
@@ -1531,7 +1770,7 @@ class ChromecastBackend:
         self._is_playing = False
         self._spawn_flow_teardown()
         from app.output import session
-        session.notify_outage(reason)
+        session.notify_outage(reason, backend=self)  # U5: reporter must be active
 
     def _flow_media_status(self, status: Any) -> None:
         """Flow-mode media-status handler — CAST SOCKET THREAD (hops to the
@@ -1873,7 +2112,11 @@ class ChromecastBackend:
             self._spawn_flow_teardown()
         _log.warning("Cast connection LOST mid-playback — reporting outage-suspected")
         from app.output import session
-        session.notify_outage("connection_lost")
+        # U5: name the reporter. This connection outlives a switch away (it is
+        # released, not torn down, on the router's retire path), so a device
+        # sleeping hours later must not hold the queue on whatever backend is
+        # active now.
+        session.notify_outage("connection_lost", backend=self)
 
     def _on_connection_restored(self) -> None:
         """Loop-side CONNECTED handler (supervisor plan U3). Only meaningful
@@ -1886,7 +2129,10 @@ class ChromecastBackend:
         if not session.output_hold_active():
             return
         _log.info("Cast connection restored — triggering supervisor re-attach")
-        session.notify_reconnect_trigger("cast_connected")
+        # U5/F5: name the reporter, exactly as _on_connection_lost does — an
+        # abandoned connection's re-dial must not drive another backend's
+        # reconnect schedule.
+        session.notify_reconnect_trigger("cast_connected", backend=self)
 
     # ── EOS ───────────────────────────────────────────────────────────────────
 
@@ -1970,7 +2216,7 @@ class ChromecastBackend:
                 "reporting outage-suspected (not advancing)",
             )
             from app.output import session
-            session.notify_outage("watchdog_unreachable")
+            session.notify_outage("watchdog_unreachable", backend=self)  # U5
             return
         await self._handle_eos("watchdog")
 
