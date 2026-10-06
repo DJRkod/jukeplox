@@ -209,9 +209,10 @@ async def flow_factory():
             if spec is BROKEN_FACTORY:
                 raise RuntimeError("decoder factory boom")
             if isinstance(spec, dict):
-                d = FakePCMDecoder(spec["data"], offset_ms=offset_ms,
-                                   block_after=spec.get("block_after"),
-                                   fail_after=spec.get("fail_after"))
+                cls = spec.get("cls", FakePCMDecoder)
+                d = cls(spec["data"], offset_ms=offset_ms,
+                        block_after=spec.get("block_after"),
+                        fail_after=spec.get("fail_after"))
             else:
                 d = FakePCMDecoder(spec, offset_ms=offset_ms)
             env.decoders.setdefault(source, []).append(d)
@@ -768,6 +769,225 @@ async def test_second_concurrent_consumer_rejected(flow_factory):
     await asyncio.wait_for(drain(), 5)
     assert first + bytes(rest) == pcm_a
     assert len(env.decoders["a"]) == 1
+
+
+async def test_decoder_close_is_bounded_when_the_feeder_ignores_cancellation(
+        monkeypatch):
+    """The measured #51 hang, at its source, against the REAL decoder.
+
+    On the rig 2026-09-18 ``FFmpegPCMDecoder.close()`` spent exactly 30.00s
+    inside ``await self._feeder_task``. The feeder HAD been cancelled — but
+    cancelling a task does not skip its finally, and that finally awaits an
+    httpx response close, a client close, and ``proc.stdin.wait_closed()``.
+    close() is reached from ``set_device`` while the process-wide attach lock
+    is held, so those 30 seconds were 30 seconds of every output switch being
+    blocked, and the ffmpeg pair was left unreaped because the code that kills
+    it sits after that await.
+
+    The session-level tests above cannot cover this: they inject a fake decoder
+    whose close() is overridden, so the real close path never runs. Mutation
+    checking proved it — reverting this exact await to unbounded left all of
+    them green."""
+    monkeypatch.setattr(flow, "_CLOSE_STEP_GRACE_S", 0.2)
+    monkeypatch.setattr(flow, "_CLOSE_COMPOSITE_GRACE_S", 0.6)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _feeder_that_will_not_die():
+        try:
+            started.set()
+            await asyncio.sleep(3600)
+        finally:
+            await release.wait()        # the finally the cancel does not skip
+
+    dec = flow.FFmpegPCMDecoder("http://example.invalid/a.flac", {})
+    dec._feeder_task = asyncio.create_task(_feeder_that_will_not_die())
+    await asyncio.wait_for(started.wait(), 5)
+
+    reaped = []
+
+    class _Proc:
+        returncode = None
+
+        def terminate(self):
+            reaped.append("terminate")
+
+        def kill(self):
+            reaped.append("kill")
+
+        async def wait(self):
+            return 0
+
+    dec._proc = _Proc()
+
+    # Asserted on completion-without-cancellation, NOT on wait_for raising.
+    # That distinction is load-bearing: the pre-fix code caught CancelledError
+    # and swallowed it, so a wait_for() safety net would have its own timeout
+    # absorbed at the feeder await and the coroutine would complete anyway —
+    # the regression passes. Mutation checking caught exactly that. Here the
+    # task is left entirely alone, so nothing external can rescue it.
+    closing = asyncio.create_task(dec.close())
+    for _ in range(200):                # bounded poll; exits immediately on done
+        if closing.done():
+            break
+        await asyncio.sleep(0.01)
+
+    assert closing.done(), (
+        "close() must abandon a feeder that ignores cancellation, not wait on it")
+    await closing
+    assert reaped, "the subprocess must still be reaped after the feeder is abandoned"
+    assert dec._closed
+    release.set()                       # let the abandoned feeder unwind
+
+
+class _IgnoresCancelDecoder(FakePCMDecoder):
+    """A decoder whose close() takes far longer than any caller should wait.
+
+    Models what the rig measured on 2026-09-18: ``_Decoder.close()`` spent
+    exactly 30.00s inside ``await self._feeder_task`` — the feeder had been
+    cancelled, but its finally-block awaits (httpx response/client close and
+    ``proc.stdin.wait_closed()``) run to completion regardless, because
+    cancelling a task does not skip its finally. All of it happened under the
+    process-wide attach lock, so every output switch queued behind it and the
+    Apply never returned.
+
+    The hang is deliberately set far ABOVE the deadline the tests below use.
+    Without that the tests are false witnesses: an unbounded close would still
+    finish inside a generous wait_for and pass."""
+
+    HANG_S = 30.0
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.close_entered = False
+
+    async def close(self):
+        self.close_entered = True
+        await asyncio.sleep(self.HANG_S)
+        await super().close()
+
+
+async def test_close_is_bounded_when_a_decoder_ignores_cancellation(
+        flow_factory, monkeypatch, caplog):
+    """close() must return even when teardown work refuses to finish.
+
+    The assertion is positive evidence, not the absence of a timeout: the
+    decoder close was genuinely attempted, and close() got PAST it to finish
+    the rest of the teardown. A close() that merely raised TimeoutError, or
+    that skipped the decoder entirely, fails this."""
+    monkeypatch.setattr(flow, "_CLOSE_STEP_GRACE_S", 0.2)
+    monkeypatch.setattr(flow, "_CLOSE_COMPOSITE_GRACE_S", 0.6)
+    a = trk("a")
+    session, env = flow_factory(
+        a, [], {"a": {"data": make_pcm(88200, 1), "block_after": 8820,
+                      "cls": _IgnoresCancelDecoder}})
+    g1 = session.bind_consumer()
+    await asyncio.wait_for(g1.__anext__(), 5)
+
+    # 3s is a safety net so a regression FAILS rather than hangs the suite —
+    # it is not the assertion. The decoder hangs for 30s.
+    with caplog.at_level(logging.WARNING, logger="app.output.flow"):
+        await asyncio.wait_for(session.close(), timeout=3)
+
+    dec = env.decoders["a"][0]
+    # NOT close_entered: that flag is set by the PUMP's finally, so asserting
+    # on it passes even when close()'s own decoder step never runs. Only that
+    # step emits this warning, so it is positive evidence the step executed
+    # and was bounded — which is the behaviour under test.
+    assert "decoder close did not finish" in caplog.text, (
+        "close() must attempt AND bound its own decoder step")
+    assert dec.close_entered
+    assert session._encoder.closed, "close() must finish the rest of teardown"
+    assert session._closed
+
+
+async def test_close_still_reaps_when_every_step_hangs(flow_factory, monkeypatch):
+    """The bound is per-step, so one wedged step cannot consume the whole
+    teardown budget and starve the steps after it."""
+    monkeypatch.setattr(flow, "_CLOSE_STEP_GRACE_S", 0.2)
+    monkeypatch.setattr(flow, "_CLOSE_COMPOSITE_GRACE_S", 0.6)
+    a = trk("a")
+    session, env = flow_factory(
+        a, [], {"a": {"data": make_pcm(88200, 1), "block_after": 8820,
+                      "cls": _IgnoresCancelDecoder}})
+    g1 = session.bind_consumer()
+    await asyncio.wait_for(g1.__anext__(), 5)
+
+    async def _hang():
+        await asyncio.sleep(_IgnoresCancelDecoder.HANG_S)
+    monkeypatch.setattr(session._encoder, "close", _hang)
+
+    await asyncio.wait_for(session.close(), timeout=3)
+    assert session._closed
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(g1.__anext__(), 5)
+
+
+def test_composite_teardown_grace_exceeds_the_steps_it_wraps():
+    """A composite close() is a sequence of individually-bounded steps, so its
+    own bound must exceed their sum — otherwise every step after the first is
+    unreachable. That is how ``_terminate_proc``'s SIGTERM→SIGKILL ladder
+    became dead code on the teardown path (#51 review). Guards the numeric
+    relationship so a later tidy-up of these three constants cannot silently
+    restore it."""
+    assert flow._CLOSE_COMPOSITE_GRACE_S >= (
+        2 * flow._STOP_GRACE_S + 2 * flow._CLOSE_STEP_GRACE_S), (
+        "the composite bound must outlast the terminate ladder plus both "
+        "leaf task waits, or the steps after the first cannot run")
+
+
+async def test_decoder_reap_survives_a_caller_bound_at_the_same_grace(
+        monkeypatch):
+    """The reap must never sit behind a wait that the reap itself unblocks.
+
+    The first cut of the #51 fix waited on the feeder and reaped AFTER it,
+    while FlowSession.close() wrapped the whole call in a bound at the same
+    grace as that inner wait. The outer bound therefore always expired first
+    and ``_terminate_proc`` never ran — the ffmpeg pair leaked silently, in
+    exactly the scenario the fix was written for, and every test stayed green
+    because the only real-decoder test called ``close()`` bare.
+
+    Reaping before the waits makes the reap independent of how the caller
+    sized its budget, so this test deliberately uses the pathological
+    configuration: an outer grace equal to the inner one."""
+    monkeypatch.setattr(flow, "_CLOSE_STEP_GRACE_S", 0.2)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _feeder_that_will_not_die():
+        try:
+            started.set()
+            await asyncio.sleep(3600)
+        finally:
+            await release.wait()        # the finally the cancel does not skip
+
+    dec = flow.FFmpegPCMDecoder("http://example.invalid/a.flac", {})
+    dec._feeder_task = asyncio.create_task(_feeder_that_will_not_die())
+    await asyncio.wait_for(started.wait(), 5)
+
+    reaped = []
+
+    class _Proc:
+        returncode = None
+
+        def terminate(self):
+            reaped.append("terminate")
+
+        def kill(self):
+            reaped.append("kill")
+
+        async def wait(self):
+            return 0
+
+    dec._proc = _Proc()
+
+    # The composition that lost the reap: caller bound == inner leaf bound.
+    await flow._bounded_teardown(dec.close(), "decoder close", 0.2)
+
+    assert reaped, (
+        "the subprocess must be reaped even when the caller's bound expires "
+        "mid-teardown — the reap cannot sit behind a cancellable wait")
+    release.set()                       # let the abandoned feeder unwind
 
 
 async def test_close_reaps_decoder_and_unblocks_consumer(flow_factory):

@@ -28,6 +28,69 @@ _log = logging.getLogger(__name__)
 
 _GST_AVAILABLE = False
 
+
+def _drop_pulse_device_provider(gst) -> list[str]:
+    """Remove GStreamer's pulse DEVICE PROVIDER from the registry. Returns the
+    names dropped.
+
+    Not a preference — a leak fix. ``Gst.DeviceMonitor`` loads every provider
+    matching its filter, and ``pulsedeviceprovider`` (rank 256) outranks
+    ``alsadeviceprovider`` (128). Each ``get_devices()`` call through it opens a
+    libpulse client context and never releases it; ``monitor.stop()`` frees
+    nothing, and nothing else does either.
+
+    Measured on the arm64 rig 2026-09-06, in a bare process doing nothing but
+    ``DeviceMonitor`` calls in a loop — no application code involved:
+
+        unpatched   3 -> 52 fds over 15 cycles   (3.27/cycle, +15 pulse memfds)
+        patched     3 ->  5 fds over 15 cycles   (0.13/cycle,   0 pulse memfds)
+
+    Composition of the leak is +1 ``memfd:pulseaudio`` and +2 pipes per call,
+    sockets flat. That is issue #53's "~9 fds per device sleep/wake cycle" — at
+    roughly 2.6 enumerations per cycle the arithmetic closes.
+
+    **Reusing one long-lived monitor does not help, so do not "simplify" this
+    away into a module-level singleton.** The leak is per ``get_devices()``
+    call, not per instantiation: a single monitor reused across 15 calls grew
+    by 45 fds, the same rate, and disposing a still-started monitor trips a
+    GStreamer-CRITICAL assertion besides.
+
+    Safe, and narrower than it looks. ``pulsesink`` is an ElementFactory
+    feature; this removes a DeviceProviderFactory feature. Verified on the rig:
+    ``ElementFactory.make("pulsesink")`` still succeeds afterwards, so the
+    opt-in PULSE_SERVER output path in ``play()`` is untouched.
+
+    Enumeration is unaffected. The rig's USB interface is supplied by the ALSA
+    provider, and ``_sync_discover`` returns the identical device list with and
+    without this removal — measured from equal state (fresh container, nothing
+    holding the card). Comparing a busy card against an idle one shows a
+    spurious loss; it is the card being open, not this removal.
+
+    Removing it also closes a latent mis-route. An enumerated device id reaches
+    only ONE consumer — the ``alsasink`` branch of ``play()``, which sets it as
+    the ALSA ``device`` property. The pulse branch never reads the enumerated
+    list; it takes pulse's own default sink. So a pulse-provided entry in the
+    picker could only ever be handed to alsasink, which cannot open it.
+
+    KNOWN LIMIT: loading the pulseaudio plugin re-registers its features, so a
+    deployment that actually creates a ``pulsesink`` (PULSE_SERVER set) gets the
+    provider back and keeps leaking. That is the opt-in path, on a host that
+    already runs a sound server; the default ALSA path — every install that has
+    not opted in — is fully fixed."""
+    removed: list[str] = []
+    try:
+        registry = gst.Registry.get()
+        for feature in registry.get_feature_list(gst.DeviceProviderFactory):
+            if "pulse" in feature.get_name().lower():
+                registry.remove_feature(feature)
+                removed.append(feature.get_name())
+    except Exception:
+        # Never fatal: a GStreamer build without this provider, or an API
+        # change, must degrade to "we leak a little" rather than to no audio.
+        _log.debug("could not drop the pulse device provider", exc_info=True)
+    return removed
+
+
 try:
     import gi
     gi.require_version("Gst", "1.0")
@@ -35,6 +98,9 @@ try:
 
     if not Gst.is_initialized():
         Gst.init(None)
+    _dropped = _drop_pulse_device_provider(Gst)
+    if _dropped:
+        _log.debug("dropped leaky device provider(s): %s", ", ".join(_dropped))
     _GST_AVAILABLE = True
 except Exception:
     pass

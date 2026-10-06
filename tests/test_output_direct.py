@@ -1076,3 +1076,94 @@ async def test_play_stop_play_cycle_still_works(gst_mock):
     await backend.play("http://plex.local/b.flac", make_track("t2"))
     assert backend._is_playing
     mock_pipeline.set_state.assert_called_with("PLAYING")
+
+
+# ── pulse device provider removal (issue #53) ─────────────────────────────────
+#
+# The leak itself lives inside GStreamer's pulse device provider and cannot be
+# unit-tested — it needs a real registry and a real libpulse. What IS ours, and
+# what these cover, is that we remove the right feature, from the right
+# registry, and that a hostile registry cannot break audio at import time.
+
+class _FakeFeature:
+    def __init__(self, name):
+        self._name = name
+
+    def get_name(self):
+        return self._name
+
+
+class _FakeRegistry:
+    def __init__(self, features):
+        self._features = list(features)
+        self.removed = []
+        self.asked_for = None
+
+    def get_feature_list(self, kind):
+        self.asked_for = kind
+        return list(self._features)
+
+    def remove_feature(self, feature):
+        self.removed.append(feature.get_name())
+        self._features.remove(feature)
+
+
+def _fake_gst(features):
+    gst = MagicMock()
+    registry = _FakeRegistry(features)
+    gst.Registry.get.return_value = registry
+    return gst, registry
+
+
+def test_drops_the_pulse_device_provider_and_nothing_else():
+    from app.output.direct import _drop_pulse_device_provider
+    gst, registry = _fake_gst([
+        _FakeFeature("v4l2deviceprovider"),
+        _FakeFeature("pulsedeviceprovider"),
+        _FakeFeature("alsadeviceprovider"),
+    ])
+
+    removed = _drop_pulse_device_provider(gst)
+
+    assert removed == ["pulsedeviceprovider"]
+    assert registry.removed == ["pulsedeviceprovider"]
+    # The ALSA provider is the one that actually supplies our sinks — on the rig
+    # it is what returns the audio interface. Removing it would empty the picker.
+    assert [f.get_name() for f in registry._features] == [
+        "v4l2deviceprovider", "alsadeviceprovider"]
+
+
+def test_removes_from_the_device_provider_registry_not_the_element_registry():
+    """The load-bearing distinction: pulsesink must keep working.
+
+    pulsesink is an ElementFactory feature and the opt-in PULSE_SERVER path in
+    play() depends on it. If this ever asked for ElementFactory instead, pulse
+    output would break for the users who deliberately enabled it — and no other
+    test in this file would notice, because they all mock ElementFactory."""
+    from app.output.direct import _drop_pulse_device_provider
+    gst, registry = _fake_gst([_FakeFeature("pulsedeviceprovider")])
+
+    _drop_pulse_device_provider(gst)
+
+    assert registry.asked_for is gst.DeviceProviderFactory
+    assert registry.asked_for is not gst.ElementFactory
+
+
+def test_a_build_without_the_pulse_provider_is_not_an_error():
+    from app.output.direct import _drop_pulse_device_provider
+    gst, registry = _fake_gst([_FakeFeature("alsadeviceprovider")])
+
+    assert _drop_pulse_device_provider(gst) == []
+    assert registry.removed == []
+
+
+def test_a_raising_registry_never_breaks_import():
+    """Degrade to leaking, never to silence.
+
+    This runs at module import, before any backend exists. A GStreamer whose
+    registry API has moved must cost us fds, not the ability to play audio."""
+    from app.output.direct import _drop_pulse_device_provider
+    gst = MagicMock()
+    gst.Registry.get.side_effect = RuntimeError("registry API moved")
+
+    assert _drop_pulse_device_provider(gst) == []
