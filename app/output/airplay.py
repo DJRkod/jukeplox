@@ -35,7 +35,12 @@ import time
 import uuid
 from typing import Any
 
-from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
+from app.output.base import (
+    AdvanceCallback,
+    DeviceNotReadyError,
+    DiscoveryUnavailable,
+    OutputDevice,
+)
 from app.output.radio_endless import (
     RadioFailedHook,
     ReconnectPolicy,
@@ -715,8 +720,32 @@ class AirPlayBackend:
             hint=None,
         )
 
-    async def discover_devices(self) -> list[OutputDevice]:
+    async def sweep_devices(self) -> list[OutputDevice]:
+        """RAISING discover for the watcher sweep (2026-09-04 plan U1).
+
+        Same browse as ``discover_devices``, different failure contract: when
+        BOTH transports fail this raises instead of returning ``[]``, so the
+        sweep leaves the registry untouched rather than grace-flipping and
+        then evicting every known AirPlay receiver over an mDNS outage.
+
+        "Both" matters — in-process zeroconf is tried first and D-Bus second,
+        so a working zeroconf path is not a failure even when D-Bus is dead.
+        That is why per-backend status is sufficient and no partial-
+        availability state is needed.
+
+        ``discover_devices`` keeps its fail-soft ``[]`` for its other callers;
+        only the sweep needs the two outcomes told apart, mirroring how
+        ``PlexPlayerBackend.sweep_devices`` relates to its own discover.
+        """
+        return await self.discover_devices(_raise_on_failure=True)
+
+    async def discover_devices(
+        self, *, _raise_on_failure: bool = False,
+    ) -> list[OutputDevice]:
         if not _binaries_available():
+            # Not a failed attempt — this backend is not installed. Left as an
+            # empty result on BOTH paths so a host without cliap2 does not
+            # start reporting a discovery outage it never had.
             return []
         async with self._scan_lock:
             # In-process one-shot browse on the shared AsyncZeroconf first;
@@ -731,6 +760,9 @@ class AirPlayBackend:
             if found is None:
                 # Neither in-process nor D-Bus available; the U6 degraded
                 # banner distinguishes "no devices" from "discovery unavailable".
+                if _raise_on_failure:
+                    raise DiscoveryUnavailable(
+                        "airplay: no mDNS transport reported scan data")
                 return []
             fresh: dict[str, tuple[str, str, int, dict[str, str]]] = {}
             devices: list[OutputDevice] = []

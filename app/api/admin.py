@@ -1218,6 +1218,28 @@ async def _switch_stranded_gate(body: SetOutputRequest) -> int:
     return await state.remove_stranded_entries(stranded), snapshot
 
 
+def _reconcile_idle_reattach() -> None:
+    """Re-derive idle re-attach ownership and the picker's purge exemption
+    after any attempt to change the output (2026-09-01 plan U5, origin R10).
+
+    Both edges — the switch that worked and the switch that did not — funnel
+    here, because both can change the predicate's answer and neither cares
+    how. Fail-soft: reconnect bookkeeping must never turn a successful Apply
+    into an error response, nor mask the real error on a failed one."""
+    try:
+        from app.output import idle_reattach
+        idle_reattach.reconcile()
+    except Exception:
+        _log.debug("idle re-attach reconcile after Apply failed", exc_info=True)
+    try:
+        from app.output import watcher as watcher_mod
+        w = watcher_mod.get_watcher()
+        if w is not None and hasattr(w, "refresh_purge_exemption"):
+            w.refresh_purge_exemption()
+    except Exception:
+        _log.debug("purge-exemption refresh after Apply failed", exc_info=True)
+
+
 @router.post("/output/active")
 async def set_output_active(body: SetOutputRequest):
     removed_count, restore_snapshot = 0, []
@@ -1226,6 +1248,13 @@ async def set_output_active(body: SetOutputRequest):
     try:
         await state.activate_backend(body.backend_type, body.device_id, host=body.host)
     except Exception as exc:
+        # R10, the "an attempt to select something else fails" edge
+        # (2026-09-01 plan U5). Deliberately needs no rollback logic:
+        # activate_backend raises BEFORE it touches the selection mirror, so
+        # the predicate still reads the OLD device and re-deriving resumes
+        # watching it (origin AE7). Placed before the rollback below so a
+        # failure in that path cannot skip it.
+        _reconcile_idle_reattach()
         # PLX-3 rollback: the switch did NOT happen (activate raises before
         # any state change), so a confirmed stranded removal must be undone
         # — re-insert the captured entries at their original positions
@@ -1253,6 +1282,13 @@ async def set_output_active(body: SetOutputRequest):
         if isinstance(exc, RuntimeError):
             raise HTTPException(status_code=409, detail=str(exc))
         raise HTTPException(status_code=502, detail=str(exc))
+    # R10, the "the admin selects something else" edge (2026-09-01 plan U5).
+    # The selection mirror now names the NEW device, so re-deriving stops
+    # watching the old one and starts on the new one if it is not yet
+    # attached. Also re-derives the purge exemption, which is the half that
+    # rescues a newly-selected sleeping device from an eviction already
+    # counting down, and starts a fresh window on the one just deselected.
+    _reconcile_idle_reattach()
     from app.events.bus import manager
     from app.events.types import OutputChangedEvent
     await manager.broadcast_to_admins(OutputChangedEvent(

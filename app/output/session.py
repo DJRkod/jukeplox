@@ -311,6 +311,62 @@ class _Outage:
                 pass
 
 
+class _AttachTarget:
+    """A reconnect context for an attach that is NOT an outage.
+
+    The attach primitives below (``_try_attach``, ``_seed_and_set_device``,
+    ``_write_back_address``) read exactly five fields off ``_Outage``:
+    ``backend``, ``backend_type``, ``device_id``, ``retired`` and ``attempts``
+    (the last only for a log line). This carries those five and nothing else,
+    shape-compatible on purpose so the primitives' bodies are UNCHANGED and
+    the outage path provably behaves as it did (2026-09-01 plan U4; the same
+    extraction the abandoned first attempt got right).
+
+    Why an idle caller must not simply begin an outage instead: entering the
+    outage state machine sets the queue hold, which gates guest enqueue and
+    suppresses auto-start. For a device that is merely asleep between parties
+    that is all wrong — the host has not lost playback, they have not started
+    it yet. What the idle caller wants is the epoch revalidation, the
+    ``_attach_serial`` serialisation, the address seeding and the
+    ``register_resolved`` write-back; not the hold."""
+
+    __slots__ = ("backend", "backend_type", "device_id", "retired", "attempts")
+
+    def __init__(self, backend: Any, backend_type: str, device_id: str) -> None:
+        self.backend = backend
+        self.backend_type = backend_type
+        self.device_id = device_id
+        # Always False: an idle attach's staleness is the attach EPOCH, which
+        # _seed_and_set_device re-validates under the lock. There is no hold to
+        # retire, so there is no second staleness axis to track.
+        self.retired = False
+        self.attempts = 0
+
+
+async def attach_without_outage(backend: Any, backend_type: str,
+                                device_id: str) -> bool:
+    """Attach *device_id* on *backend* using the supervisor's attach mechanics,
+    without entering (or requiring) an outage hold.
+
+    The one entry point the idle re-attach coordinator uses. Returns True when
+    the device is attached. Never raises — every failure mode the primitives
+    have is already absorbed into a False, including
+    ``AttachSuperseded``: a newer attach winning the backend is a correct
+    outcome for an unattended caller, not an error to report.
+
+    The epoch is captured BEFORE the attach and re-validated inside
+    ``_seed_and_set_device`` under ``_attach_serial``, so an idle attach that
+    queued behind a manual Apply aborts without calling ``set_device`` rather
+    than committing the old device's internals over the new one's."""
+    sup = get_supervisor()
+    target = _AttachTarget(backend, backend_type, device_id)
+    epoch = sup.attach_epoch
+    ok = await sup._try_attach(target, "idle", epoch)
+    if ok:
+        sup._write_back_address(target)
+    return ok
+
+
 class OutputSessionSupervisor:
     """Signal intake + confirmed-start chokepoint (the U1 skeleton of the
     session state machine; U2/U3 add classification, hold, and reconnect)."""
@@ -849,6 +905,16 @@ class OutputSessionSupervisor:
                     "for manual resume", len(self._flap_stamps),
                     FLAP_GUARD_WINDOW_S / 60,
                 )
+        # R10, "the supervisor takes over" edge (2026-09-01 plan U5). Placed
+        # BEFORE the early return below: an outage with no addressable device
+        # still owns the hold, and the idle coordinator's predicate keys off
+        # the hold, not off whether this outage found something to retry.
+        try:
+            from app.output import idle_reattach
+            idle_reattach.reconcile()
+        except Exception:
+            _log.debug("idle re-attach reconcile at outage entry failed",
+                       exc_info=True)
         if ot.backend is None or not ot.device_id:
             _log.info("Output session: outage has no addressable device — "
                       "manual resume or a device switch recovers")

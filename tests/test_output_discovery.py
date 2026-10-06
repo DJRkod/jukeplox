@@ -767,3 +767,175 @@ async def test_build_devices_snapshot_plexplayer_gapless_unverified_and_override
     gapless = {p["device_id"]: p["gapless"]
                for d in payload for p in d["protocols"]}
     assert gapless == {"caldera-1": "supported", "caldera-2": "unverified"}
+
+
+# ── U4: the persisted selection is listed even when never discovered ────────
+#
+# The registry is rebuilt from live discovery on every start, so a speaker
+# switched off at boot is not in it. The purge exemption protects an entry
+# that exists; it cannot create one. The admin's chosen device was therefore
+# absent from the picker with no sign it had ever been configured.
+
+
+def _sel_patch(monkeypatch, backend="chromecast", device="uuid-jbl",
+               name="JBL Charge 5", host="192.0.2.31"):
+    import app.state as st
+    monkeypatch.setattr(st, "selected_output_key", lambda: (backend, device))
+    monkeypatch.setattr(st, "selected_output_name", lambda: name)
+    return patch("app.database.get_setting", AsyncMock(return_value=host))
+
+
+async def test_undiscovered_selection_is_listed_offline(monkeypatch):
+    """Covers AE6. Verified to FAIL when the placeholder append is removed."""
+    from app.output.discovery import build_registry_snapshot
+    with _sel_patch(monkeypatch):
+        payload, _ = await build_registry_snapshot(
+            {}, backend_for=lambda b: None)
+
+    entry = next(d for d in payload if d["host"] == "192.0.2.31")
+    assert entry["name"] == "JBL Charge 5"
+    assert entry["online"] is False
+    assert [p["backend"] for p in entry["protocols"]] == ["chromecast"]
+
+
+async def test_placeholder_uses_a_neutral_label_when_no_name_is_stored(
+        monkeypatch):
+    """Covers AE8. Device names are only written on Apply, and only since the
+    idle re-attach work, so an older selection has none. A raw uuid in the
+    picker is worse than a generic word."""
+    from app.output.discovery import build_registry_snapshot
+    with _sel_patch(monkeypatch, name=""):
+        payload, _ = await build_registry_snapshot(
+            {}, backend_for=lambda b: None)
+
+    entry = next(d for d in payload if d["host"] == "192.0.2.31")
+    assert entry["name"] == "Selected output"
+    assert "uuid-jbl" not in entry["name"]
+
+
+async def test_a_discovered_selection_renders_once_from_the_registry(
+        monkeypatch):
+    """The real entry wins; the two must never both render."""
+    from app.output.discovery import build_registry_snapshot
+    real = OutputDevice(id="uuid-jbl", name="JBL Charge 5",
+                        backend_type="chromecast")
+    registry = {("chromecast", "uuid-jbl"): SimpleNamespace(
+        device=real, online=True, offline_since=None)}
+    cast = SimpleNamespace(_dbus_index={"uuid-jbl": ("JBL", "192.0.2.31", 8009)},
+                           _cast_infos={},
+                           _discover_lock=threading.Lock())
+
+    with _sel_patch(monkeypatch):
+        payload, _ = await build_registry_snapshot(
+            registry, backend_for=lambda b: cast if b == "chromecast" else None)
+
+    matching = [d for d in payload if d["host"] == "192.0.2.31"]
+    assert len(matching) == 1
+    assert matching[0]["online"] is True, "the live entry, not the placeholder"
+
+
+async def test_placeholder_never_enters_the_registry(monkeypatch):
+    """Covers AE7, and the load-bearing property. A registry entry is treated
+    throughout as evidence the device exists — the identity gate reads
+    entry.device — so a synthetic entry would let a device that has never been
+    seen confirm its own identity and be attached.
+
+    Verified to FAIL if the placeholder is written into the registry."""
+    from app.output.discovery import build_registry_snapshot
+    registry: dict = {}
+    with _sel_patch(monkeypatch):
+        await build_registry_snapshot(registry, backend_for=lambda b: None)
+
+    assert registry == {}, "the placeholder must be presentational only"
+
+
+async def test_no_placeholder_without_a_selection(monkeypatch):
+    from app.output.discovery import build_registry_snapshot
+    with _sel_patch(monkeypatch, device=""):
+        payload, _ = await build_registry_snapshot(
+            {}, backend_for=lambda b: None)
+    assert payload == []
+
+
+async def test_no_placeholder_for_a_direct_selection(monkeypatch):
+    """Direct's pseudo-device is appended unconditionally, so a second entry
+    would duplicate it."""
+    from app.output.discovery import build_registry_snapshot
+    with _sel_patch(monkeypatch, backend="direct", device="default"):
+        payload, _ = await build_registry_snapshot(
+            {}, backend_for=lambda b: None)
+    assert payload == []
+
+
+async def test_no_placeholder_without_a_known_host(monkeypatch):
+    """No address means no bucket key, and a junk key is worse than omitting
+    the row."""
+    from app.output.discovery import build_registry_snapshot
+    with _sel_patch(monkeypatch, host=None):
+        payload, _ = await build_registry_snapshot(
+            {}, backend_for=lambda b: None)
+    assert payload == []
+
+
+# ── code-review findings, 2026-09-04 ────────────────────────────────────────
+
+
+async def test_placeholder_is_not_queued_for_probing(monkeypatch):
+    """Review finding 3, and the one that made this feature actively harmful.
+
+    build_registry_snapshot's `aggregated` return feeds schedule_probes, which
+    probes any entry with no cached verdict. Every backend returns False for a
+    device_id it has never discovered, that verdict is PERSISTED, and the admin
+    UI then filters the row out ("No working protocols found") — so the row
+    this feature exists to restore became visible-but-unusable. Worse, the
+    poisoned (host, backend) verdict also hides the real entry when the
+    speaker comes back.
+
+    Verified to FAIL when the placeholder is left in `aggregated`."""
+    from app.output.discovery import build_registry_snapshot
+    with _sel_patch(monkeypatch):
+        payload, aggregated = await build_registry_snapshot(
+            {}, backend_for=lambda b: None)
+
+    assert any(d["host"] == "192.0.2.31" for d in payload), (
+        "precondition: the row is rendered")
+    assert [a for a in aggregated if a.host == "192.0.2.31"] == [], (
+        "a remembered device must never be probed — probing it poisons the "
+        "verdict cache for the real device at that address")
+
+
+async def test_no_placeholder_when_another_device_holds_that_address(
+        monkeypatch):
+    """Review finding 2. output_host is pinned at Apply and never
+    re-validated, so the address may since have been taken by another device.
+
+    The collision that matters is CROSS-BACKEND. Same-backend is already safe:
+    the aggregator drops a second protocol entry for a backend it has already
+    seen at that host, and the registry entry is walked first, so the real
+    device wins and the placeholder is absorbed. A first version of this test
+    used a same-backend neighbour and passed with the guard removed — a false
+    witness that proved only the aggregator's own dedupe.
+
+    Across backends there is no such protection: the bucket gains a chromecast
+    Via option carrying the SELECTED device_id under the neighbour's name, and
+    availability ORs to online. The admin taps a row labelled with the
+    neighbour and Apply attaches the selected device.
+
+    Verified to FAIL when the collision guard is removed."""
+    from app.output.discovery import build_registry_snapshot
+    neighbour = OutputDevice(id="uuid:dlna-other", name="Someone Else",
+                             backend_type="dlna")
+    registry = {("dlna", "uuid:dlna-other"): SimpleNamespace(
+        device=neighbour, online=True, offline_since=None)}
+    dlna = SimpleNamespace(
+        _device_locations={"uuid:dlna-other": "http://192.0.2.31:8080/d.xml"})
+
+    with _sel_patch(monkeypatch):
+        payload, _ = await build_registry_snapshot(
+            registry, backend_for=lambda b: dlna if b == "dlna" else None)
+
+    entry = next(d for d in payload if d["host"] == "192.0.2.31")
+    ids = [p["device_id"] for p in entry["protocols"]]
+    assert "uuid-jbl" not in ids, (
+        "the selection must not ride along in another device's row — the "
+        "admin would tap %r and attach the JBL" % entry["name"])

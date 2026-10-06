@@ -430,6 +430,22 @@ async def _release_dlna_remote(dmr: Any, notify: Any) -> None:
                          exc_info=True)
 
 
+def _dlna_id_format(usn: str | None) -> str:
+    """Declare honestly how a DLNA device's id was derived.
+
+    ``device_id = usn or location`` — so when the SSDP response carried no USN
+    the id is the LOCATION URL, which is an address, not an identity. This
+    class defaulted to OutputDevice's ``id_format="uuid"`` on both paths and so
+    claimed a stable identifier for a URL (2026-09-01 plan KTD2).
+
+    That mattered once idle re-attach began reading the declaration to decide
+    whether id equality proves identity: a URL-keyed renderer would have been
+    treated as strongly identified, which is exactly the
+    stranger-inherits-the-lease exposure the AirPlay decision exists to close.
+    """
+    return "uuid" if usn else "host_port"
+
+
 class DlnaBackend(AttachGeneration):
     """Controls a DLNA MediaRenderer device via UPnP AVTransport."""
 
@@ -599,7 +615,9 @@ class DlnaBackend(AttachGeneration):
                 continue
             device_id = usn or location
             self._device_locations[device_id] = location
-            results.append(OutputDevice(id=device_id, name=friendly_name, backend_type="dlna"))
+            results.append(OutputDevice(
+                id=device_id, name=friendly_name, backend_type="dlna",
+                id_format=_dlna_id_format(usn)))
 
         _log.debug(
             "DLNA: search complete, found %d renderer(s): %s "
@@ -650,7 +668,8 @@ class DlnaBackend(AttachGeneration):
         device_id = usn or location
         self._device_locations[device_id] = location
         return OutputDevice(id=device_id, name=friendly_name,
-                            backend_type="dlna")
+                            backend_type="dlna",
+                            id_format=_dlna_id_format(usn))
 
     async def probe_device(self, device_id: str) -> bool:
         """Picker-facing probe: True if DLNA is verified to work on the

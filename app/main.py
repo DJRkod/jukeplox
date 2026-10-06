@@ -25,6 +25,18 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
+# Keep the SQLite driver out of debug output (2026-09-04 plan U5). aiosqlite
+# logs two DEBUG lines per statement, which at LOG_LEVEL=debug is roughly 150k
+# lines in six minutes on this workload — enough to rotate the startup window
+# straight out of `docker logs`. That destroyed the evidence twice while
+# diagnosing a discovery outage, each time making "no log lines" look like
+# "the code never ran" rather than "the log is gone".
+#
+# Pinned to INFO rather than silenced: a genuine driver error still surfaces.
+# Only this one library is raised, so app.* debug output is unaffected —
+# which is the whole point of turning debug on.
+logging.getLogger("aiosqlite").setLevel(logging.INFO)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,6 +73,30 @@ async def lifespan(app: FastAPI):
             "device watcher failed to start — live discovery degraded",
             exc_info=True,
         )
+    # The boot handoff to the idle re-attach coordinator lands HERE, not in
+    # _startup_reconnect's finally, because the coordinator registers an
+    # arrival listener ON THE WATCHER and the watcher does not exist until the
+    # line above returns. state.setup() spawns _startup_reconnect as a task, and
+    # on the cached-address path — the normal path once output_addr:{id} is
+    # persisted — that task finishes long before this point, so its reconcile
+    # ran against get_watcher() is None and registered nothing.
+    #
+    # Confirmed on the rig 2026-09-05: a cold boot with the selected speaker
+    # unreachable produced ZERO coordinator activity at debug level. The
+    # predicate was right (the device is away) and registration was reached; it
+    # just had no watcher to register with, and _register's early return left
+    # the coordinator inert with no retry to heal it. Adding this call made the
+    # retry floor start ticking on the same build.
+    #
+    # reconcile() is idempotent, so the earlier boot call is kept rather than
+    # moved: whichever runs with a watcher present wins, and the other is a
+    # cheap no-op.
+    try:
+        from app.output import idle_reattach
+        idle_reattach.reconcile()
+    except Exception:
+        logging.getLogger("app.main").debug(
+            "idle re-attach reconcile after watcher start failed", exc_info=True)
     yield
     try:
         from app.output.watcher import stop_watcher
@@ -95,6 +131,16 @@ async def _release_output_backends() -> None:
     would otherwise never be scheduled before the loop closes. It is bounded,
     so an unreachable renderer delays exit by seconds, not indefinitely."""
     log = logging.getLogger("app.main")
+    # R10, the shutdown edge (2026-09-01 plan U5). Before any release: a
+    # coordinator still holding a watcher listener could otherwise be handed
+    # an arrival mid-teardown and start an attach against a backend that is
+    # being let go. Unconditional rather than predicate-driven — at shutdown
+    # the answer must be "nothing", whatever the selection says.
+    try:
+        from app.output import idle_reattach
+        idle_reattach.get_coordinator().shutdown()
+    except Exception:
+        log.debug("shutdown: idle re-attach teardown failed", exc_info=True)
     try:
         from app import state
         from app.output.base import drain_release_tasks

@@ -5448,3 +5448,61 @@ def test_memory_probe_snapshot_can_collect_first(client, probe_clean):
     swept = client.post("/admin/diagnostics/memory/snapshot",
                         json={"label": "swept", "collect": True}).json()
     assert isinstance(swept["gc_collected"], int)
+
+
+# ── U2/R4: the Scan gate, fed a truthful signal at last ─────────────────────
+#
+# _forced_one_shots already refuses to reconcile the mDNS backends when the
+# watcher reports discovery unhealthy ("an empty one-shot is not evidence").
+# The guard was never the problem — it read a status map that only the
+# subscription paths ever wrote, so on a sweep-mode host it always saw "ok"
+# and never fired. Nothing here changes the Scan; these pin the dependency so
+# a future edit to EITHER side breaks loudly.
+
+
+async def test_scan_omits_mdns_backends_when_discovery_is_degraded():
+    """Covers AE2. With discovery degraded, the Scan must not hand the mDNS
+    backends to reconcile — reconcile evicts offline entries absent from the
+    results, so including an empty result would delete the admin's devices.
+
+    Verified to FAIL when the live_status guard is removed."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.api import admin
+
+    watcher = MagicMock()
+    watcher.mdns_status.return_value = {
+        "direct": "ok", "airplay": "unavailable",
+        "chromecast": "unavailable", "dlna": "ok",
+    }
+    cast = MagicMock(); cast._dbus_discover = AsyncMock(return_value=[])
+    air = MagicMock(); air.discover_devices = AsyncMock(return_value=[])
+    dlna = MagicMock(); dlna.discover_devices = AsyncMock(return_value=[])
+
+    with patch.object(admin.state, "airplay_backend", air),          patch.object(admin.state, "chromecast_backend", cast),          patch.object(admin.state, "dlna_backend", dlna),          patch.object(admin.state, "_mdns_port_unavailable", True):
+        found, scan_status = await admin._forced_one_shots(watcher)
+
+    assert "airplay" not in found, "an empty one-shot is not evidence"
+    assert "chromecast" not in found
+    assert "dlna" in found, "DLNA is independent and still reconciles"
+
+
+async def test_scan_includes_mdns_backends_when_discovery_is_healthy():
+    """The other side: with discovery healthy an empty scan IS evidence, and
+    must still be able to evict. Without this, 'never evict' would pass the
+    test above while breaking the menu's self-maintenance."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.api import admin
+
+    watcher = MagicMock()
+    watcher.mdns_status.return_value = {
+        "direct": "ok", "airplay": "ok", "chromecast": "ok", "dlna": "ok",
+    }
+    cast = MagicMock(); cast._dbus_discover = AsyncMock(return_value=[])
+    air = MagicMock(); air.discover_devices = AsyncMock(return_value=[])
+    dlna = MagicMock(); dlna.discover_devices = AsyncMock(return_value=[])
+
+    with patch.object(admin.state, "airplay_backend", air),          patch.object(admin.state, "chromecast_backend", cast),          patch.object(admin.state, "dlna_backend", dlna),          patch.object(admin.state, "_mdns_port_unavailable", True):
+        found, _ = await admin._forced_one_shots(watcher)
+
+    assert "airplay" in found
+    assert "chromecast" in found

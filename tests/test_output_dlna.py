@@ -3377,3 +3377,76 @@ async def test_the_notify_sockets_are_freed_when_the_teardown_times_out():
         "the bound GENA callback socket was never closed — it stays bound for "
         "the life of the process, on the unreachable-renderer path this "
         "teardown exists for")
+
+
+# ── U3/KTD2: id_format must describe how the id was actually derived ─────────
+#
+# device_id = usn or location. Both construction sites defaulted to
+# OutputDevice's id_format="uuid", so a renderer keyed by its LOCATION URL
+# claimed a stable identifier for an address. That was harmless until idle
+# re-attach started reading the declaration to decide whether id equality
+# proves identity — at which point a URL-keyed renderer would have been
+# trusted as strongly identified.
+
+
+def test_dlna_id_format_helper():
+    from app.output.dlna import _dlna_id_format
+    assert _dlna_id_format("uuid:device-1") == "uuid"
+    assert _dlna_id_format("") == "host_port"
+    assert _dlna_id_format(None) == "host_port"
+
+
+async def test_discover_declares_uuid_when_the_usn_is_present(dlna_mock):
+    """A renderer with a USN is genuinely, location-independently identified."""
+    from app.output.dlna import DlnaBackend
+
+    url = "http://192.0.2.10/desc.xml"
+    search = _make_search({"USN": "uuid:device-1", "LOCATION": url})
+    fetch = _make_fetch({url: (_RENDERER_V1, "Living Room")})
+
+    with patch("app.output.dlna.async_search", search, create=True), \
+         patch("app.output.dlna._fetch_device_description", fetch):
+        devices = await DlnaBackend().discover_devices()
+
+    assert devices[0].id == "uuid:device-1"
+    assert devices[0].id_format == "uuid"
+
+
+async def test_discover_declares_host_port_when_the_usn_is_absent(dlna_mock):
+    """The fallback path. The id here IS the LOCATION URL, so it must NOT
+    claim to be a stable identifier — a renderer whose address changes would
+    otherwise be treated as a confirmed identity match on the old URL, or a
+    stranger at the reused URL treated as the selected device.
+
+    Verified to FAIL when the id_format argument is dropped (the dataclass
+    default silently reasserts "uuid")."""
+    from app.output.dlna import DlnaBackend
+
+    url = "http://192.0.2.11/desc.xml"
+    search = _make_search({"LOCATION": url})  # no USN header at all
+    fetch = _make_fetch({url: (_RENDERER_V1, "Bedroom")})
+
+    with patch("app.output.dlna.async_search", search, create=True), \
+         patch("app.output.dlna._fetch_device_description", fetch):
+        devices = await DlnaBackend().discover_devices()
+
+    assert devices[0].id == url
+    assert devices[0].id_format == "host_port"
+
+
+async def test_describe_renderer_declares_the_same_way(dlna_mock):
+    """The SSDP-alive path builds devices independently of discover_devices,
+    so it needs the same correction — the watcher feeds the registry from
+    here, and the registry is what the identity gate reads."""
+    from app.output.dlna import DlnaBackend
+
+    url = "http://192.0.2.12/desc.xml"
+    fetch = _make_fetch({url: (_RENDERER_V1, "Patio")})
+    with patch("app.output.dlna._fetch_device_description", fetch):
+        backend = DlnaBackend()
+        with_usn = await backend.describe_renderer(url, usn="uuid:device-9")
+        without = await backend.describe_renderer(url)
+
+    assert with_usn.id_format == "uuid"
+    assert without.id_format == "host_port"
+    assert without.id == url
