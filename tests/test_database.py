@@ -659,6 +659,81 @@ async def test_browse_index_atomic_replace(db):
     assert [a["album_id"] for a in albs] == ["A:20"]
 
 
+# ── derived track counts carry forward (#61, plan U2) ────────────────────────
+#
+# Counts are derived from a whole-section track crawl whose result lives only in
+# an in-memory cache. Before this, a refresh whose crawl failed did not merely
+# fail to add counts -- the atomic replace WIPED the good ones, so one timeout
+# undid every successful crawl and a restart guaranteed a cold start.
+
+async def test_track_count_carries_forward_when_a_refresh_has_none(db):
+    """A crawl failure must not cost counts that were already established."""
+    await database.set_browse_index(
+        [], [_album_row("A:10", "Kid A", "kid a", "Radiohead", "radiohead",
+                        track_count=11)])
+    # next refresh: crawl failed, so every album arrives with track_count None
+    await database.set_browse_index(
+        [], [_album_row("A:10", "Kid A", "kid a", "Radiohead", "radiohead")])
+
+    albs = await database.get_browse_albums()
+    assert [a["track_count"] for a in albs] == [11]
+
+
+async def test_a_fresh_count_supersedes_the_stored_one(db):
+    """The re-point path: carry-forward must not entrench a stale value."""
+    await database.set_browse_index(
+        [], [_album_row("A:10", "Kid A", "kid a", "Radiohead", "radiohead",
+                        track_count=11)])
+    await database.set_browse_index(
+        [], [_album_row("A:10", "Kid A", "kid a", "Radiohead", "radiohead",
+                        track_count=12)])
+
+    assert [a["track_count"] for a in await database.get_browse_albums()] == [12]
+
+
+async def test_carry_forward_never_resurrects_a_removed_album(db):
+    """It supplies a column value for rows the crawl returned -- never a row."""
+    await database.set_browse_index(
+        [], [_album_row("A:10", "Gone", "gone", "Band", "band", track_count=9),
+             _album_row("A:11", "Stays", "stays", "Band", "band", track_count=4)])
+    await database.set_browse_index(
+        [], [_album_row("A:11", "Stays", "stays", "Band", "band")])
+
+    albs = await database.get_browse_albums()
+    assert [a["album_id"] for a in albs] == ["A:11"]
+    assert albs[0]["track_count"] == 4
+
+
+async def test_unknown_stays_unknown_with_nothing_stored(db):
+    await database.set_browse_index(
+        [], [_album_row("A:10", "Kid A", "kid a", "Radiohead", "radiohead")])
+    assert [a["track_count"] for a in await database.get_browse_albums()] == [None]
+
+
+async def test_carry_forward_is_per_album_not_positional(db):
+    """Two albums, only one previously counted -- the count must not bleed."""
+    await database.set_browse_index(
+        [], [_album_row("A:10", "One", "one", "Band", "band", track_count=7)])
+    await database.set_browse_index(
+        [], [_album_row("A:20", "Two", "two", "Band", "band"),
+             _album_row("A:10", "One", "one", "Band", "band")])
+
+    got = {a["album_id"]: a["track_count"] for a in await database.get_browse_albums()}
+    assert got == {"A:10": 7, "A:20": None}
+
+
+async def test_carry_forward_does_not_disturb_the_artist_index(db):
+    await database.set_browse_index(
+        [_artist_row("A:1", "Band", "band", release_count=3)],
+        [_album_row("A:10", "One", "one", "Band", "band", track_count=7)])
+    await database.set_browse_index(
+        [_artist_row("A:1", "Band", "band", release_count=4)],
+        [_album_row("A:10", "One", "one", "Band", "band")])
+
+    arts = await database.get_browse_artists()
+    assert [a["release_count"] for a in arts] == [4]
+
+
 async def test_browse_index_empty_clears(db):
     await database.set_browse_index(
         [_artist_row("A:1", "X", "x")], [_album_row("A:10", "Y", "y", "X", "x")]

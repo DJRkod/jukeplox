@@ -423,8 +423,17 @@ async def scan_status():
     """Catalog scan state for the admin Sources scan badge (plan U15/R20):
     ``{sources, scanning, scanned, empty}`` — same snapshot the guest onboarding
     states read, so admin and guest agree on one source of truth. Admin-gated by
-    the router-level require_admin (R26)."""
-    return await state.scan_status()
+    the router-level require_admin (R26).
+
+    Adds ``grouping_degraded_libraries`` (#61): the admin surface is where a
+    failed album track-count crawl may be attributed by name. The guest payload
+    carries only the boolean, because it is publicly reachable and contractually
+    limited to sentinels.
+    """
+    return {
+        **await state.scan_status(),
+        "grouping_degraded_libraries": state.grouping_degraded_libraries(),
+    }
 
 
 async def _enable_new_source_libraries(source_id: str) -> None:

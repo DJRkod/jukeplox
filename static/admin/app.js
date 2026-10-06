@@ -1416,6 +1416,14 @@ async function renderSourceScanStatus() {
     msg = 'Scanning sources… the library will populate as it runs.';
   } else if (s.refresh_failed) {
     msg = 'The last library refresh failed — check the server logs, then Rescan.';
+  } else if (s.grouping_degraded) {
+    // Lower severity than refresh_failed on purpose (#61): the index is fine,
+    // the album track counts behind same-title grouping are not. Saying "refresh
+    // failed" here would send an admin hunting for missing music that is present.
+    const libs = s.grouping_degraded_libraries || [];
+    msg = 'Album track counts are unavailable for ' + (libs.length ? libs.join(', ') : 'a library')
+        + ' — albums held on more than one source may appear twice until the next'
+        + ' successful scan. The library itself is complete.';
   } else if (s.sources > 0 && s.scanned && s.empty) {
     msg = 'Scan complete, but no music was found — the connected sources returned nothing.';
   }

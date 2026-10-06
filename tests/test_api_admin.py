@@ -51,10 +51,27 @@ def test_sources_endpoints_require_auth(anon_client, mock_session):
 def test_scan_status_returns_snapshot(client, mock_state):
     # U15: the admin scan badge reads the shared scan_status snapshot.
     snap = {"sources": 1, "scanning": True, "scanned": False, "empty": True}
-    with patch("app.state.scan_status", AsyncMock(return_value=snap)):
+    with patch("app.state.scan_status", AsyncMock(return_value=snap)), \
+         patch("app.state.grouping_degraded_libraries", return_value=[]):
         resp = client.get("/admin/scan-status")
     assert resp.status_code == 200
-    assert resp.json() == snap
+    assert resp.json() == {**snap, "grouping_degraded_libraries": []}
+
+
+def test_admin_scan_status_names_libraries_with_degraded_grouping(client, mock_state):
+    """#61: the admin surface is where a failed album track-count crawl may be
+    attributed by name — the guest payload carries only the boolean."""
+    snap = {"sources": 2, "scanning": False, "scanned": True, "empty": False,
+            "refresh_failed": False, "grouping_degraded": True}
+    with patch("app.state.scan_status", AsyncMock(return_value=snap)), \
+         patch("app.state.grouping_degraded_libraries",
+               return_value=["ServerB: Music"]):
+        resp = client.get("/admin/scan-status")
+    body = resp.json()
+    assert body["grouping_degraded"] is True
+    assert body["grouping_degraded_libraries"] == ["ServerB: Music"]
+    # degraded grouping is NOT a failed refresh — the index is complete
+    assert body["refresh_failed"] is False
 
 
 def test_list_sources_combines_plex_and_jellyfin(client, mock_state):

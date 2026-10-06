@@ -95,6 +95,44 @@ def test_build_catalog_single_source_links_tracks_to_album():
     assert all(h["source_id"] == "m1" for h in track_holds)
 
 
+def test_build_catalog_folds_an_unknown_count_against_a_known_sibling():
+    """#61 through the PRODUCTION composition, not the predicate.
+
+    Driving merge.group_albums directly would pass even if cluster_sources
+    stopped calling it — which is how the original defect survived a green
+    suite. This goes through build_catalog.
+
+    An album-only scan (no track crawl) is where the catalog is actually
+    exposed: normally _shape_items derives a count from the source's own
+    tracks, and any album left uncounted has no tracks and is dropped as a
+    trackless orphan. With no tracks anywhere that filter is deliberately
+    skipped, so the uncounted copy survives and must fold rather than
+    duplicate.
+    """
+    built = scan.build_catalog([
+        {"source_id": "m1", "priority": 0, "server_name": "Plex", "artists": [],
+         "albums": [_album("m1:al", tc=10)], "tracks": []},
+        {"source_id": "m2", "priority": 1, "server_name": "Jelly", "artists": [],
+         "albums": [_album("m2:al", tc=None)], "tracks": []},
+    ])
+    assert len(built["albums"]) == 1
+    assert built["albums"][0]["track_count"] == 10, "the reported count was lost"
+    holds = [h for h in built["holds"] if h["entity_type"] == "album"]
+    assert {h["source_id"] for h in holds} == {"m1", "m2"}
+
+
+def test_build_catalog_does_not_fold_when_counts_compete():
+    """Several known counts on offer — the unknown copy is not guessed into one
+    of them, matching the native fold."""
+    built = scan.build_catalog([
+        {"source_id": "m1", "priority": 0, "server_name": "Plex", "artists": [],
+         "albums": [_album("m1:a", tc=10), _album("m1:b", tc=12)], "tracks": []},
+        {"source_id": "m2", "priority": 1, "server_name": "Jelly", "artists": [],
+         "albums": [_album("m2:a", tc=None)], "tracks": []},
+    ])
+    assert len(built["albums"]) == 3
+
+
 def test_build_catalog_merges_same_album_across_sources_with_two_holds():
     # AE2-style by strict-name (matching track_count, no IDs): two sources, same
     # release → one album with two holds, one per source.

@@ -85,6 +85,26 @@ _CACHE_TTL = 300  # 5 minutes
 # the broad literal Tier 2 covers them instead. Cap kept at the baseline 30.)
 _SEARCH_HUB_LIMIT = 30
 
+# Whole-section track crawls are PAGED (#61). One request carrying an entire
+# library's track listing does not fit the shared 15s read budget against a
+# remote server: it raised ReadTimeout on every browse-index refresh, leaving
+# every album on that source with no track_count and duplicating 21% of the
+# album browse. Sized so a page lands comfortably inside the budget even on a
+# slow link, while keeping the page count (and so the request count) modest.
+_TRACK_CRAWL_PAGE_SIZE = 2000
+
+
+class PlexCrawlIncomplete(RuntimeError):
+    """A paged whole-section crawl could not be completed.
+
+    Raised instead of returning what was collected, because a PARTIAL per-album
+    track count is worse than an absent one: tracks for one album are not
+    guaranteed to be contiguous in the listing, so stopping early yields
+    plausible-looking undercounts that split a release exactly as a missing
+    count does — and additionally defeat the "exactly one known count" test the
+    unknown-count fold relies on by adding a phantom candidate.
+    """
+
 
 class PlexClient:
     def __init__(
@@ -445,16 +465,50 @@ class PlexClient:
         self._store(cache_key, tracks)
         return tracks
 
-    def _count_album_leaves(self, raw: bytes) -> dict[str, int]:
-        counts: dict[str, int] = {}
+    def _album_leaf_pairs(self, raw: bytes) -> tuple[dict[str, str | None], int]:
+        """``({track rating key -> album compound id or None}, items seen)``.
+
+        Keyed by TRACK rather than accumulating per-album tallies, so that a
+        server which ignores ``X-Plex-Container-Start`` and re-serves the same
+        window cannot inflate the counts: repeated tracks collapse onto the same
+        key instead of being added twice. It also makes the completeness check
+        count DISTINCT tracks, so such a server can never satisfy ``totalSize``
+        by re-sending what we already have.
+
+        Tracks with no ``parentRatingKey`` are retained with a ``None`` album —
+        they cannot be attributed, but they are still tracks we saw and must
+        count toward completeness.
+        """
+        pairs: dict[str, str | None] = {}
         data = json.loads(raw)
-        for item in data.get("MediaContainer", {}).get("Metadata", []):
+        items = data.get("MediaContainer", {}).get("Metadata", []) or []
+        for item in items:
+            key = str(item.get("ratingKey"))
             prk = item.get("parentRatingKey")
-            if prk is None:
-                continue
-            aid = self._make_id(prk)
-            counts[aid] = counts.get(aid, 0) + 1
-        return counts
+            pairs[key] = self._make_id(prk) if prk is not None else None
+        return pairs, len(items)
+
+    async def _section_total_size(self, bare_key: str, libtype: int) -> int | None:
+        """Container ``totalSize`` for a section listing, or None when the server
+        does not report one.
+
+        Uses the ``X-Plex-Container-Size=0`` probe already used for per-style
+        counts — no payload, one cheap round trip. None means "this server is
+        not telling us how big the listing is", which the caller treats as
+        "don't page" rather than guessing.
+        """
+        data = await self._get(
+            f"/library/sections/{bare_key}/all",
+            params={
+                "type": libtype,
+                "X-Plex-Container-Size": 0,
+                "X-Plex-Container-Start": 0,
+            },
+        )
+        try:
+            return int(data.get("MediaContainer", {}).get("totalSize"))
+        except (TypeError, ValueError):
+            return None
 
     async def get_album_track_counts(self, section_key: str) -> dict[str, int]:
         """{album compound id -> track count} for a whole section, derived by
@@ -467,18 +521,69 @@ class PlexClient:
         (``type=10``) still carries ``parentRatingKey`` per track, so one bulk
         pass yields every album's real length — the content signal the same-title
         album/single fold needs. Counting is lightweight (no Track objects) and
-        runs off-loop like the other whole-library parsers (U3)."""
+        runs off-loop like the other whole-library parsers (U3).
+
+        **Paged, and completeness is proven not inferred (#61).** A whole-library
+        track listing does not fit the shared 15s read budget against a remote
+        server. ``totalSize`` is probed first and reconciled against the items
+        actually collected, because Plex documents pagination as ADVISORY: a
+        response may ignore the container headers entirely. Two consequences are
+        handled below — a server that returns more than asked has handed us the
+        whole listing (use it once, never page on, or every album is counted
+        twice), and a crawl that never reaches ``totalSize`` raises rather than
+        returning undercounts (see :class:`PlexCrawlIncomplete`).
+
+        A server that reports no ``totalSize`` is not paged at all — guessing a
+        page count against a server that won't tell us the size is how you
+        silently truncate a library.
+        """
         bare_key = self._strip(section_key) or section_key
         cache_key = f"albumleaves:{bare_key}"
         cached = self._cached(cache_key)
         if cached is not None:
             return cached
-        raw = await self._get_raw(
-            f"/library/sections/{bare_key}/all", params={"type": TYPE_TRACK}
-        )
-        counts = await asyncio.get_running_loop().run_in_executor(
-            None, self._count_album_leaves, raw
-        )
+
+        total = await self._section_total_size(bare_key, TYPE_TRACK)
+        if total == 0:
+            self._store(cache_key, {})
+            return {}
+
+        loop = asyncio.get_running_loop()
+        paging = total is not None
+        pairs: dict[str, str | None] = {}
+        start = 0
+        while True:
+            params: dict = {"type": TYPE_TRACK}
+            if paging:
+                params["X-Plex-Container-Start"] = start
+                params["X-Plex-Container-Size"] = _TRACK_CRAWL_PAGE_SIZE
+            raw = await self._get_raw(f"/library/sections/{bare_key}/all", params=params)
+            page, n = await loop.run_in_executor(None, self._album_leaf_pairs, raw)
+            before = len(pairs)
+            pairs.update(page)
+            if not paging or n == 0 or len(pairs) == before:
+                # Unpaged request; an empty page; or a page that added nothing
+                # new, which means the server is re-serving the same window and
+                # is not honouring Start. In every case nothing further is
+                # coming — the completeness check below decides what that means.
+                break
+            # Advance by what was actually served, not by what was asked for, so
+            # a server that returns a different page size than requested still
+            # walks the listing correctly.
+            start += n
+            if len(pairs) >= total:
+                break
+
+        if paging and len(pairs) < total:
+            raise PlexCrawlIncomplete(
+                f"section {bare_key}: collected {len(pairs)} of {total} distinct "
+                "tracks — refusing to derive partial album track counts"
+            )
+
+        counts: dict[str, int] = {}
+        for aid in pairs.values():
+            if aid is not None:
+                counts[aid] = counts.get(aid, 0) + 1
         self._store(cache_key, counts)
         return counts
 

@@ -19,6 +19,8 @@ even if the extremes are >2 s apart — acceptable given the tight coarse bucket
 
 from __future__ import annotations
 
+from app.album_fold import normalized_subtype, resolved_track_counts
+
 DURATION_TOL_MS = 2000  # ±2 s: same-title/disc/track tracks within this are one recording
 
 
@@ -149,6 +151,51 @@ def album_coarse(it: dict):
     return (ab, tb) if (ab is not None and tb is not None) else None
 
 
+def group_albums(items: list[dict]) -> list[list[dict]]:
+    """Cluster album items, resolving unknown track counts first (#61).
+
+    **The** album grouping entry point. Production and tests both come through
+    here so that a test cannot pass by calling :func:`album_same` in a
+    composition production never uses — the parity guard previously did exactly
+    that, and would have reported parity while the two pipelines diverged.
+
+    Resolved counts are passed to the predicate, never written into the items:
+    an inferred count must not reach a stored catalog row where a later read
+    could not tell it from one a source actually reported.
+    """
+    effective = resolved_track_counts(
+        items,
+        identity=lambda it: (it.get("artist_base_key"), it.get("title_base")),
+        subtype=lambda it: it.get("subtype"),
+        count=lambda it: it.get("track_count"),
+    )
+    eff = {id(it): e for it, e in zip(items, effective)}
+    return group(
+        items, album_coarse,
+        lambda a, b: album_same_counts(a, b, eff.get(id(a)), eff.get(id(b))),
+    )
+
+
+def album_same_counts(a: dict, b: dict, ta: int | None, tb: int | None) -> bool:
+    """:func:`album_same` with the two counts supplied explicitly.
+
+    Exists so a caller can substitute RESOLVED counts (``app/album_fold.py``)
+    for the grouping decision without writing them into the items. A resolved
+    count is inferred; persisting it into the catalog row would leave a later
+    read unable to tell it from a count a source actually reported.
+
+    It is also what makes the unknown-count fold expressible here at all:
+    :func:`group` is a pairwise union-find and cannot evaluate "exactly one
+    known count in this whole identity", but a pass over the item list can,
+    before ``group()`` is ever called.
+    """
+    if normalized_subtype(a.get("subtype")) != normalized_subtype(b.get("subtype")):
+        return False
+    if ta is None and tb is None:
+        return True
+    return ta is not None and tb is not None and ta == tb
+
+
 def album_same(a: dict, b: dict) -> bool:
     """Same release: same subtype AND (track counts both-known-and-equal OR
     both-unknown None).
@@ -168,14 +215,7 @@ def album_same(a: dict, b: dict) -> bool:
     Happiness"). ``None`` subtype normalizes to ``'album'`` (matching
     ``guest._group_albums`` and the frontend) so an inconsistent tag on one source
     never splits one genuine release."""
-    sa = (a.get("subtype") or "album").strip().lower()
-    sb = (b.get("subtype") or "album").strip().lower()
-    if sa != sb:
-        return False
-    ta, tb = a.get("track_count"), b.get("track_count")
-    if ta is None and tb is None:
-        return True
-    return ta is not None and tb is not None and ta == tb
+    return album_same_counts(a, b, a.get("track_count"), b.get("track_count"))
 
 
 def track_coarse(it: dict):
