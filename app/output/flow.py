@@ -163,6 +163,65 @@ _ENC_READ_CHUNK = 65536   # encoder→out-buffer granularity
 # SIGTERM grace before SIGKILL on subprocess teardown (airplay.py convention).
 _STOP_GRACE_S = 2.0
 
+# Per-step bound on the TEARDOWN path (close()). Distinct from _STOP_GRACE_S,
+# which bounds a subprocess signal; this bounds waits on our OWN tasks.
+#
+# Cancelling a task does not skip its finally, so a cancelled task can still
+# take arbitrarily long to unwind — on the rig 2026-09-18 that was 30.00s, held
+# under the process-wide attach lock (#51). Teardown is best-effort, so each
+# wait is bounded and abandoned rather than blocking a caller. Measurements:
+# docs/solutions/performance-issues/bound-every-teardown-await-cancel-does-not-skip-finally.md
+_CLOSE_STEP_GRACE_S = 2.0
+
+
+# Bound for a COMPOSITE close() (decoder/encoder) — a sequence of the
+# individually-bounded steps above. It MUST exceed their sum, or every step
+# after the first is unreachable: bounding the composite at the same value as
+# its first inner step is what starved _terminate_proc and leaked the ffmpeg
+# pair (#51 review). Decoder worst case = the SIGTERM→SIGKILL ladder
+# (2 * _STOP_GRACE_S) + the feeder and stderr waits (2 * _CLOSE_STEP_GRACE_S).
+#
+# This is a SAFETY NET against a decoder that is not internally bounded, not
+# the latency guarantee — that comes from the leaf bounds and from reaping the
+# subprocess before anything that can block.
+_CLOSE_COMPOSITE_GRACE_S = 2 * _STOP_GRACE_S + 2 * _CLOSE_STEP_GRACE_S
+
+
+async def _bounded_teardown(aw: Any, label: str, grace: float) -> None:
+    """Await one composite teardown step, abandoning it if it overruns.
+
+    ``grace`` is explicit, not defaulted: a composite step wraps steps that
+    carry their own budgets, and passing the leaf grace here silently makes
+    everything after the first inner step unreachable.
+
+    Never swallows the CALLER's cancellation — ``asyncio.timeout`` converts
+    only the cancellation it raised itself."""
+    try:
+        # asyncio.timeout, not wait_for: wait_for wraps a coroutine in a Task,
+        # which adds an event-loop hop and shifts teardown ordering for
+        # anything observing it. The context manager awaits in place.
+        async with asyncio.timeout(grace):
+            await aw
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        _log.warning("Flow teardown: %s did not finish within %.1fs — "
+                     "abandoned so the caller is not held", label, grace)
+    except Exception:
+        _log.warning("Flow teardown: %s failed", label, exc_info=True)
+
+
+async def _bounded_task_wait(task: Any, label: str) -> None:
+    """Wait for an already-cancelled task, bounded.
+
+    ``asyncio.wait`` rather than ``await task``: it reports completion without
+    re-raising the child's CancelledError, so there is no need for the
+    ``except CancelledError: pass`` that would also swallow our own."""
+    done, _pending = await asyncio.wait({task}, timeout=_CLOSE_STEP_GRACE_S)
+    if not done:
+        _log.warning("Flow teardown: %s ignored cancellation for %.1fs — "
+                     "abandoned", label, _CLOSE_STEP_GRACE_S)
+
 
 class FlowDecodeError(Exception):
     """A track's PCM decode failed (ffmpeg non-zero exit / read error)."""
@@ -611,20 +670,26 @@ class FFmpegPCMDecoder:
         if self._closed:
             return
         self._closed = True  # set FIRST so an unblocked read reports EOF, not error
-        if self._feeder_task is not None and not self._feeder_task.done():
-            self._feeder_task.cancel()
-            try:
-                await self._feeder_task
-            except asyncio.CancelledError:
-                pass
-        self._feeder_task = None
+        # Signal both tasks, then REAP, then wait. The order is load-bearing.
+        #
+        # The feeder's finally awaits two httpx closes and
+        # proc.stdin.wait_closed() — a cancel does not skip a finally, so it
+        # keeps running after the cancel lands. stdin.wait_closed() is waiting
+        # on THIS process, so killing ffmpeg is what lets the feeder finish.
+        # Waiting on the feeder first puts the reap behind a wait that the reap
+        # itself unblocks: on the rig that wait measured 30.00s, and under a
+        # caller's bound the reap was cut off entirely and the ffmpeg pair
+        # leaked — the pre-fix symptom, minus the hang that made it visible.
+        # Reaping first makes the waits below cheap and the reap unmissable.
+        for task in (self._feeder_task, self._stderr_task):
+            if task is not None and not task.done():
+                task.cancel()
         await _terminate_proc(self._proc, "decode-ffmpeg")
-        if self._stderr_task is not None and not self._stderr_task.done():
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except asyncio.CancelledError:
-                pass
+        if self._feeder_task is not None:
+            await _bounded_task_wait(self._feeder_task, "decode feeder")
+        self._feeder_task = None
+        if self._stderr_task is not None:
+            await _bounded_task_wait(self._stderr_task, "decode stderr")
         self._stderr_task = None
 
 
@@ -680,10 +745,7 @@ class FFmpegFlowEncoder:
         await _terminate_proc(self._proc, "encode-ffmpeg")
         if self._stderr_task is not None and not self._stderr_task.done():
             self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except asyncio.CancelledError:
-                pass
+            await _bounded_task_wait(self._stderr_task, "encode stderr")
         self._stderr_task = None
 
 
@@ -1029,26 +1091,36 @@ class FlowSession:
         self._resume_evt.set()
         self._out_data.set()
         self._out_space.set()
+        # Claim the decoder BEFORE waiting on the pump. The pump's own finally
+        # closes and nulls _active_decoder, so reading it afterwards can hand
+        # us None while the reap is left to a task we are about to abandon.
+        # close() is idempotent, so claiming it early is always safe.
+        dec = self._active_decoder
+        self._active_decoder = None
         current = asyncio.current_task()
         pending = [t for t in (self._pump_task, self._enc_reader_task)
                    if t is not None and not t.done() and t is not current]
         for t in pending:
             t.cancel()
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        dec = self._active_decoder
-        self._active_decoder = None
+            # asyncio.wait, not a bounded gather: cancelling a gather future
+            # re-cancels its children and then waits for them anyway, so that
+            # step was never actually abandonable (measured 1.45s against a
+            # 0.20s grace). asyncio.wait reports the overrun and moves on.
+            _done, still = await asyncio.wait(set(pending),
+                                              timeout=_CLOSE_STEP_GRACE_S)
+            if still:
+                _log.warning("Flow session %s: %d teardown task(s) ignored "
+                             "cancellation for %.1fs — abandoned",
+                             self._session_id, len(still), _CLOSE_STEP_GRACE_S)
+        # Bounded at the COMPOSITE grace, not the leaf one: these closes are
+        # themselves sequences of bounded steps, and sharing the leaf grace
+        # here made every step after the first unreachable.
         if dec is not None:
-            try:
-                await dec.close()
-            except Exception:
-                _log.warning("Flow session %s: decoder close failed",
-                             self._session_id, exc_info=True)
-        try:
-            await self._encoder.close()
-        except Exception:
-            _log.warning("Flow session %s: encoder close failed",
-                         self._session_id, exc_info=True)
+            await _bounded_teardown(dec.close(), "decoder close",
+                                    _CLOSE_COMPOSITE_GRACE_S)
+        await _bounded_teardown(self._encoder.close(), "encoder close",
+                                _CLOSE_COMPOSITE_GRACE_S)
         global _current_session
         if _current_session is self:
             _current_session = None
