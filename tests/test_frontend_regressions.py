@@ -1144,13 +1144,23 @@ def test_volume_orientation_setting_wired():
         "Vertical uses the rotated-horizontal-input technique (U1 pick: scheme "
         "gradient runs along the bar; arrow keys keep their natural mapping)."
     )
-    assert "s.volume_orientation" in js and "body.volume_orientation" in js, (
-        "admin app.js must BOTH hydrate (loadSettings) and save (Save Settings "
-        "collection) the volume_orientation key — either site alone regresses."
+    assert "s.volume_orientation" in js, (
+        "admin app.js must hydrate the volume_orientation key in loadSettings."
+    )
+    # The write site moved off the Save collector on 2026-10-05 (save-model U2):
+    # the radio pair commits on change through the shared helper. Both halves
+    # still have to exist — either alone regresses — so this asserts the new
+    # write site rather than dropping the check with the old one.
+    assert "body.volume_orientation" not in js, (
+        "volume_orientation commits on change; the Save collector must not also "
+        "send it, or a Save press would revert a commit made since page load."
+    )
+    assert "'volume-orientation', 'volume_orientation'" in js, (
+        "volume_orientation must be registered in the commit-on-change helper."
     )
     assert "dataset.volOrient" in js, (
         "admin app.js must apply the orientation as the body data-attribute "
-        "(at load and on save success)."
+        "(at load and on commit success)."
     )
 
 
@@ -3050,3 +3060,596 @@ def test_queue_live_region_is_polite_status():
     assert "setAttribute('role', 'status')" in browse
     assert "setAttribute('aria-live', 'polite')" in browse
     assert "jp-sr-only" in browse
+def test_gapless_toggle_lives_in_output_section():
+    """2026-10-05 save-model U1. The toggle sat in Settings, where it only took
+    effect on a Save Settings press that an operator can scroll past — the
+    reported failure was a production instance running with gapless off because
+    the box was ticked and the button never pressed. It now lives in Output,
+    which commits on change."""
+    html = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    assert html.count('id="gapless-enabled"') == 1, (
+        "the gapless toggle must appear exactly once — a duplicate id means the "
+        "move copied rather than relocated."
+    )
+    output_at = html.index('<section id="output">')
+    gapless_at = html.index('id="gapless-enabled"')
+    # The first section opening after Output bounds it.
+    next_section = html.index("<section id=", output_at + 1)
+    assert output_at < gapless_at < next_section, (
+        "the gapless toggle must sit inside the Output section, not Settings."
+    )
+
+
+def test_gapless_commits_on_change_and_left_the_save_batch():
+    """Commit-on-change, and — the half that actually prevents a regression —
+    removed from the batched Save collector. Leaving the read in place would let
+    a Save Settings press re-send whatever the checkbox showed at page load,
+    silently reverting a toggle made since."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert "body.gapless_enabled" not in js, (
+        "the Save Settings collector must not read the gapless checkbox — the "
+        "Output section owns it now."
+    )
+    assert "'gapless-enabled', 'gapless_enabled'" in js, (
+        "gapless must be registered in the shared commit-on-change helper, not "
+        "wired by a second hand-rolled copy of the same sequence."
+    )
+
+
+# The 15 controls admitted to commit-on-change, as [element, settings key]. All
+# three admission rules hold for each: the value is final the instant it
+# changes, committing it does not change what the box does on its own, and its
+# key is not in the server's appearance-broadcast set.
+COMMIT_ON_CHANGE = [
+    ("gapless-enabled", "gapless_enabled"),
+    ("queue-end-length-limit", "queue_end_length_limit"),
+    ("lyrics-contribute-enabled", "lyrics_contribute_enabled"),
+    ("ratings-visible-to-guests", "ratings_visible_to_guests"),
+    ("tags-visible-to-guests", "tags_visible_to_guests"),
+    ("guest-radio-control", "guest_radio_control"),
+    ("facet-genre", "facet_genre"),
+    ("facet-years", "facet_years"),
+    ("facet-mostplayed", "facet_mostplayed"),
+    ("facet-recentlyadded", "facet_recentlyadded"),
+    ("facet-highestrated", "facet_highestrated"),
+    ("facet-radio", "facet_radio"),
+    ("surprise-source-mode", "surprise_me_source_mode"),
+    ("surprise-diversity", "surprise_me_diversity"),
+    ("volume-orientation", "volume_orientation"),
+]
+
+# Deferred: the value is incomplete mid-edit (numbers, Closing Time texts),
+# committing would change what the box does alone (end-behavior starts an
+# auto-DJ), or the key repaints every guest through the appearance broadcast.
+DEFERRED_KEYS = [
+    "queue_end_behavior", "rail_mode", "default_scheme", "default_view",
+    "rating_style", "surprise_me_enabled", "rail_alpha_mode",
+    "rail_artist_threshold", "rail_album_threshold", "popular_random_threshold",
+    "resume_window_minutes", "random_min_seconds", "random_max_seconds",
+    "most_played_display_limit", "closing_time_enabled", "closing_time_title",
+    "closing_time_artist", "closing_time_message",
+]
+
+
+@pytest.mark.parametrize("element,key", COMMIT_ON_CHANGE)
+def test_admitted_control_commits_and_left_the_save_batch(element, key):
+    """2026-10-05 save-model U2. Each admitted control is registered on the
+    shared helper AND absent from the Save collector. Both halves matter: the
+    first makes the press unnecessary, the second stops a later press from
+    re-sending a page-load value over a commit made since (or made in a
+    different tab)."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert "'%s', '%s'" % (element, key) in js, (
+        "%s must be registered in the commit-on-change helper." % element
+    )
+    assert "body.%s" % key not in js, (
+        "%s commits on change; the Save collector must not also send it." % key
+    )
+
+
+@pytest.mark.parametrize("key", DEFERRED_KEYS)
+def test_deferred_key_still_travels_on_save(key):
+    """The other half of the split: deferring is only safe while Save still
+    sends these. A key that left the collector without joining the helper is
+    silently unwritable from the UI."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert key in js, "%s must still be sent by the Save Settings collector." % key
+
+
+def test_commit_helper_is_single_source_with_one_failure_behaviour():
+    """One helper, one failure behaviour. A second hand-rolled copy is how the
+    revert-on-failure half goes missing from one control and nobody notices."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert js.count("async function commit(") == 1, (
+        "exactly one shared commit helper — a parallel copy is what the "
+        "single-source standard exists to prevent."
+    )
+    helper = re.search(
+        r"async function commit\((.*?)\n  \}\n", js, re.S
+    )
+    assert helper, "the commit helper must be findable for shape checks."
+    body = helper.group(1)
+    assert "'/admin/settings'" in body and "{ [key]: value }" in body, (
+        "it must POST exactly one key per commit — a partial body."
+    )
+    assert "c.disabled = true" in body and "c.disabled = false" in body, (
+        "the control must be locked for the duration of the write."
+    )
+    assert "revert()" in body, (
+        "a rejected commit must put the control back where it was — the "
+        "load-bearing half of the flood-control shape."
+    )
+
+
+def test_commit_toasts_coalesce_but_never_swallow_a_failure():
+    """showToast is a singleton on one shared timer, so a burst of commits
+    clobbers itself down to the last message. Successes collapse into a count;
+    a failure displaces the pending success rather than being absorbed, because
+    reporting '3 settings saved' when one was rejected is the one outcome
+    coalescing must not produce."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert re.search(r"const COALESCE_MS = \d+;", js), (
+        "the coalescing window must be one named constant, not a per-call-site "
+        "literal."
+    )
+    assert "okCount + ' settings saved'" in js, (
+        "coalesced successes must name the count, not the last control."
+    )
+    failure = re.search(r"function noteFailure\((.*?)\n  \}\n", js, re.S)
+    assert failure, "a distinct failure path must exist."
+    body = failure.group(1)
+    assert "okCount = 0" in body and "clearTimeout(okTimer)" in body, (
+        "a failure must cancel the pending coalesced success, not queue behind it."
+    )
+    assert "label" in body, "the failure toast must name the control."
+
+
+def test_info_icon_click_cannot_commit():
+    """The ⓘ buttons sit inside these labels, and a label forwards its click to
+    the control it wraps — which, now that these controls commit on change,
+    would turn reading the help text into a write. preventDefault on the
+    bubbling click is what stops it."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    popover = re.search(
+        r"const icon = e\.target\.closest\('\.info-i'\);(.*?)\n", js, re.S
+    )
+    assert popover, "the ⓘ popover handler must exist."
+    after = js[js.index("const icon = e.target.closest('.info-i');"):][:400]
+    assert "e.preventDefault()" in after, (
+        "clicking an ⓘ must not forward to the control its label wraps."
+    )
+# ── Pending-change state (2026-10-05 settings save-model U3) ────────────────
+
+def test_static_cue_distinguishes_the_two_save_models():
+    """R13. The question that caused the original bug — "is this control the
+    commit?" — is answered before the operator touches anything, by a tag that
+    is present whether or not something is pending. Pending-state chrome alone
+    answers it only after the mistake."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    html = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    assert "'save-tag is-instant'" in js or "is-instant" in js, (
+        "committing rows must carry a static cue."
+    )
+    assert "'instant'" in js and "'needs save'" in js, (
+        "both cue labels must exist — one alone cannot distinguish two "
+        "populations."
+    )
+    assert ".save-tag.is-instant" in html and ".save-tag.is-deferred" in html, (
+        "both cue variants need styles in the template's inline <style>."
+    )
+    # Single source: the admitted list lives in the commit block, which stamps
+    # its rows; the cue pass reads the stamp rather than keeping a second copy.
+    assert "row.dataset.saveMode = 'instant'" in js, (
+        "the commit block must stamp the rows it owns."
+    )
+    assert "dataset.saveMode === 'instant'" in js, (
+        "the cue pass must read that stamp, not re-list the admitted controls."
+    )
+
+
+def test_cue_widens_the_leading_label_to_keep_one_control_column():
+    """The cue sits inside the leading label, so the old `min-width: 168px`
+    would let it push each row's controls to a different x. This is the one
+    pre-existing rule the save-model work modifies; if it reverts, the Setup
+    page's control column goes ragged rather than breaking visibly."""
+    html = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    rule = re.search(
+        r"#settings \.panel-row > label:first-child,\s*"
+        r"#output \.panel-row > label:first-child \{([^}]*)\}",
+        html,
+    )
+    assert rule, "the leading-label rule must cover both Settings and Output."
+    body = rule.group(1)
+    # A fixed basis, not a floor. Measured in a real engine, the longest label
+    # ("Default browse/search view:") comes to 247px: under a min-width it
+    # simply pushes that one row's controls out of the column, which is the
+    # exact failure this rule exists to prevent.
+    assert "flex: 0 0 248px" in body, (
+        "the label must be a FIXED-width flex item, not a min-width floor."
+    )
+    assert "inline-flex" in body and "space-between" in body, (
+        "text left, tag right — otherwise the tag does not right-align."
+    )
+    assert "min-width: 168px" not in html, (
+        "the old narrower rule must be gone, not shadowed."
+    )
+
+
+def test_unsaved_flag_is_a_reserved_column_so_geometry_cannot_shift():
+    """The marker is a slot present on every deferred row from load, hidden
+    with `visibility` so its box stays in layout. Going pending only reveals
+    it. An inline marker inserted on change pushes the controls right and, on a
+    wrapping flex row, can add a line and change the row's height — so this is
+    'reflow is impossible', not 'reflow is small'."""
+    html = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    rule = re.search(r"\.row-status \{([^}]*)\}", html)
+    assert rule, "the reserved slot needs a style."
+    assert "visibility: hidden" in rule.group(1), (
+        "the slot must be hidden with visibility, not display — display:none "
+        "removes the box from layout and reintroduces the reflow."
+    )
+    assert "display: none" not in rule.group(1), "that would vacate the box."
+    assert ".panel-row.is-pending .row-status { visibility: visible; }" in html, (
+        "going pending must only reveal the existing box."
+    )
+    assert "slot.className = 'row-status'" in js and "row.appendChild(slot)" in js, (
+        "the slot is created at tag time, for every deferred row, not on change."
+    )
+    assert "slot.textContent = 'unsaved'" in js, (
+        "the marker must carry text — colour alone is not a cue."
+    )
+
+
+def test_pending_marker_sits_on_the_row_never_inside_the_label():
+    """The ⓘ buttons live in these labels and a label forwards clicks to its
+    control; a marker added inside one is a hijack waiting to happen. The row
+    is also the element that already carries `is-inactive`, so this reuses a
+    shape the template has."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert "r.classList.add('is-pending')" in js, (
+        "the marker must be a class on the .panel-row."
+    )
+    assert "lead.appendChild(tag)" in js, "only the static cue goes in the label."
+    assert "lead.appendChild(slot)" not in js, (
+        "the pending marker must not be appended inside the label."
+    )
+
+
+def test_pending_baseline_is_the_get_response_not_the_dom():
+    """Hydration defaults are deliberately inconsistent (`!== false` for
+    default-on flags, `!!` for default-off) and numerics hydrate `|| ''`, so a
+    stored 0 renders empty. A DOM baseline would report changes nobody made.
+    The snapshot is published after the full hydrate and inside the same try —
+    a throw mid-hydrate leaves the form half-populated, and a baseline taken
+    outside would record defaults for the fields that never got written."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    hydrate = re.search(r"async function loadSettings\(\) \{(.*?)\n\}\n", js, re.S)
+    assert hydrate, "loadSettings must be findable."
+    body = hydrate.group(1)
+    dispatch = "jp:settings-hydrated"
+    assert dispatch in body, "the baseline must be published from loadSettings."
+    # Inside the try: the publish must precede the handler's own `} catch {}`.
+    assert body.index(dispatch) < body.index("} catch {}"), (
+        "the snapshot must be taken inside the hydrate's try, so a throw "
+        "mid-hydrate publishes no baseline at all rather than a partial one."
+    )
+    # After the hydrate: every field write must come first.
+    assert body.index("resumeWindow.value") < body.index(dispatch), (
+        "the snapshot must be taken after the full hydrate."
+    )
+    assert "base = e.detail" in js, "the pending block must consume it."
+
+
+def test_failed_save_keeps_marks_and_success_rebases():
+    """State is set after the outcome, never before: the server applies nothing
+    on a 4xx, so a rejected Save must leave every mark exactly where it was."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    handler = re.search(
+        r"getElementById\('btn-save-settings'\)\.addEventListener\('click'.*?\n\}\);",
+        js,
+        re.S,
+    )
+    assert handler, "the Save handler must be findable."
+    body = handler.group(0)
+    ok = body.index("showToast('Settings saved')")
+    assert "loadSettings();" in body and body.index("loadSettings();") > ok, (
+        "the rebase must happen on the success path only — re-reading on "
+        "failure would clear marks for changes the server rejected."
+    )
+    catch_at = body.index("catch")
+    assert body.index("loadSettings();") < catch_at, (
+        "the rebase must sit in the try, not the catch."
+    )
+
+
+def test_pending_bar_is_opaque_reduced_motion_aware_and_count_gated():
+    """A translucent fixed bar smears the content scrolling under it. And it
+    must still APPEAR under a reduced-motion preference — dropping the slide is
+    the accommodation; dropping the bar is a bug."""
+    html = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    rule = re.search(r"#pending-bar \{([^}]*)\}", html)
+    assert rule, "the bar needs a style."
+    assert "background: var(--surface2)" in rule.group(1), (
+        "the bar needs its own opaque background."
+    )
+    assert "calc(100vw - 112px)" not in rule.group(1), (
+        "do not inherit .undo-snack's clearance — it was tuned for the "
+        "appearance gear, which Setup never renders."
+    )
+    assert re.search(
+        r"@media \(prefers-reduced-motion: reduce\) \{ #pending-bar \{ transition: none; \} \}",
+        html,
+    ), "reduced motion must drop the slide, not the bar."
+    assert "bar.classList.toggle('show', out.count > 0)" in js, (
+        "the bar exists only when something is pending."
+    )
+    assert 'id="pending-save"' in html and 'id="pending-cancel"' in html, (
+        "the bar carries its own Save and Cancel."
+    )
+
+
+def test_bar_save_drives_the_existing_save_and_cancel_restores():
+    """One save path. The bar duplicating the collector is how the two drift."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert re.search(
+        r"pending-save'\)\) \{.*?getElementById\('btn-save-settings'\).*?\.click\(\)",
+        js,
+        re.S,
+    ), "the bar's Save must drive the page's Save button, not re-collect."
+    assert re.search(
+        r"pending-save'\)\) \{.*?btn-save-pattern-rules.*?btn-save-exclusions",
+        js,
+        re.S,
+    ), (
+        "a bar counting the rule editors must also save them — otherwise it "
+        "reports three changes and saves two."
+    )
+    assert re.search(
+        r"pending-cancel'\)\) \{.*?loadSettings\(\);.*?loadRuleEditors\(\);", js, re.S
+    ), "Cancel restores by re-reading, so 'original' has one definition."
+
+
+def test_toast_and_bar_carry_live_regions():
+    """#toast had no aria-live, so every save outcome was silent to assistive
+    tech — the same 'looked fine, wasn't saved' failure for a different user."""
+    html = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    assert re.search(
+        r'<div class="toast" id="toast"[^>]*aria-live="polite"', html
+    ), "the toast must announce save outcomes."
+    assert re.search(r'id="pending-bar"[^>]*aria-live="polite"', html), (
+        "a change in pending count must be announced."
+    )
+
+
+# The counting rule, exercised in a real JS engine rather than pinned by text.
+# Text patterns cannot prove the dedupe, and the dedupe is exactly where the
+# mockup was wrong: it showed "1 Unsaved Change" while two rows were marked.
+_PENDING_CASES = [
+    # (dirty keys, expected "count:rows")
+    ([], "0:"),
+    # One field of a four-field group that shares ONE row: one change.
+    (["a1"], "1:0"),
+    # Two fields of that same group: still one change, not two.
+    (["a1", "a2"], "1:0"),
+    # The mockup's bug: a group edit plus an unrelated edit must report TWO.
+    (["a1", "e"], "2:0,4"),
+    # A group spanning two rows marks both and counts once.
+    (["b1"], "1:1,2"),
+    # Two UNGROUPED fields sharing a row (the guest-n / guest-m shape): one.
+    (["c", "d"], "1:3"),
+    (["c", "e"], "2:3,4"),
+    (["a1", "b2", "e"], "3:0,1,2,4"),
+]
+
+
+def test_pending_unit_counting_in_node():
+    """Runs the real pendingUnits over the row shapes that actually occur:
+    a four-field single-row group (Closing Time), a multi-row group (the
+    alpha-mode trio), and two ungrouped fields sharing a row (guest-n/m)."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not on PATH; pending counting covered only structurally")
+    src = ADMIN_APP.read_text(encoding="utf-8")
+    fn = re.search(
+        r"\n  function pendingUnits\(groups, rowOf, dirty\) \{.*?\n  \}\n", src, re.S
+    )
+    assert fn, (
+        "pendingUnits must stay extractable — it is the only part of the "
+        "pending bookkeeping that can be run outside a browser."
+    )
+    cases = [c[0] for c in _PENDING_CASES]
+    harness = (
+        fn.group(0)
+        + "const G=[['a1','a2','a3','a4'],['b1','b2']];"
+        "const R={a1:0,a2:0,a3:0,a4:0,b1:1,b2:2,c:3,d:3,e:4};"
+        "const out=JSON.parse(process.argv[1]).map(d=>{"
+        "const o=pendingUnits(G,R,d);return o.count+':'+o.rows.join(',');});"
+        "console.log(JSON.stringify(out));"
+    )
+    result = subprocess.run(
+        [node, "-e", harness, json.dumps(cases)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"pendingUnits threw:\n{result.stderr}"
+    got = json.loads(result.stdout)
+    want = [c[1] for c in _PENDING_CASES]
+    assert got == want, f"pendingUnits miscounted:\ngot  {got}\nwant {want}"
+
+
+def test_every_deferred_key_is_tracked_for_pending():
+    """A deferred key that Save still sends but the pending tracker does not
+    watch is the original bug with extra steps: the operator edits it, nothing
+    says so, and navigating away loses it silently."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    block = re.search(r"const FIELDS = \[(.*?)\n  \];", js, re.S)
+    assert block, "the tracked-field table must be findable."
+    for key in DEFERRED_KEYS:
+        assert "key: '%s'" % key in block.group(1), (
+            "%s is sent by Save but not tracked for pending state." % key
+        )
+
+
+def test_admitted_keys_are_not_tracked_for_pending():
+    """The control arm. A committing control that also showed a pending marker
+    would tell the operator to press Save for something already saved."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    block = re.search(r"const FIELDS = \[(.*?)\n  \];", js, re.S)
+    assert block
+    for _element, key in COMMIT_ON_CHANGE:
+        assert "key: '%s'" % key not in block.group(1), (
+            "%s commits on change; it must not also be tracked as pending." % key
+        )
+# ── Navigate-away protection (2026-10-05 save-model U4) ─────────────────────
+
+def test_tab_guard_reads_the_one_pending_count():
+    """One guard, one source. The .ptab handler used to confirm on the rule
+    editors' own dirty flag; adding a second guard for the settings form would
+    prompt twice on a single click, and a parallel flag would drift from the
+    count the bar renders."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    guard = re.search(
+        r"querySelectorAll\('\.ptab'\)\.forEach\(btn => \{(.*?)\n\}\);", js, re.S
+    )
+    assert guard, "the .ptab guard must be findable."
+    body = guard.group(1)
+    assert "window.__jpPendingCount" in body, (
+        "the tab guard must read the same count the unsaved-changes bar does."
+    )
+    assert "confirm(" in body, "it must still ask before leaving."
+    assert "editorsDirty" not in body, (
+        "the editors are folded into the count now — a second condition here "
+        "is how one click produces two prompts."
+    )
+    # A declined prompt must return WITHOUT touching the hash, or the page
+    # navigates anyway and the confirmation was theatre.
+    assert re.search(r"\)\) return;\n\s*location\.hash = ", body), (
+        "declining must return before the hash is set."
+    )
+
+
+def test_beforeunload_guards_close_and_reload_only_when_pending():
+    """The .ptab guard only ever covered in-page navigation; there was no
+    beforeunload listener anywhere in this file, so closing the tab on a page
+    of unsaved edits lost them without a word. It must stay silent at zero, or
+    it prompts on every exit and gets ignored."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    handler = re.search(
+        r"addEventListener\('beforeunload', \(e\) => \{(.*?)\n\}\);", js, re.S
+    )
+    assert handler, "a beforeunload guard must exist."
+    body = handler.group(1)
+    assert "window.__jpPendingCount > 0" in body, (
+        "it must fire only when something is pending, and read the same count."
+    )
+    assert "return;" in body.split("\n")[1], (
+        "the zero case must bail out before preventDefault."
+    )
+    assert "e.preventDefault()" in body and "e.returnValue" in body, (
+        "both are needed for the prompt across browsers."
+    )
+
+
+# ── Save-path reporting (2026-10-05 save-model U6) ──────────────────────────
+
+def test_save_button_exists_and_is_wired():
+    """No test referenced the Save button at all — not its existence, not its
+    behaviour. Renaming or deleting it broke nothing at test time, which is how
+    a save path quietly stops working."""
+    html = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert 'id="btn-save-settings"' in html, "the Save Settings button must exist."
+    assert "getElementById('btn-save-settings').addEventListener('click'" in js, (
+        "it must be wired."
+    )
+    assert "api('POST', '/admin/settings', body)" in js, (
+        "the handler must POST the collected body."
+    )
+
+
+def test_failed_save_names_the_rejected_field():
+    """The server validates everything before persisting, so one bad field
+    fails the whole Save and applies nothing. The old bare catch threw away the
+    status and detail api() attaches, leaving the operator with N marked rows,
+    no way to tell which is wrong, and a retry that fails identically."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    handler = re.search(
+        r"getElementById\('btn-save-settings'\)\.addEventListener\('click'.*?\n\}\);",
+        js, re.S,
+    )
+    assert handler
+    body = handler.group(0)
+    assert "catch {" not in body, "the bare catch discarded the detail."
+    assert "err.detail" in body or "err && err.detail" in body, (
+        "the handler must read the detail api() attaches."
+    )
+    # FastAPI's validation shape is a list whose loc ends with the field name;
+    # a plain-string detail and a dict detail both also occur on this endpoint.
+    assert "Array.isArray(d)" in body and "first.loc" in body, (
+        "the FastAPI validation shape must be unpacked to reach the field."
+    )
+    assert "typeof d === 'string'" in body, "a plain-string detail must report."
+    assert "Save rejected" in body, "the toast must say the save was refused."
+    assert "jp:settings-rejected" in body, (
+        "the rejected field must reach the row-marking block."
+    )
+
+
+def test_rejected_row_is_marked_distinctly_from_pending():
+    """'Still pending' and 'refused' are different states. Painting them the
+    same leaves the operator re-pressing Save on a value the server will refuse
+    again."""
+    html = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    assert ".panel-row.is-rejected" in html, "a rejected row needs its own style."
+    rule = re.search(r"\.panel-row\.is-rejected \{([^}]*)\}", html)
+    assert rule and "--danger" in rule.group(1), (
+        "rejection reads as danger, not as accent."
+    )
+    assert ".reject-detail" in html, "the server's message needs somewhere to go."
+    assert "row.classList.add('is-rejected')" in js, "the row must be marked."
+    assert "det.textContent = d.message" in js, (
+        "the server's own message must be shown, not a paraphrase."
+    )
+    # Editing the refused row clears the complaint it no longer describes.
+    assert "r.classList.remove('is-rejected')" in js
+
+
+def test_save_collector_unguarded_reads_are_enumerated():
+    """Six reads in the Save collector dereference an element without a guard,
+    so moving any of those controls throws at runtime and the whole Save dies
+    silently. Gapless was guarded, which is why it was safe to relocate. This
+    test is the tripwire for the next relocation: it fails at test time rather
+    than at the operator's next Save press."""
+    js = ADMIN_APP.read_text(encoding="utf-8")
+    handler = re.search(
+        r"getElementById\('btn-save-settings'\)\.addEventListener\('click'.*?\n\}\);",
+        js, re.S,
+    )
+    assert handler
+    body = handler.group(0)
+    # Named explicitly so a reader sees WHICH controls carry the hazard.
+    unguarded = {
+        "[name=end-behavior]": "queue_end_behavior",
+        "[name=rail-mode]": "rail_mode",
+        "[name=default-view]": "default_view",
+        "[name=rating-style]": "rating_style",
+        "getElementById('guest-n')": "queue_display_n",
+        "getElementById('guest-m')": "queue_display_m",
+    }
+    for probe in unguarded:
+        assert probe in body, (
+            "%s is no longer read by the Save collector — if it moved, this "
+            "list and the collector must change together." % probe
+        )
+    # And the count is six: a seventh unguarded read is a new hazard that
+    # should be added deliberately, not drift in.
+    found = re.findall(
+        r"(?:querySelector\('\[name=[a-z-]+\]:checked'\)\.value"
+        r"|getElementById\('[a-z-]+'\)\.value)",
+        body,
+    )
+    assert len(found) == 6, (
+        "expected exactly 6 unguarded reads, found %d: %s" % (len(found), found)
+    )

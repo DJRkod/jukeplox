@@ -5523,3 +5523,99 @@ async def test_scan_includes_mdns_backends_when_discovery_is_healthy():
 
     assert "airplay" in found
     assert "chromecast" in found
+# ── Commit-on-change admission rules (2026-10-05 settings save-model U2) ────
+# The 15 controls the admin writes the instant they change, as
+# (settings key, a value the endpoint accepts). Each must round-trip as a
+# ONE-FIELD body — that is what the UI now sends — and must not reach the
+# appearance broadcast, which repaints every connected guest.
+_COMMIT_ON_CHANGE = [
+    ("gapless_enabled", True),
+    ("queue_end_length_limit", True),
+    ("lyrics_contribute_enabled", True),
+    ("ratings_visible_to_guests", True),
+    ("tags_visible_to_guests", True),
+    ("guest_radio_control", True),
+    ("facet_genre", True),
+    ("facet_years", True),
+    ("facet_mostplayed", True),
+    ("facet_recentlyadded", True),
+    ("facet_highestrated", True),
+    ("facet_radio", True),
+    ("surprise_me_source_mode", "plex"),
+    ("surprise_me_diversity", "artist"),
+    ("volume_orientation", "vertical"),
+]
+
+
+@pytest.mark.parametrize("key,value", _COMMIT_ON_CHANGE)
+async def test_admitted_key_round_trips_as_a_single_field_body(
+    client, mock_state, key, value
+):
+    """Every admitted control POSTs only its own key. The endpoint treats all
+    fields as optional, so this is already supported — the test pins it, because
+    the UI no longer has a batched write to fall back on for these."""
+    with _gapless_state_reset():
+        with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+             patch("app.database.set_setting", AsyncMock()) as set_mock:
+            resp = client.post("/admin/settings", json={key: value})
+            assert resp.status_code == 200, resp.text
+            written = {c.args[0]: c.args[1] for c in set_mock.call_args_list}
+            assert key in written, (
+                "a one-field body must persist that field: %s" % key
+            )
+            # And nothing else: a commit must not drag a neighbour along.
+            assert set(written) == {key}, (
+                "committing %s also wrote %s" % (key, sorted(set(written) - {key}))
+            )
+
+
+@pytest.mark.parametrize("key,value", _COMMIT_ON_CHANGE)
+async def test_admitted_key_does_not_broadcast_to_guests(
+    client, mock_state, key, value
+):
+    """Admission rule 3, enforced against the server rather than against taste.
+    A committing key that slipped into the appearance-broadcast set would
+    repaint every guest device — background, surfaces, text colour — on each
+    click, while the operator is still comparing options."""
+    with _gapless_state_reset():
+        with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+             patch("app.database.set_setting", AsyncMock()), \
+             patch(
+                 "app.events.bus.manager.broadcast_to_all", AsyncMock()
+             ) as bcast:
+            assert client.post(
+                "/admin/settings", json={key: value}
+            ).status_code == 200
+    sent = [type(c.args[0]).__name__ for c in bcast.call_args_list if c.args]
+    assert "AppearanceChangedEvent" not in sent, (
+        "%s must not fire the appearance broadcast — it is admitted to "
+        "commit-on-change precisely because it does not." % key
+    )
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("rail_mode", "magnetic"),
+        ("default_view", "list"),
+        ("rating_style", "dots"),
+        ("surprise_me_enabled", False),
+        ("rail_alpha_mode", "international"),
+    ],
+)
+async def test_deferred_appearance_key_still_broadcasts(
+    client, mock_state, key, value
+):
+    """The control arm. Without it the test above would pass just as well if the
+    broadcast had been deleted outright, which is the opposite of the intent:
+    these keys SHOULD repaint guests, which is exactly why they stay on Save."""
+    with patch("app.database.get_setting", AsyncMock(return_value=None)), \
+         patch("app.database.set_setting", AsyncMock()), \
+         patch("app.events.bus.manager.broadcast_to_all", AsyncMock()) as bcast:
+        assert client.post(
+            "/admin/settings", json={key: value}
+        ).status_code == 200
+    sent = [type(c.args[0]).__name__ for c in bcast.call_args_list if c.args]
+    assert "AppearanceChangedEvent" in sent, (
+        "%s is an appearance default; it must still broadcast." % key
+    )
