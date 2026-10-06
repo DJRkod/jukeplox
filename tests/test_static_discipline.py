@@ -82,6 +82,14 @@ GUEST_ALLOWED = {
 }
 
 ADMIN_ALLOWED = {
+    # Save-model test hooks (2026-10-05 U3). Both are window properties set
+    # from inside the pending-state IIFE, not page logic: __jpPendingUnits is
+    # the pure counting function, lifted out so the dedupe rule can be run in a
+    # real JS engine (text patterns cannot prove it, and it is exactly where
+    # the design mockup was wrong); __jpPendingCount is the current count, read
+    # by the navigate-away guard. Precedent: static/browse/index.js exposes
+    # window.__jpComputeBuckets for the same reason.
+    "__jpPendingUnits", "__jpPendingCount",
     # WebSocket
     "ws", "wsBackoff", "connectWS",
     # Toast

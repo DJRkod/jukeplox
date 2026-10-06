@@ -74,13 +74,34 @@ function _pageTabFromHash() {
 
 document.querySelectorAll('.ptab').forEach(btn => {
   btn.addEventListener('click', () => {
-    // Dirty-state guard (pattern-rules plan U4, review decision): the rule
-    // editors mutate local state only until Save — leaving the Setup tab
-    // with unsaved edits silently discards them, so ask first.
-    if (editorsDirty && !confirm('Unsaved rule changes will be lost. Leave Setup?')) return;
+    // Dirty-state guard (pattern-rules plan U4, review decision; widened by
+    // the 2026-10-05 save-model U4): leaving Setup with uncommitted edits
+    // discards them silently, so ask first. The count is the same one the
+    // unsaved-changes bar renders — the rule editors are folded into it — so
+    // this is ONE guard reading one source, not two guards prompting twice on
+    // a single click. A declined prompt returns without changing the hash, so
+    // the page and every pending mark stay exactly as they were.
+    const pending = window.__jpPendingCount || 0;
+    if (pending > 0 && !confirm(
+      pending === 1
+        ? 'You have 1 unsaved change. Leave Setup and lose it?'
+        : 'You have ' + pending + ' unsaved changes. Leave Setup and lose them?'
+    )) return;
     location.hash = btn.dataset.ptab;
   });
 });
+// Tab close and reload (save-model U4). The .ptab guard only ever covered
+// in-page navigation; there was no beforeunload listener anywhere in this file,
+// so closing the tab on a page of unsaved edits lost them without a word. The
+// message cannot be customised — browsers show their own generic prompt — and
+// the listener must stay silent at a count of zero or it prompts on every exit.
+window.addEventListener('beforeunload', (e) => {
+  if (!(window.__jpPendingCount > 0)) return;
+  e.preventDefault();
+  e.returnValue = '';
+  return '';
+});
+
 window.addEventListener('hashchange', () => applyPageTab(_pageTabFromHash()));
 applyPageTab(_pageTabFromHash());
 
@@ -1845,6 +1866,7 @@ function renderDefaultSchemePicker() {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'ap-swatch' + (id === defaultScheme ? ' on' : '');
+    b.dataset.scheme = id;   // save-model U3 reads the selection off the DOM
     b.title = s.name;
     b.setAttribute('aria-label', 'Default scheme: ' + s.name);
     b.style.background = s.grad || s.anchor;
@@ -2088,6 +2110,12 @@ async function loadSettings() {
     // WS event (renderSurpriseRecent is the shared render path).
     try { renderSurpriseRecent(await api('GET', '/admin/surprise/recent')); }
     catch { const el = document.getElementById('surprise-recent'); if (el) el.textContent = '—'; }
+    // Save-model U3: the pending baseline is this response, captured AFTER the
+    // full hydrate and INSIDE this try. A throw mid-hydrate leaves the form
+    // half-populated, and a baseline taken outside would record defaults for
+    // the fields that never got written. An event rather than a shared global:
+    // the bookkeeping lives in an IIFE, so nothing new reaches top level.
+    document.dispatchEvent(new CustomEvent('jp:settings-hydrated', { detail: s }));
   } catch {}
 }
 
@@ -2103,14 +2131,10 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
   const body = { queue_end_behavior: endBehavior, rail_mode: railMode, default_scheme: defaultScheme, default_view: defaultView, rating_style: ratingStyle };
   if (n !== '') body.queue_display_n = parseInt(n, 10);
   if (m !== '') body.queue_display_m = parseInt(m, 10);
+  // Surprise Me: only the enable flag is batched — it is in the appearance
+  // broadcast. Its source-mode and diversity selects commit on change.
   const surpriseEnabledEl = document.getElementById('surprise-enabled');
-  const surpriseModeEl = document.getElementById('surprise-source-mode');
-  const surpriseDivEl = document.getElementById('surprise-diversity');
   if (surpriseEnabledEl) body.surprise_me_enabled = surpriseEnabledEl.checked;
-  if (surpriseModeEl) body.surprise_me_source_mode = surpriseModeEl.value;
-  if (surpriseDivEl) body.surprise_me_diversity = surpriseDivEl.value;
-  const lyricsContributeEl = document.getElementById('lyrics-contribute-enabled');
-  if (lyricsContributeEl) body.lyrics_contribute_enabled = lyricsContributeEl.checked;
   // Random-pick length band (plan U4): always send both as integers, empty → 0,
   // so clearing a box turns that bound off (diverges from guest-n/m's "empty =
   // unchanged" on purpose — 0 is the canonical off sentinel here).
@@ -2125,22 +2149,6 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
   // Most Played leaderboard size (empty/0 → default 100). Display-only.
   const mpLimitEl = document.getElementById('most-played-display-limit');
   if (mpLimitEl) body.most_played_display_limit = parseInt(mpLimitEl.value, 10) || 100;
-  // Track ratings + tags (2026-06-26 plan U9): two visibility flags + five facet
-  // toggles, all booleans.
-  const rvgEl = document.getElementById('ratings-visible-to-guests');
-  if (rvgEl) body.ratings_visible_to_guests = rvgEl.checked;
-  const tvgEl = document.getElementById('tags-visible-to-guests');
-  if (tvgEl) body.tags_visible_to_guests = tvgEl.checked;
-  // Radio Mode (2026-08-11 plan U8, R9): guest radio-control flag (boolean).
-  const grcEl = document.getElementById('guest-radio-control');
-  if (grcEl) body.guest_radio_control = grcEl.checked;
-  ['genre', 'years', 'mostplayed', 'recentlyadded', 'highestrated'].forEach(f => {
-    const el = document.getElementById('facet-' + f);
-    if (el) body['facet_' + f] = el.checked;
-  });
-  // Radio TAB visibility (2026-08-12): default-OFF opt-in, sent as its own bool.
-  const fRadioEl = document.getElementById('facet-radio');
-  if (fRadioEl) body.facet_radio = fRadioEl.checked;
   // Closing Time (2026-06-24): toggle + trigger song/message. Strings persist
   // as typed (server trims); a blank trigger simply never fires.
   const ctEnabledEl = document.getElementById('closing-time-enabled');
@@ -2151,12 +2159,11 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
   if (ctArtistEl) body.closing_time_artist = ctArtistEl.value;
   const ctMessageEl = document.getElementById('closing-time-message');
   if (ctMessageEl) body.closing_time_message = ctMessageEl.value;
-  const qeLimitEl = document.getElementById('queue-end-length-limit');
-  if (qeLimitEl) body.queue_end_length_limit = qeLimitEl.checked;
-  // Gapless toggle + auto-resume window (2026-07-11 supervisor plan U5).
-  // Window empty/0 → default 60 (mirrors most-played-display-limit's shape).
-  const gaplessEl = document.getElementById('gapless-enabled');
-  if (gaplessEl) body.gapless_enabled = gaplessEl.checked;
+  // Auto-resume window (2026-07-11 supervisor plan U5). Empty/0 → default 60
+  // (mirrors most-played-display-limit's shape). Gapless left this batch on
+  // 2026-10-05: it lives in Output now and commits the moment it is toggled, so
+  // this collector must NOT send gapless_enabled — a stale read here would
+  // silently revert a toggle made after the page loaded.
   const resumeWindowEl = document.getElementById('resume-window-minutes');
   if (resumeWindowEl) body.resume_window_minutes = parseInt(resumeWindowEl.value, 10) || 60;
   // International rail (plan 004): alpha-mode + the two thresholds (empty/0 →
@@ -2167,17 +2174,207 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
   if (artistThreshEl) body.rail_artist_threshold = parseInt(artistThreshEl.value, 10) || 2;
   const albumThreshEl = document.getElementById('rail-album-threshold');
   if (albumThreshEl) body.rail_album_threshold = parseInt(albumThreshEl.value, 10) || 2;
-  // Volume bar orientation (2026-08-04 volume rework U3): sent with the batch;
-  // applied locally on save success (other admin devices: next load).
-  const volOrientEl = document.querySelector('[name=volume-orientation]:checked');
-  if (volOrientEl) body.volume_orientation = volOrientEl.value;
   try {
     await api('POST', '/admin/settings', body);
     showToast('Settings saved');
-    if (volOrientEl) document.body.dataset.volOrient = volOrientEl.value;
+    // Rebase the pending baseline by re-reading, so the marks clear against
+    // what the server actually stored rather than against the form. Only on
+    // success: a rejected Save applies nothing and must leave every mark up.
+    loadSettings();
   }
-  catch { showToast('Failed to save settings'); }
+  catch (err) {
+    // The server validates everything before persisting, so a 4xx applied
+    // NOTHING — every mark stays up, and the one useful thing to add is which
+    // field it refused. api() already attaches status and detail; the old bare
+    // catch threw both away, leaving a retry that fails identically.
+    const d = err && err.detail;
+    let field = null, msg = null;
+    if (typeof d === 'string') {
+      msg = d;
+    } else if (Array.isArray(d)) {
+      // FastAPI validation shape: loc is ['body', '<field>'].
+      const first = d[0] || {};
+      const loc = first.loc || [];
+      field = loc[loc.length - 1] || null;
+      msg = first.msg || null;
+    } else if (d && typeof d === 'object') {
+      field = d.field || null;
+      msg = d.message || d.reason || null;
+    }
+    showToast(field
+      ? 'Save rejected — ' + field + ': ' + (msg || 'invalid value')
+      : 'Failed to save settings' + (msg ? ' — ' + msg : ''));
+    document.dispatchEvent(new CustomEvent('jp:settings-rejected', {
+      detail: { field: field, message: msg },
+    }));
+  }
 });
+
+// ── Commit-on-change (2026-10-05 settings save-model U2) ───────────────────
+// Fifteen controls write themselves the moment they change, so no Save press
+// stands between the operator and the effect. A control is admitted only if all
+// three hold: its value is final the instant it changes; committing it does not
+// change what the box does on its own; and its key is not in the server's
+// appearance-broadcast set. `end-behavior` fails the second (a stray click would
+// start an auto-DJ) and the six appearance keys fail the third (each commit
+// would repaint every guest device mid-comparison), so all seven stay on Save.
+//
+// Every admitted key was removed from the Save collector in the same change.
+// Leaving one would let a Save press re-send the value the form held at page
+// load, silently reverting a commit made since — or made in another tab.
+//
+// IIFE expression statement: inner declarations are indented, so this adds no
+// top-level name (static discipline), matching the ⓘ-popover block below.
+(function () {
+  // [element id, settings key, name used in a failure toast]
+  const CHECKBOXES = [
+    ['gapless-enabled', 'gapless_enabled', 'Gapless playback'],
+    ['queue-end-length-limit', 'queue_end_length_limit', 'Queue-end length limit'],
+    ['lyrics-contribute-enabled', 'lyrics_contribute_enabled', 'Lyrics contribution'],
+    ['ratings-visible-to-guests', 'ratings_visible_to_guests', 'Guest rating visibility'],
+    ['tags-visible-to-guests', 'tags_visible_to_guests', 'Guest tag visibility'],
+    ['guest-radio-control', 'guest_radio_control', 'Guest radio control'],
+    ['facet-genre', 'facet_genre', 'Genre tab'],
+    ['facet-years', 'facet_years', 'Years tab'],
+    ['facet-mostplayed', 'facet_mostplayed', 'Most Played tab'],
+    ['facet-recentlyadded', 'facet_recentlyadded', 'Recently Added tab'],
+    ['facet-highestrated', 'facet_highestrated', 'Highest Rated tab'],
+    ['facet-radio', 'facet_radio', 'Radio tab'],
+  ];
+  const SELECTS = [
+    ['surprise-source-mode', 'surprise_me_source_mode', 'Surprise Me source'],
+    ['surprise-diversity', 'surprise_me_diversity', 'Surprise Me diversity'],
+  ];
+  // [radio group name, settings key, name used in a failure toast]
+  const RADIO_GROUPS = [
+    ['volume-orientation', 'volume_orientation', 'Volume bar orientation'],
+  ];
+
+  // showToast is a singleton with one shared timer, so a burst of commits would
+  // clobber each other and leave only the last one visible. Successes inside
+  // this window collapse into one message naming the count. One constant, so
+  // the behaviour is a single decision rather than a per-call-site habit.
+  const COALESCE_MS = 1200;
+  let okCount = 0;
+  let okTimer = null;
+
+  function flushOk() {
+    okTimer = null;
+    if (!okCount) return;
+    showToast(okCount === 1 ? 'Setting saved' : okCount + ' settings saved');
+    okCount = 0;
+  }
+
+  function noteOk() {
+    okCount += 1;
+    if (okTimer) clearTimeout(okTimer);
+    okTimer = setTimeout(flushOk, COALESCE_MS);
+  }
+
+  // A failure is never absorbed into a coalesced success: it cancels the pending
+  // count and names the control instead. Reporting "3 settings saved" when one
+  // of the three was rejected is the one outcome coalescing must not produce.
+  function noteFailure(label, err) {
+    if (okTimer) { clearTimeout(okTimer); okTimer = null; }
+    okCount = 0;
+    const d = err && err.detail;
+    showToast(label + ': ' + ((typeof d === 'string' && d) || 'could not save'));
+  }
+
+  // Reverting a rejected commit needs the value the control held BEFORE the
+  // change, and `change` arrives after the DOM has already moved. The snapshot
+  // is taken on focus — a pointer or keyboard interaction always focuses a
+  // control before it can change it — and refreshed after each success, so a
+  // second edit reverts to what the server actually holds. A checkbox needs no
+  // snapshot: its previous state is the inverse of its current one.
+  const prior = new Map();
+
+  // The flood-control sequence, once: lock, POST exactly one key, confirm, and
+  // on failure put the control back. The revert is the load-bearing half —
+  // without it the form shows a value the server refused.
+  async function commit(els, key, label, read, revert, onOk) {
+    els.forEach(c => { c.disabled = true; });
+    try {
+      const value = read();
+      await api('POST', '/admin/settings', { [key]: value });
+      if (onOk) onOk(value);
+      noteOk();
+    } catch (err) {
+      revert();
+      noteFailure(label, err);
+    } finally {
+      els.forEach(c => { c.disabled = false; });
+    }
+  }
+
+  // Mark the row as instant-committing so the static-cue pass can tag it
+  // without a second copy of the admitted list. This block owns that list.
+  function markInstant(el) {
+    const row = el.closest('.panel-row');
+    if (row) row.dataset.saveMode = 'instant';
+  }
+
+  CHECKBOXES.forEach(([id, key, label]) => {
+    document.querySelectorAll('#' + id).forEach(el => {
+      markInstant(el);
+      el.addEventListener('change', () => commit(
+        [el], key, label,
+        () => el.checked,
+        () => { el.checked = !el.checked; },
+      ));
+    });
+  });
+
+  SELECTS.forEach(([id, key, label]) => {
+    document.querySelectorAll('#' + id).forEach(el => {
+      markInstant(el);
+      el.addEventListener('focus', () => { if (!el.disabled) prior.set(el, el.value); });
+      el.addEventListener('change', () => commit(
+        [el], key, label,
+        () => el.value,
+        () => { if (prior.has(el)) el.value = prior.get(el); },
+        (v) => prior.set(el, v),
+      ));
+    });
+  });
+
+  RADIO_GROUPS.forEach(([name, key, label]) => {
+    const group = Array.from(document.querySelectorAll('[name=' + name + ']'));
+    if (!group.length) return;
+    markInstant(group[0]);
+    const checkedValue = () => {
+      const sel = group.find(r => r.checked);
+      return sel ? sel.value : null;
+    };
+    group.forEach(r => {
+      // Snapshot on focus: the click that focuses a radio sets `checked` in the
+      // click default action, which runs after focus — so the group still holds
+      // the outgoing selection here.
+      r.addEventListener('focus', () => {
+        const v = checkedValue();
+        if (v !== null) prior.set(group, v);
+      });
+      r.addEventListener('change', () => {
+        if (!r.checked) return;
+        commit(
+          group, key, label,
+          () => r.value,
+          () => {
+            const was = prior.get(group);
+            const back = group.find(x => x.value === was);
+            if (back) back.checked = true;
+          },
+          (v) => {
+            prior.set(group, v);
+            // volume_orientation's local apply moves with the key rather than
+            // being stranded on a Save path that no longer sends it.
+            if (key === 'volume_orientation') document.body.dataset.volOrient = v;
+          },
+        );
+      });
+    });
+  });
+})();
 
 // Popular-threshold field (2026-06-24): intentionally NOT mode-gated — it stays
 // fully enabled regardless of the selected Queue-end mode (reverses the earlier
@@ -2196,6 +2393,287 @@ document.querySelectorAll('[name=rail-alpha-mode]').forEach(r => r.addEventListe
   if (artistInp) artistInp.disabled = !active;
   if (albumInp) albumInp.disabled = !active;
 }));
+
+// ── Pending-change state (2026-10-05 settings save-model U3) ──────────────
+// Twenty Settings controls still need an explicit Save — see the admission
+// rules above for why each is excluded. This makes that legible: a static cue
+// on every row saying which kind it is, a marker on the rows actually holding
+// an uncommitted edit, and one count in a bar that exists only when something
+// is pending.
+//
+// The baseline is the GET /admin/settings response, never the DOM. Hydration
+// defaults are deliberately inconsistent — `!== false` for default-on flags,
+// `!!` for default-off — and numerics hydrate `|| ''`, so a stored 0 renders as
+// an empty box. Comparing DOM strings against those would report changes nobody
+// made. Normalisation on both sides mirrors the Save collector's own coercion,
+// so a box that hydrated empty and was typed back to its stored value reads
+// clean.
+//
+// One IIFE, indented declarations: no new top-level name (static discipline).
+(function () {
+  // num: the default the collector substitutes for an empty box.
+  // blankKeeps: empty means "leave the stored value alone" (guest-n/m only).
+  // boolOn: hydrates checked unless explicitly false, rather than the reverse.
+  const FIELDS = [
+    { id: 'popular-random-threshold',  key: 'popular_random_threshold',  num: 2 },
+    { id: 'resume-window-minutes',     key: 'resume_window_minutes',     num: 60 },
+    { id: 'random-min-seconds',        key: 'random_min_seconds',        num: 0 },
+    { id: 'random-max-seconds',        key: 'random_max_seconds',        num: 0 },
+    { id: 'rail-artist-threshold',     key: 'rail_artist_threshold',     num: 2 },
+    { id: 'rail-album-threshold',      key: 'rail_album_threshold',      num: 2 },
+    { id: 'most-played-display-limit', key: 'most_played_display_limit', num: 100 },
+    { id: 'guest-n', key: 'queue_display_n', num: 0, blankKeeps: true },
+    { id: 'guest-m', key: 'queue_display_m', num: 0, blankKeeps: true },
+    { id: 'closing-time-enabled', key: 'closing_time_enabled', bool: true },
+    { id: 'surprise-enabled',     key: 'surprise_me_enabled',  bool: true, boolOn: true },
+    { id: 'closing-time-title',   key: 'closing_time_title',   text: true },
+    { id: 'closing-time-artist',  key: 'closing_time_artist',  text: true },
+    { id: 'closing-time-message', key: 'closing_time_message', text: true },
+    { radio: 'end-behavior',    key: 'queue_end_behavior', fallback: 'stop' },
+    { radio: 'rail-mode',       key: 'rail_mode',          fallback: 'vanilla' },
+    { radio: 'rail-alpha-mode', key: 'rail_alpha_mode',    fallback: 'english' },
+    { radio: 'default-view',    key: 'default_view',       fallback: 'list' },
+    { radio: 'rating-style',    key: 'rating_style',       fallback: 'stars' },
+    { scheme: true,             key: 'default_scheme',     fallback: 'gold-rush' },
+  ];
+
+  // A mode plus the parameters it governs, or a cross-validated pair: marked
+  // together and counted once, because committing half of one is not a thing
+  // the operator asked for.
+  const GROUPS = [
+    ['closing_time_enabled', 'closing_time_title', 'closing_time_artist', 'closing_time_message'],
+    ['random_min_seconds', 'random_max_seconds'],
+    ['rail_alpha_mode', 'rail_artist_threshold', 'rail_album_threshold'],
+    ['queue_end_behavior', 'popular_random_threshold'],
+  ];
+
+  // The Pattern Matching and Artist Exclusion editors keep their own dirty flag
+  // and their own endpoints. They are counted here so the bar tells the truth
+  // about everything outstanding, and its Save drives their Save buttons too.
+  const EDITORS = '__editors';
+
+  let base = null;
+
+  const byKey = {};
+  FIELDS.forEach(f => { byKey[f.key] = f; });
+
+  function fieldEl(f) {
+    if (f.radio) return document.querySelector('[name=' + f.radio + ']');
+    if (f.scheme) return document.getElementById('default-scheme-picker');
+    return document.getElementById(f.id);
+  }
+
+  function rowFor(f) {
+    const el = fieldEl(f);
+    return el ? el.closest('.panel-row') : null;
+  }
+
+  function baseValue(f) {
+    const v = base ? base[f.key] : undefined;
+    if (f.radio || f.scheme) return (v === undefined || v === null) ? f.fallback : v;
+    if (f.bool) return f.boolOn ? v !== false : !!v;
+    if (f.text) return (v === undefined || v === null) ? '' : String(v);
+    return parseInt(v, 10) || f.num;
+  }
+
+  function nowValue(f) {
+    if (f.radio) {
+      const sel = document.querySelector('[name=' + f.radio + ']:checked');
+      return sel ? sel.value : f.fallback;
+    }
+    if (f.scheme) {
+      const on = document.querySelector('#default-scheme-picker .ap-swatch.on');
+      return on ? on.dataset.scheme : f.fallback;
+    }
+    const el = document.getElementById(f.id);
+    if (!el) return baseValue(f);
+    if (f.bool) return el.checked;
+    if (f.text) return el.value;
+    if (el.value === '') return f.blankKeeps ? baseValue(f) : f.num;
+    return parseInt(el.value, 10) || f.num;
+  }
+
+  // Pure, and exposed for the node harness. Given the group definitions, a
+  // field-to-row lookup and the dirty field keys, return the rows to mark and
+  // the number of changes to report.
+  //
+  // The dedupe is the whole point. All four Closing Time fields live in ONE
+  // .panel-row, so mapping a group's fields to rows yields that row four times;
+  // a loop that adds it on the first field and clears it on the rest reports a
+  // real pending change as zero. The mockup did exactly that, and showed
+  // "1 Unsaved Change" while two rows were visibly marked. Ungrouped fields
+  // coalesce by row for the same reason — guest-n and guest-m share one row and
+  // are one change, without needing an entry in GROUPS.
+  function pendingUnits(groups, rowOf, dirty) {
+    const grouped = {};
+    const units = [];
+    groups.forEach(g => { g.forEach(k => { grouped[k] = 1; }); units.push(g); });
+    const byRow = {};
+    const rowOrder = [];
+    Object.keys(rowOf).forEach(k => {
+      if (grouped[k]) return;
+      if (rowOf[k] === null || rowOf[k] === undefined) return;
+      const r = String(rowOf[k]);
+      if (!byRow[r]) { byRow[r] = []; rowOrder.push(r); }
+      byRow[r].push(k);
+    });
+    rowOrder.forEach(r => units.push(byRow[r]));
+
+    const rows = [];
+    let count = 0;
+    units.forEach(ks => {
+      if (!ks.some(k => dirty.indexOf(k) !== -1)) return;
+      count += 1;
+      ks.forEach(k => {
+        const r = rowOf[k];
+        if (r !== null && r !== undefined && rows.indexOf(r) === -1) rows.push(r);
+      });
+    });
+    return { count: count, rows: rows };
+  }
+  window.__jpPendingUnits = pendingUnits;
+
+  // ── static cue ───────────────────────────────────────────────────────────
+  // Runs once the rows exist. The instant rows were stamped by the
+  // commit-on-change block, so the admitted list is not duplicated here.
+  function tagRows() {
+    document.querySelectorAll('#settings .panel-row, #output .panel-row').forEach(row => {
+      if (row.dataset.saveTagged) return;
+      const instant = row.dataset.saveMode === 'instant';
+      const deferred = FIELDS.some(f => rowFor(f) === row);
+      if (!instant && !deferred) return;
+      row.dataset.saveTagged = '1';
+      const lead = row.querySelector('label');
+      if (lead) {
+        const tag = document.createElement('span');
+        tag.className = 'save-tag ' + (instant ? 'is-instant' : 'is-deferred');
+        tag.textContent = instant ? 'instant' : 'needs save';
+        lead.appendChild(tag);
+      }
+      if (!instant) {
+        // The reserved slot, present from load and merely revealed when the row
+        // goes pending — never inserted on change, which would reflow the row.
+        const slot = document.createElement('span');
+        slot.className = 'row-status';
+        slot.textContent = 'unsaved';
+        row.appendChild(slot);
+      }
+    });
+  }
+
+  // ── pending computation ──────────────────────────────────────────────────
+  const barEl = () => document.getElementById('pending-bar');
+  const countEl = () => document.getElementById('pending-count');
+  let marked = [];
+
+  function editorsRow() {
+    const btn = document.getElementById('btn-save-pattern-rules');
+    return btn ? btn.closest('.panel-row') : null;
+  }
+
+  function recompute() {
+    if (!base) return;
+    const rowOf = {};
+    const rowList = [];
+    const idOf = (el) => {
+      if (!el) return null;
+      let i = rowList.indexOf(el);
+      if (i === -1) { i = rowList.length; rowList.push(el); }
+      return i;
+    };
+    const dirty = [];
+    FIELDS.forEach(f => {
+      rowOf[f.key] = idOf(rowFor(f));
+      if (nowValue(f) !== baseValue(f)) dirty.push(f.key);
+    });
+    rowOf[EDITORS] = idOf(editorsRow());
+    if (typeof editorsDirty !== 'undefined' && editorsDirty) dirty.push(EDITORS);
+
+    const out = pendingUnits(GROUPS, rowOf, dirty);
+
+    marked.forEach(r => r.classList.remove('is-pending'));
+    marked = out.rows.map(i => rowList[i]).filter(Boolean);
+    marked.forEach(r => r.classList.add('is-pending'));
+    // Editing a refused row clears its rejection — the operator has answered
+    // the complaint, and leaving the danger treatment up would describe the
+    // value they just replaced.
+    marked.forEach(r => {
+      if (!r.classList.contains('is-rejected')) return;
+      r.classList.remove('is-rejected');
+      const det = r.querySelector('.reject-detail');
+      if (det) det.remove();
+    });
+
+    const bar = barEl(), cnt = countEl();
+    if (!bar || !cnt) return;
+    cnt.innerHTML = out.count === 1
+      ? '<b>1</b> Unsaved Change'
+      : '<b>' + out.count + '</b> Unsaved Changes';
+    bar.classList.toggle('show', out.count > 0);
+    window.__jpPendingCount = out.count;
+  }
+
+  // One recompute per interaction rather than a listener per control: the
+  // comparison is twenty values, and it also catches the rule editors, whose
+  // dirty flag is set from a dozen places.
+  document.addEventListener('input', recompute, true);
+  document.addEventListener('change', recompute, true);
+  document.addEventListener('click', () => setTimeout(recompute, 0), true);
+
+  // A rejected Save names one field; mark that row so the operator can see
+  // which of several pending rows the server refused, without a console.
+  document.addEventListener('jp:settings-rejected', (e) => {
+    const d = e.detail || {};
+    document.querySelectorAll('.panel-row.is-rejected').forEach(r => {
+      r.classList.remove('is-rejected');
+      const old = r.querySelector('.reject-detail');
+      if (old) old.remove();
+    });
+    const f = byKey[d.field];
+    const row = f ? rowFor(f) : null;
+    if (!row) return;
+    row.classList.add('is-rejected');
+    if (d.message && !row.querySelector('.reject-detail')) {
+      const det = document.createElement('span');
+      det.className = 'reject-detail';
+      det.textContent = d.message;
+      row.appendChild(det);
+    }
+  });
+
+  // The cue is static information about which controls need Save, so it must
+  // not wait on the settings GET: if that request fails the operator still has
+  // a form in front of them, and losing the cue there is losing it exactly
+  // when the page is least trustworthy. Idempotent, so the hydrate can re-run
+  // it after a re-render without doubling the tags.
+  tagRows();
+
+  document.addEventListener('jp:settings-hydrated', (e) => {
+    base = e.detail || {};
+    tagRows();
+    recompute();
+  });
+
+  document.addEventListener('click', (e) => {
+    if (e.target.closest('#pending-save')) {
+      // Drive the existing Save rather than duplicating the collector, and the
+      // editors' own Saves too — a bar reporting three changes must save three.
+      const btn = document.getElementById('btn-save-settings');
+      if (btn) btn.click();
+      if (typeof editorsDirty !== 'undefined' && editorsDirty) {
+        const pr = document.getElementById('btn-save-pattern-rules');
+        const ex = document.getElementById('btn-save-exclusions');
+        if (pr) pr.click();
+        if (ex) ex.click();
+      }
+    } else if (e.target.closest('#pending-cancel')) {
+      // Re-reading is the restore: it rewrites every field from the server and
+      // re-publishes the baseline, so there is one definition of "original".
+      loadSettings();
+      loadRuleEditors();
+    }
+  });
+})();
 
 // Info-circle popovers (2026-06-24): clicking an ⓘ shows its help text in a small
 // popover and NEVER toggles the radio/checkbox it sits inside (preventDefault on

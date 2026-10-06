@@ -208,7 +208,23 @@
       border-top: 1px solid var(--border); }
     #settings .settings-subhead:first-of-type { margin-top: .35rem; padding-top: 0; border-top: none; }
     #settings .panel-row { align-items: flex-start; }
-    #settings .panel-row > label:first-child { min-width: 168px; padding-top: .4rem; }
+    /* The static save-mode cue (`instant` / `needs save`) sits inside this
+       leading label. With a plain min-width the tag pushes past it, so every
+       row's controls start at a different x and the control column goes
+       ragged; a fixed-width flex box with the tag right-aligned inside keeps
+       the cue beside what it describes and restores one straight column. The
+       basis is FIXED, not a floor: measured in a real engine, the longest
+       label ("Default browse/search view:") came to 247px, and a min-width
+       lets anything longer push that one row's controls out of the column.
+       Output carries the same rule so the gapless row relocated there in U1
+       lines up with Settings. (2026-10-05 save-model U3 — the one pre-existing
+       rule this work modifies.) */
+    #settings .panel-row > label:first-child,
+    #output .panel-row > label:first-child {
+      flex: 0 0 248px; padding-top: .4rem;
+      display: inline-flex; align-items: baseline;
+      justify-content: space-between; gap: .5rem;
+    }
     #settings .field-prose { font-size: .9rem; line-height: 1.7; color: var(--muted); }
     #settings .field-note { font-style: italic; color: var(--muted); opacity: .85; }
     /* text inputs were unstyled (raw browser default) — match number/select. */
@@ -364,6 +380,59 @@
     body[data-source-lock="plex"] .no-plex-hold { opacity: .45; }
     body[data-source-lock="plex"] .admin-shell .list-item.no-plex-hold { cursor: not-allowed; }
     body[data-source-lock="plex"] .admin-shell .no-plex-hold .kebab-btn { cursor: pointer; }
+    /* ── Save-model chrome (2026-10-05 U3) ────────────────────────────────
+       Which controls need Save is answered before the operator touches one,
+       not after: every row carries a static cue, and the rows actually holding
+       an uncommitted edit carry a marker. No colour is hard-coded — the
+       appearance engine rewrites these variables live across 12 schemes. */
+    .save-tag { font-size: .6rem; letter-spacing: .04em; text-transform: uppercase; font-weight: 600; padding: .08rem .34rem; border-radius: 3px; white-space: nowrap; flex-shrink: 0; }
+    .save-tag.is-instant { color: var(--accent-ui, var(--accent)); background: var(--accent-dim); border: 1px solid var(--accent-dim); }
+    .save-tag.is-deferred { color: var(--muted); background: transparent; border: 1px solid var(--border); }
+
+    /* The unsaved flag is a RESERVED column, present on every deferred row from
+       load and merely made visible when the row goes pending. `visibility`
+       keeps the box in layout, so the page geometry is identical whether or not
+       anything is pending — reflow is impossible by construction rather than
+       merely reduced. An inline marker inserted on change pushes the controls
+       right and, on a wrapping flex row, can add a line and change the row's
+       height. */
+    .row-status { order: 99; margin-left: auto; min-width: 5.5rem; text-align: right; flex-shrink: 0; font-size: .6rem; letter-spacing: .04em; text-transform: uppercase; font-weight: 600; color: var(--accent-ui, var(--accent)); visibility: hidden; }
+    .panel-row.is-pending .row-status { visibility: visible; }
+    /* A rejected row (2026-10-05 U6). The server applies nothing on a 4xx, so
+       one bad field fails the whole Save; without this the operator is left
+       with N marked rows, no way to tell which is wrong, and a retry that
+       fails identically. Danger, not accent — "still pending" and "refused"
+       are different states and must not look alike. */
+    .panel-row.is-rejected { background: color-mix(in srgb, var(--danger) 12%, transparent); box-shadow: inset 2px 0 0 var(--danger); }
+    .panel-row.is-rejected .row-status { visibility: visible; color: var(--danger); }
+    .reject-detail { flex-basis: 100%; font-size: .76rem; color: var(--danger); margin-top: .15rem; }
+
+    .panel-row.is-pending { background: var(--accent-dim); border-radius: 4px; box-shadow: inset 2px 0 0 var(--accent-ui, var(--accent)); }
+
+    /* Shaped on .undo-snack but deliberately NOT inheriting its 112px
+       clearance: that figure was tuned to clear the appearance gear, which
+       Setup never renders. What this has to clear is the build badge and the
+       toast, both bottom-right. Opaque background — a translucent fixed bar
+       smears the content scrolling under it. */
+    #pending-bar { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%) translateY(150%); display: flex; align-items: center; gap: .6rem; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.5); padding: .5rem .6rem .5rem .85rem; z-index: 200; transition: transform .18s ease; max-width: calc(100vw - 2rem); }
+    #pending-bar.show { transform: translateX(-50%) translateY(0); }
+    #pending-bar .pending-count { font-size: .85rem; color: var(--text); white-space: nowrap; margin-right: .15rem; }
+    #pending-bar .pending-count b { color: var(--accent-ui, var(--accent)); }
+
+    /* Narrow: vacate the bottom-right corner rather than centring under it, so
+       the bar and a commit toast cannot land on top of each other. */
+    @media (max-width: 620px) {
+      #pending-bar { left: 10px; right: 100px; transform: translateX(0) translateY(150%); max-width: none; }
+      #pending-bar.show { transform: translateX(0) translateY(0); }
+      #settings .panel-row > label:first-child,
+      #output .panel-row > label:first-child { flex: 1 1 auto; }
+      .row-status { min-width: 0; }
+    }
+
+    /* The bar must still APPEAR under a reduced-motion preference — only the
+       slide is dropped. */
+    @media (prefers-reduced-motion: reduce) { #pending-bar { transition: none; } }
+
     .undo-snack { position: fixed; left: 50%; transform: translateX(-50%); bottom: 18px; z-index: 200; display: flex; align-items: center; gap: 1rem; background: var(--surface2); color: var(--text); padding: .6rem .9rem; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.5); font-size: .9rem; max-width: calc(100vw - 112px); }
     .undo-snack-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .undo-snack button { background: none; border: none; color: var(--accent); font-size: .9rem; font-weight: 600; cursor: pointer; padding: .2rem .4rem; }
@@ -721,6 +790,18 @@
         <button class="btn btn-sm" id="btn-retest-ap2" style="display:none;background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:.85rem" title="Re-run the AirPlay 2 probe for this device (use after a speaker firmware update)">↻ Re-test AP2</button>
       </div>
       <div id="output-device-hint" style="display:none; margin-top:.5rem; color:#bbb; font-size:.9rem;"></div>
+      <!-- Gapless playback (2026-07-11 supervisor plan U5; relocated out of
+           Settings 2026-10-05). Default OFF. It lives beside the device picker
+           because that is the decision it modifies, and because everything in
+           this section applies the moment it changes — which is what this
+           toggle now does, rather than waiting on Save Settings. -->
+      <div class="panel-row">
+        <label>Gapless playback:</label>
+        <div class="radio-group">
+          <label><input type="checkbox" id="gapless-enabled"> Chain tracks without a gap on outputs that support it</label>
+          <button type="button" class="info-i" title="Off by default. When on, the next track is prepared before the current one ends so supported outputs transition without silence. The output picker's via list shows each protocol's gapless capability.">&#9432;</button>
+        </div>
+      </div>
     </section>
 
     <!-- Optional integrations (server-fed multi-room backends — 2026-08-11 plan U9).
@@ -869,18 +950,11 @@
           <span class="field-note">(applies to Popular Random)</span>
         </div>
       </div>
-      <!-- Gapless playback + auto-resume window (2026-07-11 supervisor plan
-           U5). Toggle default OFF; resume window >= 1 minute (server rejects
-           0/negative), default 60. Both save via the batched Save Settings
-           POST. Minimal treatment — the deliberate visual pass is deferred to
-           a mockups round per the project standard. -->
-      <div class="panel-row">
-        <label>Gapless playback:</label>
-        <div class="radio-group">
-          <label><input type="checkbox" id="gapless-enabled"> Chain tracks without a gap on outputs that support it</label>
-          <button type="button" class="info-i" title="Off by default. When on, the next track is prepared before the current one ends so supported outputs transition without silence. The output picker's via list shows each protocol's gapless capability.">&#9432;</button>
-        </div>
-      </div>
+      <!-- Auto-resume window (2026-07-11 supervisor plan U5): minutes the
+           supervisor may still auto-resume after an output outage. Server
+           rejects 0/negative; default 60. Saves via the batched Save Settings
+           POST. (Gapless moved to the Output section 2026-10-05 — it applies
+           on change there, like everything else in that section.) -->
       <div class="panel-row">
         <label>Auto-resume window:</label>
         <div class="field-prose">
@@ -1144,7 +1218,20 @@
   </div>
 </main>
 
-<div class="toast" id="toast"></div>
+<!-- Save outcomes were silent to assistive tech: #toast carried no live
+     region, so "looked fine, wasn't saved" had a second form. -->
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<!-- Unsaved-changes bar (2026-10-05 save-model U3). Rendered only when the
+     count is above zero. It carries its own Save and Cancel: Cancel is the
+     affordance the explicit-Save model never had — without it the only way to
+     abandon a set of edits was to reload the page. Its Save drives the page's
+     own Save button rather than duplicating the collector. -->
+<div id="pending-bar" role="status" aria-live="polite">
+  <span class="pending-count" id="pending-count"></span>
+  <button class="btn btn-primary btn-sm" id="pending-save">Save</button>
+  <button class="btn btn-sm" id="pending-cancel">Cancel</button>
+</div>
 <div class="overflow-overlay" id="overflow-overlay"></div>
 <div class="overflow-menu" id="overflow-menu">
   <div id="queue-album-area"></div>
