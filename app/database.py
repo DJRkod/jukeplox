@@ -1680,11 +1680,39 @@ async def get_browse_albums_by_identity(
 async def set_browse_index(artists: list[dict], albums: list[dict]) -> None:
     """Atomically replace BOTH browse-index tables in one transaction
     (credit_cache replace pattern). INSERT OR IGNORE guards against a duplicate
-    compound id within a single crawl batch."""
+    compound id within a single crawl batch.
+
+    **Album track counts carry forward (#61).** The counts are DERIVED — Plex's
+    newer music agent omits leafCount, so they come from a whole-section track
+    crawl whose result lives only in the client's in-memory cache. A refresh
+    whose crawl failed therefore used to do more than fail to add counts: the
+    DELETE below wiped the previously-good ones, so a single timeout undid every
+    successful crawl and a container restart guaranteed a cold start. The system
+    could never accumulate a good state.
+
+    So an album arriving with no count inherits the count already stored for that
+    same album id. A freshly-derived count always wins, which is the re-point
+    path that keeps this from entrenching stale values (see
+    docs/solutions/architecture-patterns/durable-derived-mappings-must-self-correct.md
+    — reuse-only writes can only preserve old mistakes).
+
+    Carry-forward supplies a COLUMN VALUE for rows the new crawl already
+    returned. It never contributes a row, so an album a source no longer reports
+    disappears from browse regardless of any stored count.
+    """
     db = _conn()
     async with _write_tx_lock:
         await db.execute("BEGIN IMMEDIATE")
         try:
+            prior_counts: dict[str, int] = {}
+            if albums and any(a.get("track_count") is None for a in albums):
+                # Read inside the transaction, before the DELETE, so the
+                # guarantee is atomic with the replace rather than racing it.
+                async with db.execute(
+                    "SELECT album_id, track_count FROM browse_album_index"
+                    " WHERE track_count IS NOT NULL"
+                ) as cur:
+                    prior_counts = {r[0]: r[1] async for r in cur}
             await db.execute("DELETE FROM browse_artist_index")
             await db.execute("DELETE FROM browse_album_index")
             if artists:
@@ -1704,7 +1732,9 @@ async def set_browse_index(artists: list[dict], albums: list[dict]) -> None:
                     [
                         (a["album_id"], a["title"], a["title_base"], a["artist"],
                          a["artist_base_key"], a.get("year"), a.get("thumb"),
-                         a.get("subtype"), a.get("added_at"), a.get("track_count"),
+                         a.get("subtype"), a.get("added_at"),
+                         (a.get("track_count") if a.get("track_count") is not None
+                          else prior_counts.get(a["album_id"])),
                          a.get("server_name"), a.get("section_key"))
                         for a in albums
                     ],

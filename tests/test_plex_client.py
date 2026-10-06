@@ -492,6 +492,262 @@ async def test_get_album_track_counts_counts_tracks_by_parent(respx_mock):
     assert counts == {"10": 2, "20": 1}
 
 
+# ── paged whole-section track crawl (#61, plan U1) ────────────────────────────
+#
+# The crawl that derives album track counts timed out against a remote server on
+# EVERY browse-index refresh, leaving 4,385 albums with no count and duplicating
+# 21% of the album browse. It is now paged, and completeness is proven against
+# the container's totalSize rather than inferred from a short final page —
+# because Plex documents pagination as advisory.
+
+def _paged_section(tracks: list[dict], *, total: int | None = None,
+                   ignore_paging: bool = False, ignore_start: bool = False):
+    """respx side_effect emulating a Plex section listing.
+
+    ``X-Plex-Container-Size=0`` is answered as the totalSize probe. Otherwise a
+    slice is served, with two emulated misbehaviours Plex's advisory pagination
+    permits: ``ignore_paging`` returns the WHOLE listing for every request, and
+    ``ignore_start`` honours the size but always serves from offset 0 — the case
+    that silently doubles counts if the crawl accumulates per-album tallies.
+    """
+    import httpx
+    calls: list[dict] = []
+
+    def handler(request):
+        p = request.url.params
+        size = p.get("X-Plex-Container-Size")
+        start = int(p.get("X-Plex-Container-Start") or 0)
+        container: dict = {}
+        if total is not None:
+            container["totalSize"] = total
+        if size is not None and int(size) == 0:
+            calls.append({"probe": True})
+            return httpx.Response(200, json={"MediaContainer": container})
+        if size is None or ignore_paging:
+            calls.append({"start": None, "size": None, "served": len(tracks)})
+            return httpx.Response(
+                200, json={"MediaContainer": {**container, "Metadata": tracks}}
+            )
+        window = (tracks[0:int(size)] if ignore_start
+                  else tracks[start:start + int(size)])
+        calls.append({"start": start, "size": int(size), "served": len(window)})
+        return httpx.Response(200, json={"MediaContainer": {**container, "Metadata": window}})
+
+    handler.calls = calls
+    return handler
+
+
+def _tracks(spec: list[tuple[str, int]]) -> list[dict]:
+    """Build a track listing: ``[(album_rating_key, how_many), ...]``."""
+    out = []
+    n = 0
+    for parent, count in spec:
+        for _ in range(count):
+            n += 1
+            out.append({"ratingKey": str(1000 + n), "title": f"t{n}",
+                        "parentRatingKey": parent})
+    return out
+
+
+async def test_paged_crawl_matches_single_response_counts(respx_mock, monkeypatch):
+    """The whole point: paging changes how the listing is fetched, never what it
+    means. Same data, same counts."""
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 3)
+    tracks = _tracks([("10", 4), ("20", 3), ("30", 2)])
+    handler = _paged_section(tracks, total=len(tracks))
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(side_effect=handler)
+
+    counts = await make_client().get_album_track_counts("1")
+
+    assert counts == {"10": 4, "20": 3, "30": 2}
+    # probe + ceil(9/3) pages, and no extra empty page after the last full one
+    assert len([c for c in handler.calls if not c.get("probe")]) == 3
+
+
+async def test_album_straddling_a_page_boundary_is_summed(respx_mock, monkeypatch):
+    """Tracks for one album are NOT contiguous-safe across pages — the sum has to
+    span them, which is also why a partial crawl must never be used."""
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 2)
+    tracks = _tracks([("10", 5)])  # one album, spread over three pages
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(
+        side_effect=_paged_section(tracks, total=5))
+
+    assert await make_client().get_album_track_counts("1") == {"10": 5}
+
+
+async def test_section_smaller_than_one_page_needs_one_request(respx_mock, monkeypatch):
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 50)
+    tracks = _tracks([("10", 2)])
+    handler = _paged_section(tracks, total=2)
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(side_effect=handler)
+
+    assert await make_client().get_album_track_counts("1") == {"10": 2}
+    assert len([c for c in handler.calls if not c.get("probe")]) == 1
+
+
+async def test_exact_page_multiple_does_not_fetch_a_trailing_empty_page(
+        respx_mock, monkeypatch):
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 2)
+    tracks = _tracks([("10", 2), ("20", 2)])  # exactly 2 full pages
+    handler = _paged_section(tracks, total=4)
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(side_effect=handler)
+
+    assert await make_client().get_album_track_counts("1") == {"10": 2, "20": 2}
+    assert len([c for c in handler.calls if not c.get("probe")]) == 2
+
+
+async def test_server_returning_the_whole_listing_is_counted_once(
+        respx_mock, monkeypatch):
+    """Plex documents pagination as advisory. A server that ignores the headers
+    and returns everything is complete on the first response."""
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 2)
+    tracks = _tracks([("10", 4), ("20", 2)])
+    handler = _paged_section(tracks, total=6, ignore_paging=True)
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(side_effect=handler)
+
+    counts = await make_client().get_album_track_counts("1")
+
+    assert counts == {"10": 4, "20": 2}, "counts were accumulated across repeats"
+    assert len([c for c in handler.calls if not c.get("probe")]) == 1
+
+
+async def test_server_ignoring_start_cannot_inflate_the_crawl(respx_mock, monkeypatch):
+    """The real double-count hazard: a server that honours Size but always
+    serves from offset 0. Accumulating per-album tallies would count the first
+    window once per page and then declare the crawl complete — every album on
+    the source silently doubled. Keying by track id makes the repeat collapse,
+    so the crawl correctly reports that it could not cover the section.
+    """
+    from app.plex import client as pc
+    from app.plex.client import PlexCrawlIncomplete
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 2)
+    tracks = _tracks([("10", 3), ("20", 3)])
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(
+        side_effect=_paged_section(tracks, total=6, ignore_start=True))
+
+    with pytest.raises(PlexCrawlIncomplete):
+        await make_client().get_album_track_counts("1")
+
+
+async def test_duplicate_track_ids_across_pages_are_not_double_counted(
+        respx_mock, monkeypatch):
+    """Overlapping windows (a server that re-sends a boundary item) must not
+    inflate an album's length — the count is of distinct tracks."""
+    import httpx
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 3)
+    tracks = _tracks([("10", 4)])
+    pages = [tracks[0:3], tracks[2:4]]  # index 2 appears in both
+
+    def overlapping(request):
+        p = request.url.params
+        size = p.get("X-Plex-Container-Size")
+        if size is not None and int(size) == 0:
+            return httpx.Response(200, json={"MediaContainer": {"totalSize": 4}})
+        start = int(p.get("X-Plex-Container-Start") or 0)
+        window = pages[0] if start == 0 else pages[1]
+        return httpx.Response(
+            200, json={"MediaContainer": {"totalSize": 4, "Metadata": window}})
+
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(
+        side_effect=overlapping)
+
+    assert await make_client().get_album_track_counts("1") == {"10": 4}
+
+
+async def test_incomplete_crawl_raises_rather_than_returning_partial_counts(
+        respx_mock, monkeypatch):
+    """A short crawl yields plausible-looking UNDERCOUNTS, which split releases
+    exactly as a missing count does. Absent beats wrong."""
+    from app.plex import client as pc
+    from app.plex.client import PlexCrawlIncomplete
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 2)
+    tracks = _tracks([("10", 2)])  # server claims 10 tracks, serves 2
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(
+        side_effect=_paged_section(tracks, total=10))
+
+    with pytest.raises(PlexCrawlIncomplete):
+        await make_client().get_album_track_counts("1")
+
+
+async def test_a_failing_page_propagates_and_yields_no_counts(respx_mock, monkeypatch):
+    """Earlier pages must not survive a mid-crawl failure."""
+    import httpx
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 2)
+    tracks = _tracks([("10", 2), ("20", 2)])
+    inner = _paged_section(tracks, total=4)
+    state = {"pages": 0}
+
+    def flaky(request):
+        p = request.url.params
+        if p.get("X-Plex-Container-Size") not in (None, "0"):
+            state["pages"] += 1
+            if state["pages"] == 2:
+                raise httpx.ReadTimeout("boom")
+        return inner(request)
+
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(side_effect=flaky)
+    client = make_client()
+
+    with pytest.raises(httpx.ReadTimeout):
+        await client.get_album_track_counts("1")
+    assert client._cached("albumleaves:1") is None, "partial counts were cached"
+
+
+async def test_zero_total_size_returns_empty_without_fetching_pages(
+        respx_mock, monkeypatch):
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 2)
+    handler = _paged_section([], total=0)
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(side_effect=handler)
+
+    assert await make_client().get_album_track_counts("1") == {}
+    assert [c for c in handler.calls if not c.get("probe")] == []
+
+
+async def test_server_reporting_no_total_size_is_not_paged(respx_mock, monkeypatch):
+    """Without a totalSize we cannot prove completeness, so we do not guess a
+    page count — guessing is how you silently truncate a library."""
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 2)
+    tracks = _tracks([("10", 5)])
+    handler = _paged_section(tracks, total=None)
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(side_effect=handler)
+
+    assert await make_client().get_album_track_counts("1") == {"10": 5}
+    served = [c for c in handler.calls if not c.get("probe")]
+    assert len(served) == 1 and served[0]["size"] is None
+
+
+async def test_pages_are_fetched_sequentially(respx_mock, monkeypatch):
+    """Paging must not raise concurrent load on a source — the existing
+    per-server semaphore governs sockets, not this loop."""
+    import asyncio
+    import httpx
+    from app.plex import client as pc
+    monkeypatch.setattr(pc, "_TRACK_CRAWL_PAGE_SIZE", 2)
+    tracks = _tracks([("10", 6)])
+    inner = _paged_section(tracks, total=6)
+    peak = {"now": 0, "max": 0}
+
+    async def slow(request):
+        peak["now"] += 1
+        peak["max"] = max(peak["max"], peak["now"])
+        await asyncio.sleep(0.01)
+        peak["now"] -= 1
+        return inner(request)
+
+    respx_mock.get("http://plex.local:32400/library/sections/1/all").mock(side_effect=slow)
+    assert await make_client().get_album_track_counts("1") == {"10": 6}
+    assert peak["max"] == 1, f"pages overlapped (peak {peak['max']})"
+
+
 async def test_get_albums_for_artist_returns_all_release_types(respx_mock):
     """section-all with parentRatingKey returns all release types; client-side filter applied."""
     import httpx

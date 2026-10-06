@@ -1168,6 +1168,104 @@ def test_group_albums_same_title_single_and_album_unknown_count_not_folded(mock_
     assert len(ioh) == 2  # the folded album row + the single's own row
 
 
+# ── unknown track counts fold against their identity (#61) ───────────────────
+
+def test_group_albums_unknown_count_folds_into_the_lone_known_sibling(mock_deps):
+    """AE1: the reported bug. One server supplies a count, the other supplies
+    none, so the two copies never shared a bucket and the album rendered twice.
+    They now fold, and the row reports the known length."""
+    rows = [_album_idx_row("A:10", "Kid A", "Radiohead",
+                           server="ServerA", track_count=11),
+            _album_idx_row("B:10", "Kid A", "Radiohead",
+                           server="ServerB", track_count=None)]
+    with patch("app.database.get_browse_albums", AsyncMock(return_value=rows)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums")
+    kid = [d for d in resp.json() if d["title"] == "Kid A"]
+    assert len(kid) == 1
+    assert kid[0]["track_count"] == 11
+    assert {s["server_name"] for s in kid[0]["sources"]} == {"ServerA", "ServerB"}
+
+
+def test_group_albums_unknown_count_does_not_guess_between_editions(mock_deps):
+    """AE2: several known counts compete, so nothing folds. Guessing would hide
+    a release the user owns — the Peter Gabriel self-titled case."""
+    rows = [_album_idx_row("A:8", "Peter Gabriel", "Peter Gabriel",
+                           server="ServerA", track_count=8),
+            _album_idx_row("A:10", "Peter Gabriel", "Peter Gabriel",
+                           server="ServerA", track_count=10),
+            _album_idx_row("B:x", "Peter Gabriel", "Peter Gabriel",
+                           server="ServerB", track_count=None)]
+    with patch("app.database.get_browse_albums", AsyncMock(return_value=rows)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums")
+    pg = [d for d in resp.json() if d["title"] == "Peter Gabriel"]
+    assert len(pg) == 3
+    assert {d["track_count"] for d in pg} == {8, 10, None}
+
+
+def test_group_albums_unknown_count_folds_only_within_a_subtype(mock_deps):
+    """AE3: a Single with no count must not adopt the Album's length and vanish
+    into it — the regression the subtype gate was added for (#16)."""
+    rows = [_album_idx_row("A:album", "Idea of Happiness", "Van She",
+                           server="ServerA", subtype="album", track_count=12),
+            _album_idx_row("B:single", "Idea of Happiness", "Van She",
+                           server="ServerB", subtype="single", track_count=None)]
+    with patch("app.database.get_browse_albums", AsyncMock(return_value=rows)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums")
+    ioh = [d for d in resp.json() if d["title"] == "Idea of Happiness"]
+    assert len(ioh) == 2
+    ids = {s["album_id"] for d in ioh for s in d["sources"]}
+    assert "B:single" in ids, "the single was folded into the album and lost"
+
+
+def test_group_albums_same_source_copies_survive_the_fold(mock_deps):
+    """AE5: one source holding a counted and an uncounted copy still yields two
+    rows — the same-source rule is untouched by resolution."""
+    rows = [_album_idx_row("A:1", "Loveless", "My Bloody Valentine",
+                           server="ServerA", track_count=11),
+            _album_idx_row("A:2", "Loveless", "My Bloody Valentine",
+                           server="ServerA", track_count=None)]
+    with patch("app.database.get_browse_albums", AsyncMock(return_value=rows)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums")
+    lv = [d for d in resp.json() if d["title"] == "Loveless"]
+    assert len(lv) == 2
+
+
+def test_group_albums_two_known_counts_still_stay_apart(mock_deps):
+    """AE6: the conservative case is unchanged — two different known counts
+    remain the strongest evidence of two different releases."""
+    rows = [_album_idx_row("A:US", "Further Down the Spiral", "Nine Inch Nails",
+                           server="ServerA", track_count=13),
+            _album_idx_row("B:JP", "Further Down the Spiral", "Nine Inch Nails",
+                           server="ServerB", track_count=15)]
+    with patch("app.database.get_browse_albums", AsyncMock(return_value=rows)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums")
+    fds = [d for d in resp.json() if d["title"] == "Further Down the Spiral"]
+    assert {d["track_count"] for d in fds} == {13, 15}
+
+
+def test_group_albums_all_unknown_still_folds_as_before(mock_deps):
+    """AE6: two copies both without counts folded before and must still fold."""
+    rows = [_album_idx_row("A:10", "Kid A", "Radiohead",
+                           server="ServerA", track_count=None),
+            _album_idx_row("B:10", "Kid A", "Radiohead",
+                           server="ServerB", track_count=None)]
+    with patch("app.database.get_browse_albums", AsyncMock(return_value=rows)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums")
+    assert len([d for d in resp.json() if d["title"] == "Kid A"]) == 1
+
+
 # ── U5: per-release track resolution (index path) ────────────────────────────
 
 def _idx_arow(aid, server="ServerA", count=11, **kw):
@@ -1176,6 +1274,112 @@ def _idx_arow(aid, server="ServerA", count=11, **kw):
             "year": 1991, "thumb": None, "subtype": None, "added_at": None,
             "track_count": count, "server_name": server,
             "section_key": kw.get("section_key", server + ":1")}
+
+
+def test_resolve_tracks_unknown_count_copy_is_reachable_after_folding(mock_deps):
+    """AE4 (#61): the row the user tapped folded two copies on an inferred count.
+    Drilling in must return BOTH copies' tracks — otherwise the browse row lists
+    a source whose tracks the drill-in silently drops."""
+    _, plex = mock_deps
+    arow = _idx_arow("A:1", server="ServerA", count=11)
+    other = _idx_arow("B:1", server="ServerB", count=None)
+
+    async def fake_get_tracks(section_key, album_id=None, **kw):
+        return [_t(f"{album_id}:t1", f"{album_id} Track 1", server_name="S")]
+    plex.get_tracks.side_effect = fake_get_tracks
+
+    with patch("app.database.get_browse_album_by_id", AsyncMock(return_value=arow)), \
+         patch("app.database.get_browse_albums_by_identity",
+               AsyncMock(return_value=[arow, other])):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums/A:1/tracks")
+    assert {t["track_id"] for t in resp.json()} == {"A:1:t1", "B:1:t1"}
+
+
+def test_resolve_tracks_from_the_unknown_side_also_folds(mock_deps):
+    """The clicked copy is the one with no count. It used to fold nothing at all
+    ('own tracks only'); now it resolves to the single known count on offer."""
+    _, plex = mock_deps
+    clicked = _idx_arow("B:1", server="ServerB", count=None)
+    other = _idx_arow("A:1", server="ServerA", count=11)
+
+    async def fake_get_tracks(section_key, album_id=None, **kw):
+        return [_t(f"{album_id}:t1", f"{album_id} Track 1", server_name="S")]
+    plex.get_tracks.side_effect = fake_get_tracks
+
+    with patch("app.database.get_browse_album_by_id", AsyncMock(return_value=clicked)), \
+         patch("app.database.get_browse_albums_by_identity",
+               AsyncMock(return_value=[clicked, other])):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums/B:1/tracks")
+    assert {t["track_id"] for t in resp.json()} == {"A:1:t1", "B:1:t1"}
+
+
+def test_resolve_tracks_ambiguous_identity_does_not_fold(mock_deps):
+    """AE4/R2: competing known counts mean nothing resolves, so an unknown-count
+    copy still stands alone — resolution narrows matches, it never relaxes the
+    ambiguity guard."""
+    _, plex = mock_deps
+    clicked = _idx_arow("B:1", server="ServerB", count=None)
+    copies = [clicked,
+              _idx_arow("A:1", server="ServerA", count=8),
+              _idx_arow("A:2", server="ServerA", count=10)]
+
+    async def fake_get_tracks(section_key, album_id=None, **kw):
+        return [_t(f"{album_id}:t1", f"{album_id} Track 1", server_name="S")]
+    plex.get_tracks.side_effect = fake_get_tracks
+
+    with patch("app.database.get_browse_album_by_id", AsyncMock(return_value=clicked)), \
+         patch("app.database.get_browse_albums_by_identity",
+               AsyncMock(return_value=copies)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums/B:1/tracks")
+    assert [t["track_id"] for t in resp.json()] == ["B:1:t1"]
+
+
+def test_resolve_tracks_resolution_does_not_union_same_server_siblings(mock_deps):
+    """AE5/R6: an unknown-count copy must not fold into a counted copy on its
+    OWN source — that union is the tripling bug."""
+    _, plex = mock_deps
+    arow = _idx_arow("A:1", server="ServerA", count=11)
+    sibling = _idx_arow("A:2", server="ServerA", count=None)
+
+    async def fake_get_tracks(section_key, album_id=None, **kw):
+        return [_t(f"{album_id}:t1", f"{album_id} Track 1", server_name="ServerA")]
+    plex.get_tracks.side_effect = fake_get_tracks
+
+    with patch("app.database.get_browse_album_by_id", AsyncMock(return_value=arow)), \
+         patch("app.database.get_browse_albums_by_identity",
+               AsyncMock(return_value=[arow, sibling])):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums/A:1/tracks")
+    assert [t["track_id"] for t in resp.json()] == ["A:1:t1"]
+
+
+def test_resolve_tracks_still_skips_a_server_with_two_matching_copies(mock_deps):
+    """R6: two copies on the other server both resolve to the clicked count, so
+    that server stays ambiguous and is skipped."""
+    _, plex = mock_deps
+    arow = _idx_arow("A:1", server="ServerA", count=11)
+    copies = [arow,
+              _idx_arow("B:1", server="ServerB", count=None),
+              _idx_arow("B:2", server="ServerB", count=None)]
+
+    async def fake_get_tracks(section_key, album_id=None, **kw):
+        return [_t(f"{album_id}:t1", f"{album_id} Track 1", server_name="S")]
+    plex.get_tracks.side_effect = fake_get_tracks
+
+    with patch("app.database.get_browse_album_by_id", AsyncMock(return_value=arow)), \
+         patch("app.database.get_browse_albums_by_identity",
+               AsyncMock(return_value=copies)):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums/A:1/tracks")
+    assert [t["track_id"] for t in resp.json()] == ["A:1:t1"]
 
 
 def test_resolve_tracks_same_server_siblings_not_unioned(mock_deps):

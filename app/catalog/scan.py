@@ -100,7 +100,10 @@ def cluster_sources(sources: list[dict]) -> dict:
     artist_items, album_items, track_items = _shape_items(sources)
     return {
         "artists": merge.group(artist_items, merge.artist_coarse, lambda a, b: True),
-        "albums": merge.group(album_items, merge.album_coarse, merge.album_same),
+        # Resolves unknown counts against their identity before clustering (#61),
+        # matching the native browse fold. Goes through merge.group_albums so
+        # the parity guard exercises the same composition production does.
+        "albums": merge.group_albums(album_items),
         "tracks": merge.group(track_items, merge.track_coarse, merge.track_same),
     }
 
@@ -126,7 +129,16 @@ def _rows(clustered: dict, artist_idents: list[str], album_idents: list[str],
             "identity": ident, "title": rep["title"], "title_base": rep["title_base"],
             "artist": rep["artist"], "artist_base_key": rep["artist_base_key"],
             "year": rep["year"], "thumb": rep["thumb"], "subtype": rep["subtype"],
-            "added_at": rep["added_at"], "track_count": rep["track_count"],
+            "added_at": rep["added_at"],
+            # Any member's REPORTED count, not just the representative's. A
+            # cluster can now hold a counted copy alongside an uncounted one
+            # (#61), and the representative is chosen by source priority, so it
+            # may be the uncounted side. Members never disagree — grouping
+            # requires equal known counts — so the first real count is the
+            # cluster's. Still a reported count, never a resolved one.
+            "track_count": next(
+                (it["track_count"] for it in cluster
+                 if it.get("track_count") is not None), rep["track_count"]),
         })
         holds += _holds(cluster, "album", ident, "local_key")
         for it in cluster:

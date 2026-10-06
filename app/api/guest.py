@@ -41,6 +41,7 @@ def validate_plex_id(value: str | None) -> None:
 
 _templates = Jinja2Templates(directory="app/templates")
 from app import assets as _assets
+from app.album_fold import resolved_track_counts
 _assets.register(_templates)  # `asset_v` global → build-derived cache-buster
 
 from app import state
@@ -570,15 +571,30 @@ def _group_albums(tagged: list, compiled=(), order: dict | None = None) -> list:
     sources=[{server_name, album_id}] (one matching copy per server in THIS
     release, priority-ordered) for Play From Source… / Queue Release routing.
 
-    A track_count of None (count unknown — stale index, or a surface like search
-    that doesn't carry it) buckets together per identity, reproducing the prior
-    title-only grouping for those copies. dataclasses.replace keeps client-cache
-    objects unmutated."""
+    A track_count of None (count unknown) buckets together per identity,
+    reproducing the prior title-only grouping for those copies. dataclasses.replace
+    keeps client-cache objects unmutated.
+
+    An unknown count first RESOLVES against its identity (#61): where exactly one
+    known count is on offer for the same identity and subtype, the unknown copies
+    adopt it and fold. The old premise — that an unknown count is rare and
+    incidental — failed on a real library where one source reported no count for
+    any of its 4,385 albums, splitting 2,541 identities and duplicating a fifth
+    of the browse. Where several known counts compete the copies stay separate,
+    exactly as before: no rule can pair four same-titled releases against four
+    unknown copies, and guessing would hide one the user owns.
+    See app/album_fold.py."""
     order = order or {}
+    effective = resolved_track_counts(
+        [album for album, _ in tagged],
+        identity=lambda a: (_norm(a.title, compiled), _norm(a.artist, compiled)),
+        subtype=lambda a: a.subtype,
+        count=lambda a: a.track_count,
+    )
     # identity (title|artist) → release bucket (track_count) → {server: [albums]},
     # all insertion-ordered so render order is preserved.
     groups: dict[str, dict] = {}
-    for album, srv in tagged:
+    for idx, (album, srv) in enumerate(tagged):
         key = _norm(album.title, compiled) + '|' + _norm(album.artist, compiled)
         releases = groups.setdefault(key, {})
         # Bucket by (track_count, subtype): track_count alone can't separate a
@@ -589,16 +605,20 @@ def _group_albums(tagged: list, compiled=(), order: dict | None = None) -> list:
         # Van She "Idea of Happiness"). subtype is the content signal that keeps
         # them apart; None normalizes to 'album' (matching the frontend's
         # `a.subtype || 'album'`) so an inconsistent tag never splits one release.
-        bucket = (album.track_count, (album.subtype or 'album').lower())
+        bucket = (effective[idx], (album.subtype or 'album').lower())
         servers = releases.setdefault(bucket, {})
         servers.setdefault(srv or "", []).append(album)
     out = []
     for releases in groups.values():
-        for servers in releases.values():
+        for bucket, servers in releases.items():
             names = sorted(servers.keys(), key=lambda n: _srv_rank(order, n))
             sources = [{"server_name": n, "album_id": servers[n][0].id} for n in names]
             for copy in servers[names[0]]:
-                out.append(dataclasses.replace(copy, sources=sources))
+                # The emitted row reports the bucket's effective count, so a row
+                # folded out of an unknown-count copy states the release length
+                # rather than None (R4). replace() keeps the cached Album intact.
+                out.append(dataclasses.replace(
+                    copy, sources=sources, track_count=bucket[0]))
     return out
 
 
@@ -1226,9 +1246,31 @@ def _select_release_copies(arow: dict, copies: list, clicked_id: str) -> list:
     matches the clicked release. Zero or multiple matches on a server is
     ambiguous (e.g. identical masters), so that server is skipped and the clicked
     copy's own tracks stand alone (R6). A clicked release with unknown count
-    (stale index) folds nothing — own tracks only."""
+    that cannot be resolved folds nothing — own tracks only.
+
+    Counts are resolved first (#61): a clicked copy whose own count is unknown
+    now folds when its identity offers exactly one known count, matching what
+    the browse row showed. Copies are still matched by count, so the ambiguity
+    guard is unchanged — resolution narrows which copies match, it never relaxes
+    the "zero or multiple matches means skip that server" rule."""
     own_server = (arow.get("server_name") or "").lower().strip()
-    own_count = arow.get("track_count")
+    # Unknown counts resolve exactly as they do in the browse fold (#61), so a
+    # row the user sees as ONE album resolves to one album. Without this, a copy
+    # folded into the row on an inferred count could never be matched here — the
+    # browse row would list a source whose tracks the drill-in silently dropped.
+    # Same partition as _group_albums (identity + subtype) over this identity's
+    # copies, so the two cannot disagree about what folded.
+    pool = list(copies)
+    if not any(c.get("album_id") == clicked_id for c in pool):
+        pool.append(arow)
+    effective = resolved_track_counts(
+        pool,
+        identity=lambda c: (c.get("title_base"), c.get("artist_base_key")),
+        subtype=lambda c: c.get("subtype"),
+        count=lambda c: c.get("track_count"),
+    )
+    eff = {c.get("album_id"): e for c, e in zip(pool, effective)}
+    own_count = eff.get(clicked_id, arow.get("track_count"))
     selected = [arow]
     by_server: dict[str, list] = {}
     for c in copies:
@@ -1239,7 +1281,7 @@ def _select_release_copies(arow: dict, copies: list, clicked_id: str) -> list:
         by_server.setdefault((c.get("server_name") or "").lower().strip(), []).append(c)
     if own_count is not None:
         for group in by_server.values():
-            matches = [c for c in group if c.get("track_count") == own_count]
+            matches = [c for c in group if eff.get(c["album_id"]) == own_count]
             if len(matches) == 1:
                 selected.append(matches[0])
     return selected

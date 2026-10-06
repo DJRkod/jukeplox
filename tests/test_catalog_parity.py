@@ -41,17 +41,30 @@ def _catalog_group_count(rows) -> int:
     items = [{"match_ids": {}, "source_id": srv, "local_key": f"{srv}:{i}",
               "title_base": "rec", "artist_base_key": "act", "track_count": tc}
              for i, (tc, srv) in enumerate(rows)]
-    return len(merge.group(items, merge.album_coarse, merge.album_same))
+    # Through merge.group_albums, the same entry point cluster_sources uses.
+    # Calling merge.group(..., album_same) directly here would exercise a
+    # composition production does not use, and would report parity while the
+    # two pipelines diverged (#61).
+    return len(merge.group_albums(items))
 
 
 # (rows, expected folded-group count) — the oracle pins the expected value too,
 # so an identical regression in BOTH pipelines can't slip through count-equality.
 _FOLD_CASES = {
     "both_unknown":      ([(None, "Plex"), (None, "Jelly")], 1),   # AE3: folds
-    "known_and_unknown": ([(10, "Plex"), (None, "Jelly")], 2),     # AE7: splits
+    # #61: an unknown count now adopts the ONE known count on offer and folds.
+    # Previously 2 — the deliberate conservative split that, on a source
+    # reporting no counts at all, duplicated a fifth of the album browse.
+    "known_and_unknown": ([(10, "Plex"), (None, "Jelly")], 1),
     "equal_known":       ([(10, "Plex"), (10, "Jelly")], 1),       # folds
     "different_known":   ([(10, "Plex"), (12, "Jelly")], 2),       # AE4: distinct
-    "three_way_mixed":   ([(10, "Plex"), (10, "Jelly"), (None, "Local")], 2),
+    "three_way_mixed":   ([(10, "Plex"), (10, "Jelly"), (None, "Local")], 1),
+    # Several known counts compete, so nothing resolves and the unknown copy
+    # stands alone — no rule can pair it, and guessing would hide a release.
+    "ambiguous_editions": ([(10, "Plex"), (12, "Jelly"), (None, "Local")], 3),
+    # The unknown copy is on the SAME source as the counted one: distinct
+    # entities the source itself separates, so they must never merge.
+    "same_source_unknown": ([(10, "Plex"), (None, "Plex")], 2),
 }
 
 
