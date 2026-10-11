@@ -312,23 +312,45 @@
     return _normalizeName(s || (name || ''));
   }
 
+  // Key ONCE per item, then sort the keys — decorate-sort-undecorate.
+  // sortKey() is not cheap (it walks every compiled pattern rule) and a
+  // comparator runs ~n log n times, so keying inside the comparator
+  // normalized every name ~2 log n times over: 11,451 albums against 16
+  // pattern rules cost 2,957 ms of UNINTERRUPTIBLE main thread per sort on
+  // phone-class CPU, which is long enough that a tap on the sort control
+  // can't be serviced until it finishes — the symptom was "the sort menu
+  // takes seconds to open". Keyed per item it is 203 ms, byte-identical
+  // ordering (2026-10-11 debug).
+  //
+  // Array.prototype.sort is stable, so equal-key items keep arrival order
+  // exactly as the comparator form did. That is why alpha_desc inverts the
+  // COMPARISON instead of reversing the ascending result — reversing would
+  // flip equal-key runs. Both properties are guarded in
+  // tests/test_frontend_regressions.py (orderings + per-item key count).
   function applySort(items, sort, nameField) {
-    const a = [...items];
-    if (sort === 'alpha_asc') a.sort((x, y) => sortKey(x[nameField]).localeCompare(sortKey(y[nameField])));
-    else if (sort === 'alpha_desc') a.sort((x, y) => sortKey(y[nameField]).localeCompare(sortKey(x[nameField])));
-    else if (sort === 'year_desc') a.sort((x, y) => (y.year || 0) - (x.year || 0));
-    else if (sort === 'year_asc') a.sort((x, y) => (x.year || 0) - (y.year || 0));
+    if (sort === 'alpha_asc' || sort === 'alpha_desc') {
+      const keyed = items.map(it => [sortKey(it[nameField]), it]);
+      keyed.sort(sort === 'alpha_asc'
+        ? (p, q) => p[0].localeCompare(q[0])
+        : (p, q) => q[0].localeCompare(p[0]));
+      return keyed.map(p => p[1]);
+    }
     // Artist sorts (plan 005): order by the artist field with album title as the
     // ascending tiebreak (both directions) so an artist's albums always read A→Z
     // by title. The title tiebreak never affects rail monotonicity — same-artist
     // items share a bucket. Uses sortKey so artist sorting agrees with the
     // artist-keyed rail (same normalization).
-    else if (sort === 'artist_asc') a.sort((x, y) =>
-      sortKey(x.artist).localeCompare(sortKey(y.artist)) ||
-      sortKey(x.title).localeCompare(sortKey(y.title)));
-    else if (sort === 'artist_desc') a.sort((x, y) =>
-      sortKey(y.artist).localeCompare(sortKey(x.artist)) ||
-      sortKey(x.title).localeCompare(sortKey(y.title)));
+    if (sort === 'artist_asc' || sort === 'artist_desc') {
+      const keyed = items.map(it => [sortKey(it.artist), sortKey(it.title), it]);
+      keyed.sort(sort === 'artist_asc'
+        ? (p, q) => p[0].localeCompare(q[0]) || p[1].localeCompare(q[1])
+        : (p, q) => q[0].localeCompare(p[0]) || p[1].localeCompare(q[1]));
+      return keyed.map(p => p[2]);
+    }
+    // Year sorts compare a number — no normalization, nothing to hoist.
+    const a = [...items];
+    if (sort === 'year_desc') a.sort((x, y) => (y.year || 0) - (x.year || 0));
+    else if (sort === 'year_asc') a.sort((x, y) => (x.year || 0) - (y.year || 0));
     return a;
   }
 
@@ -2640,26 +2662,57 @@
   function _renderCellsChunked(column, count, buildCell, isStale, onComplete) {
     return new Promise((resolve) => {
       let i = 0;
-      const pump = () => {
+      // Build a time-budgeted slice into `sink` — always an off-DOM fragment,
+      // never the live column (see the batching note below).
+      const slice = (sink) => {
         const start = _nowMs();
-        const frag = document.createDocumentFragment();
         while (i < count) {
-          frag.appendChild(buildCell(i));
+          sink.appendChild(buildCell(i));
           i++;
           // One cell is always built before the clock is read, so a slow single
           // build can never stall progress (and the loop can't spin doing zero).
           if (_nowMs() - start >= _RENDER_FRAME_BUDGET_MS) break;
         }
-        column.appendChild(frag);
       };
       const finish = () => { if (!isStale()) onComplete(); resolve(); };
-      pump();                              // first slice synchronous → instant paint
+
+      const first = document.createDocumentFragment();
+      slice(first);
+      column.appendChild(first);           // first slice synchronous → instant paint
       if (i >= count) { finish(); return; }
+
+      // The remaining cells accumulate OFF-DOM and land in geometrically
+      // growing batches, because the budget above bounds only the JS build —
+      // not the layout each append provokes. Appending to the LIVE column
+      // every frame makes the browser re-lay-out the whole column once per
+      // frame: O(rows so far) per frame, O(n²) overall. Measured on 11,451
+      // rows at phone-class CPU (2026-10-11 debug):
+      //
+      //   appending every frame   80,193 ms, frames growing 45 ms → 256 ms
+      //   building off-DOM         8,845 ms, frames flat at 18 ms
+      //
+      // while cells-per-frame and JS-per-frame stayed flat in both — i.e. 93%
+      // of the old cost was browser layout, not cell building. Doubling the
+      // batch keeps the live appends to O(log n) (~12 for 11,451 rows instead
+      // of ~535) so total layout is O(n), while the list still grows
+      // progressively rather than appearing in one jump at the end.
+      let holder = document.createDocumentFragment();
+      let pending = 0;
+      let batch = Math.max(1, i);          // first batch matches the first slice
+      const flush = () => {
+        if (!pending) return;
+        column.appendChild(holder);
+        holder = document.createDocumentFragment();
+        pending = 0;
+      };
       const step = () => {
         if (isStale()) { resolve(); return; }   // a newer render claimed the pane
-        pump();
+        const before = i;
+        slice(holder);
+        pending += i - before;
+        if (pending >= batch) { flush(); batch *= 2; }
         if (i < count) requestAnimationFrame(step);
-        else finish();
+        else { flush(); finish(); }        // tail batch lands before onComplete
       };
       requestAnimationFrame(step);
     });
@@ -4965,6 +5018,13 @@
     const sorted = applySort(items, sort, nameField);
     const r = computeBuckets(sorted, dim, nameField, alpha);
     return { buckets: r.buckets, keyForItem: r.keyForItem, sorted: sorted.map(i => i[nameField]), items: sorted };
+  };
+  // Test-only hook (no runtime caller): exposes applySort so
+  // tests/test_frontend_regressions.py can verify in a real JS engine both
+  // that the orderings are unchanged AND that each name is normalized ONCE
+  // per item rather than once per comparison (2026-10-11 debug).
+  window.__jpApplySort = function (items, sort, nameField) {
+    return applySort(items, sort, nameField);
   };
   window.__jpAddedAgo = _addedAgo;
 })();

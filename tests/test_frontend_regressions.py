@@ -3653,3 +3653,272 @@ def test_save_collector_unguarded_reads_are_enumerated():
     assert len(found) == 6, (
         "expected exactly 6 unguarded reads, found %d: %s" % (len(found), found)
     )
+# -- The chunked render must not append to the LIVE column every frame --------
+# _RENDER_FRAME_BUDGET_MS bounds only the JS spent building cells. It does not
+# bound the layout each append provokes, and appending to an attached container
+# makes the browser re-lay-out everything already in it -- O(rows so far) per
+# frame, O(n^2) overall. Measured on 11,451 rows at phone-class CPU
+# (2026-10-11 debug): appending every frame took 80,193 ms with per-frame cost
+# growing 45 ms -> 256 ms, while building off-DOM took 8,845 ms with frames flat
+# at 18 ms. Cells-per-frame and JS-per-frame were flat in both arms, so 93% of
+# the old cost was browser layout rather than cell building.
+#
+# The invariant is therefore about HOW OFTEN the live column is appended to,
+# which is observable without a real browser: under the harness clock below one
+# cell is built per slice, so a per-frame append would be one append per cell.
+
+_CHUNK_APPEND_HARNESS = (
+    "const fs=require('fs'),vm=require('vm');"
+    f"const src=fs.readFileSync({json.dumps(str(ROOT / 'static/browse/index.js'))},'utf8');"
+    # Advancing the clock 100ms per reading (> the 10ms budget) means exactly
+    # one cell per slice, so frames == cells and the append count is the only
+    # free variable.
+    "let clock=0;const rafQ=[];"
+    "const mkFrag=()=>({items:[],appendChild(x){this.items.push(x);}});"
+    "const ctx={window:{},performance:{now:()=>{clock+=100;return clock;}},"
+    "requestAnimationFrame:(cb)=>{rafQ.push(cb);},"
+    "document:{createDocumentFragment:mkFrag}};"
+    "vm.createContext(ctx);vm.runInContext(src,ctx);"
+    "const f=ctx.window.__jpRenderCellsChunked;"
+    "if(typeof f!=='function'){console.error('no __jpRenderCellsChunked hook');process.exit(2);}"
+    "const N=JSON.parse(process.argv[1]);"
+    # The live column counts how many times it is appended to, and how many
+    # cells arrived in total (completeness must survive the batching).
+    "const col={appends:0,cells:0,appendChild(fr){this.appends++;this.cells+=fr.items.length;}};"
+    "const built=[];let done=0;"
+    "f(col,N,(i)=>{built.push(i);return{i};},()=>false,()=>{done++;});"
+    "let frames=0;while(rafQ.length){rafQ.shift()();if(++frames>1000000)break;}"
+    "console.log(JSON.stringify({appends:col.appends,cells:col.cells,"
+    "built:built.length,ordered:built.every((v,k)=>v===k),done:done,frames:frames}));"
+    "process.exit(0);"
+)
+
+
+def test_browse_chunked_render_appends_to_live_column_logarithmically():
+    """One append per frame is what made big lists quadratic. Batching must keep
+    the live-column appends to O(log n) while still delivering every cell, in
+    order, exactly once, with onComplete fired once.
+
+    At n=1000 with one cell per slice, a per-frame append is 1000 appends; the
+    doubling schedule is ~12. The bound below is deliberately generous about the
+    exact schedule and still an order of magnitude under the per-frame count, so
+    it fails loudly on a regression without pinning the batch sizes."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not on PATH; chunk batching covered only structurally")
+    n = 1000
+    result = subprocess.run(
+        [node, "-e", _CHUNK_APPEND_HARNESS, json.dumps(n)],
+        capture_output=True, encoding="utf-8", errors="replace", timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"chunk-append harness failed (rc={result.returncode}):\n"
+        f"STDOUT:{result.stdout}\nSTDERR:{result.stderr}"
+    )
+    data = json.loads(result.stdout)
+
+    # Completeness first: batching must not lose or duplicate a cell, and the
+    # rail's per-cell anchors depend on every cell reaching the column before
+    # onComplete runs.
+    assert data["built"] == n, data
+    assert data["ordered"] is True, "cells must be built in index order"
+    assert data["cells"] == n, (
+        f"only {data['cells']} of {n} cells reached the live column; the tail "
+        f"batch must be flushed before onComplete")
+    assert data["done"] == 1, data
+
+    # The invariant. 2*log2(1000) + 6 == 26; a per-frame append is 1000.
+    # n-1, not n: the first slice runs synchronously rather than in a frame.
+    assert data["frames"] >= n - 1, (
+        "harness clock should force one cell per slice; frames "
+        f"({data['frames']}) < cells-1 ({n - 1}) means the budget assumption broke")
+    assert data["appends"] <= 26, (
+        f"appended to the live column {data['appends']} times for {n} cells. "
+        f"Each append re-lays-out everything already in the column, so a "
+        f"per-frame append is O(n^2) overall (2026-10-11 debug: 80,193 ms vs "
+        f"8,845 ms on 11,451 rows). Batch the appends.")
+
+
+# -- applySort normalizes once per item, not once per comparison (2026-10-11) --
+# sortKey() walks every compiled pattern rule, and a comparator runs ~n log n
+# times, so calling sortKey INSIDE the comparator normalized each name ~2 log n
+# times over. On the live deployment (11,451 albums, 16 pattern rules) that was
+# 2,957 ms of frozen main thread on phone-class CPU per sort -- long enough that
+# a tap on the Sort control could not be serviced until it finished, which is
+# how it got reported ("the menu takes forever to appear"). Keying once per item
+# measured 203 ms with byte-identical ordering.
+#
+# Two guards, because either alone would miss the defect:
+#   - the orderings, so a faster sort that reorders the library fails;
+#   - the number of sortKey CALLS, so a correct-but-quadratic implementation
+#     fails too.
+#
+# The call count is taken by injecting a counter into sortKey in the harness's
+# copy of the source, not by instrumenting the shipped file. An earlier version
+# of this guard counted property READS off accessor fixtures instead, and a
+# mutant that hoisted the read out of the comparator but kept normalizing
+# inside it passed -- reads stayed at n while the work stayed at n log n. The
+# invariant is about normalization, so count normalization.
+
+_SORT_KEY_NEEDLE = "function sortKey(name) {"
+
+_SORT_NODE_HARNESS = (
+    "const fs=require('fs'),vm=require('vm');"
+    f"let src=fs.readFileSync({json.dumps(str(ROOT / 'static/browse/index.js'))},'utf8');"
+    f"const needle={json.dumps(_SORT_KEY_NEEDLE)};"
+    "const hits=src.split(needle).length-1;"
+    "if(hits!==1){console.error('sortKey signature found '+hits+' times; the "
+    "call-count injection below needs updating');process.exit(3);}"
+    "src=src.replace(needle,needle+'__skCalls++;');"
+    "const ctx={window:{},__skCalls:0};vm.createContext(ctx);vm.runInContext(src,ctx);"
+    "const f=ctx.window.__jpApplySort;"
+    "if(typeof f!=='function'){console.error('no __jpApplySort hook');process.exit(2);}"
+    "const spec=JSON.parse(process.argv[1]);"
+    "const out={};"
+    "for(const sort of spec.sorts){"
+    "  const reads={title:0,artist:0};"
+    "  const items=spec.rows.map(function(row){"
+    "    const o={};"
+    "    Object.defineProperty(o,'title',{enumerable:true,get:function(){reads.title++;return row[0];}});"
+    "    Object.defineProperty(o,'artist',{enumerable:true,get:function(){reads.artist++;return row[1];}});"
+    "    if(row[2]!==null)o.year=row[2];"
+    "    o._t=row[0];"
+    "    return o;"
+    "  });"
+    "  ctx.__skCalls=0;"
+    "  const sorted=f(items,sort,'title');"
+    # Snapshot the counters BEFORE reporting the order: reading .title to build
+    # the order would otherwise inflate the very numbers under test. _t carries
+    # the title as a plain property for exactly that reason.
+    "  const counted={title:reads.title,artist:reads.artist,sortKey:ctx.__skCalls};"
+    "  out[sort]={order:sorted.map(function(o){return o._t;}),"
+    "             reads:counted,n:items.length};"
+    "}"
+    "console.log(JSON.stringify(out));process.exit(0);"
+)
+
+
+def _run_apply_sort(rows, sorts):
+    """Run the REAL applySort in node. rows are [title, artist, year|None]."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not on PATH; applySort covered only structurally")
+    spec = json.dumps({"rows": rows, "sorts": sorts})
+    result = subprocess.run(
+        [node, "-e", _SORT_NODE_HARNESS, spec],
+        capture_output=True, encoding="utf-8", errors="replace", timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"applySort node harness failed (rc={result.returncode}):\n"
+        f"STDOUT:{result.stdout}\nSTDERR:{result.stderr}"
+    )
+    return json.loads(result.stdout)
+
+
+# Arrival order matters: items 0 and 5 share the sort key "cure" (a leading
+# "The " is stripped), which is what makes the stability assertions below bite.
+_SORT_FIXTURE = [
+    ["The Cure", "Cure", 1989],
+    ["abbey road", "The Beatles", 1969],
+    ["Disintegration", "Cure", 1980],
+    ["ABBA Gold", "ABBA", None],          # no year at all -> sorts as 0
+    ["An Awesome LP", "zz top", 1975],
+    ["Cure", "Cure", 1992],
+]
+
+
+def test_apply_sort_orderings_are_unchanged_node_vm():
+    """Pins all six orderings of the real applySort, including the two
+    properties a decorate-sort-undecorate rewrite is most likely to break:
+    equal-key items must keep arrival order in BOTH alpha directions (so
+    "descending" has to invert the comparison, never reverse the ascending
+    result), and the album-title tiebreak of the artist sorts must stay
+    ASCENDING even when the artist key descends. Both are mutation-verified.
+
+    Pattern rules are unloaded in the vm, so sortKey here is "strip a leading
+    The/A/An, trim, lowercase" -- deterministic. That is sufficient for this
+    guard: sortKey is pure, so calling it once per item instead of once per
+    comparison cannot change ordering, with or without rules loaded."""
+    sorts = ["alpha_asc", "alpha_desc", "year_asc", "year_desc",
+             "artist_asc", "artist_desc", "popular"]
+    data = _run_apply_sort(_SORT_FIXTURE, sorts)
+
+    assert data["alpha_asc"]["order"] == [
+        "ABBA Gold", "abbey road", "An Awesome LP", "The Cure", "Cure",
+        "Disintegration"], data["alpha_asc"]["order"]
+    # "The Cure" still precedes "Cure" -- reversing the ascending array would
+    # swap them, since they share a key.
+    assert data["alpha_desc"]["order"] == [
+        "Disintegration", "The Cure", "Cure", "An Awesome LP", "abbey road",
+        "ABBA Gold"], data["alpha_desc"]["order"]
+    assert data["year_asc"]["order"] == [
+        "ABBA Gold", "abbey road", "An Awesome LP", "Disintegration",
+        "The Cure", "Cure"], data["year_asc"]["order"]
+    assert data["year_desc"]["order"] == [
+        "Cure", "The Cure", "Disintegration", "An Awesome LP", "abbey road",
+        "ABBA Gold"], data["year_desc"]["order"]
+    # Artist asc: ABBA, Beatles, then the three Cure releases by title A->Z.
+    assert data["artist_asc"]["order"] == [
+        "ABBA Gold", "abbey road", "The Cure", "Cure", "Disintegration",
+        "An Awesome LP"], data["artist_asc"]["order"]
+    # Artist desc: artist Z->A, but the within-artist titles still read A->Z.
+    assert data["artist_desc"]["order"] == [
+        "An Awesome LP", "The Cure", "Cure", "Disintegration", "abbey road",
+        "ABBA Gold"], data["artist_desc"]["order"]
+    # An unrecognised sort (e.g. "popular", which callers resolve themselves)
+    # returns a copy in arrival order rather than throwing or reordering.
+    assert data["popular"]["order"] == [r[0] for r in _SORT_FIXTURE]
+
+
+@pytest.mark.parametrize("n", [120, 480])
+def test_apply_sort_calls_sortkey_once_per_item_not_once_per_comparison(n):
+    """The performance invariant, stated as a count rather than a timing.
+
+    A comparator-side sortKey normalizes each name on every comparison it
+    takes part in: ~2*n*log2(n) calls (~1,400 at n=120, ~6,000 at n=480
+    measured). Keying once per item is exactly one call per key. Asserting
+    equality -- not a loose bound -- is what makes this reject the defect
+    rather than merely notice it, and the two sizes show the count does not
+    track n log n."""
+    rows = [["Album %04d" % (i * 7919 % n), "Artist %04d" % (i * 104729 % n),
+             1970 + i % 40] for i in range(n)]
+    data = _run_apply_sort(rows, ["alpha_asc", "alpha_desc", "artist_asc",
+                                  "artist_desc", "year_asc"])
+
+    # One key per item for the name sorts...
+    for sort in ("alpha_asc", "alpha_desc"):
+        assert data[sort]["reads"]["sortKey"] == n, (
+            f"{sort} called sortKey {data[sort]['reads']['sortKey']} times for "
+            f"{n} items; applySort must normalize each name once per ITEM, not "
+            f"once per comparison (2026-10-11 debug: 2,957 ms of frozen main "
+            f"thread on the live library)")
+        # The alpha sorts key on nameField only -- touching .artist would be
+        # work that cannot affect the result.
+        assert data[sort]["reads"]["artist"] == 0, sort
+
+    # ...and two per item for the artist sorts (artist key + title tiebreak).
+    for sort in ("artist_asc", "artist_desc"):
+        assert data[sort]["reads"]["sortKey"] == 2 * n, (
+            f"{sort} called sortKey {data[sort]['reads']['sortKey']} times for "
+            f"{n} items; expected one artist key and one title key per item")
+
+    # Year sorts compare a plain number and must not normalize names at all.
+    assert data["year_asc"]["reads"]["sortKey"] == 0
+    assert data["year_asc"]["reads"]["title"] == 0
+    assert data["year_asc"]["reads"]["artist"] == 0
+
+
+def test_apply_sort_test_hook_is_exposed():
+    """Structural pin: the node guards above are only possible while the hook
+    exists, and a silently-removed hook would skip them, not fail them."""
+    browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    assert "window.__jpApplySort" in browse, (
+        "static/browse/index.js must expose the window.__jpApplySort test hook "
+        "so applySort's orderings and its per-item key count stay verifiable "
+        "in a real JS engine."
+    )
+    assert _SORT_KEY_NEEDLE in browse, (
+        "the harness injects its sortKey call counter at "
+        f"{_SORT_KEY_NEEDLE!r}; that signature changed, so the call-count "
+        "guard would no longer be measuring anything."
+    )
