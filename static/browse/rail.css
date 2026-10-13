@@ -52,6 +52,29 @@
      blows out exactly in the geometry-constrained state). */
   font-family: 'Space Mono', ui-monospace, monospace;
   font-size: 0.66rem;
+  /* The rail owns vertical gestures that start inside it (2026-10-12).
+     Without this, Android Chrome arbitrates a drag beginning on the rail as a
+     page scroll and takes the gesture away: measured on a Pixel against
+     11,451 albums with real touch events, the page received 1 of 14 finger
+     movements and got pointercancel 40 ms after the first one, so the list
+     leapt one bucket and then stopped following the finger — the rail's
+     highlighted letter never left the press point (G -> G). With this
+     declaration all 14 movements arrive, no cancel fires, and the letter
+     tracks the finger (G -> W). A return arm reproduced the broken landing
+     offset to the pixel (262,025 px twice), so that is the mechanism, not
+     drift.
+
+     This is why tap-to-jump always worked while dragging never did: a tap has
+     no movement, so arbitration never starts. Every prior rail fix was
+     tap-path work, which is how a core interaction (R5/R6 of the 2026-06-06
+     rail plan) shipped non-functional on touch and stayed that way.
+
+     The cost is that this 22px strip can no longer flick-scroll the page.
+     Accepted deliberately — it already misbehaved for scrolling, firing a
+     stray bucket jump first — and it matches the iOS Contacts rail this was
+     modelled on. Declared on the base rule so all five looks inherit it;
+     do not scope it to one mode. */
+  touch-action: none;
 }
 .alpha-rail.visible { display: flex; }
 /* Reserved gear corner (2026-06-11 gear-visibility reqs, option A): at

@@ -4075,3 +4075,48 @@ def test_magnetic_falloff_curve_node_vm():
     # scale rather than being faintly nudged.
     far = _run_magnetic_falloffs([0.0], 400.0)
     assert far[0] < 1e-6, far
+
+
+# ── Rail touch-drag gesture ownership ──────────────────────────────────────
+#
+# Drag-to-scrub is R5/R6 of the 2026-06-06 rail plan and it never worked on a
+# phone, because the rail did not claim the gesture. `touch-action` had never
+# appeared anywhere in static/ in the repo's whole history. Measured on the
+# device with real touch events (Pixel, Chrome 155, 11,451 albums):
+#
+#   as-deployed                 1 of 14 moves delivered, pointercancel @ 40 ms
+#   touch-action: none          14 of 14 delivered, no cancel, letter G -> W
+#   as-deployed (return arm)    1 of 14, identical 262,025 px landing
+#
+# This suite cannot observe it: the node harness has no browser input pipeline,
+# so gesture arbitration does not exist there and a drag test would pass either
+# way. The guard therefore pins the declaration itself.
+
+def test_rail_owns_vertical_touch_gestures():
+    """The rail must claim vertical touch gestures, or Chrome takes them and
+    drag-scrubbing silently dies on every phone."""
+    css = (ROOT / "static/browse/rail.css").read_text(encoding="utf-8")
+    bare = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    start = bare.index(".alpha-rail {")
+    base = bare[start:bare.index("}", start)]
+    assert re.search(r"touch-action\s*:\s*none", base), (
+        "the base .alpha-rail rule must set touch-action: none. Without it "
+        "Android Chrome arbitrates a drag starting on the rail as a page "
+        "scroll and fires pointercancel 40 ms in: measured 1 of 14 finger "
+        "movements delivered and the rail's letter frozen at the press point, "
+        "versus 14 of 14 and G -> W with it (2026-10-12). Nothing else in "
+        "this suite can catch the regression — node has no input pipeline."
+    )
+    # It belongs on the base rule, not a per-look override: all five rail looks
+    # share one drag handler and must all scrub.
+    for mode in ("mode-vanilla", "mode-magnetic", "mode-waveform",
+                 "mode-loupe", "mode-vu"):
+        sel = ".alpha-rail.%s {" % mode
+        if sel not in bare:
+            continue
+        blk = bare[bare.index(sel):]
+        blk = blk[:blk.index("}")]
+        assert not re.search(r"touch-action\s*:\s*(auto|pan-y)", blk), (
+            "%s re-enables browser scrolling on the rail, which breaks "
+            "drag-scrubbing for that look only." % mode
+        )
