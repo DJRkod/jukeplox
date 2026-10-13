@@ -43,6 +43,10 @@
   // can read _railDragging for its defensive bail-out (rail tap during drag).
   let _railDragging = false;
   let _railBounds = null;
+  // Magnetic-mode button centre-Y cache (viewport coords). Populated by
+  // _magneticCentersFor, cleared by _magneticInvalidateCenters — the
+  // invalidation contract is documented at _magneticCentersFor.
+  let _magneticCenters = null;
   let _alphaOverlay = null;
   let _alphaObserver = null;
   // Plan 003 U3: scroll-event + rAF highlight state. Replaces the
@@ -943,6 +947,11 @@
     }
     if (typeof ResizeObserver !== 'undefined') {
       _railResizeObserver = new ResizeObserver(() => {
+        _magneticInvalidateCenters();   // cached centres are viewport-relative
+        // Both per-gesture geometry caches have to move together: if only the
+        // centres refresh, a mid-drag host resize leaves the flared letter and
+        // the scrubbed bucket disagreeing for the rest of the gesture.
+        if (_railDragging && _railSingleton) _railBounds = _railSingleton.getBoundingClientRect();
         _scheduleCondensation();
         _railLaneRefresh();
       });
@@ -977,30 +986,89 @@
   }
 
   // Plan 003 U5: magnetic mode interaction. _magneticUpdate is invoked on
-  // every pointer movement over the rail and walks every button to compute
-  // a Gaussian-falloff scale + opacity. _magneticReset clears inline styles
+  // every pointer movement over the rail and gives every button a
+  // Gaussian-falloff scale + opacity. _magneticReset clears inline styles
   // when the cursor leaves the rail so transitions return buttons to base
   // state. Constants lifted verbatim from magnetic.html mockup.
+  //
+  // Tuning note (2026-10-12): sigma is a MOUSE number from the mockup. On a
+  // 719px rail with ~30 buckets each cell is ~24px, so a 50px sigma lights
+  // about four letters either side of the pointer. A fingertip is a blunter
+  // instrument than a cursor and this may want widening; it is deliberately
+  // left at the mockup value until it has been felt on a real phone.
   const _MAGNETIC_SIGMA = 50;
   const _MAGNETIC_MAX_SCALE = 2.2;
 
-  function _magneticUpdate(mouseY) {
-    if (_railDragging) return;
-    if (!_railSingleton || !_railSingleton.classList.contains('mode-magnetic')) return;
-    const children = Array.from(_railSingleton.children);
+  // Button centre-Y cache, viewport coordinates.
+  //
+  // _magneticUpdate used to call getBoundingClientRect() on all ~30 buttons on
+  // EVERY pointer movement. That is a forced synchronous layout per frame, and
+  // with render containment gone (94860db) each one walks all 11,451 rows of
+  // the column instead of the visible handful — the same shape as the
+  // sort-menu stall, which is why enabling the flare during a drag had to come
+  // with this cache rather than after it.
+  //
+  // Measuring once per gesture is sound for the same reason the scrub trusts
+  // one _railBounds read for a whole drag: the rail's box does not move while
+  // a finger is down. The length check self-heals a changed bucket set, and
+  // the ResizeObserver already watching the rail invalidates on viewport or
+  // condensation changes. (_magneticCenters itself is declared with the rest
+  // of the rail state at the top of this module.)
+
+  function _magneticInvalidateCenters() {
+    _magneticCenters = null;
+  }
+
+  function _magneticCentersFor(rail) {
+    const n = rail.children.length;
+    if (_magneticCenters && _magneticCenters.length === n) return _magneticCenters;
+    const centers = new Array(n);
+    let firstHeight = 0;
+    for (let i = 0; i < n; i++) {
+      const r = rail.children[i].getBoundingClientRect();
+      if (i === 0) firstHeight = r.height;
+      centers[i] = r.top + r.height / 2;
+    }
+    // A hidden rail (display:none) measures as ~30 zero rects, and the
+    // length check above cannot tell those from real centres — so return
+    // them without caching and let the next call re-measure.
+    if (n && firstHeight === 0) return centers;
+    _magneticCenters = centers;
+    return centers;
+  }
+
+  // Pure: centres + a pointer Y in, falloffs in [0,1] out. Split out so the
+  // curve is testable without a DOM — the node harness has no layout engine,
+  // so anything that reads geometry is untestable there by construction.
+  function _magneticFalloffs(centers, pointerY) {
     const twoSigmaSq = 2 * _MAGNETIC_SIGMA * _MAGNETIC_SIGMA;
-    children.forEach(btn => {
-      const rect = btn.getBoundingClientRect();
-      const btnY = rect.top + rect.height / 2;
-      const dist = Math.abs(mouseY - btnY);
-      const falloff = Math.exp(-(dist * dist) / twoSigmaSq);
+    const out = new Array(centers.length);
+    for (let i = 0; i < centers.length; i++) {
+      const dist = Math.abs(pointerY - centers[i]);
+      out[i] = Math.exp(-(dist * dist) / twoSigmaSq);
+    }
+    return out;
+  }
+  if (typeof window !== 'undefined') window.__jpMagneticFalloffs = _magneticFalloffs;
+
+  function _magneticUpdate(mouseY) {
+    // No _railDragging bail here. On a touchscreen the finger IS the pointer,
+    // so hover and drag are one gesture and suppressing the flare during a
+    // drag removed the feature entirely on a phone (2026-10-12 debug). The
+    // mouse path keeps its own _railDragging guard, so plan 003's desktop
+    // "drag takes priority" behaviour is unchanged.
+    if (!_railSingleton || !_railSingleton.classList.contains('mode-magnetic')) return;
+    const children = _railSingleton.children;
+    const centers = _magneticCentersFor(_railSingleton);
+    const falloffs = _magneticFalloffs(centers, mouseY);
+    for (let i = 0; i < children.length; i++) {
       // U4 (2026-06-09 rail plan): write the falloff as a CSS custom
       // property; the stylesheet computes scale/opacity from it. Inline
       // transform/opacity writes outranked the [aria-current] accent rules
       // (the "highlight never transfers" defect). _MAGNETIC_MAX_SCALE
       // lives in the stylesheet calc as (max - 1) = 1.2.
-      btn.style.setProperty('--falloff', falloff.toFixed(3));
-    });
+      children[i].style.setProperty('--falloff', falloffs[i].toFixed(3));
+    }
   }
 
   function _magneticReset() {
@@ -1108,6 +1176,7 @@
     _condensationGen++;
     // U4: defensively clear any engaged magnetic flare on deactivation.
     _magneticReset();
+    _magneticInvalidateCenters();
     _activeColumn = null;
     _activeBuckets = null;
   }
@@ -1219,15 +1288,24 @@
     _alphaScrollHandler();
   }
 
-  // Instant jump with convergence. Under content-visibility render containment
-  // (rail.css), target.offsetTop is computed from contain-intrinsic-size
-  // ESTIMATES for every not-yet-rendered cell above it; a single scrollTop
-  // write therefore lands past the bucket start (~4 rows deep on a large
-  // library — 2026-08-04 debug), because the browser realizes the destination
-  // band at TRUE sizes right after the write and the content shifts. Re-read
-  // and re-write across frames until the target's offset stabilizes. Bounded;
-  // aborts on user input, when a newer jump takes over (generation), or when
-  // a re-render detaches the target.
+  // Instant jump with convergence. The SURVIVING reason is that the initial
+  // write at the bottom of this function is ancestor-blind:
+  // `target.offsetTop - col.offsetTop` subtracts the column's own offset but
+  // nothing for the column's ancestors, and .list-with-rail sits offsetTop 39
+  // inside .browse-surface — so every jump lands ~40px short and the
+  // rect-based correction loop is what makes it flush (measured 2026-10-12,
+  // 6 of 7 letters; the 7th was the last bucket, where scrollTop clamps at max
+  // and absorbs the error). Re-read and re-write across frames until the
+  // target's offset stabilizes. Bounded; aborts on user input, when a newer
+  // jump takes over (generation), or when a re-render detaches the target.
+  //
+  // HISTORICAL — do not restore as the live rationale: this loop was built for
+  // content-visibility render containment, under which target.offsetTop came
+  // from contain-intrinsic-size ESTIMATES for not-yet-rendered cells and a
+  // single write landed ~4 rows deep (2026-08-04 debug). 94860db deleted that
+  // containment. Keeping the stale premise first in this comment is what made
+  // the mechanism look vestigial three times; see the measured note further
+  // down and test_rail_geometry_is_containment_safe_structural.
   function _settleJump(scrollRoot, col, target) {
     const gen = ++_settleJumpGen;   // a newer jump owns the scroller now
     // Abort on USER input only — scrollTop deltas can't distinguish the user
@@ -1253,8 +1331,22 @@
     // (matching) geometry. Requiring _STABLE_FRAMES consecutive flush frames
     // keeps that safety (any shift resets the counter) while ending the loop as
     // soon as content genuinely settles — instead of always running the full 20.
+    // Why this loop still exists after 94860db removed render containment
+    // (measured 2026-10-12, deployed build, 11,451 albums): a rail tap needs
+    // exactly one correction of exactly 40px, on 6 of 7 letters sampled across
+    // the library — the 7th was the final bucket, where scrollTop clamps at max
+    // and absorbs it. A constant error at very different scroll positions is
+    // systematic, and the cause is the initial write below, not deferred
+    // layout. `target.offsetTop - col.offsetTop` subtracts the COLUMN's offset
+    // but nothing for the column's ancestors: .list-item is offsetTop 0 inside
+    // .alpha-items-column, which is offsetTop 0 inside .list-with-rail, which
+    // is itself offsetTop 39 inside .browse-surface. The correction below is
+    // rect-based and therefore exact in any offsetParent arrangement, which is
+    // why it converges. OPEN: making the initial write rect-based too would
+    // land flush on the first frame instead of nudging 40px a frame later.
+    //
     // Each tick forces a synchronous getBoundingClientRect layout on the
-    // content-visibility list (~15ms on a large library); holding for the full
+    // list (~15ms on a large library); holding for the full
     // window tripled the jump's main-thread cost (~160ms raw → ~500ms) and left
     // content micro-adjusting for ~333ms+ — the "chug", and the window in which a
     // fast follow-up tap lands on a row that has shifted (wrong-artist drill,
@@ -1334,9 +1426,22 @@
     rail.addEventListener('pointermove', (e) => {
       if (!rail.classList.contains('mode-magnetic')) return;
       if (e.pointerType !== 'touch') return;
-      if (_railDragging) return;
+      // Deliberately NOT gated on _railDragging. Touch pointermove is only
+      // ever delivered with a finger down, and _railDragging is true for that
+      // whole window, so a drag guard here makes the branch unreachable —
+      // which is why magnetic looked identical to vanilla on a phone for four
+      // months. Pointer capture targets the rail, so these still arrive
+      // mid-drag. Plan 003 U5's "cascade pauses during drag" is superseded for
+      // touch only; see docs/plans/2026-06-06-003-feat-rail-mode-toggle-plan.md
       rail.classList.add('engaged');
-      _magneticUpdate(e.clientY);
+      // Clamp to the rail's box the way _railPointerMove already clamps the
+      // scrub: past either end the scrub keeps working on the clamped Y, so
+      // feeding the flare the raw clientY faded it to nothing while the drag
+      // was still live. Raw value when the bounds have not been read yet.
+      const flareY = _railBounds
+        ? Math.max(_railBounds.top, Math.min(_railBounds.bottom, e.clientY))
+        : e.clientY;
+      _magneticUpdate(flareY);
     });
     // U4 (2026-06-09 rail plan, R10): touch-safe flare reset. mouseleave
     // never fires for touch, so a tap/scrub used to strand the engaged
@@ -1362,6 +1467,14 @@
       _railDragging = true;
       try { rail.setPointerCapture(e.pointerId); } catch (_) { /* noop */ }
       _railBounds = rail.getBoundingClientRect();
+      // Measure the buttons here, alongside the read the scrub already pays
+      // for, so the per-move flare costs no layout of its own. The invalidate
+      // is what makes "once per gesture" true: cached centres are
+      // viewport-relative and the page can scroll between gestures.
+      if (rail.classList.contains('mode-magnetic')) {
+        _magneticInvalidateCenters();
+        _magneticCentersFor(rail);
+      }
       const overlay = _ensureOverlay();
       // Glow-up U4: loupe mode restyles the SAME scrub overlay into the
       // thumb-following lens (one overlay system, per plan). CSS keys off

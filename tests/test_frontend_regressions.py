@@ -3922,3 +3922,156 @@ def test_apply_sort_test_hook_is_exposed():
         f"{_SORT_KEY_NEEDLE!r}; that signature changed, so the call-count "
         "guard would no longer be measuring anything."
     )
+
+
+# ── Magnetic flare must be reachable on a touchscreen (2026-10-12) ─────────
+#
+# Magnetic is specified as "Mac-Dock-style scale-on-proximity HOVER" (plan
+# 003 line 14), and plan 003 line 209 had the touch path early-return while
+# _railDragging is true. But touch pointermove is only ever delivered with a
+# finger down, and _railDragging is true for exactly that window (set at
+# pointerdown, cleared at release) — so the branch was unreachable on every
+# browser with pointer capture, and magnetic rendered identically to vanilla
+# on a phone for four months.
+#
+# Plan 003's own acceptance check (AE-NEW-6, "cascade pauses during drag;
+# resumes on release") passed VACUOUSLY: it did pause, and nothing ever
+# resumed on touch because there was nothing to resume to. A manual smoke test
+# cannot distinguish "correctly suppressed" from "permanently dead".
+#
+# The desktop mouse path keeps its own _railDragging guard, so plan 003's
+# "drag takes priority" behaviour is unchanged there.
+
+
+def _rail_pointermove_touch_handler():
+    """The magnetic touch pointermove handler's source, brace-matched. There
+    are two pointermove listeners on the rail; this is the one that filters to
+    touch and drives the flare, not the drag-scrub one."""
+    js = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    needle = "rail.addEventListener('pointermove'"
+    for start in [m.start() for m in re.finditer(re.escape(needle), js)]:
+        i = js.index("{", start)
+        depth = 0
+        for j in range(i, len(js)):
+            if js[j] == "{":
+                depth += 1
+            elif js[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    body = js[start:j + 1]
+                    break
+        if "_magneticUpdate" in body and "pointerType" in body:
+            return body
+    raise AssertionError("could not find the magnetic touch pointermove handler")
+
+
+def _magnetic_update_body():
+    """_magneticUpdate's source, brace-matched."""
+    js = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    start = js.index("  function _magneticUpdate(")
+    i = js.index("{", start)
+    depth = 0
+    for j in range(i, len(js)):
+        if js[j] == "{":
+            depth += 1
+        elif js[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start:j + 1]
+    raise AssertionError("could not brace-match _magneticUpdate")
+
+
+def test_magnetic_flare_is_reachable_during_a_touch_drag():
+    """The touch path must not bail on _railDragging — that flag is true for
+    the entire window in which touch pointermove is delivered."""
+    body = _rail_pointermove_touch_handler()
+    # Both the bare and the braced form -- `if (_railDragging) { return; }`
+    # evaded the original pattern and reintroduces the defect verbatim.
+    assert not re.search(r"if\s*\(\s*_railDragging\s*\)\s*\{?\s*return", body), (
+        "the magnetic touch handler bails while _railDragging is true. That "
+        "flag is set at pointerdown and cleared at release, and touch "
+        "pointermove only arrives between those two, so this guard makes the "
+        "flare unreachable on any touchscreen — magnetic renders identically "
+        "to vanilla. Plan 003's AE-NEW-6 passes vacuously against it."
+    )
+    assert "_magneticUpdate" in body, "the touch handler must drive the flare"
+
+
+def test_magnetic_mouse_path_still_defers_to_a_drag():
+    """Plan 003's desktop behaviour is deliberately preserved: with a mouse,
+    hover and drag are distinct gestures, so the drag keeps priority."""
+    js = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    start = js.index("rail.addEventListener('mousemove'")
+    body = js[start:js.index("});", start)]
+    assert re.search(r"if\s*\(\s*_railDragging\s*\)\s*return", body), (
+        "the mousemove path should still defer to an in-flight drag; only the "
+        "touch path is exempted, because touch has no hover."
+    )
+
+
+def test_magnetic_update_reads_no_geometry_per_pointer_move():
+    """_magneticUpdate runs on every pointer movement. A geometry read there
+    is a forced synchronous layout per frame, and with render containment
+    removed each one walks all 11,451 rows rather than the visible handful."""
+    body = _magnetic_update_body()
+    assert "getBoundingClientRect" not in body, (
+        "_magneticUpdate reads geometry on every pointer movement. It is "
+        "called once per finger movement during a drag, so ~30 rect reads per "
+        "frame force a full layout of an 11,451-row column each time — the "
+        "same defect shape as the sort-menu stall (47,639 ms). Measure the "
+        "button centres once per gesture and cache them."
+    )
+    assert "_magneticCentersFor" in body, (
+        "_magneticUpdate must source its centres from the cache"
+    )
+
+
+_MAGNETIC_NODE_HARNESS = (
+    "const fs=require('fs'),vm=require('vm');"
+    f"const src=fs.readFileSync({json.dumps(str(ROOT / 'static/browse/index.js'))},'utf8');"
+    "const ctx={window:{}};vm.createContext(ctx);vm.runInContext(src,ctx);"
+    "const f=ctx.window.__jpMagneticFalloffs;"
+    "if(typeof f!=='function'){console.error('no __jpMagneticFalloffs hook');process.exit(2);}"
+    "const spec=JSON.parse(process.argv[1]);"
+    "console.log(JSON.stringify(f(spec.centers, spec.y)));process.exit(0);"
+)
+
+
+def _run_magnetic_falloffs(centers, y):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not on PATH; magnetic falloff curve covered only structurally")
+    payload = json.dumps({"centers": centers, "y": y})
+    proc = subprocess.run(
+        [node, "-e", _MAGNETIC_NODE_HARNESS, payload],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, f"node harness failed: {proc.stderr[:800]}"
+    return json.loads(proc.stdout)
+
+
+def test_magnetic_falloff_curve_node_vm():
+    """Pins the Gaussian curve and the sigma it is computed against. The curve
+    is split into a pure function precisely so it is testable here — the node
+    harness has no layout engine, so anything reading geometry cannot be."""
+    # 50px apart, which is exactly one sigma.
+    centers = [100.0, 150.0, 200.0, 250.0, 300.0]
+    out = _run_magnetic_falloffs(centers, 200.0)
+
+    assert len(out) == len(centers)
+    # Peak sits on the button under the pointer.
+    assert out[2] == pytest.approx(1.0), out
+    # Symmetric about the pointer.
+    assert out[1] == pytest.approx(out[3]), out
+    assert out[0] == pytest.approx(out[4]), out
+    # Monotonic away from the peak — a sign error or a squared-distance slip
+    # would break this while leaving the peak intact.
+    assert out[2] > out[1] > out[0], out
+    assert out[2] > out[3] > out[4], out
+    # Absolute values pin sigma at 50: exp(-0.5) at 1 sigma, exp(-2) at 2.
+    assert out[1] == pytest.approx(0.60653, abs=1e-4), out
+    assert out[0] == pytest.approx(0.13534, abs=1e-4), out
+    # Far away the flare is effectively off, so distant letters sit at base
+    # scale rather than being faintly nudged.
+    far = _run_magnetic_falloffs([0.0], 400.0)
+    assert far[0] < 1e-6, far
