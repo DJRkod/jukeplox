@@ -1549,23 +1549,27 @@ def test_random_length_filter_control_present():
     )
 
 
-# ── Browse grid render containment (2026-06-21 browse-index plan U7) ──────────
+# ── Browse grid: full DOM, no render containment (U7 reversed 2026-10-12) ─────
 
-def test_browse_grid_has_render_containment():
-    """Large Artists/Albums grids must use content-visibility containment so
-    off-screen cells skip layout/paint. It MUST keep the cells in the DOM (no
-    JS windowing / display:none) — the alpha rail's per-cell anchors and the
-    cross-server dedup need the full ordered set."""
-    rail_css = (ROOT / "static/browse/rail.css").read_text(encoding="utf-8")
-    assert "content-visibility: auto" in rail_css, (
-        "rail.css must apply content-visibility:auto to browse cells (plan U7)."
+def test_browse_grid_keeps_every_cell_in_the_dom():
+    """What plan U7/R12/R13 actually guarantees: the full ordered set stays in
+    the DOM. The alpha rail's per-cell anchors and the cross-server dedup need
+    every cell present, so no JS windowing and no display:none culling.
+
+    U7 also added content-visibility containment; that part was reversed on
+    2026-10-12 after it was measured costing 44-53 s on the first geometry read
+    (see test_browse_rows_do_not_use_render_containment and the note at the top
+    of rail.css). This test deliberately no longer asserts containment."""
+    browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    # Cells are built for every item, never a windowed slice.
+    assert "_renderCellsChunked(column, sorted.length" in browse, (
+        "renders must cover the full sorted set, not a visible window."
     )
-    assert "contain-intrinsic-size" in rail_css, (
-        "rail.css must set contain-intrinsic-size so the scrollbar stays sized."
+    # Both top-level lists render the whole set; a windowed render would pass
+    # a slice length or a viewport count instead of `sorted.length`.
+    assert browse.count("_renderCellsChunked(column, sorted.length") >= 2, (
+        "Artists and Albums must both render the full sorted set."
     )
-    # Both view modes are covered: tiles and list rows.
-    assert ".tile-grid > .tile" in rail_css
-    assert ".alpha-items-column > .list-item" in rail_css
 
 
 def test_browse_containment_lives_in_shared_css_only():
@@ -2299,11 +2303,37 @@ def test_rail_tap_jump_is_instant_not_smooth():
 
 
 def test_rail_geometry_is_containment_safe_structural():
-    """Rail geometry must not trust one-shot offset reads under
-    content-visibility render containment (2026-08-04 rail-tracking debug).
+    """Rail geometry must not trust one-shot offset reads.
 
-    Off-screen cells occupy their contain-intrinsic-size ESTIMATE (rail.css)
-    until first rendered, so:
+    PREMISE CORRECTED 2026-10-12. This guard was written for
+    content-visibility render containment, which 94860db deleted — so its
+    original reason is gone and it was flagged three times as possibly
+    vestigial. Measured before deciding: it is not. With containment gone,
+    a rail tap on the deployed build still needs exactly one correction of
+    exactly 40px, on 6 of 7 letters sampled across the whole library
+    (the 7th was the final bucket, where scrollTop clamps at max and absorbs
+    the error). A constant error at wildly different scroll positions is
+    systematic, not drift.
+
+    The cause is the one-shot formula itself, not deferred layout:
+    _settleJump's initial write is `target.offsetTop - col.offsetTop`, which
+    subtracts the COLUMN's own offset but nothing for the column's ancestors
+    between it and the scroller. Measured chain: .list-item offsetTop 0 inside
+    .alpha-items-column, which is offsetTop 0 inside .list-with-rail — which is
+    itself offsetTop 39 inside .browse-surface. So the formula evaluates to 0
+    for the first bucket while the true flush position is 40px down, and the
+    convergence loop silently pays that difference on every jump. The loop's
+    own correction is rect-based (`target.getBoundingClientRect().top -
+    scrollRoot.getBoundingClientRect().top`) and is exact in any offsetParent
+    arrangement, which is why it lands.
+
+    So: keep the loop, and treat the 40px as a separate open bug in the
+    initial write — making that write rect-based would land flush on the first
+    frame instead of visibly nudging one frame later.
+
+    Original 2026-08-04 rationale, retained for history: off-screen cells
+    occupied their contain-intrinsic-size ESTIMATE (rail.css) until first
+    rendered, so:
     - a single scrollTop write from target.offsetTop lands past the bucket
       start (~4 rows deep on a large library) once the destination band
       realizes at true sizes — jumps must go through _settleJump, which
@@ -2316,8 +2346,12 @@ def test_rail_geometry_is_containment_safe_structural():
     -266px -> -0.1px with the fix)."""
     browse = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
     assert "function _settleJump" in browse, (
-        "rail jumps need the _settleJump convergence loop: one scrollTop write "
-        "lands mid-letter under content-visibility size estimates."
+        "rail jumps need the _settleJump convergence loop. Not for the "
+        "containment reason this guard was written for (94860db removed that) "
+        "but because the one-shot write `target.offsetTop - col.offsetTop` "
+        "ignores the column's ancestors: .list-with-rail sits offsetTop 39 "
+        "inside .browse-surface, so every jump lands 40px short and the loop "
+        "is what makes it flush (measured 2026-10-12, 6 of 7 letters)."
     )
     call_sites = browse.count("_settleJump(scrollRoot")
     assert call_sites >= 2, (
@@ -3653,6 +3687,8 @@ def test_save_collector_unguarded_reads_are_enumerated():
     assert len(found) == 6, (
         "expected exactly 6 unguarded reads, found %d: %s" % (len(found), found)
     )
+
+
 # -- The chunked render must not append to the LIVE column every frame --------
 # _RENDER_FRAME_BUDGET_MS bounds only the JS spent building cells. It does not
 # bound the layout each append provokes, and appending to an attached container
@@ -3922,6 +3958,108 @@ def test_apply_sort_test_hook_is_exposed():
         f"{_SORT_KEY_NEEDLE!r}; that signature changed, so the call-count "
         "guard would no longer be measuring anything."
     )
+# -- No render containment on list rows; no forced geometry in open() ---------
+# Measured on a Pixel 10 Pro XL (Chrome 155) against 11,451 albums, 2026-10-12.
+#
+# `content-visibility: auto` on every row let Chrome DEFER each row's layout.
+# Nothing resolved that debt during normal painting -- but the first call that
+# demanded exact geometry had to resolve all 11,451 rows in one synchronous
+# pass. createSortControl's open() demands geometry twice (scrollIntoView for
+# the active option, getBoundingClientRect for the viewport clamp), so the
+# first tap on the sort menu after each list render froze the main thread:
+#
+#   content-visibility      first tap -> menu visible      layout in that frame
+#   auto (as shipped)                     52,398 ms                  44,363 ms
+#   visible                                  321 ms                       1 ms
+#   auto (return arm)                     61,147 ms                  53,186 ms
+#
+# Script time in those frames was 1-2 ms: none of it was our JavaScript. What
+# the containment bought on the initial render, same device, was ~450 ms of
+# layout and one 520 ms frame instead of ~100 ms -- total render time unchanged
+# at ~3 s. Half a second of draw jank is not worth a 50-second freeze.
+#
+# Desktop Chrome pays the same forced resolve in 7 ms, which is why this was
+# invisible until it was measured on a phone. Nothing in this suite can catch
+# it directly: the node harness has no layout engine. These guards therefore
+# pin the two shapes that caused it.
+
+def test_browse_rows_do_not_use_render_containment():
+    """Row/tile render containment must stay OFF: it defers layout that the
+    first geometry read then resolves all at once (44-53 s on a real phone)."""
+    css = (ROOT / "static/browse/rail.css").read_text(encoding="utf-8")
+    # Strip comments so the explanatory note above the rules can mention the
+    # property without tripping this guard.
+    bare = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    # Match any rule whose SELECTOR targets a browse row or a tile, not just
+    # the two exact selectors the properties happened to sit on in 2026-06-21:
+    # a bare `.list-item { content-visibility: auto }`, or a descendant /
+    # :is() / media-query variant, is the identical defect. The negative
+    # lookahead keeps `.tile` from matching `.tile-grid`.
+    row_sel = re.compile(r"\.(?:list-item|tile)(?![\w-])")
+    for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", bare):
+        sel, rule = " ".join(m.group(1).split()), m.group(2)
+        if not row_sel.search(sel):
+            continue
+        assert "content-visibility" not in rule, (
+            f"{sel} reintroduces content-visibility. On 11,451 rows this defers "
+            f"layout that the first geometry read resolves synchronously: "
+            f"measured 52,398 ms to open the sort menu versus 321 ms without "
+            f"it (Pixel 10 Pro XL, 2026-10-12). It bought ~450 ms on the "
+            f"initial render."
+        )
+        assert "contain-intrinsic-size" not in rule, (
+            f"{sel} reintroduces contain-intrinsic-size. Besides the stall, the "
+            f"estimate OVER-reported the column by 29%: 998,177 px against a "
+            f"true 774,008 px (87.2 vs 67.6 px/row), skewing the scrollbar and "
+            f"every offsetTop the rail reads. contain-intrinsic-size sizes the "
+            f"CONTENT box, and .list-item adds 23.4 px of padding plus border "
+            f"on top of it."
+        )
+
+
+# ── Rail touch-drag gesture ownership ──────────────────────────────────────
+#
+# Drag-to-scrub is R5/R6 of the 2026-06-06 rail plan and it never worked on a
+# phone, because the rail did not claim the gesture. `touch-action` had never
+# appeared anywhere in static/ in the repo's whole history. Measured on the
+# device with real touch events (Pixel, Chrome 155, 11,451 albums):
+#
+#   as-deployed                 1 of 14 moves delivered, pointercancel @ 40 ms
+#   touch-action: none          14 of 14 delivered, no cancel, letter G -> W
+#   as-deployed (return arm)    1 of 14, identical 262,025 px landing
+#
+# This suite cannot observe it: the node harness has no browser input pipeline,
+# so gesture arbitration does not exist there and a drag test would pass either
+# way. The guard therefore pins the declaration itself.
+
+def test_rail_owns_vertical_touch_gestures():
+    """The rail must claim vertical touch gestures, or Chrome takes them and
+    drag-scrubbing silently dies on every phone."""
+    css = (ROOT / "static/browse/rail.css").read_text(encoding="utf-8")
+    bare = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    start = bare.index(".alpha-rail {")
+    base = bare[start:bare.index("}", start)]
+    assert re.search(r"touch-action\s*:\s*none", base), (
+        "the base .alpha-rail rule must set touch-action: none. Without it "
+        "Android Chrome arbitrates a drag starting on the rail as a page "
+        "scroll and fires pointercancel 40 ms in: measured 1 of 14 finger "
+        "movements delivered and the rail's letter frozen at the press point, "
+        "versus 14 of 14 and G -> W with it (2026-10-12). Nothing else in "
+        "this suite can catch the regression — node has no input pipeline."
+    )
+    # It belongs on the base rule, not a per-look override: all five rail looks
+    # share one drag handler and must all scrub.
+    for mode in ("mode-vanilla", "mode-magnetic", "mode-waveform",
+                 "mode-loupe", "mode-vu"):
+        sel = ".alpha-rail.%s {" % mode
+        if sel not in bare:
+            continue
+        blk = bare[bare.index(sel):]
+        blk = blk[:blk.index("}")]
+        assert not re.search(r"touch-action\s*:\s*(auto|pan-y)", blk), (
+            "%s re-enables browser scrolling on the rail, which breaks "
+            "drag-scrubbing for that look only." % mode
+        )
 
 
 # ── Magnetic flare must be reachable on a touchscreen (2026-10-12) ─────────
@@ -4077,46 +4215,96 @@ def test_magnetic_falloff_curve_node_vm():
     assert far[0] < 1e-6, far
 
 
-# ── Rail touch-drag gesture ownership ──────────────────────────────────────
-#
-# Drag-to-scrub is R5/R6 of the 2026-06-06 rail plan and it never worked on a
-# phone, because the rail did not claim the gesture. `touch-action` had never
-# appeared anywhere in static/ in the repo's whole history. Measured on the
-# device with real touch events (Pixel, Chrome 155, 11,451 albums):
-#
-#   as-deployed                 1 of 14 moves delivered, pointercancel @ 40 ms
-#   touch-action: none          14 of 14 delivered, no cancel, letter G -> W
-#   as-deployed (return arm)    1 of 14, identical 262,025 px landing
-#
-# This suite cannot observe it: the node harness has no browser input pipeline,
-# so gesture arbitration does not exist there and a drag test would pass either
-# way. The guard therefore pins the declaration itself.
+def _sort_control_open_body():
+    """The source of createSortControl's open(), brace-matched."""
+    js = (ROOT / "static/shared.js").read_text(encoding="utf-8")
+    start = js.index("  function open() {")
+    i = js.index("{", start)
+    depth = 0
+    for j in range(i, len(js)):
+        if js[j] == "{":
+            depth += 1
+        elif js[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start:j + 1]
+    raise AssertionError("could not brace-match createSortControl open()")
 
-def test_rail_owns_vertical_touch_gestures():
-    """The rail must claim vertical touch gestures, or Chrome takes them and
-    drag-scrubbing silently dies on every phone."""
-    css = (ROOT / "static/browse/rail.css").read_text(encoding="utf-8")
-    bare = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
-    start = bare.index(".alpha-rail {")
-    base = bare[start:bare.index("}", start)]
-    assert re.search(r"touch-action\s*:\s*none", base), (
-        "the base .alpha-rail rule must set touch-action: none. Without it "
-        "Android Chrome arbitrates a drag starting on the rail as a page "
-        "scroll and fires pointercancel 40 ms in: measured 1 of 14 finger "
-        "movements delivered and the rail's letter frozen at the press point, "
-        "versus 14 of 14 and G -> W with it (2026-10-12). Nothing else in "
-        "this suite can catch the regression — node has no input pipeline."
+
+def _raf_callback_body(src):
+    """The body of the requestAnimationFrame callback inside `src`,
+    brace-matched. A string-index comparison is not enough: a NON-deferred
+    read placed after the rAF call still compares as "later" and passes."""
+    start = src.index("requestAnimationFrame")
+    i = src.index("{", start)
+    depth = 0
+    for j in range(i, len(src)):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[i:j + 1]
+    raise AssertionError("could not brace-match the requestAnimationFrame callback")
+
+
+def test_sort_menu_open_forces_no_synchronous_geometry():
+    """open() must not read geometry synchronously. A forced layout inside the
+    tap handler is what turned a deferred-layout debt into a visible freeze,
+    and it blocks the menu from painting at all until it completes.
+
+    scrollIntoView must not appear: the panel opens scrolled to the top, so the
+    active option is already visible. getBoundingClientRect may only appear
+    after a requestAnimationFrame, so the menu paints first."""
+    body = _sort_control_open_body()
+    js = (ROOT / "static/shared.js").read_text(encoding="utf-8")
+    # open() calls setActive(), and the scrollIntoView lives THERE -- so pin
+    # that open() passes the non-scrolling form and that setActive accepts it.
+    # Checking only open()'s own body would miss the call it delegates to.
+    # Match the call's own line: the argument list contains nested parentheses
+    # (setActive(Math.max(...), false)), so a [^)]* pattern stops at the first
+    # inner ")" and never reaches the flag.
+    call_lines = [ln for ln in body.splitlines() if "setActive(" in ln]
+    assert call_lines, "open() must set the active option"
+    assert any(re.search(r",\s*false\s*\)\s*;?\s*$", ln) for ln in call_lines), (
+        "createSortControl.open() must call setActive(..., false): the default "
+        "path scrolls the active option into view, which forces a synchronous "
+        f"document layout before the menu can paint. Found: {call_lines!r}"
     )
-    # It belongs on the base rule, not a per-look override: all five rail looks
-    # share one drag handler and must all scrub.
-    for mode in ("mode-vanilla", "mode-magnetic", "mode-waveform",
-                 "mode-loupe", "mode-vu"):
-        sel = ".alpha-rail.%s {" % mode
-        if sel not in bare:
-            continue
-        blk = bare[bare.index(sel):]
-        blk = blk[:blk.index("}")]
-        assert not re.search(r"touch-action\s*:\s*(auto|pan-y)", blk), (
-            "%s re-enables browser scrolling on the rail, which breaks "
-            "drag-scrubbing for that look only." % mode
+    assert re.search(r"function setActive\(\s*i\s*,\s*scroll", js), (
+        "setActive must take a `scroll` flag so open() can skip the "
+        "scrollIntoView; without the parameter the call above is a no-op."
+    )
+    assert re.search(r"function setActive\(\s*i\s*,\s*scroll\s*=\s*true\s*\)", js), (
+        "setActive's `scroll` parameter must DEFAULT to true. open() is the "
+        "one caller that opts out (explicitly, with false); every keyboard "
+        "caller -- ArrowDown/ArrowUp/Home/End -- relies on the default to "
+        "scroll the active option into view. Flipping the default would "
+        "silently kill keyboard scroll-into-view while leaving open()'s "
+        "explicit `false` looking perfectly correct."
+    )
+    assert "scrollIntoView" not in body, (
+        "createSortControl.open() calls scrollIntoView, which forces a "
+        "synchronous document layout before the menu can paint. The panel is "
+        "freshly opened at the top, so the active option needs no scrolling; "
+        "keyboard navigation can still scroll, where the layout is already warm."
+    )
+    if "getBoundingClientRect" in body:
+        assert "requestAnimationFrame" in body, (
+            "createSortControl.open() reads getBoundingClientRect "
+            "synchronously. Defer the viewport clamp to a requestAnimationFrame "
+            "so showing the menu never waits on a forced layout (2026-10-12: a "
+            "forced layout with 11,451 rows mounted took 44-53 s)."
+        )
+        # Brace-match the callback and require EVERY read to sit inside it.
+        # Comparing string indices only proved one read came after the rAF
+        # call, which a second synchronous read lower in open() satisfies.
+        deferred = _raf_callback_body(body)
+        assert body.count("getBoundingClientRect") == deferred.count("getBoundingClientRect"), (
+            "createSortControl.open() reads getBoundingClientRect outside its "
+            "requestAnimationFrame callback. Every geometry read must sit "
+            "inside it so showing the menu never waits on a forced layout "
+            "(2026-10-12: a forced layout with 11,451 rows mounted took "
+            f"44-53 s). Reads in open(): {body.count('getBoundingClientRect')}, "
+            f"of which deferred: {deferred.count('getBoundingClientRect')}."
         )
