@@ -634,28 +634,55 @@
   white-space: nowrap;
 }
 
-/* ── Render containment for large grids/lists (2026-06-21 browse-index plan U7) ──
-   At public scale the Artists / Albums views render thousands of cells. Without
-   containment the engine lays out and paints every off-screen cell up front —
-   the source of the all-at-once render jank on big collections.
-   `content-visibility: auto` lets the browser SKIP layout/paint for cells
-   outside the viewport while KEEPING their DOM node, so the alpha rail's
-   per-cell `data-bucket-start` anchors, the cross-server dedup, and scroll
-   geometry all keep working over the full ordered set. This is render
-   containment, NOT JS windowing that removes nodes (plan R12/R13 — full DOM
-   kept, single-source: both pages link this file).
-   `contain-intrinsic-size: auto <len>` makes each cell remember its last
-   rendered size after first paint; the length is the pre-paint estimate that
-   keeps the scrollbar roughly sized. Covers tile mode (.tile in .tile-grid,
-   incl. the artist drill-in release grid) and list mode (.list-item rows). */
-.tile-grid > .tile {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 210px;
-}
-.alpha-items-column > .list-item {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 64px;
-}
+/* ── Render containment REMOVED from browse cells (2026-10-12) ───────────────
+   `content-visibility: auto` + `contain-intrinsic-size` used to sit on
+   `.tile-grid > .tile` and `.alpha-items-column > .list-item` (2026-06-21
+   browse-index plan U7) so off-screen cells skipped layout and paint. Do not
+   put it back without reading this.
+
+   Deferring layout only defers it. Nothing resolves the debt while the page
+   merely paints — but the first call that asks for exact geometry has to
+   resolve EVERY deferred cell in one synchronous pass. `createSortControl`
+   asks twice when its menu opens, so the first tap on Sort after each list
+   render froze the main thread. Measured on a Pixel 10 Pro XL (Chrome 155)
+   against an 11,451-album library:
+
+     content-visibility     first Sort tap → menu      layout in that frame
+     auto (as shipped)                52,398 ms                  44,363 ms
+     visible                             321 ms                       1 ms
+     auto (return arm)                61,147 ms                  53,186 ms
+
+   Script time in those frames was 1–2 ms: none of it was our JavaScript, and
+   the sort itself stayed at ~0.6 s. Desktop Chrome resolves the same layout in
+   ~7 ms, which is why this survived for months — it is invisible unless you
+   measure a phone.
+
+   What the containment bought, same device, same library: ~450 ms of layout
+   and one 520 ms frame on the initial render, versus ~100 ms without it.
+   Total time to a complete list was ~3 s either way. Half a second of draw
+   jank is not worth a 50-second freeze.
+
+   Removing it also fixed the geometry the rail depends on. The column measured
+   998,177 px under the estimate against a true 774,008 px — it OVER-reported
+   by 29%, i.e. 87.2 px/row against a real 67.6 px/row, so the scrollbar and
+   every offsetTop the rail reads were wrong by that much.
+
+   The cause is a box-model mismatch worth remembering: `contain-intrinsic-size`
+   sizes the CONTENT box, but `.list-item` adds `padding: .7rem .75rem` plus a
+   1px bottom border = 23.4 px outside it. So the 64px estimate produced a
+   64 + 23.4 = 87.4 px row (measured 87.2), while a real row is 67.6 px — whose
+   content is only ~44.2 px. The estimate was ~45% too BIG, not slightly small.
+   Note this contradicts the 2026-08-04 rail-drift write-up, which compared the
+   64px estimate against a 67.4px row height and concluded the estimate ran
+   3.4 px LOW. Those are different boxes: content vs border. Comparing an
+   intrinsic-size estimate to a border-box height is not a like-for-like
+   comparison, and getting the sign wrong hid how far off the estimate was.
+
+   The full DOM is still kept (plan R12/R13) — the rail's per-cell
+   `data-bucket-start` anchors and the cross-server dedup need the whole
+   ordered set, and this was never JS windowing. The render-jank problem U7
+   was aimed at is handled instead by the chunked, batched builder in
+   static/browse/index.js (`_renderCellsChunked`). */
 
 /* ── Track ratings + tags (2026-06-26 ratings-and-tags plan U5/U6) ──────────
    Shared by guest + admin (both load this sheet). Pips sit trailing-right on a

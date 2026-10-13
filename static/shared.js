@@ -621,26 +621,49 @@ function createSortControl({ id, options, value, onChange }) {
     return it;
   });
 
-  function setActive(i) {
+  // `scroll` is false when the panel is being OPENED: it is already scrolled
+  // to the top, so the active option is in view, and scrollIntoView() forces a
+  // synchronous document layout — see open(). Keyboard navigation keeps the
+  // scroll, where it is both needed and cheap (the layout is already warm).
+  function setActive(i, scroll = true) {
     if (i < 0 || i >= itemEls.length) return;
     if (itemEls[activeIdx]) itemEls[activeIdx].classList.remove('jp-active');
     activeIdx = i;
     itemEls[activeIdx].classList.add('jp-active');
     trigger.setAttribute('aria-activedescendant', itemEls[activeIdx].id);
-    itemEls[activeIdx].scrollIntoView({ block: 'nearest' });
+    if (scroll) itemEls[activeIdx].scrollIntoView({ block: 'nearest' });
   }
 
   function isOpen() { return !pop.hidden; }
 
+  // Opening reads NO geometry synchronously. Both reads it used to do —
+  // scrollIntoView for the active option and getBoundingClientRect for the
+  // viewport clamp — force a layout of the whole document before the menu can
+  // paint, so the menu cannot appear until that layout finishes. With a very
+  // long list mounted that was 44–53 s on a Pixel 10 Pro XL (2026-10-12
+  // debug); the rows carried content-visibility, and a forced read has to
+  // resolve every deferred row at once. That containment is gone, but the
+  // sharp edge is not worth keeping: any future long list would re-arm it.
   function open() {
     if (isOpen()) return;
     pop.hidden = false;
     pop.classList.remove('jp-rt');
     trigger.setAttribute('aria-expanded', 'true');
-    setActive(Math.max(0, opts.findIndex(([v]) => v === current)));
-    // Viewport clamp (R9): if the panel overflows the right edge, right-anchor it.
-    if (pop.getBoundingClientRect().right > window.innerWidth - 8) pop.classList.add('jp-rt');
+    setActive(Math.max(0, opts.findIndex(([v]) => v === current)), false);
     document.addEventListener('click', onDocClick, true);
+    // Viewport clamp (R9) runs a frame later, so the menu paints first. A
+    // right-edge panel settles one frame after opening rather than blocking it.
+    requestAnimationFrame(() => {
+      if (!isOpen()) return;
+      if (pop.getBoundingClientRect().right > window.innerWidth - 8) pop.classList.add('jp-rt');
+      // Scroll the PANEL, never an ancestor — scrolling the document is what
+      // made the removed scroll-into-view call expensive. No-op unless the
+      // panel actually overflows its max-height (8 orders against 60vh).
+      const act = itemEls[activeIdx];
+      if (act && pop.scrollHeight > pop.clientHeight) {
+        pop.scrollTop = Math.max(0, act.offsetTop - (pop.clientHeight - act.offsetHeight) / 2);
+      }
+    });
   }
 
   function close() {
