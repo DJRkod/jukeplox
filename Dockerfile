@@ -162,5 +162,13 @@ ENV DATA_DIR=/data \
 # ignores it). The real listen port is ${PORT} below.
 EXPOSE 80
 
-# Shell form (not JSON) is REQUIRED so ${BIND_HOST}/${PORT} expand at runtime.
-CMD uvicorn app.main:app --host ${BIND_HOST} --port ${PORT:-80}
+# A shell IS required so ${BIND_HOST}/${PORT} expand at runtime -- but bare
+# shell form leaves /bin/sh as pid 1, and sh does not forward SIGTERM to its
+# child. Every `docker stop` therefore timed out and ended in SIGKILL (exit
+# 137), so the app never once shut down cleanly: no chance to close the
+# aiosqlite connection or tear down an output session. BuildKit had been
+# warning about this (JSONArgsRecommended) on every build.
+#
+# Invoking sh explicitly keeps the expansion, and `exec` then REPLACES the
+# shell with uvicorn, so uvicorn is pid 1 and receives the signal directly.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host ${BIND_HOST} --port ${PORT:-80}"]

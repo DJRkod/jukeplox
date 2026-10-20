@@ -1767,3 +1767,80 @@ async def test_get_raw_concurrency_is_capped_per_client():
     client._http.get = fake_get
     await asyncio.gather(*[client._get_raw(f"/p{i}") for i in range(20)])
     assert 0 < peak <= 4
+
+
+# ── single-item lookups: upstream 404 is "not found", not a fault ────────────
+#
+# Plex answers a non-existent rating key with HTTP 404. `_check_status` raises
+# that as httpx.HTTPStatusError, which escaped `get_album`/`get_track` BEFORE
+# either could reach its own `raise KeyError` on an empty item list -- so three
+# guest-reachable endpoints answered 500 for a stale id, two of them
+# unauthenticated writes. KeyError is the signal the Jellyfin, Subsonic and
+# local adapters already raise, and the one the API layer already turns into a
+# 404, so the Plex adapter now matches them.
+
+def _fake_resp(status: int, payload=None):
+    """A response object shaped like the one _get sees from httpx."""
+    import httpx
+    from unittest.mock import MagicMock
+    resp = MagicMock()
+    resp.status_code = status
+    resp.json.return_value = payload if payload is not None else {}
+    if status >= 400:
+        req = httpx.Request("GET", "http://plex.local:32400/library/metadata/1")
+        real = httpx.Response(status, request=req)
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            f"Client error '{status}'", request=req, response=real)
+    else:
+        resp.raise_for_status = MagicMock()
+    return resp
+
+
+def _client_answering(status: int, payload=None):
+    client = make_client()
+
+    async def fake_get(*a, **kw):
+        return _fake_resp(status, payload)
+
+    client._http.get = fake_get
+    return client
+
+
+async def test_get_album_turns_an_upstream_404_into_keyerror():
+    """The defect: this raised httpx.HTTPStatusError, which the album drill-in
+    did not catch (it catches KeyError), producing a 500."""
+    client = _client_answering(404)
+    with pytest.raises(KeyError):
+        await client.get_album("srv:99999999")
+
+
+async def test_get_track_turns_an_upstream_404_into_keyerror():
+    """Same defect on the track path, which reaches the UNAUTHENTICATED
+    POST /api/queue."""
+    client = _client_answering(404)
+    with pytest.raises(KeyError):
+        await client.get_track("srv:99999999")
+
+
+async def test_a_server_fault_is_not_mistaken_for_not_found():
+    """Only 404 maps to KeyError. Swallowing a 503 as 'not found' would show
+    a guest an empty-looking library during a Plex outage and report nothing
+    wrong -- strictly worse than an error."""
+    import httpx
+    for status in (500, 502, 503):
+        client = _client_answering(status)
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.get_album("srv:1")
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.get_track("srv:1")
+
+
+async def test_a_200_with_no_metadata_still_raises_keyerror():
+    """The pre-existing not-found path (Plex answers 200 with an empty item
+    list) must keep working -- the fix adds a second route to KeyError, it
+    does not replace the first."""
+    client = _client_answering(200, {"MediaContainer": {"Metadata": []}})
+    with pytest.raises(KeyError):
+        await client.get_album("srv:1")
+    with pytest.raises(KeyError):
+        await client.get_track("srv:1")

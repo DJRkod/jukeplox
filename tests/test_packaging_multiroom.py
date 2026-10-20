@@ -99,3 +99,27 @@ def test_snapserver_version_in_range():
     assert m, f"could not parse snapserver version from: {blob!r}"
     major, minor = int(m.group(1)), int(m.group(2))
     assert major == 0 and 26 <= minor < 30, f"snapserver {m.group(0)} outside [0.26, 0.30)"
+
+
+# ── signal delivery to the app process ───────────────────────────────────────
+
+def test_dockerfile_cmd_delivers_signals_to_uvicorn():
+    """Bare shell-form CMD makes /bin/sh pid 1, and sh does not forward
+    SIGTERM -- so `docker stop` always ended in SIGKILL (exit 137) and the app
+    never shut down cleanly. A shell is still needed for ${BIND_HOST}/${PORT}
+    expansion, so the requirement is JSON form invoking sh with `exec`, which
+    replaces the shell with uvicorn.
+    """
+    df = _read("Dockerfile")
+    cmd = [ln for ln in df.splitlines() if ln.startswith("CMD")]
+    assert len(cmd) == 1, f"expected exactly one CMD, found {len(cmd)}"
+    line = cmd[0]
+    assert line.startswith("CMD ["), (
+        "CMD must be JSON/exec form; bare shell form leaves sh as pid 1 and "
+        f"swallows SIGTERM: {line}")
+    assert "exec uvicorn" in line, (
+        "the shell must `exec` uvicorn so it replaces the shell and becomes "
+        f"pid 1: {line}")
+    # The reason a shell is involved at all -- keep the expansion.
+    assert "${BIND_HOST}" in line and "${PORT" in line, (
+        f"runtime env expansion lost from CMD: {line}")
