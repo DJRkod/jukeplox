@@ -1,0 +1,14 @@
+{
+  "name": "rail-jump-40px",
+  "kind": "recorded",
+  "defect_class": "jump-landing",
+  "target": "static/browse/index.js",
+  "observable": "count of post-landing scroll corrections per rail tap, sampled per frame (not whether the jump 'looked right')",
+  "source_note": "docs/solutions/ui-bugs/alphabet-rail-pointer-capture-click-retarget-no-highlight.md -- measured on the deployed build 2026-10-12: exactly one ~40px correction on 6 of 7 letters sampled. _settleJump's own comment carries the open to-do.",
+  "expected": {
+    "corrections_per_tap": 1,
+    "correction_px_approx": 40,
+    "letters_sampled": 7,
+    "letters_affected": 6
+  }
+}

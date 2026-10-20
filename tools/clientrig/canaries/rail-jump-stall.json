@@ -1,0 +1,16 @@
+{
+  "name": "rail-jump-stall",
+  "kind": "injected",
+  "defect_class": "input-stall",
+  "target": "static/browse/index.js",
+  "observable": "milliseconds from a dispatched touch to the first scroll write, from the interaction-timing entry",
+  "anchor": "scrollRoot.scrollTop = target.offsetTop - ((col && col.offsetTop) || 0);",
+  "template": "__jpCanaryBusyWait({magnitude});\n    scrollRoot.scrollTop = target.offsetTop - ((col && col.offsetTop) || 0);",
+  "magnitudes": [
+    2000,
+    800,
+    300,
+    120,
+    40
+  ]
+}

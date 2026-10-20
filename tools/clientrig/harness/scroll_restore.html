@@ -1,0 +1,217 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>scroll restore reproduction</title>
+<!--
+  Reproduction harness for report #2: backing out of an album lands you
+  somewhere other than where you were in a sorted list.
+
+  The real browse module, stylesheet and DOM are the shipped ones; the catalog
+  and the fetch responses are the only synthetic parts (catalog.js).
+
+  The measurement is deliberately by IDENTITY, not by pixels. "Was the scroll
+  offset restored to 4821?" is both flaky and weak: content height is not stable
+  across engines, font metrics or lazy rendering, so the number can differ while
+  the user is looking at exactly the right thing -- and can match while they are
+  not. The question that matters is "is the row the user was looking at back
+  where it was", so the harness records the id of the row at a fixed viewport
+  offset before and after.
+
+  ?anchor=none disables the browser's own scroll-anchoring correction on the
+  scroll container. Chrome and Firefox have had anchoring for years and it has
+  been quietly compensating here; WebKit only gained it in Safari 27, so older
+  iPhones never had that safety net. Disabling it against SHIPPED code is the
+  red arm -- the reproduction an earlier draft of the plan wrongly believed was
+  impossible without an Apple device.
+-->
+<link rel="stylesheet" href="/static/browse/rail.css">
+<style>
+  html, body { margin: 0; height: 100%; font: 14px system-ui, sans-serif; }
+  #browse-container { height: 100%; }
+  .pane-host { position: relative; height: 100%; }
+  .pane-host[hidden] { display: none; }
+  .scroll-pane { height: 100%; overflow-y: auto; }
+  .list-item { padding: .7rem .75rem; border-bottom: 1px solid #ddd;
+               white-space: nowrap; }
+  /* Applied when ?anchor=none -- see the note above. */
+  body.no-anchor .scroll-pane,
+  body.no-anchor .alpha-items-column { overflow-anchor: none; }
+</style>
+
+<div id="browse-container">
+  <div id="artists-view" class="pane-host" hidden><div id="artists-list" class="scroll-pane"></div></div>
+  <div id="albums-view" class="pane-host"><div id="albums-list" class="scroll-pane"></div></div>
+  <div id="genres-list"></div>
+  <div id="years-list"></div>
+  <div id="year-albums-items"></div>
+  <div id="mostplayed-list"></div>
+  <div id="recentlyadded-list"></div>
+  <div id="search-bar"><input id="search-input" type="text"></div>
+  <div id="search-results"></div>
+  <div id="overflow-menu"></div>
+  <div id="overflow-overlay"></div>
+  <button id="close-menu-btn"></button>
+</div>
+
+<script src="/harness/catalog.js"></script>
+<script>
+if (new URLSearchParams(location.search).get('anchor') === 'none') {
+  document.body.classList.add('no-anchor');
+}
+
+// The probe offset: how far down the viewport we ask "what is here?". Chosen
+// below any sticky chrome so the answer is a list row rather than a header.
+const PROBE_Y = 200;
+
+function rowAt(y) {
+  const pane = document.getElementById('albums-list');
+  const box = pane.getBoundingClientRect();
+  const el = document.elementFromPoint(box.left + box.width / 2, box.top + y);
+  const item = el && el.closest ? el.closest('.list-item, .tile') : null;
+  if (!item) return null;
+  return {
+    id: item.dataset.id || item.dataset.albumId || null,
+    title: (item.querySelector('.list-title') || item).textContent
+             .trim().slice(0, 40),
+    // Sub-row offset: how far through this row the probe line falls. The fix
+    // restores this too, so a correct restore is exact rather than approximate.
+    delta: Math.round((box.top + y) - item.getBoundingClientRect().top),
+  };
+}
+
+window.__probe = function () {
+  const pane = document.getElementById('albums-list');
+  return {
+    scrollTop: Math.round(pane.scrollTop),
+    scrollHeight: pane.scrollHeight,
+    clientHeight: pane.clientHeight,
+    rowAtProbe: rowAt(PROBE_Y),
+    rowCount: pane.querySelectorAll('.list-item, .tile').length,
+    anchorDisabled: document.body.classList.contains('no-anchor'),
+    inDrill: !!pane.querySelector('.release-view'),
+  };
+};
+</script>
+
+<script src="/static/shared.js"></script>
+<script src="/static/browse/index.js"></script>
+<script>
+window.__harness = {
+  handle: null,
+
+  async mount() {
+    this.handle = window.mountBrowser('#browse-container', { authMode: 'guest' });
+    return typeof this.handle === 'object';
+  },
+
+  async loadAlbums() {
+    await this.handle.activateView('albums-view');
+    return await this.waitFor(() => {
+      const col = document.querySelector('#albums-list .alpha-items-column');
+      return !!(col && col.children.length > 100);
+    });
+  },
+
+  async waitFor(pred, timeoutMs = 20000) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < timeoutMs) {
+      if (pred()) return true;
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+    return false;
+  },
+
+  async settle(frames = 90) {
+    for (let i = 0; i < frames; i++) {
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+    return true;
+  },
+
+  scrollTo(px) {
+    const pane = document.getElementById('albums-list');
+    pane.scrollTop = px;
+    void pane.scrollHeight;          // force the scroll to land
+    return Math.round(pane.scrollTop);
+  },
+
+  // Drill via a REAL row click, so the capture that runs is the shipped one
+  // rather than something the harness invented.
+  async drillByClickingRowAt(y) {
+    const before = rowAt(y);
+    if (!before) return { ok: false, reason: 'no row at the probe offset' };
+    const pane = document.getElementById('albums-list');
+    const box = pane.getBoundingClientRect();
+    const el = document.elementFromPoint(box.left + box.width / 2, box.top + y);
+    const item = el.closest('.list-item, .tile');
+    const target = item.querySelector('.list-title') || item;
+    target.click();
+    const entered = await this.waitFor(
+      () => !!pane.querySelector('.release-view'));
+    return { ok: entered, clicked: before };
+  },
+
+  // Change the layout while the user is drilled in. Reachable in production:
+  // an admin flipping the default view pushes an appearance change to every
+  // guest, and the setter re-renders the cached lists underneath the drill.
+  // Tile geometry is nothing like list geometry, so a remembered pixel offset
+  // means something completely different afterwards.
+  setViewMode(mode) {
+    this.handle.setViewMode(mode);
+    return true;
+  },
+
+  setRailMode(mode) {
+    this.handle.setRailMode(mode);
+    return true;
+  },
+
+  // Evict the module's cached album list. _restoreAlbumsView has
+  // `if (!albumsData) { await loadAlbums(); return; }` -- an early return that
+  // reloads and never restores the scroll position at all. Reachable whenever
+  // something clears the cache while a guest is drilled in.
+  evictAlbumCache() {
+    if (typeof window.__jpEvictAlbums === 'function') {
+      window.__jpEvictAlbums();
+      return true;
+    }
+    return false;
+  },
+
+  // NOTE: there is deliberately no driver for changing the album list
+  // after load. The fetch mock serialises to JSON, so the module holds a
+  // deep copy and mutating the catalog has no effect -- measured at 1900
+  // catalog entries against 1500 rendered rows. Drivers that appeared to
+  // do it made guards pass vacuously, so they were removed rather than
+  // left in place looking functional.
+
+  // What the OLD pixel-only restore would have produced, for comparison.
+  rowAtRememberedOffset() {
+    const pane = document.getElementById('albums-list');
+    const remembered = this._remembered;
+    if (remembered == null) return null;
+    const was = pane.scrollTop;
+    pane.scrollTop = remembered;
+    void pane.scrollHeight;
+    const r = rowAt(PROBE_Y);
+    pane.scrollTop = was;
+    void pane.scrollHeight;
+    return r;
+  },
+
+  rememberOffsetNow() {
+    this._remembered = document.getElementById('albums-list').scrollTop;
+    return this._remembered;
+  },
+
+  async backOut() {
+    const pane = document.getElementById('albums-list');
+    const back = pane.querySelector('.wf-origin');
+    if (!back) return { ok: false, reason: 'no wayfind origin to click' };
+    back.click();
+    const left = await this.waitFor(
+      () => !pane.querySelector('.release-view')
+            && pane.querySelectorAll('.list-item, .tile').length > 100);
+    return { ok: left };
+  },
+};
+</script>

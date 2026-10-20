@@ -1,0 +1,17 @@
+{
+  "name": "scroll-restore-off-by-rows",
+  "kind": "injected",
+  "defect_class": "scroll-restoration",
+  "target": "static/browse/index.js",
+  "observable": "identity of the list item at the remembered viewport offset after backing out (not the pixel offset, which legitimately differs between engines)",
+  "anchor": "const delta = off() - snap.anchorOffset;",
+  "template": "const delta = off() - snap.anchorOffset; // canary\n      const _off = {magnitude} * 68; owner.scrollTop += _off;",
+  "magnitudes": [
+    40,
+    12,
+    4,
+    2,
+    1
+  ],
+  "anchor_note": "Re-anchored 2026-10-19. The original anchored on the old pixel-only restore line, which U8 replaced when the restore became anchor-based. A drifted anchor patches nothing, so the canary would have been a clean build and a lane could have been credentialed on a detection that never happened. Now it perturbs the anchored placement itself, which is the thing that can actually lose the user their place."
+}

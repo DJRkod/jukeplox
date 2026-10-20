@@ -203,6 +203,29 @@ CREATE TABLE IF NOT EXISTS browse_album_index (
 CREATE INDEX IF NOT EXISTS idx_browse_album_artist ON browse_album_index (artist_base_key);
 CREATE INDEX IF NOT EXISTS idx_browse_album_identity ON browse_album_index (title_base, artist_base_key);
 
+-- 2026-10-19 client-experience rig U10: guest-reported experience records.
+--
+-- Deliberately thin, and deliberately joinless. There is no identifier column
+-- of any kind: the population is a house party, not the open internet, so a
+-- handful of bucketed attributes can narrow to one phone if something exists to
+-- join them on. Time is stored to the MINUTE for the same reason.
+--
+-- `payload_json` is the record exactly as the guest's browser sent it, so the
+-- operator-facing view can show precisely what is stored rather than a
+-- reinterpretation of it.
+--
+-- Retention is a rolling row cap applied on write (see prune_client_reports):
+-- without one this grows without bound across parties, which is a
+-- data-minimisation problem even though nothing ever leaves the installation.
+CREATE TABLE IF NOT EXISTS client_reports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    minute       TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    engine       TEXT,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_client_reports_id ON client_reports (id);
+
 -- 2026-06-27 multi-source plan U5: track-grained UNIFIED CATALOG. Supersedes
 -- the browse-index (artist+album only) by adding a track table, a STABLE
 -- allocate-once local identity per entity (the `identity` PK), an
@@ -1743,3 +1766,91 @@ async def set_browse_index(artists: list[dict], albums: list[dict]) -> None:
         except Exception:
             await db.rollback()
             raise
+
+# ── Guest experience reports (client-experience rig U10) ─────────────────────
+#
+# Nothing here is joinable. No identifier is stored, time is minute-resolution,
+# and the payload is kept verbatim so the operator-facing view shows exactly
+# what was collected rather than a summary of it.
+
+CLIENT_REPORT_ROW_CAP = 5000
+
+
+async def add_client_reports(records: list[dict]) -> int:
+    """Store a batch and prune to the row cap. Returns the number stored.
+
+    Pruning happens on write rather than on a timer: a timer is a thing that can
+    silently stop, and the cap exists so an unattended installation cannot
+    accumulate guest data indefinitely.
+    """
+    if not records:
+        return 0
+    # Local import: this module has no top-level json (the one other use is
+    # also function-local), and a NameError here would only surface the first
+    # time a guest actually reported something.
+    import json
+    db = _conn()
+    def _payload(r: dict) -> str:
+        # Cap the stored size, but never by slicing the serialised form:
+        # truncated JSON is unparseable, so the operator-facing view would show
+        # "unparseable" instead of the record, which is worse than storing less.
+        # Drop the long values and say so, keeping the record readable.
+        blob = json.dumps(r, separators=(",", ":"))
+        if len(blob) <= 4000:
+            return blob
+        trimmed = {k: v for k, v in r.items()
+                   if not isinstance(v, str) or len(v) <= 200}
+        trimmed["_truncated"] = True
+        blob = json.dumps(trimmed, separators=(",", ":"))
+        return blob if len(blob) <= 4000 else json.dumps(
+            {"kind": str(r.get("kind") or "unknown")[:32], "_truncated": True})
+
+    rows = [
+        (str(r.get("minute") or "")[:16],
+         str(r.get("kind") or "unknown")[:32],
+         str(r.get("engine") or "")[:32],
+         _payload(r))
+        for r in records
+    ]
+    await db.executemany(
+        "INSERT INTO client_reports (minute, kind, engine, payload_json) "
+        "VALUES (?, ?, ?, ?)", rows)
+    await db.execute(
+        "DELETE FROM client_reports WHERE id <= ("
+        "  SELECT MAX(id) - ? FROM client_reports)", (CLIENT_REPORT_ROW_CAP,))
+    await db.commit()
+    return len(rows)
+
+
+async def get_client_reports(limit: int = 200) -> list[dict]:
+    """Most recent first. Feeds the operator's raw-data view."""
+    db = _conn()
+    import json
+    cur = await db.execute(
+        "SELECT id, minute, kind, engine, payload_json FROM client_reports "
+        "ORDER BY id DESC LIMIT ?", (max(1, min(int(limit), 1000)),))
+    out = []
+    for row in await cur.fetchall():
+        try:
+            payload = json.loads(row[4])
+        except Exception:
+            payload = {"unparseable": True}
+        out.append({"id": row[0], "minute": row[1], "kind": row[2],
+                    "engine": row[3], "payload": payload})
+    return out
+
+
+async def count_client_reports() -> int:
+    db = _conn()
+    cur = await db.execute("SELECT COUNT(*) FROM client_reports")
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def clear_client_reports() -> int:
+    """Delete everything. The operator must be able to take it all back."""
+    n = await count_client_reports()
+    db = _conn()
+    await db.execute("DELETE FROM client_reports")
+    await db.commit()
+    return n

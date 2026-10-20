@@ -2127,6 +2127,12 @@ class SettingsRequest(BaseModel):
         'ladyland-orange', 'chasing-rabbits', 'sympathy-lime', 'pink-side',
         'silver-mountains', 'rainy-purple',
     ] | None = None
+    # 2026-10-19 client-experience rig U10: guest experience reporting.
+    # OFF unless an operator sets it. A party jukebox that records what
+    # guests' phones did is a decision to take deliberately, not a default
+    # anyone inherits -- so the absence of this setting means off, and a
+    # failure to read it also means off.
+    client_reporting_enabled: bool | None = None
     # Tile-view plan (2026-06-15) U1: install-wide default browse/search view.
     default_view: Literal['list', 'tile'] | None = None
     # Rating display style (2026-06-27): install-wide look for the 0–5 rating.
@@ -2285,6 +2291,11 @@ async def update_settings(body: SettingsRequest):
 
     if body.rail_mode is not None:
         await database.set_setting("rail_mode", body.rail_mode)
+
+    if body.client_reporting_enabled is not None:
+        await database.set_setting(
+            "client_reporting_enabled",
+            "1" if body.client_reporting_enabled else "0")
 
     if body.default_scheme is not None:
         await database.set_setting("default_scheme", body.default_scheme)
@@ -2729,3 +2740,30 @@ async def admin_websocket(websocket: WebSocket):
         pass
     finally:
         manager.disconnect(websocket, "admin")
+
+# ── Guest experience reports: the operator's view (rig U10) ─────────────────
+#
+# Showing the stored records verbatim is part of the bargain. The feature asks
+# an operator to let their guests' browsers report timings, so the operator has
+# to be able to see precisely what that produced -- not a summary, and not a
+# chart that implies more or less than the data holds. The delete is here for
+# the same reason: anything collected must be removable in one action.
+
+
+@router.get("/admin/client-reports")
+async def admin_client_reports(limit: int = 200):
+    """Stored guest reports, newest first, exactly as received."""
+    return {
+        "enabled": str(await database.get_setting(
+            "client_reporting_enabled") or "0") in ("1", "true", "True", "on"),
+        "count": await database.count_client_reports(),
+        "row_cap": database.CLIENT_REPORT_ROW_CAP,
+        "reports": await database.get_client_reports(limit),
+    }
+
+
+@router.delete("/admin/client-reports")
+async def admin_clear_client_reports():
+    """Erase every stored report. One action, no confirmation dance here --
+    the UI owns that."""
+    return {"deleted": await database.clear_client_reports()}

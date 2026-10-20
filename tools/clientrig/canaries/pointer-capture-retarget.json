@@ -1,0 +1,13 @@
+{
+  "name": "pointer-capture-retarget",
+  "kind": "recorded",
+  "defect_class": "click-retarget",
+  "target": "static/browse/index.js",
+  "observable": "index of the brightest rail button over a sampled touch sequence (a single frozen frame is also non-zero, so a presence check cannot express this)",
+  "source_note": "docs/solutions/ui-bugs/alphabet-rail-pointer-capture-click-retarget-no-highlight.md -- setPointerCapture on pointerdown retargets the subsequent click to the rail nav, so closest('[data-letter]') returns null and the highlight never runs. Verified with 12 real touch moves over USB, A/B/A: deployed 0/12 frames lit, patched 12/12, deployed-return 0/12.",
+  "expected": {
+    "frames_lit_deployed": 0,
+    "frames_lit_patched": 12,
+    "touch_moves": 12
+  }
+}

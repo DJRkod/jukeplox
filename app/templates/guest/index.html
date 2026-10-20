@@ -474,9 +474,21 @@
   <button id="close-menu-btn">Cancel</button>
 </div>
 
+<!-- Guest experience reporting (client-experience rig U10). Dormant
+     unless an operator enables it in Admin -> Setup: the module asks the
+     installation first and collects nothing if the answer is no or the
+     question fails. Posts to a relative path only, so nothing can leave
+     this installation. -->
+<script src="/static/clientreport.js?v={{ asset_v }}"></script>
 <script src="/static/shared.js?v={{ asset_v }}"></script>
 <script src="/static/browse/index.js?v={{ asset_v }}"></script>
 <script src="/static/playback/index.js?v={{ asset_v }}"></script>
+<div id="jp-report-note" hidden
+     style="padding:.6rem .9rem;font-size:.75rem;color:var(--muted);text-align:center">
+  This jukebox is measuring how well its own pages respond on your device.
+  No listening history and no personal data is recorded, and nothing
+  leaves this machine. Ask the host to turn it off.
+</div>
 <script src="/static/guest/app.js?v={{ asset_v }}"></script>
 </body>
 </html>

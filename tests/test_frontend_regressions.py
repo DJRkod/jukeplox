@@ -4308,3 +4308,206 @@ def test_sort_menu_open_forces_no_synchronous_geometry():
             f"44-53 s). Reads in open(): {body.count('getBoundingClientRect')}, "
             f"of which deferred: {deferred.count('getBoundingClientRect')}."
         )
+
+# ── Report #3: rail ownership belongs to the visible column ──────────────────
+# Behavioural coverage lives in tests/test_clientrig_browse_guards.py, which
+# needs a real engine: Node has no layout engine, so offsetParent, visibility
+# and rail presence are unanswerable here. These are the source-shape pins that
+# run on every pass, in the spirit of "know what CI cannot see, and pin the code
+# shapes instead".
+
+
+def _activate_rail_body():
+    """The source of _activateRail, brace-matched."""
+    js = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    start = js.index("  function _activateRail(column, buckets) {")
+    i = js.index("{", start)
+    depth = 0
+    for j in range(i, len(js)):
+        if js[j] == "{":
+            depth += 1
+        elif js[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start:j + 1]
+    raise AssertionError("could not brace-match _activateRail")
+
+
+def test_activate_rail_refuses_a_column_that_is_not_rendered():
+    """Rail activation must bail on a hidden column BEFORE claiming ownership.
+
+    Every appearance setter ends by re-rendering both cached lists without
+    awaiting either. Each render drives its own rAF-paced chunked builder, so
+    they race, and Albums -- far longer than Artists -- reliably finishes last.
+    Whoever finished last used to claim the rail, which parked it in the Albums
+    pane; with Artists on screen the user then had NO rail until a tab switch
+    re-rendered the visible list.
+
+    Measured on the unfixed build (300 artists / 1500 albums): rail hosted in
+    `albums-view` in both arms, visible only when Albums was the visible pane.
+    """
+    body = _activate_rail_body()
+    claim = body.index("_activeColumn = column")
+    guard = body[:claim]
+    assert "return" in guard, (
+        "_activateRail claims _activeColumn with no preceding early return: a "
+        "render completing against a hidden column will take ownership of the "
+        "rail and strand it in a pane the user cannot see (report #3)"
+    )
+    assert "offsetParent" in guard or "getClientRects" in guard, (
+        "_activateRail must test whether the column is actually RENDERED before "
+        "taking ownership. `isConnected` alone is not enough -- a column inside "
+        "an inactive tab is still connected, which is exactly the case that "
+        "produced report #3. Both templates hide inactive views with "
+        "`display: none`, so offsetParent === null is the exact test."
+    )
+
+
+def test_the_appearance_setters_share_one_ownership_seam():
+    """The double-render shape appears at several call sites, and the fix must
+    live at the seam they share rather than in any one of them.
+
+    A caller-local patch would leave the identical defect reachable from the
+    other controls -- the view toggle and the international-rail toggle both
+    reproduced it before the fix.
+    """
+    js = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    sites = js.count("if (artistsData) renderArtistsList();")
+    assert sites >= 3, (
+        f"expected several appearance setters to re-render both cached lists; "
+        f"found {sites}. If this dropped, confirm the ownership guard in "
+        f"_activateRail still covers every caller."
+    )
+    body = _activate_rail_body()
+    assert "offsetParent" in body, (
+        "the ownership guard has left _activateRail -- if it moved into an "
+        "individual setter, the other setters reintroduce report #3"
+    )
+
+# ── Report #2: restore the album the user opened, not a pixel offset ────────
+# Behavioural coverage is in tests/test_clientrig_browse_guards.py (it needs a
+# real engine for geometry). These pins are the half that runs everywhere.
+#
+# Report #2 does not reproduce on a desktop engine: measured 2026-10-19 across
+# list mode, tile mode, a narrow viewport and late-arriving art, with the
+# browser's scroll-anchoring correction on and off, every arm restored the exact
+# row at the exact sub-row offset and scrollHeight was identical before and
+# after. The remaining candidates are iOS-only -- Safari's own history
+# restoration, the URL bar collapsing and changing the visible height, and
+# momentum scrolling still gliding when the tap lands so the recorded offset is
+# one the list was merely passing through.
+#
+# The fix is justified without a reproduction because it is correct on its own
+# terms: you opened an album, you should come back to it.
+
+
+def _fn_body(path, signature):
+    """A brace-matched function body from a static JS file."""
+    js = (ROOT / path).read_text(encoding="utf-8")
+    start = js.index(signature)
+    i = js.index("{", start)
+    depth = 0
+    for j in range(i, len(js)):
+        if js[j] == "{":
+            depth += 1
+        elif js[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start:j + 1]
+    raise AssertionError(f"could not brace-match {signature!r}")
+
+
+def _capture_scroll_body():
+    return _fn_body("static/browse/index.js",
+                    "  function _captureScroll(elId, key, anchorId) {")
+
+
+def _restore_scroll_body():
+    return _fn_body("static/browse/index.js",
+                    "  function _restoreScroll(elId, key) {")
+
+
+def test_capture_scroll_records_the_item_not_only_the_offset():
+    """The capture must remember WHICH row, not just where it sat.
+
+    An offset alone is only meaningful while the content above it keeps exactly
+    the height it had. That holds for a deterministic rebuild and stops holding
+    the moment the list reorders, shrinks, relayouts, or the capture happens
+    mid-fling on a platform with momentum scrolling.
+    """
+    body = _capture_scroll_body()
+    assert "anchorId" in body, (
+        "_captureScroll no longer records an anchor id -- the restore is back "
+        "to remembering a pixel offset, which is report #2's shape"
+    )
+    assert "anchorOffset" in body, (
+        "_captureScroll records the anchor but not its offset within the "
+        "scroller, so the restore can only be approximate"
+    )
+    assert "scroll:" in body, (
+        "the pixel offset must still be captured as the fallback for panes that "
+        "pass no anchor (search, genres, years)"
+    )
+
+
+def test_restore_scroll_prefers_the_anchor_and_reads_back():
+    """The restore must try the item first, and verify rather than assume.
+
+    A write that got clamped because the list had not finished growing must be
+    retried, not accepted -- "browsers clamp scrollTop" was the old comment, and
+    a clamp is exactly when the user loses their place.
+    """
+    body = _restore_scroll_body()
+    assert "anchorId" in body, (
+        "_restoreScroll ignores the captured anchor and uses the offset only"
+    )
+    # Compare the ANCHOR ATTEMPT against the PIXEL FALLBACK specifically. An
+    # earlier version of this pin compared the first occurrence of
+    # "snap.scroll", which is the separate window-scrolling branch for panes
+    # with no scroll owner -- so it failed against a correct implementation.
+    # A guard that can reject a correct result is one of the five failure
+    # shapes this rig exists to catch, and it should not live in the rig's own
+    # tests.
+    attempt_at = body.index("if (place())")
+    fallback_at = body.index("owner.scrollTop = snap.scroll")
+    assert attempt_at < fallback_at, (
+        "the pixel fallback is written before the anchor is attempted; the "
+        "anchor must be preferred or the fix does nothing in the cases it "
+        "exists for"
+    )
+    assert "requestAnimationFrame" in body, (
+        "no retry after layout settles -- a restore clamped against a list that "
+        "was still growing is silently accepted"
+    )
+
+
+def test_the_album_and_artist_drills_pass_an_identity_to_the_capture():
+    """A capture with no anchor falls back to the old behaviour, so the drill
+    sites have to supply one or the fix is inert where it matters."""
+    js = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    assert "_captureScroll('albums-list', 'albums', albumId)" in js, (
+        "the album drill captures no identity, so backing out of an album "
+        "falls back to the pixel offset"
+    )
+    assert "_captureScroll('artists-list', 'artists', artistId)" in js, (
+        "the artist drill captures no identity"
+    )
+
+
+def test_row_identity_uses_the_existing_item_reference():
+    """Finding the row again must not require new markup.
+
+    Rows already carry their data object on `_jpItem` for the delegated click
+    handler, so identity is available without touching the row template -- which
+    matters because the template is built by a single innerHTML parse for
+    thousands of rows.
+    """
+    js = (ROOT / "static/browse/index.js").read_text(encoding="utf-8")
+    body = _fn_body("static/browse/index.js",
+                    "  function _rowForItemId(container, id) {")
+    assert "_jpItem" in body, (
+        "_rowForItemId does not use the existing _jpItem reference -- if it "
+        "needs a new data attribute, the row template changed"
+    )
+    assert js.count("cell._jpItem = album") >= 1
+    assert js.count("cell._jpItem = artist") >= 1

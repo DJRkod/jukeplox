@@ -297,6 +297,10 @@ def test_appearance_ratings_tags_visibility_default_off(mock_deps):
     assert body["browse_facets"] == {
         "genre": True, "years": True, "mostplayed": True,
         "recentlyadded": True, "highestrated": True,
+        # The Radio facet is the exception: it defaults OFF (opt-in, mirroring
+        # guest_radio_control), so the tab is hidden from guests until an admin
+        # turns it on. Added 2026-08-12 (11fd1e7).
+        "radio": False,
     }
 
 
@@ -3943,8 +3947,11 @@ def test_appearance_fresh_install_defaults(client, mock_deps):
                            "rail_artist_threshold": 2, "rail_album_threshold": 2,
                            "ratings_visible_to_guests": False, "tags_visible_to_guests": False,
                            "guest_radio_control": False,
+                           # radio defaults OFF (opt-in, 2026-08-12 11fd1e7):
+                           # hidden from guests until an admin enables it.
                            "browse_facets": {"genre": True, "years": True, "mostplayed": True,
-                                             "recentlyadded": True, "highestrated": True},
+                                             "recentlyadded": True, "highestrated": True,
+                                             "radio": False},
                            "rating_style": "stars"}
 
 
@@ -3963,7 +3970,8 @@ def test_appearance_density_maps_to_waveform(client, mock_deps):
                     "ratings_visible_to_guests": False, "tags_visible_to_guests": False,
                     "guest_radio_control": False,
                     "browse_facets": {"genre": True, "years": True, "mostplayed": True,
-                                      "recentlyadded": True, "highestrated": True},
+                                      "recentlyadded": True, "highestrated": True,
+                                      "radio": False},
                     "rating_style": "stars"}
 
 
@@ -3981,7 +3989,8 @@ def test_appearance_garbage_values_fall_back(client, mock_deps):
                     "ratings_visible_to_guests": False, "tags_visible_to_guests": False,
                     "guest_radio_control": False,
                     "browse_facets": {"genre": True, "years": True, "mostplayed": True,
-                                      "recentlyadded": True, "highestrated": True},
+                                      "recentlyadded": True, "highestrated": True,
+                                      "radio": False},
                     "rating_style": "stars"}
 
 

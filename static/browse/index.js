@@ -904,6 +904,26 @@
   // Plan 003 U4: letterIndex is now `{firstIndex: Map, counts: Map}`. Density
   // mode additionally walks .density-row children to set log-scale bar widths.
   function _activateRail(column, buckets) {
+    // Report #3 (2026-10-19): the rail belongs to the column the user can SEE,
+    // not to whichever render happened to finish last.
+    //
+    // Every appearance setter — setRailMode, setViewMode, setRailAlpha — ends
+    // with `if (artistsData) renderArtistsList(); if (albumsData)
+    // renderAlbumsList();`. That pattern appears 4x in this file. Both renders
+    // are unawaited and each drives its own rAF-paced chunked builder, so they
+    // race; and because Albums is far longer than Artists it reliably finishes
+    // LAST and used to claim the rail. Measured on the unfixed build with 300
+    // artists / 1500 albums: the rail was hosted in `albums-view` in BOTH arms,
+    // so with Artists on screen the user had no rail at all until a tab switch
+    // re-rendered the visible list. Albums-visible looked healthy, which is why
+    // that arm is useless as a reproduction.
+    //
+    // `offsetParent === null` is the exact test for "inside a display:none
+    // ancestor", which is what an inactive tab is — both templates use
+    // `.view { display: none }` / `.view.active { display: block }`. Refusing
+    // here rather than in each setter means every caller is covered, including
+    // ones added later, because they all land on this one function.
+    if (!column || !column.isConnected || column.offsetParent === null) return;
     const rail = _ensureRailSingleton();
     const mode = rail.dataset.mode || 'vanilla';
     // Rebuild the child buttons when the bucket set changes (sort flip,
@@ -2483,20 +2503,81 @@
     return _findScrollAncestor(el);
   }
 
-  function _captureScroll(elId, key) {
-    const el = document.getElementById(elId);
-    const owner = _scrollOwner(el);
-    _navSnapshots[key] = { scroll: owner ? owner.scrollTop : (window.scrollY || 0) };
+  // Find the rendered row for a given item id. Rows already carry their data
+  // object on `_jpItem` (the delegated click handler reads it), so identity
+  // needs no extra markup and no change to the row template. Tiles fall back to
+  // a data attribute where they expose one.
+  function _rowForItemId(container, id) {
+    if (!container || !id) return null;
+    const cells = container.querySelectorAll('.list-item, .tile');
+    for (let i = 0; i < cells.length; i++) {
+      const c = cells[i];
+      const item = c._jpItem
+        || (c.dataset && c.dataset.id ? { id: c.dataset.id } : null);
+      if (item && item.id === id) return c;
+    }
+    return null;
   }
 
+  // Remember WHERE THE USER WAS, which is the row they opened -- not the pixel
+  // offset that happened to put it on screen. `anchorId` is optional: the
+  // search/genre/year panes still capture an offset only, which is unchanged
+  // behaviour for them.
+  function _captureScroll(elId, key, anchorId) {
+    const el = document.getElementById(elId);
+    const owner = _scrollOwner(el);
+    const snap = { scroll: owner ? owner.scrollTop : (window.scrollY || 0) };
+    if (anchorId && owner && el) {
+      const row = _rowForItemId(el, anchorId);
+      if (row) {
+        snap.anchorId = anchorId;
+        snap.anchorOffset = Math.round(
+          row.getBoundingClientRect().top - owner.getBoundingClientRect().top);
+      }
+    }
+    _navSnapshots[key] = snap;
+  }
+
+  // Restore by item, falling back to the offset.
+  //
+  // A remembered pixel offset only means what it meant if the content above it
+  // still has exactly the height it had. That holds for a deterministic rebuild
+  // -- measured 2026-10-19 across list mode, tile mode, a narrow viewport and
+  // late-arriving art, all exact, scrollHeight identical before and after -- and
+  // it stops holding the moment anything differs: the list reorders, shrinks,
+  // relayouts for another view mode, or the capture happened while the scroll
+  // was still gliding on a platform with momentum (iOS), where the recorded
+  // offset is one the list was merely passing through.
+  //
+  // Restoring the ROW the user opened is correct under all of those, because it
+  // restores what they were looking at rather than a number that approximated
+  // it. The read-back is the other half: a write that got clamped because the
+  // list had not finished growing is retried on the next frame instead of being
+  // accepted.
   function _restoreScroll(elId, key) {
     const snap = _navSnapshots[key];
     if (!snap) return;
     const el = document.getElementById(elId);
     const owner = _scrollOwner(el);
-    // Shorter-than-before lists are safe: browsers clamp scrollTop.
-    if (owner) owner.scrollTop = snap.scroll;
-    else window.scrollTo(0, snap.scroll);
+    if (!owner) { window.scrollTo(0, snap.scroll); return; }
+
+    const place = () => {
+      if (!snap.anchorId) return false;
+      const row = _rowForItemId(el, snap.anchorId);
+      if (!row) return false;                  // the item is gone; use the offset
+      const off = () => row.getBoundingClientRect().top
+                      - owner.getBoundingClientRect().top;
+      const delta = off() - snap.anchorOffset;
+      if (Math.abs(delta) < 1) return true;
+      owner.scrollTop += delta;
+      return Math.abs(off() - snap.anchorOffset) < 2;   // read back, don't assume
+    };
+
+    if (place()) return;
+    owner.scrollTop = snap.scroll;
+    // One retry after layout settles: covers a clamp against a list that was
+    // still growing, and a row that had not been built yet.
+    if (snap.anchorId) requestAnimationFrame(() => { place(); });
   }
 
   // Drills into the artists/albums panes bump these; the load* completions
@@ -2688,7 +2769,7 @@
     _showPane('albums-view');
     const origin = opts.origin || { label: 'Albums', jump: _restoreAlbumsView };
     _albumsPaneEpoch++;
-    _captureScroll('albums-list', 'albums');
+    _captureScroll('albums-list', 'albums', albumId);
     showAlbumTracks(albumId, title, null, {
       el: document.getElementById('albums-list'),
       origin,
@@ -3003,7 +3084,7 @@
     } else {
       el = document.getElementById('artists-list');
       _artistsPaneEpoch++;
-      if (!extOrigin) _captureScroll('artists-list', 'artists');
+      if (!extOrigin) _captureScroll('artists-list', 'artists', artistId);
       // External origin (Now Playing / Queue jump, plan U5) labels the back
       // link with the surface the user actually came from (R7).
       origin = extOrigin || { label: 'Artists', jump: _restoreArtistsView };
@@ -3219,7 +3300,7 @@
     } else if (returnView === 'albums') {
       el = document.getElementById('albums-list');
       _albumsPaneEpoch++;
-      _captureScroll('albums-list', 'albums');
+      _captureScroll('albums-list', 'albums', albumId);
       backLabel = 'Albums';
       // _restoreAlbumsView bumps the album-tracks gen (in-flight tracks
       // fetch bails) and the albums-items gen (stale play-counts pass

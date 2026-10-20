@@ -57,6 +57,8 @@
 /api/browse/genres/albums
 /api/browse/years
 /api/browse/years/
+/api/client-report
+/api/client-report/config
 /api/highest-rated
 /api/lyrics
 /api/most-played

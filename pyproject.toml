@@ -50,6 +50,15 @@ dev = [
     "pytest-mock>=3.14",
     "httpx>=0.27",
     "respx>=0.21",
+    # Client-experience rig browser lanes (tools/clientrig/). Pinned exactly,
+    # because the pin is the ONLY mechanism that fixes the browser versions:
+    # the engine revisions are baked into the wheel, there is no separate knob,
+    # and a lane's credential is only meaningful against the engine it was
+    # earned on. The wheel bundles its own Node runtime, so no package.json and
+    # no npm enter this repo. Browsers are a separate download:
+    #   python -m playwright install chromium webkit
+    # Dev-only: tools/ and tests/ are not COPYed into the image.
+    "playwright==1.64.0",
 ]
 
 [tool.pytest.ini_options]
