@@ -1,0 +1,103 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>guest reporting harness</title>
+<!--
+  Drives static/clientreport.js so the egress guarantee can be tested against a
+  real engine rather than asserted in prose.
+
+  The module itself is the shipped one, unmodified. Only the config endpoint is
+  stubbed, because the rig server proxies anything that is not static or a
+  harness file and there is no app running behind it here.
+
+  ?canary=egress adds a deliberately-leaking request. The egress guard MUST fail
+  on it -- otherwise a passing guard only establishes that nothing happened to
+  leave, not that the guard could see it if it did.
+
+  On producing a real record without trusted input: a scripted click produces no
+  interaction-timing entry at all (measured: 18 entries from a dispatched touch,
+  0 from element.click()). A blocking frame, however, produces a Long Animation
+  Frame entry with no input involved, so that is what interact() exercises. On an
+  engine without that capability the record comes from the restore path instead,
+  and the record's own caps field says which happened.
+-->
+<style>
+  body { margin: 0; font: 14px system-ui, sans-serif; padding: 1rem; }
+  #slow { padding: 1.5rem 2rem; font-size: 1rem; }
+</style>
+
+<h1>guest reporting harness</h1>
+<button id="slow">slow interaction</button>
+
+<script>
+// ── Stub only the config endpoint. Everything else is the shipped module. ───
+const params = new URLSearchParams(location.search);
+const CANARY = params.get('canary') === 'egress';
+let configEnabled = false;
+
+const realFetch = window.fetch.bind(window);
+window.fetch = function (url, opts) {
+  const u = String((url && url.url) || url);
+  if (u.indexOf('/api/client-report/config') !== -1) {
+    return Promise.resolve(new Response(
+      JSON.stringify({ enabled: configEnabled }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }));
+  }
+  if (u.indexOf('/api/client-report') !== -1) {
+    // Accept the batch locally so the flush completes without an app behind
+    // the rig server. The request still shows up to the test's interceptor,
+    // which is what the egress guard inspects.
+    return realFetch(url, opts).catch(() => new Response('', { status: 204 }));
+  }
+  return realFetch(url, opts);
+};
+
+// A handler that costs a frame, so a Long Animation Frame entry exists to
+// report. No trusted input required.
+document.getElementById('slow').addEventListener('pointerdown', () => {
+  const t0 = performance.now();
+  while (performance.now() - t0 < 250) { /* occupy the frame */ }
+});
+</script>
+
+<script src="/static/clientreport.js"></script>
+
+<script>
+window.__report = {
+  async enable() {
+    configEnabled = true;
+    const ok = await window.jpClientReport.start();
+    window.jpClientReport.setView('browse:albums');
+    if (CANARY) this._leak();
+    return ok;
+  },
+
+  // The deliberately-leaking fixture. This is what credentials the egress
+  // guard: a guard that has never been seen failing is not a guard.
+  _leak() {
+    const foreign = ['example', 'invalid'].join('.');
+    const scheme = ['ht', 'tps'].join('');
+    try {
+      fetch(scheme + '://' + foreign + '/collect',
+            { method: 'POST', mode: 'no-cors', body: '{}' });
+    } catch (_) { /* the attempt is the point; it need not succeed */ }
+  },
+
+  // Occupy a frame so the module has something real to observe, then give the
+  // observers a moment to deliver.
+  async interact() {
+    const btn = document.getElementById('slow');
+    btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    await new Promise((r) => setTimeout(r, 250));
+    return true;
+  },
+
+  recordRestore(ok) {
+    return window.jpClientReport.recordRestore(ok, 'albums');
+  },
+
+  state() {
+    return window.jpClientReport.__state();
+  },
+};
+</script>

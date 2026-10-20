@@ -2429,3 +2429,98 @@ async def guest_websocket(websocket: WebSocket):
         pass
     finally:
         manager.disconnect(websocket, "guest")
+
+# ── Guest experience reporting (client-experience rig U10) ──────────────────
+#
+# Four UX reports arrived from phones and browsers nobody here owns, and two of
+# them could not be reproduced on any locally available engine. This is the
+# answer: the guest's own browser measures what it actually experienced and
+# tells the jukebox. Nothing leaves the installation -- the client posts to a
+# relative path, which cannot address another host, and a running test in the
+# rig drives the whole flow in a real engine and fails on any request to a
+# foreign origin.
+#
+# OFF BY DEFAULT. A party jukebox that records what guests' phones did is the
+# operator's decision to make, not a default anyone inherits.
+
+CLIENT_REPORT_SETTING = "client_reporting_enabled"
+
+# Per-IP rate limit, mirroring the pattern already used on two other
+# guest-facing routes. This is a new UNAUTHENTICATED write on a LAN-reachable
+# app that persists a row per record, so without a bound a buggy client -- or
+# anyone at the party -- can grow the store at will.
+_CLIENT_REPORT_WINDOW_S = 60.0
+_CLIENT_REPORT_MAX = 12            # batches per IP per window
+_CLIENT_REPORT_MAX_RECORDS = 40    # records per batch, server-enforced
+_client_report_hits: dict[str, list[float]] = {}
+
+
+def _check_client_report_rate_limit(ip: str) -> None:
+    now = time.monotonic()
+    cutoff = now - _CLIENT_REPORT_WINDOW_S
+    hits = [t for t in _client_report_hits.get(ip, ()) if t > cutoff]
+    if len(hits) >= _CLIENT_REPORT_MAX:
+        _client_report_hits[ip] = hits
+        raise HTTPException(status_code=429,
+                            detail="Too many client reports - slow down")
+    hits.append(now)
+    _client_report_hits[ip] = hits
+    # Drop other IPs whose window has fully aged out, so a churn of one-shot
+    # addresses cannot grow the map without bound.
+    stale = [k for k, v in _client_report_hits.items()
+             if k != ip and not any(t > cutoff for t in v)]
+    for k in stale:
+        del _client_report_hits[k]
+
+
+async def _client_reporting_enabled() -> bool:
+    from app import database
+    raw = await database.get_setting(CLIENT_REPORT_SETTING)
+    return str(raw or "0") in ("1", "true", "True", "on")
+
+
+class ClientReportBatch(BaseModel):
+    records: list[dict] = Field(default_factory=list)
+
+
+@router.get("/api/client-report/config")
+async def client_report_config():
+    """Whether the guest's browser should collect anything at all.
+
+    The client treats a failure to read this as "no", which is the safe
+    direction for something that observes guests.
+    """
+    return {"enabled": await _client_reporting_enabled()}
+
+
+@router.post("/api/client-report")
+async def client_report(batch: ClientReportBatch, request: Request):
+    """Accept a batch of guest experience records.
+
+    Returns 204 and stores nothing when the feature is off, rather than an
+    error: a guest whose page still holds an older build should not see
+    failures because the operator turned reporting off.
+    """
+    if not await _client_reporting_enabled():
+        return Response(status_code=204)
+
+    ip = request.client.host if request.client else "unknown"
+    _check_client_report_rate_limit(ip)
+
+    records = (batch.records or [])[:_CLIENT_REPORT_MAX_RECORDS]
+    # Strip anything that could make two records joinable, whatever the client
+    # sent. The client is careful, but the client is also the untrusted half.
+    cleaned = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        keep = {k: v for k, v in r.items()
+                if k not in ("url", "href", "path", "query", "ip", "ua",
+                             "userAgent", "id", "sessionId", "token")}
+        minute = str(keep.get("minute") or "")[:16]   # minute resolution only
+        keep["minute"] = minute
+        cleaned.append(keep)
+
+    from app import database
+    stored = await database.add_client_reports(cleaned)
+    return {"stored": stored}

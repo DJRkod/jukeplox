@@ -1,0 +1,146 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rail repaint reproduction</title>
+<!--
+  Reproduction harness for report #3: changing the rail style leaves no rail
+  until a tab is switched.
+
+  The real browse module is loaded, unmodified. The only synthetic parts are the
+  catalog and the fetch responses, which is the same boundary the existing perf
+  bench draws and the reason this page is safe to serve anywhere.
+
+  The precondition that matters is the one the perf bench does not model: ONE
+  PANE IS HIDDEN. In the real app a tab switch toggles `.view.active`, so only
+  one browse column is on screen at a time, and the module watches column
+  visibility to decide whether the rail should still be shown. With both panes
+  visible the defect cannot appear, which is why a harness that renders them
+  side by side would report everything healthy.
+
+  Both lists are loaded before the measurement, because the defect needs both
+  cached: the style setter re-renders every cached list, and the two renders
+  race.
+-->
+<link rel="stylesheet" href="/static/browse/rail.css">
+<style>
+  html, body { margin: 0; height: 100%; font: 14px system-ui, sans-serif; }
+  #browse-container { height: 100%; }
+  .pane-host { position: relative; height: 100%; }
+  .pane-host[hidden] { display: none; }
+  .scroll-pane { height: 100%; overflow-y: auto; }
+  .list-item { padding: .7rem .75rem; border-bottom: 1px solid #ddd;
+               white-space: nowrap; }
+</style>
+
+<div id="browse-container">
+  <div id="artists-view" class="pane-host"><div id="artists-list" class="scroll-pane"></div></div>
+  <div id="albums-view" class="pane-host"><div id="albums-list" class="scroll-pane"></div></div>
+  <div id="genres-list"></div>
+  <div id="years-list"></div>
+  <div id="year-albums-items"></div>
+  <div id="mostplayed-list"></div>
+  <div id="recentlyadded-list"></div>
+  <div id="search-bar"><input id="search-input" type="text"></div>
+  <div id="search-results"></div>
+  <div id="overflow-menu"></div>
+  <div id="overflow-overlay"></div>
+  <button id="close-menu-btn"></button>
+</div>
+
+<!-- Shared synthetic catalog + fetch mock. Shared because this harness
+     originally carried its own row shapes and got two field names wrong,
+     producing an empty list that a presence check called healthy. -->
+<script src="/harness/catalog.js"></script>
+<script>
+
+// ── Observable state the driver reads. Deliberately a set of discriminating
+// quantities, not a boolean: "the rail is somewhere" cannot express the defect.
+window.__railState = function () {
+  const rail = document.querySelector('.alpha-rail');
+  const visibleRail = document.querySelector('.alpha-rail.visible');
+  const artistsCol = document.querySelector('#artists-items .alpha-items-column')
+                  || document.querySelector('#artists-list .alpha-items-column');
+  const albumsCol = document.querySelector('#albums-items .alpha-items-column')
+                 || document.querySelector('#albums-list .alpha-items-column');
+  const host = rail ? rail.parentElement : null;
+  const visiblePane = document.querySelector('.pane-host:not([hidden])');
+  return {
+    railExists: !!rail,
+    railVisible: !!visibleRail,
+    railMode: rail ? (rail.dataset.mode || null) : null,
+    buttonCount: rail ? rail.querySelectorAll('[data-bucket]').length : 0,
+    hostId: host ? (host.id || host.className) : null,
+    visiblePaneId: visiblePane ? visiblePane.id : null,
+    // Does the rail's host sit inside the pane the user can actually see?
+    railInVisiblePane: !!(rail && visiblePane && visiblePane.contains(rail)),
+    artistsColumnPresent: !!artistsCol,
+    albumsColumnPresent: !!albumsCol,
+    renderOrder: window.__renderOrder || [],
+  };
+};
+</script>
+
+<script src="/static/shared.js"></script>
+<script src="/static/browse/index.js"></script>
+<script>
+// ── Driver surface. The test calls these; none of it touches the module's
+// internals, so the guard pins behaviour rather than implementation.
+window.__harness = {
+  handle: null,
+
+  async mount() {
+    this.handle = window.mountBrowser('#browse-container', { authMode: 'guest' });
+    return typeof this.handle === 'object';
+  },
+
+  // Load BOTH lists, which is the defect's precondition: the style setter
+  // re-renders every cached list, and it is the race between those two renders
+  // that decides who owns the rail.
+  async cacheBothLists() {
+    await this.handle.activateView('artists-view');
+    const a = await this.waitForColumn('#artists-list');
+    await this.handle.activateView('albums-view');
+    const b = await this.waitForColumn('#albums-list');
+    // Report what happened. Returning true unconditionally made an empty
+    // harness look like a working one, which is the false-witness shape.
+    return { artists: a, albums: b, ok: a && b };
+  },
+
+  // Mimic a tab switch: exactly one pane on screen.
+  show(paneId) {
+    for (const p of document.querySelectorAll('.pane-host')) {
+      p.hidden = (p.id !== paneId);
+    }
+    return document.querySelector('.pane-host:not([hidden])').id;
+  },
+
+  async waitForColumn(sel, timeoutMs = 20000) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < timeoutMs) {
+      const col = document.querySelector(sel + ' .alpha-items-column');
+      if (col && col.children.length > 50) return true;
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+    return false;
+  },
+
+  // Let both racing renders finish. Frame-based rather than a fixed sleep, so
+  // it does not silently become a warm-up on a fast machine or a flake on a
+  // slow one.
+  async settle(frames = 90) {
+    for (let i = 0; i < frames; i++) {
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+    return true;
+  },
+
+  setRailMode(mode) { this.handle.setRailMode(mode); return true; },
+  setViewMode(mode) { this.handle.setViewMode(mode); return true; },
+  setRailAlpha(mode) {
+    if (typeof this.handle.setRailAlpha === 'function') {
+      this.handle.setRailAlpha(mode);
+      return true;
+    }
+    return false;
+  },
+};
+</script>

@@ -30,6 +30,10 @@ JS_FILES = [
     ROOT / "static/shared.js",
     ROOT / "static/browse/index.js",  # may not exist pre-U2
     ROOT / "static/playback/index.js",  # shared playback module (2026-06-09 layout plan)
+    # 2026-10-19 rig U10: guest experience reporting. Without this line the
+    # characterization baseline cannot see the module's endpoints at all,
+    # so a new client-visible API surface would ship uncovered.
+    ROOT / "static/clientreport.js",
 ]
 
 # Capture a quoted literal that starts with /api/, /admin/, or /static/, up to

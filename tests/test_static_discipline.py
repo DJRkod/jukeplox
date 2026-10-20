@@ -360,6 +360,11 @@ FORBIDDEN_SYMBOLS = {
 # file" — the path of least resistance for sidestepping the symbol allowlist).
 SCRIPT_SRC_ALLOWED = {
     "/static/shared.js",
+    # 2026-10-19 client-experience rig U10: guest-side experience reporting.
+    # A deliberate new entry, not an escape hatch for browse logic -- the module
+    # collects timing and a view NAME, touches no rendering, and is dormant
+    # unless an operator enables it.
+    "/static/clientreport.js",
     "/static/browse/index.js",
     "/static/playback/index.js",
     "/static/guest/app.js",

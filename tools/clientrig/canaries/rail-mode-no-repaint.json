@@ -1,0 +1,11 @@
+{
+  "name": "rail-mode-no-repaint",
+  "kind": "injected",
+  "defect_class": "missing-repaint",
+  "target": "static/browse/index.js",
+  "observable": "presence of .alpha-rail.visible on the VISIBLE column after a style change, and which column owns it",
+  "anchor": "_config.railMode = mode;",
+  "template": "_config.railMode = mode;\n        return;",
+  "graded": false,
+  "binary_note": "the rail either repaints on the visible column or it does not"
+}

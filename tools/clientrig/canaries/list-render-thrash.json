@@ -1,0 +1,16 @@
+{
+  "name": "list-render-thrash",
+  "kind": "injected",
+  "defect_class": "layout-thrash",
+  "target": "static/browse/index.js",
+  "observable": "longest single frame during the chunked render, in milliseconds",
+  "anchor": "column.appendChild(first);",
+  "template": "for (let _t = 0; _t < {magnitude}; _t++) void column.offsetHeight;\n      column.appendChild(first);",
+  "magnitudes": [
+    4000,
+    1500,
+    600,
+    200,
+    60
+  ]
+}
