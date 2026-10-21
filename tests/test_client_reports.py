@@ -159,3 +159,63 @@ async def test_an_oversized_payload_is_truncated_rather_than_rejected(db):
     assert "unparseable" not in payload, payload
     assert payload.get("_truncated") is True
     assert payload.get("kind") == "interaction"
+
+
+# ── Reachability: the tests above proved the logic, not the URL ───────────────
+#
+# Everything above this line calls the handlers and the database layer
+# directly. All twelve passed while the two admin routes were registered at
+# `/admin/admin/client-reports` -- the decorators repeated a prefix the router
+# already carries, so the documented path 404'd and nothing could reach them.
+# It took deploying to the rig to notice.
+#
+# Proving a handler's logic is not proving a handler is reachable. These two
+# tests close that gap, and the structural one closes it for every route in
+# the app rather than only for this feature.
+
+def test_admin_client_report_routes_are_reachable_at_their_real_paths(
+        client, mock_session):
+    """The path an operator would actually request.
+
+    The database is stubbed because what is under test is routing, not
+    storage -- storage is covered above. A 404 here is the defect; a 200
+    means the request reached the handler.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    with patch.object(database, "get_setting", AsyncMock(return_value="0")),          patch.object(database, "count_client_reports", AsyncMock(return_value=0)),          patch.object(database, "get_client_reports", AsyncMock(return_value=[])),          patch.object(database, "clear_client_reports", AsyncMock(return_value=0)):
+        got = client.get("/admin/client-reports")
+        assert got.status_code == 200, got.text
+        assert got.json()["row_cap"] == database.CLIENT_REPORT_ROW_CAP
+        assert client.delete("/admin/client-reports").status_code == 200
+
+
+def test_admin_client_report_routes_require_auth(anon_client, mock_session):
+    assert anon_client.get("/admin/client-reports").status_code == 401
+    assert anon_client.delete("/admin/client-reports").status_code == 401
+
+
+def test_no_registered_route_repeats_a_path_segment():
+    """A decorator that restates the router's own prefix yields `/admin/admin/
+    ...`, which answers 404 at the path everyone writes down.
+
+    FastAPI will not warn: the doubled path is a perfectly valid route, just
+    not the one anybody requests. This sweeps every router in the app, so the
+    next person to paste a decorator into a prefixed router is caught by a
+    failing test rather than by a deployment.
+    """
+    from app.main import app
+
+    doubled = []
+    for route in app.routes:
+        path = getattr(route, "path", "") or ""
+        parts = [p for p in path.split("/") if p]
+        for a, b in zip(parts, parts[1:]):
+            # Literal repeats only. `/x/{id}/{id}` is a different mistake and
+            # a path parameter legitimately repeats a literal in some designs.
+            if a == b and not a.startswith("{"):
+                doubled.append(path)
+                break
+    assert doubled == [], (
+        f"these routes repeat a path segment, which usually means the "
+        f"decorator restated the router's prefix: {doubled}")

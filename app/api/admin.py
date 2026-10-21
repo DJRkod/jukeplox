@@ -2819,7 +2819,7 @@ async def admin_websocket(websocket: WebSocket):
 # the same reason: anything collected must be removable in one action.
 
 
-@router.get("/admin/client-reports")
+@router.get("/client-reports")
 async def admin_client_reports(limit: int = 200):
     """Stored guest reports, newest first, exactly as received."""
     return {
@@ -2831,7 +2831,7 @@ async def admin_client_reports(limit: int = 200):
     }
 
 
-@router.delete("/admin/client-reports")
+@router.delete("/client-reports")
 async def admin_clear_client_reports():
     """Erase every stored report. One action, no confirmation dance here --
     the UI owns that."""
