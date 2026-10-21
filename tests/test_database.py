@@ -1028,3 +1028,144 @@ async def test_seal_migration_is_idempotent(db):
         second = (await cur.fetchone())[0]
     assert first == second  # unchanged
     assert (await database.get_plex_servers())[0]["token"] == "TOK"
+
+
+# ── U2: prepared browse answer storage ──────────────────────────────────────
+#
+# Stores the exact bytes a guest receives, keyed by (facet, serving path).
+# Three properties are deliberate and tested here rather than assumed:
+#
+# * **Upsert, never delete-then-insert.** There is no window in which the
+#   prior bytes are gone, so a failed or partial build leaves the previous
+#   answer serving. The alternative -- installing an empty answer -- is how a
+#   derived table in this repo once emptied itself while reporting success.
+# * **Per-facet and per-path by construction.** Writing artists cannot disturb
+#   a good albums row, and a serving-path flip (which happens on source
+#   reachability, not operator action) does not evict the other path's bytes.
+# * **The writer holds the shared write lock.** aiosqlite serializes
+#   statements on the one shared connection and an unlocked explicit BEGIN is
+#   a deterministic, silent collision -- the fresh-install-audit failure.
+
+
+async def test_prepared_browse_round_trips_per_facet_and_path(db):
+    await database.set_prepared_browse("albums", "native", "sig-a", b"gz-a", 3000)
+    await database.set_prepared_browse("artists", "native", "sig-b", b"gz-b", 900)
+
+    alb = await database.get_prepared_browse("albums", "native")
+    art = await database.get_prepared_browse("artists", "native")
+    assert (alb["signature"], alb["body_gzip"], alb["raw_len"]) == ("sig-a", b"gz-a", 3000)
+    assert (art["signature"], art["body_gzip"], art["raw_len"]) == ("sig-b", b"gz-b", 900)
+    assert alb["built_at"]
+
+
+async def test_prepared_browse_missing_row_returns_none(db):
+    assert await database.get_prepared_browse("albums", "native") is None
+
+
+async def test_writing_one_facet_leaves_the_other_intact(db):
+    await database.set_prepared_browse("albums", "native", "sig-a", b"gz-a", 1)
+    await database.set_prepared_browse("artists", "native", "sig-b", b"gz-b", 1)
+    await database.set_prepared_browse("albums", "native", "sig-a2", b"gz-a2", 2)
+
+    assert (await database.get_prepared_browse("artists", "native"))["signature"] == "sig-b"
+    assert (await database.get_prepared_browse("albums", "native"))["signature"] == "sig-a2"
+
+
+async def test_serving_paths_do_not_evict_each_other(db):
+    """A non-Plex source being briefly unreachable flips the serving path with
+    no operator action. A single-key table would throw away the warm answer on
+    every flip and the install might never hold one."""
+    await database.set_prepared_browse("albums", "native", "sig-n", b"gz-n", 1)
+    await database.set_prepared_browse("albums", "catalog", "sig-c", b"gz-c", 1)
+    assert (await database.get_prepared_browse("albums", "native"))["signature"] == "sig-n"
+    assert (await database.get_prepared_browse("albums", "catalog"))["signature"] == "sig-c"
+
+
+async def test_a_failed_write_leaves_the_previous_answer_serving(db):
+    """Asserted on the stored bytes, not on a return code."""
+    await database.set_prepared_browse("albums", "native", "good", b"good-bytes", 10)
+
+    # A body the driver cannot bind forces the write to fail inside the
+    # transaction, after BEGIN.
+    with pytest.raises(Exception):
+        await database.set_prepared_browse("albums", "native", "bad",
+                                           object(), 11)  # type: ignore[arg-type]
+
+    row = await database.get_prepared_browse("albums", "native")
+    assert (row["signature"], row["body_gzip"]) == ("good", b"good-bytes")
+
+
+async def test_failed_write_does_not_leave_a_transaction_open(db):
+    """The collision this repo has already paid for: a writer that fails after
+    BEGIN without rolling back leaves the next explicit BEGIN raising
+    "cannot start a transaction within a transaction" on the shared
+    connection."""
+    with pytest.raises(Exception):
+        await database.set_prepared_browse("albums", "native", "bad", object(), 1)  # type: ignore[arg-type]
+    # The very next locked writer must still work.
+    await database.set_prepared_browse("albums", "native", "after", b"x", 1)
+    assert (await database.get_prepared_browse("albums", "native"))["signature"] == "after"
+
+
+async def test_concurrent_writers_do_not_collide(db):
+    """Gathered writers are the shape that produced "cannot start a
+    transaction within a transaction" on this connection before the lock
+    invariant existed."""
+    import asyncio
+    await asyncio.gather(*[
+        database.set_prepared_browse(f, p, f"sig-{f}-{p}", b"gz", 1)
+        for f in ("albums", "artists") for p in ("native", "catalog")
+    ])
+    for f in ("albums", "artists"):
+        for p in ("native", "catalog"):
+            row = await database.get_prepared_browse(f, p)
+            assert row["signature"] == f"sig-{f}-{p}"
+
+
+async def test_a_realistic_body_round_trips_without_truncation(db):
+    """~307 KB is the measured compressed size of the real albums payload."""
+    import gzip
+    body = gzip.compress(b"x" * 3_000_000, compresslevel=6, mtime=0)
+    await database.set_prepared_browse("albums", "native", "sig", body, 3_000_000)
+    row = await database.get_prepared_browse("albums", "native")
+    assert row["body_gzip"] == body
+    assert gzip.decompress(row["body_gzip"]) == b"x" * 3_000_000
+    assert row["raw_len"] == 3_000_000
+
+
+async def test_clear_prepared_browse_reports_what_it_dropped(db):
+    await database.set_prepared_browse("albums", "native", "a", b"x", 1)
+    await database.set_prepared_browse("artists", "native", "b", b"y", 1)
+    assert await database.clear_prepared_browse() == 2
+    assert await database.get_prepared_browse("albums", "native") is None
+    assert await database.clear_prepared_browse() == 0
+
+
+async def test_write_does_not_block_a_reader_for_long(db):
+    """The connection, not the lock, is the scarce resource.
+
+    aiosqlite serializes statements per connection, so a multi-megabyte write
+    stalls readers too -- which is why only the compressed copy is stored. This
+    records the reader's added latency with a write in flight rather than
+    asserting a lock-hold duration, and is generous enough not to be a
+    flaky timing test: it fails only if a realistic write starves a reader for
+    most of a second.
+    """
+    import asyncio
+    import gzip
+    import time
+
+    body = gzip.compress(b"y" * 3_000_000, compresslevel=6, mtime=0)
+    await database.set_prepared_browse("albums", "native", "warm", body, 3_000_000)
+
+    writer = asyncio.create_task(
+        database.set_prepared_browse("albums", "native", "hot", body, 3_000_000))
+    await asyncio.sleep(0)                      # let the writer start
+    t0 = time.perf_counter()
+    await database.get_prepared_browse("artists", "native")
+    reader_s = time.perf_counter() - t0
+    await writer
+
+    assert reader_s < 1.0, (
+        "a reader waited %.3fs behind one prepared-answer write; the stored "
+        "copy is meant to be small enough that this stays short" % reader_s)

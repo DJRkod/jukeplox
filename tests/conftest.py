@@ -129,6 +129,7 @@ def mock_state(mock_session):
          patch("app.state.trigger_browse_index_refresh", MagicMock()), \
          patch("app.state.trigger_catalog_refresh", MagicMock()), \
          patch("app.state.trigger_artist_grouping_rebuild", MagicMock()), \
+         patch("app.state.trigger_prepared_browse_rebuild", MagicMock()), \
          patch("app.database.get_browse_album_by_id", AsyncMock(return_value=None)), \
          patch("app.database.get_browse_albums_by_identity", AsyncMock(return_value=[])), \
          patch("app.state.direct_backend", None), \
