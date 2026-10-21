@@ -196,11 +196,15 @@ async def test_browse_artist_songs_endpoint_returns_dict_payload(db):
 
 
 async def test_browse_artists_endpoint_uses_catalog_when_active(db):
+    """The catalog branch moved with the derivation when the route became a
+    thin prepared-answer wrapper. Same assertion, same branch -- calling the
+    derivation directly keeps this testing routing rather than HTTP plumbing.
+    """
     await _seed_two_source_album(db)
     with patch("app.state.get_plex_client",
                AsyncMock(return_value=_FakeRegistry([
                    _FakeSource(source_type="plex"), _FakeSource(source_type="jellyfin")]))):
-        arts = await guest.browse_artists()
+        arts = await guest._derive_browse_artists()
     assert [a.id for a in arts] == ["ar"]
 
 
@@ -423,3 +427,137 @@ async def test_annotate_plex_held_identity_mode_resolves_live(db):
     with patch("app.state.get_plex_client", AsyncMock(return_value=_typed_registry())):
         await guest._annotate_plex_held(rows)
     assert [r["plex_held"] for r in rows] == [True, False, False]
+
+
+# ── U6: the album list must not issue one holds query per album ─────────────
+#
+# `views.albums()` built each Album with its own `store.get_holds` call, so a
+# multi-source install paid one sequential round-trip per album against the one
+# shared aiosqlite connection -- thousands of them at a real library size, on
+# the event loop. The chunked bulk primitive `store.get_holds_map` was written
+# for exactly this ("list payloads stamp every row per request, so this must be
+# one holds pass, never per-row get_holds calls") and this path never adopted
+# it.
+#
+# The existing bulk-vs-per-row oracle in this file covers the TRACK entity, so
+# album equivalence is re-established here rather than inherited.
+
+
+class _ExecCounter:
+    """Counts statements issued on the shared connection.
+
+    The defect is a COUNT of round-trips, so the assertion is on the count --
+    not on latency, which would be flaky, and not on a stand-in flag.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.n = 0
+
+    def execute(self, *args, **kwargs):
+        self.n += 1
+        return self._real.execute(*args, **kwargs)
+
+    def __getattr__(self, name):          # everything else passes through
+        return getattr(self._real, name)
+
+
+def _count_executes(monkeypatch):
+    counter = _ExecCounter(database._conn())
+    monkeypatch.setattr(database, "_conn", lambda: counter)
+    return counter
+
+
+async def _seed_albums_with_hold_shapes(n_extra=0):
+    """Three albums covering the hold shapes that change the emitted payload,
+    plus optional filler for chunk-boundary work."""
+    albums = [
+        {"identity": "two", "title": "Two Holders", "title_base": "two holders",
+         "artist": "Act", "artist_base_key": "act", "year": 2001, "track_count": 1},
+        {"identity": "none", "title": "No Holders", "title_base": "no holders",
+         "artist": "Act", "artist_base_key": "act", "year": 2002, "track_count": 1},
+        {"identity": "one", "title": "One Holder", "title_base": "one holder",
+         "artist": "Act", "artist_base_key": "act", "year": 2003, "track_count": 1},
+    ]
+    holds = [
+        {"entity_type": "album", "identity": "two", "source_id": "m1",
+         "provider_local_key": "m1:two", "priority": 0, "server_name": "Plex"},
+        {"entity_type": "album", "identity": "two", "source_id": "jelly",
+         "provider_local_key": "jelly:two", "priority": 1, "server_name": "Jelly"},
+        {"entity_type": "album", "identity": "one", "source_id": "jelly",
+         "provider_local_key": "jelly:one", "priority": 0, "server_name": "Jelly"},
+    ]
+    for i in range(n_extra):
+        ident = "f%d" % i
+        albums.append({"identity": ident, "title": "Filler %d" % i,
+                       "title_base": "filler %d" % i, "artist": "Act",
+                       "artist_base_key": "act", "year": 2010, "track_count": 1})
+        holds.append({"entity_type": "album", "identity": ident, "source_id": "m1",
+                      "provider_local_key": "m1:%s" % ident, "priority": 0,
+                      "server_name": "Plex"})
+    await store.replace_catalog(
+        artists=[{"identity": "ar", "title": "Act", "base_key": "act"}],
+        albums=albums, tracks=[], holds=holds)
+
+
+async def test_albums_payload_characterization_across_hold_shapes(db):
+    """Captures the emitted shape BEFORE the query-shape change, so the change
+    is provably behaviour-preserving. Ordering inside `sources` is
+    priority-ascending and is load-bearing -- the first hold supplies the
+    resolvable key for drill-in routing."""
+    await _seed_albums_with_hold_shapes()
+    by_id = {a.id: a for a in await views.albums()}
+
+    assert [s["server_name"] for s in by_id["two"].sources] == ["Plex", "Jelly"]
+    assert [s["album_id"] for s in by_id["two"].sources] == ["m1:two", "jelly:two"]
+    assert [s["server_name"] for s in by_id["one"].sources] == ["Jelly"]
+    assert [s["album_id"] for s in by_id["one"].sources] == ["jelly:one"]
+    # No holders collapses to None, not an empty list -- the frontend branches
+    # on falsiness and an empty list would read as "sources present".
+    assert by_id["none"].sources is None
+
+
+async def test_albums_bulk_holds_match_per_identity_reads(db):
+    """The album oracle. The existing equivalence test in this file covers
+    entity_type="track" only, so it cannot be inherited for albums."""
+    await _seed_albums_with_hold_shapes()
+    got = await views.albums()
+    for alb in got:
+        per_row = await store.get_holds("album", alb.id)
+        expected = [{"server_name": h["server_name"] or "",
+                     "album_id": h["provider_local_key"],
+                     "source_type": ""} for h in per_row] or None
+        assert alb.sources == expected, alb.id
+
+
+# Measured: `views.albums()` carries ~7 statements of fixed overhead (the
+# source-type lookup and the album listing) before any holds work. The
+# invariant that matters is that the total does not grow with album count, so
+# one ceiling is asserted across a 0 -> 501 range rather than three separate
+# absolute budgets. Against the per-row implementation this reads 7, 50 and
+# 508 respectively.
+_ALBUMS_STATEMENT_CEILING = 15
+
+
+@pytest.mark.parametrize("n_extra,expected_albums", [(0, 3), (40, 43), (498, 501)])
+async def test_albums_statement_count_does_not_grow_with_album_count(
+        db, monkeypatch, n_extra, expected_albums):
+    """The defect itself, asserted on the resource rather than on latency.
+
+    The per-row implementation issued one holds round-trip per album against
+    the single shared connection -- 508 statements for 501 albums. The bulk
+    pass chunks at 500 bound parameters, so 501 albums crosses the chunk
+    boundary and still costs a listing plus two chunks.
+    """
+    await _seed_albums_with_hold_shapes(n_extra=n_extra)
+    counter = _count_executes(monkeypatch)
+    albs = await views.albums()
+    assert len(albs) == expected_albums
+    assert counter.n <= _ALBUMS_STATEMENT_CEILING, (
+        "albums() issued %d statements for %d albums -- it must not scale "
+        "with album count" % (counter.n, expected_albums))
+
+    # Content still correct at the chunk boundary, not just cheap.
+    by_id = {a.id: a for a in albs}
+    assert [s["album_id"] for s in by_id["two"].sources] == ["m1:two", "jelly:two"]
+    assert by_id["none"].sources is None

@@ -5339,3 +5339,230 @@ async def test_album_drill_with_a_stale_id_is_404_not_500(client, mock_deps):
     plex.get_album = AsyncMock(side_effect=KeyError("Album a-gone not found"))
     resp = client.get("/api/browse/albums/a-gone/tracks")
     assert resp.status_code == 404, resp.text
+
+
+# ── U4: serving the prepared answer ─────────────────────────────────────────
+#
+# The positive control below is the important one. Both obvious negative
+# controls -- forcing the comparison to always match, or pinning the validator
+# constant -- break the guard in the SAME direction, so neither can detect the
+# failure where the signature never matches: zero benefit, higher cost than
+# before, and every test green. Only an assertion that live derivation was NOT
+# invoked can see that.
+
+import gzip
+import json
+
+from app import browse_prepared as _bp
+from app import state as _state
+from app.api import guest as _guest
+
+
+@pytest.fixture
+def prepared(monkeypatch):
+    """A clean prepared-answer world with nothing stored."""
+    monkeypatch.setattr(_state, "_prepared_browse", {}, raising=False)
+    monkeypatch.setattr(_state, "_prepared_inputs", None, raising=False)
+    monkeypatch.setattr(_guest, "_prepared_live_derivations", 0, raising=False)
+    monkeypatch.setattr(_guest, "_prepared_last_arm", {}, raising=False)
+    monkeypatch.setattr(_state, "trigger_prepared_browse_rebuild", MagicMock())
+    return _bp.SignatureInputs(
+        path=_bp.PATH_NATIVE, index_content="idx", rules="r", exclusions="e",
+        enabled_libraries="l", server_order="o", credit_roster="c")
+
+
+def _store(facet, inputs, rows):
+    """Install a prepared answer exactly as the rebuild would."""
+    raw_bytes = _bp.serialize(rows)
+    _state._publish_prepared_answer(
+        facet, inputs.path, _bp.signature(facet, inputs),
+        _bp.compress(raw_bytes), len(raw_bytes))
+    _state._publish_prepared_inputs(inputs)
+    return raw_bytes
+
+
+def _live_count():
+    return _guest._prepared_live_derivations
+
+
+async def test_stored_answer_is_byte_identical_to_live_derivation(
+        client, mock_deps, prepared):
+    """Covers AE5, asserted THROUGH the route rather than by calling the
+    grouping helper directly."""
+    live = client.get("/api/browse/albums")
+    assert live.status_code == 200
+    live_bytes = live.content
+
+    _store("albums", prepared, json.loads(live_bytes.decode()))
+    served = client.get("/api/browse/albums", headers={"accept-encoding": "gzip"})
+    assert served.status_code == 200
+    assert served.headers["content-encoding"] == "gzip"
+    # The test client decodes Content-Encoding transparently, so comparing
+    # .content directly is comparing the decoded bytes -- which is the claim
+    # that matters: what a browser ends up with is unchanged.
+    assert served.content == live_bytes
+
+
+async def test_prepared_hit_does_not_derive_live(client, mock_deps, prepared):
+    """The positive control. A warm latency measurement cannot distinguish
+    "serving stored bytes" from "falling back every time"."""
+    rows = json.loads(client.get("/api/browse/albums").content.decode())
+    before = _live_count()
+    _store("albums", prepared, rows)
+
+    client.get("/api/browse/albums")
+    client.get("/api/browse/albums")
+    assert _live_count() == before, (
+        "live derivation ran while a matching prepared answer was stored")
+
+
+async def test_matching_validator_gets_no_body(client, mock_deps, prepared):
+    """Covers AE4."""
+    rows = json.loads(client.get("/api/browse/albums").content.decode())
+    _store("albums", prepared, rows)
+
+    first = client.get("/api/browse/albums", headers={"accept-encoding": "gzip"})
+    etag = first.headers["etag"]
+    again = client.get("/api/browse/albums",
+                       headers={"accept-encoding": "gzip", "if-none-match": etag})
+    assert again.status_code == 304
+    assert again.content == b""
+
+
+async def test_stale_validator_gets_a_full_body(client, mock_deps, prepared):
+    rows = json.loads(client.get("/api/browse/albums").content.decode())
+    _store("albums", prepared, rows)
+    resp = client.get("/api/browse/albums",
+                      headers={"accept-encoding": "gzip",
+                               "if-none-match": '"not-the-current-one"'})
+    assert resp.status_code == 200
+    assert resp.content
+
+
+async def test_encodings_get_distinct_validators_and_vary(
+        client, mock_deps, prepared):
+    """Two representations behind one URL. A shared validator would let a
+    cache apply a not-modified answer to the wrong variant, or hand compressed
+    bytes to a client that cannot decode them."""
+    rows = json.loads(client.get("/api/browse/albums").content.decode())
+    _store("albums", prepared, rows)
+
+    gz = client.get("/api/browse/albums", headers={"accept-encoding": "gzip"})
+    idn = client.get("/api/browse/albums", headers={"accept-encoding": "identity"})
+    assert gz.headers["etag"] != idn.headers["etag"]
+    assert gz.headers["vary"] == "Accept-Encoding"
+    assert idn.headers["vary"] == "Accept-Encoding"
+    assert "content-encoding" not in {k.lower() for k in idn.headers}
+
+
+async def test_identity_client_gets_expanded_bytes(client, mock_deps, prepared):
+    """Only the compressed copy is stored, so this path expands it."""
+    live_bytes = client.get("/api/browse/albums").content
+    _store("albums", prepared, json.loads(live_bytes.decode()))
+    resp = client.get("/api/browse/albums", headers={"accept-encoding": "identity"})
+    assert resp.content == live_bytes
+
+
+async def test_live_fallback_is_uncompressed_and_unvalidated(
+        client, mock_deps, prepared):
+    """R2 is scoped to the prepared path: compressing this body in-request is
+    the loop-blocking work the change removes, and a validator here would name
+    a body the server cannot later confirm from storage."""
+    resp = client.get("/api/browse/albums", headers={"accept-encoding": "gzip"})
+    assert resp.status_code == 200
+    assert "etag" not in {k.lower() for k in resp.headers}
+    assert "content-encoding" not in {k.lower() for k in resp.headers}
+    assert resp.headers["cache-control"] == "no-store"
+
+
+async def test_no_stored_answer_derives_live_and_arms(client, mock_deps, prepared):
+    """Covers AE2 -- a fresh install serves a correct answer, slowly."""
+    before = _live_count()
+    resp = client.get("/api/browse/albums")
+    assert resp.status_code == 200 and resp.json()
+    assert _live_count() == before + 1
+    _state.trigger_prepared_browse_rebuild.assert_called()
+
+
+async def test_signature_mismatch_derives_live(client, mock_deps, prepared):
+    """Covers AE1 -- an input changed, so the edit is reflected immediately
+    even though the stored bytes predate it."""
+    rows = json.loads(client.get("/api/browse/albums").content.decode())
+    _store("albums", prepared, rows)
+    # An exclusion edit lands: inputs move, stored bytes do not.
+    _state._publish_prepared_inputs(prepared.replace(exclusions="edited"))
+    before = _live_count()
+    assert client.get("/api/browse/albums").status_code == 200
+    assert _live_count() == before + 1
+
+
+async def test_a_path_flip_never_serves_the_other_paths_bytes(
+        client, mock_deps, prepared):
+    rows = json.loads(client.get("/api/browse/albums").content.decode())
+    _store("albums", prepared, rows)
+    # A non-Plex source connects: the serving path flips under the stored row.
+    _state._publish_prepared_inputs(prepared.replace(path=_bp.PATH_CATALOG))
+    before = _live_count()
+    client.get("/api/browse/albums")
+    assert _live_count() == before + 1
+
+
+async def test_facets_are_independent(client, mock_deps, prepared):
+    """A stored albums answer with no artists answer serves stored albums and
+    live artists."""
+    alb_rows = json.loads(client.get("/api/browse/albums").content.decode())
+    _store("albums", prepared, alb_rows)
+    before = _live_count()
+    client.get("/api/browse/albums")
+    assert _live_count() == before          # albums served from store
+    client.get("/api/browse/artists")
+    assert _live_count() == before + 1      # artists derived live
+
+
+async def test_unreadable_stored_bytes_fall_back_rather_than_error(
+        client, mock_deps, prepared):
+    """A guest must never see an error because a cache went bad."""
+    _state._publish_prepared_answer(
+        "albums", prepared.path, _bp.signature("albums", prepared),
+        b"not-valid-gzip", 10)
+    _state._publish_prepared_inputs(prepared)
+    resp = client.get("/api/browse/albums", headers={"accept-encoding": "identity"})
+    assert resp.status_code == 200
+    assert resp.json()
+
+
+async def test_a_prepared_hit_still_arms_a_stale_index_refresh(
+        client, mock_deps, prepared, monkeypatch):
+    """The regression the plan named and this implementation first shipped.
+
+    These routes are the primary pump keeping the index and credit roster
+    fresh. Serving stored bytes without re-checking freshness stops the pump,
+    and music added to Plex would never appear in Browse until someone opened
+    a different tab, rescanned, or restarted the container.
+    """
+    rows = json.loads(client.get("/api/browse/albums").content.decode())
+    _store("albums", prepared, rows)
+
+    monkeypatch.setattr(_state, "cache_is_fresh", AsyncMock(return_value=False))
+    trig = MagicMock()
+    monkeypatch.setattr(_state, "trigger_browse_index_refresh", trig)
+
+    before = _live_count()
+    resp = client.get("/api/browse/albums", headers={"accept-encoding": "gzip"})
+    assert resp.status_code == 200
+    assert _live_count() == before, "should still have served the stored bytes"
+    trig.assert_called(), "a stale index must still arm a refresh on the hit path"
+
+
+async def test_a_fresh_index_is_not_refreshed_on_a_prepared_hit(
+        client, mock_deps, prepared, monkeypatch):
+    """The other half: the pump is stale-while-revalidate, not refresh-always."""
+    rows = json.loads(client.get("/api/browse/albums").content.decode())
+    _store("albums", prepared, rows)
+
+    monkeypatch.setattr(_state, "cache_is_fresh", AsyncMock(return_value=True))
+    trig = MagicMock()
+    monkeypatch.setattr(_state, "trigger_browse_index_refresh", trig)
+
+    client.get("/api/browse/albums", headers={"accept-encoding": "gzip"})
+    trig.assert_not_called()

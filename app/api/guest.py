@@ -733,8 +733,13 @@ async def scan_status():
     return await state.scan_status()
 
 
-@router.get("/api/browse/artists")
-async def browse_artists():
+async def _derive_browse_artists():
+    """The live artists derivation, exactly as it has always been.
+
+    Extracted from the route so the prepared-answer path can reuse it
+    unchanged: the stored bytes must be what this produces, or R4 is not
+    satisfied.
+    """
     if await _catalog_active():
         from app.catalog import views
         return await views.artists()
@@ -826,6 +831,134 @@ async def browse_artists():
             if (a["title"] if isinstance(a, dict) else (a.title or "")).lower().strip() not in exclusions
         ]
     return deduped
+
+
+_BROWSE_REVALIDATE = "no-cache"
+# Arming from the request path is rate-limited per facet. Without this, a
+# signature that never matches means every guest pays live derivation AND
+# continuously re-arms a rebuild -- strictly worse than shipping nothing.
+_PREPARED_ARM_INTERVAL_S = 30.0
+_prepared_last_arm: dict = {}
+# Incremented whenever a request derives live. The positive control in the
+# tests asserts this does NOT move once a prepared answer is stored, because
+# both obvious negative controls break the guard toward always-matching and so
+# cannot detect the never-matching case.
+_prepared_live_derivations = 0
+
+
+def _prepared_arm(facet: str) -> None:
+    now = time.monotonic()
+    last = _prepared_last_arm.get(facet, 0.0)
+    if now - last < _PREPARED_ARM_INTERVAL_S:
+        return
+    _prepared_last_arm[facet] = now
+    state.trigger_prepared_browse_rebuild()
+
+
+async def _prepared_deriver(facet: str, path: str, inputs):
+    """What the background rebuild calls. Registered on state so that module
+    never imports this one back."""
+    from app import browse_prepared as bp
+    if facet == bp.FACET_ARTISTS:
+        return await _derive_browse_artists()
+    return await _derive_browse_albums()
+
+
+state.set_prepared_deriver(_prepared_deriver)
+
+
+def _accepts_gzip(request: Request) -> bool:
+    return "gzip" in (request.headers.get("accept-encoding") or "").lower()
+
+
+async def _pump_browse_refreshes(facet: str) -> None:
+    """Keep the stale-while-revalidate pump running on the PREPARED path.
+
+    These two routes are the primary pump that keeps the library index and the
+    credit roster fresh: each checks freshness on the request path and arms a
+    background refresh. Serving stored bytes without that check stops the pump
+    -- the only other triggers are Recently Added, six admin routes and
+    startup, so music added to Plex would never appear in Browse until someone
+    opened a different tab, rescanned, or restarted the container. That is a
+    visible regression, and R4 forbids it.
+
+    Costs one or two settings reads on a cache hit. The triggers themselves are
+    already single-flighted no-ops when fresh or in flight.
+    """
+    if not await state.cache_is_fresh("browse_index_computed_at"):
+        state.trigger_browse_index_refresh()
+    if facet == "artists" and not await state.cache_is_fresh(
+            "credit_cache_computed_at"):
+        state.trigger_credit_refresh()
+
+
+async def _serve_browse(facet: str, request: Request, derive):
+    """Serve a prepared answer when one matches, else derive live.
+
+    The validator is per-representation: two encodings share one URL, so a
+    single validator would let a cache hand compressed bytes to a client that
+    cannot decode them, or apply a not-modified answer to the wrong variant.
+    Hence `Vary: Accept-Encoding` on every response and an encoding-tagged
+    validator.
+
+    The live fallback is uncompressed and carries NO validator. Compressing it
+    in-request is the loop-blocking work this whole change removes, and handing
+    out a validator for a body the server cannot later confirm from storage
+    would invite a conditional request it must answer with a full body anyway.
+    """
+    global _prepared_live_derivations
+    from app import browse_prepared as bp
+
+    path = bp.PATH_CATALOG if await _catalog_active() else bp.PATH_NATIVE
+    inputs = state.published_prepared_inputs()
+    gz = _accepts_gzip(request)
+
+    if inputs is not None and inputs.path == path:
+        try:
+            signature = bp.signature(facet, inputs)
+            hit = state.get_prepared_answer(facet, path, signature)
+            if hit is not None:
+                await _pump_browse_refreshes(facet)
+                body_gzip, _raw_len = hit
+                etag = '"%s-%s"' % (signature, "gz" if gz else "id")
+                headers = {"ETag": etag, "Cache-Control": _BROWSE_REVALIDATE,
+                           "Vary": "Accept-Encoding"}
+                if (request.headers.get("if-none-match") or "") == etag:
+                    return Response(status_code=304, headers=headers)
+                if gz:
+                    headers["Content-Encoding"] = "gzip"
+                    return Response(content=body_gzip,
+                                    media_type="application/json",
+                                    headers=headers)
+                # Only the compressed copy is stored, so an identity client is
+                # served by expanding it -- in the executor, never on the loop.
+                loop = asyncio.get_running_loop()
+                body = await loop.run_in_executor(None, bp.decompress, body_gzip)
+                return Response(content=body, media_type="application/json",
+                                headers=headers)
+        except Exception:
+            # Unreadable or corrupt stored bytes must degrade to the live path,
+            # never reach the guest as an error. A guest cannot clear a cache
+            # and has no way to tell "broken" from "slow".
+            _log.exception("Prepared %s answer unusable; deriving live", facet)
+
+    _prepared_live_derivations += 1
+    state.note_prepared_served_live()
+    _prepared_arm(facet)
+    rows = await derive()
+    return Response(content=bp.serialize(rows), media_type="application/json",
+                    headers={"Cache-Control": "no-store",
+                             "Vary": "Accept-Encoding"})
+
+
+@router.get("/api/browse/artists")
+async def browse_artists(request: Request):
+    return await _serve_browse("artists", request, _derive_browse_artists)
+
+
+@router.get("/api/browse/albums")
+async def browse_albums(request: Request):
+    return await _serve_browse("albums", request, _derive_browse_albums)
 
 
 def _credit_artist_dict(act: dict) -> dict:
@@ -1138,8 +1271,8 @@ async def _decorate_plex_popularity(artist_identity: str, tracks: list[dict]) ->
     return matched
 
 
-@router.get("/api/browse/albums")
-async def browse_albums():
+async def _derive_browse_albums():
+    """The live albums derivation, exactly as it has always been."""
     if await _catalog_active():
         from app.catalog import views
         return await views.albums()

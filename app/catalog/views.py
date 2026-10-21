@@ -59,10 +59,19 @@ def _artist(row: dict) -> Artist:
                   release_count=row["release_count"])
 
 
-async def _album(row: dict, types: dict | None = None) -> Album:
+async def _album(row: dict, types: dict | None = None,
+                 holds: list[dict] | None = None) -> Album:
+    """One merged album entry.
+
+    `holds` lets a LIST caller supply the rows from a single bulk pass. Passing
+    them is what keeps `albums()` from issuing a round-trip per album against
+    the one shared connection; single-entity callers leave it None and keep the
+    per-identity read.
+    """
     if types is None:
         types = await _source_types()
-    holds = await store.get_holds("album", row["identity"])
+    if holds is None:
+        holds = await store.get_holds("album", row["identity"])
     sources = [{"server_name": h["server_name"] or "", "album_id": h["provider_local_key"],
                 "source_type": types.get(h["source_id"], "")}
                for h in holds] or None
@@ -103,8 +112,16 @@ async def artists() -> list[Artist]:
 
 
 async def albums() -> list[Album]:
+    # One holds pass for the whole list, never one per album: the per-row
+    # version issued 508 statements for 501 albums, sequentially, on the event
+    # loop and against the single shared aiosqlite connection. `get_holds_map`
+    # exists for exactly this and chunks at 500 bound parameters. An identity
+    # with no holders simply has no entry, which `_album` renders as None just
+    # as an empty per-row read did.
     types = await _source_types()
-    return [await _album(r, types) for r in await store.get_albums()]
+    rows = await store.get_albums()
+    holds = await store.get_holds_map("album", [r["identity"] for r in rows])
+    return [await _album(r, types, holds.get(r["identity"], [])) for r in rows]
 
 
 async def artist_albums(artist_identity: str) -> list[Album]:
