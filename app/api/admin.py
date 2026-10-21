@@ -856,14 +856,49 @@ async def rescan_sources():
     return {"ok": True}
 
 
+@router.post("/browse/prepared/rebuild")
+async def force_prepared_browse_rebuild():
+    """Drop the stored answers and arm a fresh build.
+
+    Clearing first is what keeps this from appearing to do nothing: a build can
+    legitimately be discarded by the total guard if an input moves while it
+    runs, and an operator who pressed a button deserves to see the answer gone
+    rather than a silent no-op. A missing answer means live derivation, which
+    is correct and merely slow.
+    """
+    dropped = await database.clear_prepared_browse()
+    state.drop_prepared_answers()
+    _arm_prepared_browse()
+    return {"ok": True, "dropped": dropped,
+            "building": state.prepared_browse_building()}
+
+
 @router.get("/plex/index-status")
 async def plex_index_status():
     """Browse-index freshness for the admin UI (plan U6/R7): the last-built
     timestamp (ISO string or null if never built) and whether a crawl is
     currently in flight."""
+    prepared = state.prepared_browse_status()
     return {
         "computed_at": await database.get_setting("browse_index_computed_at"),
         "building": state.browse_index_building(),
+        # Prepared-answer state, reported SEPARATELY from library-refresh
+        # failure. Conflating them tells an operator their library is stale
+        # when the answer is merely unprepared -- the recorded mistake from
+        # the count-degradation work.
+        #
+        # Read "stored_facets" precisely: it means the answer matches its
+        # INPUTS, not that it matches the library. The Plex connect/poll flow
+        # fires no library-change signal (issue #79), so the index itself can
+        # be known-stale while an answer built from it is perfectly current.
+        "prepared": {
+            **prepared,
+            # How often requests fell through to live derivation. A signature
+            # that never matches is otherwise completely invisible: zero
+            # benefit, higher cost than before, and every test green. This is
+            # the operator-facing half of that guard.
+            "arm_failures": _prepared_arm_failures,
+        },
     }
 
 
@@ -2602,6 +2637,25 @@ class ArtistExclusionsRequest(BaseModel):
         return v
 
 
+_prepared_arm_failures = 0
+
+
+def _arm_prepared_browse() -> None:
+    """Arm a prepared-answer rebuild from an admin save, best-effort.
+
+    These are ride-alongs on an operator action that has already succeeded, so
+    a failure here must not fail the request. It is counted rather than only
+    logged, because the consequence -- staying on the live path for that input
+    until something else arms a rebuild -- is otherwise invisible.
+    """
+    global _prepared_arm_failures
+    try:
+        state.trigger_prepared_browse_rebuild()
+    except Exception:
+        _prepared_arm_failures += 1
+        _log.exception("Arming the prepared-browse rebuild failed")
+
+
 @router.get("/pattern-rules")
 async def get_pattern_rules_admin():
     return {"rules": await database.get_pattern_rules()}
@@ -2614,6 +2668,11 @@ async def set_pattern_rules_admin(body: PatternRulesRequest):
     # Rebuild it locally from the stored roster (no Plex re-crawl, R3/R6); the
     # drill-in's signature guard falls back to the live scan until it lands.
     state.trigger_artist_grouping_rebuild()
+    # Rules also change which albums fold and which artists dedupe, so the
+    # prepared answer is stale. Best-effort: a save that succeeds while this
+    # fails leaves the signature guard to serve live until something else
+    # arms a rebuild, which is slow rather than wrong.
+    _arm_prepared_browse()
     return {"ok": True}
 
 
@@ -2625,6 +2684,10 @@ async def get_artist_exclusions_admin():
 @router.post("/artist-exclusions")
 async def set_artist_exclusions_admin(body: ArtistExclusionsRequest):
     await database.set_artist_exclusions(body.names)
+    # Before this, saving an exclusion fired NOTHING -- it applied at request
+    # time over the warm index, so nothing needed to be told. A prepared answer
+    # bakes exclusions in, so it does.
+    _arm_prepared_browse()
     return {"ok": True}
 
 

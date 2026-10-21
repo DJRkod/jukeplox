@@ -5634,3 +5634,107 @@ async def test_admin_queue_add_with_a_stale_track_id_is_404_not_500(
         resp = client.post("/admin/queue", json={"track_id": "t-gone"})
     assert resp.status_code == 404, resp.text
     assert resp.json()["detail"] == "Track not found"
+
+
+# ── U5: the invalidation surface ────────────────────────────────────────────
+#
+# Buys LATENCY, not correctness: the signature guard already makes a missed
+# arming slow rather than wrong. Worth stating so nobody drops this believing
+# correctness is at stake, and nobody keeps it believing it is what makes the
+# design safe.
+#
+# Two of these sites announced nothing at all before: saving artist exclusions
+# fired no trigger whatsoever, and the Plex connect/poll flow changes the
+# ranked server order and the enabled-library set with no library-change
+# signal.
+
+
+async def test_saving_artist_exclusions_arms_a_prepared_rebuild(
+        client, mock_state, mock_session):
+    """This save previously fired nothing -- exclusions applied at request time
+    over the warm index, so nothing needed telling. A prepared answer bakes
+    them in, so it does."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    with patch("app.state.trigger_prepared_browse_rebuild", MagicMock()) as trig,          patch("app.database.set_artist_exclusions", AsyncMock()):
+        resp = client.post("/admin/artist-exclusions", json={"names": ["Various"]})
+        assert resp.status_code == 200
+        trig.assert_called_once()
+
+
+async def test_saving_pattern_rules_arms_a_prepared_rebuild(
+        client, mock_state, mock_session):
+    """Rules change which albums fold and which artists dedupe."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    with patch("app.state.trigger_prepared_browse_rebuild", MagicMock()) as trig,          patch("app.database.set_pattern_rules", AsyncMock()):
+        resp = client.post("/admin/pattern-rules", json={"rules": []})
+        assert resp.status_code == 200
+        trig.assert_called_once()
+
+
+async def test_an_arming_failure_does_not_fail_the_admin_save(
+        client, mock_state, mock_session):
+    """These are ride-alongs on an operator action that already succeeded. The
+    consequence of a failure -- staying on the live path for that input until
+    something else arms a rebuild -- is slow, not wrong."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.api import admin as admin_api
+    before = admin_api._prepared_arm_failures
+    boom = MagicMock(side_effect=RuntimeError("no loop"))
+    with patch("app.state.trigger_prepared_browse_rebuild", boom),          patch("app.database.set_artist_exclusions", AsyncMock()):
+        resp = client.post("/admin/artist-exclusions", json={"names": ["X"]})
+    assert resp.status_code == 200, resp.text
+    assert admin_api._prepared_arm_failures == before + 1, (
+        "an arming failure must be counted, not only logged -- it is otherwise "
+        "invisible")
+
+
+# ── U8: operator visibility ─────────────────────────────────────────────────
+
+async def test_index_status_reports_prepared_state_separately(
+        client, mock_state, mock_session):
+    """Prepared-answer state must not be conflated with library-refresh
+    failure: that tells an operator their library is stale when the answer is
+    merely unprepared."""
+    from unittest.mock import AsyncMock, patch
+    with patch("app.database.get_setting", AsyncMock(return_value="2026-10-20T00:00:00Z")):
+        body = client.get("/admin/plex/index-status").json()
+    assert "prepared" in body
+    assert set(body["prepared"]) >= {"building", "stored_facets",
+                                     "failed_facets", "served_live",
+                                     "arm_failures"}
+    # The library-refresh keys stay where they were.
+    assert "computed_at" in body and "building" in body
+
+
+async def test_index_status_surfaces_the_fallback_rate(
+        client, mock_state, mock_session):
+    """A signature that never matches is otherwise invisible -- zero benefit,
+    higher cost, every test green. This is the operator-facing half of the
+    positive control."""
+    from unittest.mock import AsyncMock, patch
+    from app import state as st
+    st._prepared_served_live = 7
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        body = client.get("/admin/plex/index-status").json()
+    assert body["prepared"]["served_live"] == 7
+
+
+async def test_forced_rebuild_drops_stored_and_in_memory_answers(
+        client, mock_state, mock_session):
+    """Clearing only the table would leave the published bytes serving until a
+    restart, so the button would look like it did nothing."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app import browse_prepared as _bpp
+    from app import state as st
+    st._publish_prepared_answer("albums", _bpp.PATH_NATIVE, "sig", b"gz", 1)
+    st._publish_prepared_inputs("anything")
+    with patch("app.database.clear_prepared_browse", AsyncMock(return_value=2)),          patch("app.state.trigger_prepared_browse_rebuild", MagicMock()) as trig:
+        body = client.post("/admin/browse/prepared/rebuild").json()
+    assert body["ok"] is True and body["dropped"] == 2
+    assert st.get_prepared_answer("albums", _bpp.PATH_NATIVE, "sig") is None
+    assert st.published_prepared_inputs() is None
+    trig.assert_called_once()
+
+
+async def test_forced_rebuild_requires_auth(anon_client, mock_session):
+    assert anon_client.post("/admin/browse/prepared/rebuild").status_code == 401

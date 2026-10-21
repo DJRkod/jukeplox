@@ -14,7 +14,8 @@ _db: aiosqlite.Connection | None = None
 # on the empty-enabled fast path). INVARIANT: every explicit
 # BEGIN/BEGIN IMMEDIATE transaction on this connection holds this lock
 # (save_plex_servers, set_genre_cache, set_credit_cache,
-# set_browse_index, catalog/store.replace_catalog), as do the
+# set_browse_index, set_prepared_browse, catalog/store.replace_catalog), as do
+# the
 # crawl-scale implicit-transaction alias writers
 # (catalog/store.register_alias / repoint_alias) whose execute→commit
 # windows otherwise interleave with locked writers during identity
@@ -311,6 +312,31 @@ CREATE TABLE IF NOT EXISTS catalog_identity_alias (
     PRIMARY KEY (entity_type, lookup_key)
 );
 CREATE INDEX IF NOT EXISTS idx_catalog_alias_identity ON catalog_identity_alias (entity_type, identity);
+
+-- The prepared browse answer: the exact bytes a guest receives, derived once
+-- per input change instead of once per request. Served ONLY when `signature`
+-- matches the signature composed from current inputs, so a missed
+-- invalidation degrades to live derivation rather than to a wrong answer.
+--
+-- Keyed by (facet, path) because the serving path is derived from live source
+-- registry membership rather than configuration: an intermittently-reachable
+-- non-Plex source flips it without operator action, and a single-key table
+-- would evict the other path's warm bytes on every flip.
+--
+-- Only the COMPRESSED copy is stored. aiosqlite serializes statements per
+-- connection on the one shared connection, so a multi-megabyte write stalls
+-- every reader too, not just other writers -- ~307 KB instead of ~3 MB is an
+-- order of magnitude less time holding it. A client that does not accept
+-- compression is served by expanding this off the event loop.
+CREATE TABLE IF NOT EXISTS prepared_browse (
+    facet      TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    signature  TEXT NOT NULL,
+    body_gzip  BLOB NOT NULL,
+    raw_len    INTEGER NOT NULL,
+    built_at   TEXT NOT NULL,
+    PRIMARY KEY (facet, path)
+);
 """
 
 
@@ -1204,6 +1230,90 @@ async def get_browse_facets() -> dict[str, bool]:
 
 
 # ── genre cache ───────────────────────────────────────────────────────────────
+
+async def get_prepared_browse(facet: str, path: str) -> dict | None:
+    """The stored answer for one facet on one serving path, or None.
+
+    Returns the compressed bytes and the signature they were built under. The
+    caller compares that signature against one composed from current inputs and
+    falls back to live derivation on any mismatch -- never trusting this row
+    just because it exists.
+    """
+    async with _conn().execute(
+        "SELECT facet, path, signature, body_gzip, raw_len, built_at"
+        " FROM prepared_browse WHERE facet = ? AND path = ?",
+        (facet, path),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {"facet": row["facet"], "path": row["path"],
+            "signature": row["signature"], "body_gzip": row["body_gzip"],
+            "raw_len": row["raw_len"], "built_at": row["built_at"]}
+
+
+async def set_prepared_browse(facet: str, path: str, signature: str,
+                              body_gzip: bytes, raw_len: int) -> None:
+    """Install one facet's prepared answer.
+
+    A single-row upsert rather than delete-then-insert, which is what makes the
+    carry-forward guarantee structural: there is no window in which the prior
+    bytes are gone. A failed or partial build therefore leaves the previous
+    answer in place and serving, which matters because the alternative --
+    installing an empty answer -- is how a derived table in this repo once
+    silently emptied itself (#61, and the crawl that took 104,064 tracks to
+    zero while reporting success).
+
+    Per-facet by construction: writing artists cannot disturb a good albums
+    row. A guard keyed on "the rebuild ran" rather than on each facet is the
+    recorded mistake.
+    """
+    # Local import, matching this module's convention (see the `import json`
+    # calls further down) rather than adding a module-level one.
+    from datetime import datetime, timezone
+
+    db = _conn()
+    async with _write_tx_lock:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute(
+                "INSERT INTO prepared_browse"
+                " (facet, path, signature, body_gzip, raw_len, built_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(facet, path) DO UPDATE SET"
+                "   signature = excluded.signature,"
+                "   body_gzip = excluded.body_gzip,"
+                "   raw_len   = excluded.raw_len,"
+                "   built_at  = excluded.built_at",
+                (facet, path, signature, body_gzip, raw_len,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def clear_prepared_browse() -> int:
+    """Drop every stored answer; returns how many rows went.
+
+    For the operator-forced rebuild and for tests. Dropping rather than
+    rewriting is safe because a missing row means live derivation, which is
+    correct and merely slow.
+    """
+    db = _conn()
+    async with _write_tx_lock:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute("SELECT COUNT(*) FROM prepared_browse") as cur:
+                n = (await cur.fetchone())[0]
+            await db.execute("DELETE FROM prepared_browse")
+            await db.commit()
+            return n
+        except Exception:
+            await db.rollback()
+            raise
+
 
 async def get_genre_cache() -> list[dict]:
     """Return cached genre list ordered by count descending. Empty list if unpopulated."""

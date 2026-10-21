@@ -5253,3 +5253,340 @@ async def test_resolve_device_name_is_fail_soft(monkeypatch):
         raise RuntimeError("watcher exploded")
     monkeypatch.setattr(watcher_mod, "get_watcher", _raise)
     assert st._resolve_device_name("chromecast", "uuid-1") == ""
+
+
+# ── U3: the prepared-browse rebuild ─────────────────────────────────────────
+#
+# This is where the plan's central bet is either kept or broken. A document
+# review found the first design broken in a specific way worth restating,
+# because the test names below only make sense against it:
+#
+#   A build reads exclusions E1 and hands a ~3s job to an executor. One second
+#   in, the operator saves E2. The build finishes, composes its signature from
+#   CURRENT inputs, and stores sig(E2) beside bytes(E1). Every later request
+#   composes sig(E2), matches exactly, and is served the pre-edit answer --
+#   which browsers then cache under a matching validator.
+#
+# The fix is a snapshot plus a TOTAL guard: derive only from the snapshot,
+# compute the stored signature from the snapshot, and discard at install time
+# unless every component still matches. Guarding on an index generation alone
+# is insufficient because four of the inputs never touch it.
+
+
+import asyncio as _aio
+import threading
+
+from app import browse_prepared as bp
+from app import database, state
+
+
+def _reset_prepared(monkeypatch):
+    # The rebuild asks which serving path would answer before anything else,
+    # and that read hits the database.
+    monkeypatch.setattr(state, "catalog_active", AsyncMock(return_value=False))
+    monkeypatch.setattr(state, "_prepared_browse", {}, raising=False)
+    monkeypatch.setattr(state, "_prepared_inputs", None, raising=False)
+    monkeypatch.setattr(state, "_prepared_failed", {}, raising=False)
+    monkeypatch.setattr(state, "_prepared_rebuild_running", False, raising=False)
+    monkeypatch.setattr(state, "_prepared_rebuild_dirty", False, raising=False)
+
+
+def _inputs(**over):
+    base = dict(path=bp.PATH_NATIVE, index_content="idx", rules="rules",
+                exclusions="excl", enabled_libraries="libs",
+                server_order="order", credit_roster="credit",
+                catalog_content="", registry="")
+    base.update(over)
+    return bp.SignatureInputs(**base)
+
+
+# ── the off-loop property, written before the implementation ────────────────
+
+async def test_derivation_runs_off_the_event_loop(monkeypatch):
+    """Structural, by thread identity -- never a wall-clock assertion.
+
+    Read the limit of this test honestly: an executor hop bounds thread
+    residency, not GIL residency. Grouping yields and zlib releases the GIL,
+    but a single large JSON encode is one C call that holds it throughout, so
+    the loop still cannot run during the encode. This proves the hop exists;
+    it cannot prove the loop stays responsive. That measurement is U9's.
+    """
+    _reset_prepared(monkeypatch)
+    loop_thread = threading.get_ident()
+    seen = []
+
+    def _recording_serialize(rows):
+        seen.append(threading.get_ident())
+        return b"[]"
+
+    monkeypatch.setattr(state, "_prepared_compose_inputs",
+                        AsyncMock(return_value=_inputs()), raising=False)
+    monkeypatch.setattr(state, "_prepared_deriver",
+                        AsyncMock(return_value=[]), raising=False)
+    monkeypatch.setattr(bp, "serialize", _recording_serialize)
+    monkeypatch.setattr(database, "set_prepared_browse", AsyncMock())
+
+    await state._rebuild_prepared_browse()
+
+    assert seen, "serialization never ran"
+    assert all(t != loop_thread for t in seen), (
+        "serialization ran on the event loop thread; the executor hop is "
+        "missing")
+
+
+# ── the P0: a total guard, not a generation guard ───────────────────────────
+
+async def test_an_input_changing_mid_build_discards_the_result(monkeypatch):
+    """The failure the plan exists to prevent.
+
+    Exclusions change while the build is in flight. The stored signature must
+    never describe a newer world than the bytes beside it, so the result is
+    discarded rather than installed.
+    """
+    _reset_prepared(monkeypatch)
+    writes = AsyncMock()
+    monkeypatch.setattr(database, "set_prepared_browse", writes)
+    monkeypatch.setattr(state, "_prepared_deriver",
+                        AsyncMock(return_value=[]), raising=False)
+
+    calls = {"n": 0}
+
+    async def _compose(path):
+        # First call is the snapshot; later calls are the install-time
+        # recomposition, by which point the operator has saved a new value.
+        calls["n"] += 1
+        return _inputs(exclusions="E1" if calls["n"] == 1 else "E2")
+
+    monkeypatch.setattr(state, "_prepared_compose_inputs", _compose,
+                        raising=False)
+
+    await state._rebuild_prepared_browse()
+
+    writes.assert_not_awaited()
+    assert state._prepared_rebuild_dirty is True, (
+        "a discarded build must re-arm, or the answer stays stale until some "
+        "unrelated event triggers another build")
+
+
+async def test_a_stable_build_installs_the_snapshot_signature(monkeypatch):
+    """The stored signature describes the bytes stored beside it -- asserted as
+    a pair, not as two independent halves."""
+    _reset_prepared(monkeypatch)
+    captured = {}
+
+    async def _set(facet, path, signature, body_gzip, raw_len):
+        captured[facet] = (signature, body_gzip, raw_len)
+
+    monkeypatch.setattr(database, "set_prepared_browse", _set)
+    monkeypatch.setattr(state, "_prepared_compose_inputs",
+                        AsyncMock(return_value=_inputs()), raising=False)
+    monkeypatch.setattr(state, "_prepared_deriver",
+                        AsyncMock(return_value=[{"id": "a", "title": "T"}]),
+                        raising=False)
+
+    await state._rebuild_prepared_browse()
+
+    for facet in (bp.FACET_ALBUMS, bp.FACET_ARTISTS):
+        sig, body, raw_len = captured[facet]
+        assert sig == bp.signature(facet, _inputs())
+        expected = bp.serialize([{"id": "a", "title": "T"}])
+        assert bp.decompress(body) == expected
+        assert raw_len == len(expected)
+
+
+async def test_failure_re_arms_and_keeps_the_previous_answer(monkeypatch):
+    """A failed build must not leave a stale-but-matching pair in place with
+    nothing scheduled to repair it."""
+    _reset_prepared(monkeypatch)
+    monkeypatch.setattr(state, "_prepared_compose_inputs",
+                        AsyncMock(return_value=_inputs()), raising=False)
+    monkeypatch.setattr(state, "_prepared_deriver",
+                        AsyncMock(side_effect=RuntimeError("boom")),
+                        raising=False)
+    writes = AsyncMock()
+    monkeypatch.setattr(database, "set_prepared_browse", writes)
+
+    await state._rebuild_prepared_browse()
+
+    writes.assert_not_awaited()
+    assert state._prepared_rebuild_dirty is True
+    assert state._prepared_failed.get(bp.FACET_ALBUMS) is True
+
+
+async def test_one_facet_failing_does_not_wipe_the_other(monkeypatch):
+    """Per-facet, not keyed on "the rebuild ran" -- the guard shape that once
+    emptied a 104,064-track table while reporting success."""
+    _reset_prepared(monkeypatch)
+    monkeypatch.setattr(state, "_prepared_compose_inputs",
+                        AsyncMock(return_value=_inputs()), raising=False)
+    written = []
+
+    async def _set(facet, path, signature, body_gzip, raw_len):
+        written.append(facet)
+
+    monkeypatch.setattr(database, "set_prepared_browse", _set)
+
+    async def _derive(facet, path, inputs):
+        if facet == bp.FACET_ARTISTS:
+            raise RuntimeError("artists failed")
+        return [{"id": "a"}]
+
+    monkeypatch.setattr(state, "_prepared_deriver", _derive, raising=False)
+
+    await state._rebuild_prepared_browse()
+
+    assert written == [bp.FACET_ALBUMS]
+    assert state._prepared_failed.get(bp.FACET_ARTISTS) is True
+    assert state._prepared_failed.get(bp.FACET_ALBUMS) is not True
+
+
+# ── single-flight and the dirty re-arm ──────────────────────────────────────
+
+async def test_trigger_is_single_flighted(monkeypatch):
+    _reset_prepared(monkeypatch)
+    monkeypatch.setattr(state, "_prepared_rebuild_running", True, raising=False)
+    rebuild = AsyncMock()
+    monkeypatch.setattr(state, "_rebuild_prepared_browse", rebuild,
+                        raising=False)
+    state.trigger_prepared_browse_rebuild()
+    await _aio.sleep(0)
+    rebuild.assert_not_awaited()
+
+
+async def test_a_trigger_arriving_mid_build_re_arms_exactly_once(monkeypatch):
+    """The repo's existing triggers no-op while a build is in flight, which is
+    right for a crawl and here would silently drop an invalidation. Assert the
+    COUNT: a dropped trigger and an infinite re-arm loop are both failures.
+    """
+    _reset_prepared(monkeypatch)
+    runs = {"n": 0}
+
+    async def _rebuild():
+        runs["n"] += 1
+        if runs["n"] == 1:
+            state.trigger_prepared_browse_rebuild()   # arrives mid-build
+
+    monkeypatch.setattr(state, "_rebuild_prepared_browse", _rebuild,
+                        raising=False)
+    state.trigger_prepared_browse_rebuild()
+    for _ in range(20):
+        await _aio.sleep(0)
+    assert runs["n"] == 2, "expected exactly one re-armed rebuild, got %d runs" % runs["n"]
+
+
+# ── the hot-path reader ─────────────────────────────────────────────────────
+
+def test_hot_path_reader_requires_an_exact_signature_match(monkeypatch):
+    _reset_prepared(monkeypatch)
+    state._publish_prepared_answer(bp.FACET_ALBUMS, bp.PATH_NATIVE, "sig-1",
+                                   b"gz", 10)
+    assert state.get_prepared_answer(bp.FACET_ALBUMS, bp.PATH_NATIVE, "sig-1") \
+        == (b"gz", 10)
+    assert state.get_prepared_answer(bp.FACET_ALBUMS, bp.PATH_NATIVE, "sig-2") is None
+    assert state.get_prepared_answer(bp.FACET_ARTISTS, bp.PATH_NATIVE, "sig-1") is None
+    assert state.get_prepared_answer(bp.FACET_ALBUMS, bp.PATH_CATALOG, "sig-1") is None
+
+
+def test_published_inputs_let_the_hot_path_avoid_the_database(monkeypatch):
+    """Composing from sequential awaited reads would cost roughly six
+    serialized round-trips on the one shared connection for a response that
+    may carry no body at all -- and N sequential reads can digest an input
+    state that never simultaneously existed."""
+    _reset_prepared(monkeypatch)
+    assert state.published_prepared_inputs() is None
+    state._publish_prepared_inputs(_inputs())
+    assert state.published_prepared_inputs().exclusions == "excl"
+
+
+# ── U7: the multi-source path ───────────────────────────────────────────────
+
+async def test_multisource_prepared_answer_is_off_by_default(monkeypatch):
+    """The rig is all-Plex and cannot exercise this derivation, and the rows
+    are not a pure function of the catalog tables, so it is opt-in. Storing
+    nothing means the path derives live -- today's behaviour."""
+    _reset_prepared(monkeypatch)
+    monkeypatch.setattr(state, "catalog_active", AsyncMock(return_value=True))
+    monkeypatch.setattr(database, "get_setting", AsyncMock(return_value=None))
+    writes = AsyncMock()
+    monkeypatch.setattr(database, "set_prepared_browse", writes)
+    monkeypatch.setattr(state, "_prepared_deriver", AsyncMock(return_value=[]),
+                        raising=False)
+    # Stub the snapshot too, so the GATE is the only thing that can stop the
+    # write. Without this the rebuild dies on an uninitialised database first
+    # and the test passes whatever the gate does -- which it did, until a
+    # mutation run showed flipping the default to ON changed nothing.
+    monkeypatch.setattr(state, "_prepared_compose_inputs",
+                        AsyncMock(return_value=_inputs(path=bp.PATH_CATALOG)),
+                        raising=False)
+    await state._rebuild_prepared_browse()
+    writes.assert_not_awaited()
+
+
+async def test_a_failed_gate_read_means_off(monkeypatch):
+    monkeypatch.setattr(database, "get_setting",
+                        AsyncMock(side_effect=RuntimeError("no db")))
+    assert await state._prepared_multisource_enabled() is False
+
+
+async def test_registry_membership_is_in_the_catalog_signature(monkeypatch):
+    """A source present at rebuild time but absent at serve time must not
+    match. Registry membership is reachability-derived, so this moves without
+    any operator action."""
+    class _S:
+        def __init__(self, sid, stype):
+            self.source_id, self.source_type = sid, stype
+
+    class _Reg:
+        def __init__(self, srcs):
+            self.sources = srcs
+
+    monkeypatch.setattr(database, "get_browse_artists", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_browse_albums", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_pattern_rules", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_artist_exclusions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_effective_enabled_libraries",
+                        AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_plex_servers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_credit_acts", AsyncMock(return_value=[]))
+    from app.catalog import store as cstore
+    monkeypatch.setattr(cstore, "get_albums", AsyncMock(return_value=[]))
+    monkeypatch.setattr(cstore, "get_artists", AsyncMock(return_value=[]))
+
+    monkeypatch.setattr(state, "get_plex_client",
+                        AsyncMock(return_value=_Reg([_S("a", "plex"),
+                                                     _S("b", "jellyfin")])))
+    both = await state._prepared_compose_inputs(bp.PATH_CATALOG)
+    monkeypatch.setattr(state, "get_plex_client",
+                        AsyncMock(return_value=_Reg([_S("a", "plex")])))
+    one = await state._prepared_compose_inputs(bp.PATH_CATALOG)
+
+    assert both.registry != one.registry
+    assert bp.signature(bp.FACET_ALBUMS, both) != bp.signature(bp.FACET_ALBUMS, one)
+
+
+async def test_stored_answers_are_republished_at_startup(monkeypatch):
+    """Without this the database row is write-only and the stated reason for
+    choosing SQLite over memory -- a warm first request after a restart -- is
+    untrue."""
+    _reset_prepared(monkeypatch)
+    inputs = _inputs()
+    sig = bp.signature(bp.FACET_ALBUMS, inputs)
+    rows = {(bp.FACET_ALBUMS, bp.PATH_NATIVE): {
+        "signature": sig, "body_gzip": b"gz", "raw_len": 11}}
+    monkeypatch.setattr(database, "get_prepared_browse",
+                        AsyncMock(side_effect=lambda f, p: rows.get((f, p))))
+    monkeypatch.setattr(state, "_prepared_compose_inputs",
+                        AsyncMock(return_value=inputs), raising=False)
+
+    await state.load_prepared_answers()
+
+    assert state.get_prepared_answer(bp.FACET_ALBUMS, bp.PATH_NATIVE, sig)         == (b"gz", 11)
+    assert state.published_prepared_inputs() == inputs
+
+
+async def test_a_failed_startup_load_leaves_nothing_published(monkeypatch):
+    _reset_prepared(monkeypatch)
+    monkeypatch.setattr(database, "get_prepared_browse",
+                        AsyncMock(side_effect=RuntimeError("no db")))
+    await state.load_prepared_answers()        # must not raise
+    assert state.published_prepared_inputs() is None

@@ -328,6 +328,11 @@ async def get_plex_client():
 def invalidate_plex_client() -> None:
     global _plex_client, _ondeck, _ondeck_gen
     _plex_client = None
+    # The serving path is derived from live registry membership and the album
+    # answer embeds the ranked server order, so both move here -- and this is
+    # reached by the Plex connect/poll flow, which fires no library-change
+    # signal at all.
+    trigger_prepared_browse_rebuild()
     from app.api import guest as _guest_api
     _guest_api._enabled_libs_cache = None
     # Bump the refresh generation so an in-flight enabled-libraries refresh that
@@ -2437,6 +2442,10 @@ async def _refresh_credit_cache() -> None:
         _log.exception("Credit cache refresh failed")
     finally:
         _credit_refresh_running = False
+        # The roster is an input to the ARTISTS answer, and this refresh
+        # completes AFTER the response that triggered it -- so a rebuild armed
+        # by the same rescan would have captured the pre-crawl roster.
+        trigger_prepared_browse_rebuild()
 
 
 def trigger_credit_refresh() -> None:
@@ -2617,6 +2626,13 @@ async def _refresh_browse_index() -> None:
         _log.exception("Browse index refresh failed")
     finally:
         _browse_index_refresh_running = False
+        # The prepared answer derives from this index, so arm a rebuild here --
+        # the real "library contents changed" seam. Deliberately NOT inside
+        # _rebuild_artist_grouping, which is also reached from a guest drill-in
+        # self-heal: arming there lets ordinary guest navigation kick off a
+        # full rebuild. Correctness never depends on this landing; the
+        # signature guard already makes a missed arming slow, not wrong.
+        trigger_prepared_browse_rebuild()
 
 
 def trigger_browse_index_refresh() -> None:
@@ -2708,6 +2724,9 @@ async def _refresh_catalog() -> None:
         _log.exception("Catalog refresh failed")
     finally:
         _catalog_refresh_running = False
+        # Catalog content is an input to the multi-source answer, and like the
+        # credit crawl this lands after the response that triggered it.
+        trigger_prepared_browse_rebuild()
 
 
 def trigger_catalog_refresh() -> None:
@@ -2874,6 +2893,368 @@ def trigger_artist_grouping_rebuild() -> None:
 
     task = asyncio.create_task(_run())
     task.add_done_callback(_log_task_exc)
+
+
+# ── prepared browse answer ───────────────────────────────────────────────────
+#
+# The finished browse answer, derived once per input change instead of once per
+# request, and served only when a signature of every input it derives from
+# matches. Readers COMPARE rather than trust a stamp, which is what makes a
+# missed invalidation slow instead of wrong.
+#
+# Why this does not simply copy the grouping-map precedent above: that map has
+# two inputs and controls both, so computing its signature after the build is
+# safe. This has eight, and four of them (rules, exclusions, server order,
+# enabled libraries) change without touching any generation counter. Composing
+# the stored signature from CURRENT inputs after a ~3s build therefore lets a
+# mid-build edit produce sig(new) beside bytes(old) -- a matching signature
+# over a stale answer, cached in browsers under that validator. So the build
+# snapshots its inputs first, derives only from the snapshot, and discards at
+# install time unless EVERY component still matches.
+
+# (facet, path) -> (signature, gzip bytes, raw byte length)
+_prepared_browse: dict = {}
+# The component values the hot path compares against, published by whoever
+# last composed them. Keeping these in memory is not an optimisation: composing
+# from sequential awaited reads would cost several serialized round-trips on
+# the one shared connection for a response that may carry no body at all, and N
+# sequential reads can digest an input state that never simultaneously existed.
+_prepared_inputs = None
+_prepared_failed: dict = {}
+_prepared_rebuild_running = False
+_prepared_rebuild_dirty = False
+# One initial pass plus at most one re-run, for a trigger that landed
+# mid-build. See the bounded loop in trigger_prepared_browse_rebuild.
+_PREPARED_MAX_PASSES = 2
+_prepared_served_live = 0
+# Set by the API layer at import time so this module never imports it back.
+_prepared_deriver = None
+
+
+def set_prepared_deriver(fn) -> None:
+    """Register the function that derives a facet's rows.
+
+    The derivation lives in the API layer; this module owns the snapshot, the
+    guard, the storage and the trigger. Injecting it keeps the dependency
+    one-directional and lets every rule above be tested without a route.
+    """
+    global _prepared_deriver
+    _prepared_deriver = fn
+
+
+def _publish_prepared_inputs(inputs) -> None:
+    """Install the component values the hot path reads. One global-reference
+    assignment, so a concurrent request sees whole-old or whole-new."""
+    global _prepared_inputs
+    _prepared_inputs = inputs
+
+
+def published_prepared_inputs():
+    """What the request path compares against, or None before anything has
+    composed them (cold process). None means fall back to live derivation,
+    which is correct and merely slow."""
+    return _prepared_inputs
+
+
+def _publish_prepared_answer(facet: str, path: str, signature: str,
+                             body_gzip: bytes, raw_len: int) -> None:
+    global _prepared_browse
+    nxt = dict(_prepared_browse)
+    nxt[(facet, path)] = (signature, body_gzip, raw_len)
+    _prepared_browse = nxt          # whole-old-or-whole-new for readers
+
+
+def get_prepared_answer(facet: str, path: str, signature: str):
+    """The stored bytes IFF they were built under `signature`, else None.
+
+    Any drift -- cold process, mid-rebuild, an input changed, a logic-version
+    bump -- yields None and the caller derives live. That is the escape hatch
+    the whole design rests on.
+    """
+    entry = _prepared_browse.get((facet, path))
+    if entry is not None and entry[0] == signature:
+        return (entry[1], entry[2])
+    return None
+
+
+def note_prepared_served_live() -> None:
+    """Count a fallback. A signature that never matches is otherwise invisible:
+    zero benefit, higher cost, every test green."""
+    global _prepared_served_live
+    _prepared_served_live += 1
+
+
+PREPARED_MULTISOURCE_SETTING = "prepared_browse_multisource"
+
+
+async def _prepared_multisource_enabled() -> bool:
+    """Whether the multi-source prepared answer is switched on.
+
+    Default OFF, and a failed read also means off -- the safe direction for a
+    cache on a code path no rig here can exercise.
+    """
+    from app import database
+    try:
+        raw = await database.get_setting(PREPARED_MULTISOURCE_SETTING)
+    except Exception:
+        return False
+    return str(raw or "0") in ("1", "true", "True", "on")
+
+
+async def _prepared_compose_inputs(path: str):
+    """Compose the signature inputs from stored state. DB only, no network.
+
+    Content components are digested over the rows actually stored rather than
+    taken from the freshness stamps this repo writes -- those advance on every
+    refresh whether or not a row changed, so a stamp-derived signature would
+    self-invalidate several times a day and again on every restart, forcing a
+    full re-derivation and a full multi-megabyte re-download each time.
+
+    Digesting here rather than having each writer persist a digest keeps the
+    writers untouched and reads from the same tables the answer is derived
+    from, so the two cannot disagree. It is affordable because this runs at
+    rebuild and publish time, never on the request path.
+    """
+    from app import browse_prepared as bp
+    from app import database
+    from app.normalize import compile_rules
+
+    artists = await database.get_browse_artists()
+    albums = await database.get_browse_albums()
+    compiled = compile_rules(await database.get_pattern_rules())
+    exclusions = await database.get_artist_exclusions()
+    libs = await database.get_effective_enabled_libraries()
+    servers = await database.get_plex_servers()
+    credits = await database.get_credit_acts(va_only=True)
+
+    catalog_content = ""
+    registry = ""
+    if path == bp.PATH_CATALOG:
+        from app.catalog import store as catalog_store
+        cat_albums = await catalog_store.get_albums()
+        cat_artists = await catalog_store.get_artists()
+        catalog_content = bp.digest_values(
+            str(len(cat_artists)), str(len(cat_albums)),
+            *[str(r.get("identity")) for r in cat_artists],
+            *[str(r.get("identity")) for r in cat_albums])
+        # Registry membership is REACHABILITY-derived, not configuration:
+        # the multi-source album rows carry per-source labels read from the
+        # live registry, and the serving-path selector itself is "is any
+        # connected source non-Plex". A source that is briefly unreachable at
+        # rebuild time would otherwise produce rows with downgraded source
+        # attribution that then match the signature and serve fast to everyone.
+        reg = await get_plex_client()
+        srcs = getattr(reg, "sources", None) or []
+        registry = bp.digest_values(*sorted(
+            "%s|%s" % (getattr(x, "source_id", ""), getattr(x, "source_type", ""))
+            for x in srcs))
+
+    return bp.SignatureInputs(
+        path=path,
+        catalog_content=catalog_content,
+        registry=registry,
+        index_content=bp.digest_values(
+            str(len(artists)), str(len(albums)),
+            *[str(r.get("artist_id")) for r in artists],
+            *[str(r.get("album_id")) for r in albums],
+            *[str(r.get("track_count")) for r in albums]),
+        rules=bp.digest_values(rules_sig(compiled)),
+        exclusions=bp.digest_values(*sorted(str(e) for e in (exclusions or []))),
+        enabled_libraries=bp.digest_values(
+            *sorted(str(l.get("section_key")) for l in (libs or []))),
+        server_order=bp.digest_values(
+            *[f"{s.get('machine_id')}|{s.get('name')}|{s.get('owned')}"
+              for s in (servers or [])]),
+        credit_roster=bp.digest_values(
+            *sorted(str(c.get("name_lower") or c.get("name"))
+                    for c in (credits or []))),
+    )
+
+
+async def publish_prepared_inputs(path: str) -> None:
+    """Compose and publish without rebuilding.
+
+    Called at startup so the first request after a restart can match the row
+    already in the database -- which is the stated reason for storing the
+    answer there rather than in memory.
+    """
+    try:
+        _publish_prepared_inputs(await _prepared_compose_inputs(path))
+    except Exception:
+        _log.exception("Publishing prepared-browse inputs failed")
+
+
+async def _rebuild_prepared_browse() -> None:
+    """Rebuild both facets. DB + in-memory only, no network.
+
+    Being network-free is what makes this cheap enough to arm on an admin
+    policy edit -- roughly three seconds of local work rather than a crawl.
+    """
+    global _prepared_rebuild_dirty
+    from app import browse_prepared as bp
+    from app import database
+
+    path = bp.PATH_CATALOG if await catalog_active() else bp.PATH_NATIVE
+
+    if path == bp.PATH_CATALOG and not await _prepared_multisource_enabled():
+        # The rig this was validated on is all-Plex and cannot exercise the
+        # multi-source derivation at all, and its rows are not a pure function
+        # of the catalog tables (see the registry note above). So it stays
+        # opt-in until it has been exercised against a synthetic non-Plex
+        # source. Storing nothing means the path derives live -- today's
+        # behaviour, unchanged.
+        return
+
+    # 1. Snapshot. Every later step reads this and nothing else.
+    try:
+        snapshot = await _prepared_compose_inputs(path)
+    except Exception:
+        _log.exception("Prepared-browse snapshot failed")
+        _prepared_rebuild_dirty = True
+        return
+
+    built = {}
+    for facet in (bp.FACET_ALBUMS, bp.FACET_ARTISTS):
+        try:
+            rows = await _prepared_deriver(facet, path, snapshot)
+            loop = asyncio.get_running_loop()
+            # Serialization and compression are CPU. An executor hop bounds
+            # thread residency, not GIL residency -- a single large JSON encode
+            # holds the GIL for its duration -- so this is necessary but not
+            # sufficient, and the loop-lag budget is measured on hardware.
+            raw = await loop.run_in_executor(None, bp.serialize, rows)
+            packed = await loop.run_in_executor(None, bp.compress, raw)
+            built[facet] = (bp.signature(facet, snapshot), packed, len(raw))
+        except Exception:
+            # Per facet, never keyed on "the rebuild ran": a guard of that
+            # shape is what once emptied a populated table while reporting
+            # success. A failure here leaves the previous answer serving.
+            _log.exception("Prepared-browse rebuild failed for %s", facet)
+            _prepared_failed[facet] = True
+            _prepared_rebuild_dirty = True
+
+    if not built:
+        return
+
+    # 2. The total guard. Recompose from live inputs and discard unless EVERY
+    #    component still matches -- an index generation alone would miss four
+    #    of them.
+    try:
+        current = await _prepared_compose_inputs(path)
+    except Exception:
+        _log.exception("Prepared-browse install check failed")
+        _prepared_rebuild_dirty = True
+        return
+    if current != snapshot:
+        _log.info("Prepared-browse result discarded: an input moved mid-build")
+        _prepared_rebuild_dirty = True
+        return
+
+    for facet, (signature, packed, raw_len) in built.items():
+        try:
+            await database.set_prepared_browse(facet, path, signature, packed,
+                                               raw_len)
+            _publish_prepared_answer(facet, path, signature, packed, raw_len)
+            _prepared_failed[facet] = False
+        except Exception:
+            _log.exception("Storing the prepared %s answer failed", facet)
+            _prepared_failed[facet] = True
+            _prepared_rebuild_dirty = True
+    _publish_prepared_inputs(snapshot)
+
+
+def trigger_prepared_browse_rebuild() -> None:
+    """Fire-and-forget rebuild, single-flighted WITH a dirty re-arm.
+
+    Every other trigger in this module simply no-ops while a build is in
+    flight, which is correct for a crawl and wrong here: the dropped trigger is
+    an invalidation, and the in-flight build is about to install a result
+    computed before it. So a trigger arriving mid-build sets a dirty flag and
+    exactly one further rebuild runs on completion.
+    """
+    global _prepared_rebuild_running, _prepared_rebuild_dirty
+    if _prepared_rebuild_running:
+        _prepared_rebuild_dirty = True
+        return
+    _prepared_rebuild_running = True
+
+    async def _run():
+        global _prepared_rebuild_running, _prepared_rebuild_dirty
+        try:
+            # BOUNDED. An unbounded loop spins forever when the rebuild fails
+            # persistently, because failure sets the dirty flag -- "retry while
+            # dirty" then never terminates and burns a core. One re-run is what
+            # the design needs (a trigger that landed mid-build must not be
+            # dropped); a durable failure waits for the next real trigger.
+            for _ in range(_PREPARED_MAX_PASSES):
+                _prepared_rebuild_dirty = False
+                await _rebuild_prepared_browse()
+                if not _prepared_rebuild_dirty:
+                    break
+        finally:
+            _prepared_rebuild_running = False
+
+    task = asyncio.create_task(_run())
+    task.add_done_callback(_log_task_exc)
+
+
+async def load_prepared_answers() -> None:
+    """Re-publish the stored answers at startup.
+
+    Without this the database row is write-only: the serving path compares
+    against the in-memory copy, which is empty in a fresh process, so every
+    request after a restart falls back to live derivation until a rebuild
+    completes. That would make the stated reason for storing the answer in
+    SQLite rather than memory -- "a warm first request after a restart" --
+    simply untrue.
+
+    Best-effort and never blocking: on any failure the answer is absent, which
+    means live derivation, which is correct and merely slow.
+    """
+    from app import browse_prepared as bp
+    from app import database
+    try:
+        path = bp.PATH_CATALOG if await catalog_active() else bp.PATH_NATIVE
+        for facet in (bp.FACET_ALBUMS, bp.FACET_ARTISTS):
+            row = await database.get_prepared_browse(facet, path)
+            if row:
+                _publish_prepared_answer(facet, path, row["signature"],
+                                         row["body_gzip"], row["raw_len"])
+        # Publish the inputs too, or nothing can match what was just loaded.
+        _publish_prepared_inputs(await _prepared_compose_inputs(path))
+    except Exception:
+        _log.exception("Loading stored prepared-browse answers failed")
+
+
+def drop_prepared_answers() -> None:
+    """Forget the in-memory copies as well as the stored rows.
+
+    Clearing only the table would leave the published bytes serving until the
+    process restarted, so an operator-forced rebuild would look like it did
+    nothing.
+    """
+    global _prepared_browse, _prepared_inputs
+    _prepared_browse = {}
+    _prepared_inputs = None
+
+
+def prepared_browse_building() -> bool:
+    return _prepared_rebuild_running
+
+
+def prepared_browse_status() -> dict:
+    """Operator-facing state.
+
+    "current" below means "matches its inputs", NOT "matches the library": the
+    Plex-connect flow fires no library-change signal, so the index itself can
+    be known-stale while an answer built from it is perfectly current.
+    """
+    return {
+        "building": _prepared_rebuild_running,
+        "stored_facets": sorted(f for (f, _p) in _prepared_browse),
+        "failed_facets": sorted(f for f, bad in _prepared_failed.items() if bad),
+        "served_live": _prepared_served_live,
+    }
 
 
 def _seed_startup_address(backend, device_id: str, addr: dict):

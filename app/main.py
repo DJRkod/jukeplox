@@ -52,6 +52,11 @@ async def lifespan(app: FastAPI):
     # Browse-index plan U6: warm the persistent browse index at startup so the
     # first guest browse is fast instead of paying the full cross-server crawl.
     # Fire-and-forget + single-flighted; never blocks startup.
+    # Re-publish any prepared browse answer stored by the previous process, so
+    # the first guest after a restart is served from it rather than paying a
+    # full derivation while the rebuild runs. Awaited because it is two indexed
+    # reads and must land before the first request, not fire-and-forget.
+    await state.load_prepared_answers()
     state.trigger_browse_index_refresh()
     # Multi-source catalog (plan U6): warm the unified catalog at startup too,
     # alongside the browse index. Fire-and-forget + single-flighted.
