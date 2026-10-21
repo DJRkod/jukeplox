@@ -587,12 +587,41 @@ class PlexClient:
         self._store(cache_key, counts)
         return counts
 
-    async def get_track(self, track_id: str) -> Track:
-        bare_id = self._strip(track_id) or track_id
-        data = await self._get(f"/library/metadata/{bare_id}")
+    async def _metadata_items(self, bare_id: str, kind: str, ident: str) -> list:
+        """One metadata item by rating key, or KeyError if it isn't there.
+
+        `KeyError` is this project's cross-source not-found signal: the
+        Jellyfin, Subsonic and local adapters all raise it for a missing
+        album or track, and the API layer already translates it to a 404.
+        Plex, though, answers a non-existent rating key with HTTP 404, which
+        `_check_status` raises as `httpx.HTTPStatusError` BEFORE the caller
+        can reach its own `raise KeyError` on an empty item list. That made
+        three guest-reachable endpoints answer 500 for a stale id -- the
+        album drill-in, and both the track and album queue-adds, the latter
+        two being unauthenticated writes.
+
+        Both single-item lookups route through here so the Plex adapter
+        cannot drift from the other three, for the same reason
+        `_check_status` is shared between `_get` and `_get_raw`.
+        """
+        try:
+            data = await self._get(f"/library/metadata/{bare_id}")
+        except httpx.HTTPStatusError as exc:
+            # 404 means "no such item", which is a KeyError here. Every other
+            # status is a real transport or server fault and must stay loud --
+            # turning a 503 into "not found" would hide an outage behind an
+            # empty-looking library.
+            if exc.response is not None and exc.response.status_code == 404:
+                raise KeyError(f"{kind} {ident} not found") from exc
+            raise
         items = data.get("MediaContainer", {}).get("Metadata", [])
         if not items:
-            raise KeyError(f"Track {track_id} not found")
+            raise KeyError(f"{kind} {ident} not found")
+        return items
+
+    async def get_track(self, track_id: str) -> Track:
+        bare_id = self._strip(track_id) or track_id
+        items = await self._metadata_items(bare_id, "Track", track_id)
         return self._parse_track(items[0])
 
     async def get_album(self, album_id: str) -> Album:
@@ -600,10 +629,7 @@ class PlexClient:
         # where grandparentTitle holds the artist because the parent is the
         # album). Mirrors the Album parsing pattern in get_albums.
         bare_id = self._bare_rating_key(self._strip(album_id)) or album_id
-        data = await self._get(f"/library/metadata/{bare_id}")
-        items = data.get("MediaContainer", {}).get("Metadata", [])
-        if not items:
-            raise KeyError(f"Album {album_id} not found")
+        items = await self._metadata_items(bare_id, "Album", album_id)
         item = items[0]
         return Album(
             id=self._make_id(item["ratingKey"]),

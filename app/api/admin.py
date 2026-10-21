@@ -1345,7 +1345,13 @@ async def admin_append_to_queue(body: AdminQueueAppendRequest):
         # bypass, R6): the SAME shared helper from app/api/guest.py (S-3),
         # evaluated live server-side.
         await _require_playable(body.track_id)
-        track = await client.get_track(body.track_id)
+        try:
+            track = await client.get_track(body.track_id)
+        except KeyError:
+            # Parity with the guest endpoint (see its track branch): a stale
+            # id is a 404, not a 500. test_guest_admin_queue_endpoints_parity
+            # is the guard that these two stay aligned.
+            raise HTTPException(status_code=404, detail="Track not found")
         item = await q.append(track, bypass_lock=True)
         # Undo receipt (collected-library plan U5): same shape as the guest
         # endpoint so the SHARED row-tap handler gets parity on both pages;

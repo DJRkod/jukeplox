@@ -2093,6 +2093,12 @@ async def append_to_queue(body: QueueAppendRequest):
             item = await q.append(track)
         except QueueLockError:
             raise HTTPException(status_code=423, detail="queue_locked")
+        except KeyError:
+            # The id is well-formed but no longer resolves -- a guest whose
+            # page still holds a track removed from the library since they
+            # loaded it. Not found, not a server fault. Covers both the
+            # catalog and native branches above, which raise the same signal.
+            raise HTTPException(status_code=404, detail="Track not found")
         # Undo receipt (collected-library plan U5): track branch ONLY —
         # album appends are batches with no single entry to undo and keep
         # their plain {ok, tracks_added} shape.

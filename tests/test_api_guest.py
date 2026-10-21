@@ -5303,3 +5303,39 @@ def test_search_native_serves_tags_no_inline_fold(mock_deps):
         body = TestClient(app, raise_server_exceptions=True).get("/api/search?q=cool").json()
     assert [s["name"] for s in body["tags"]] == ["cool"]
     assert "n1" not in {t["track_id"] for t in body["tracks"]}  # no inline fold in native
+
+
+# ── stale ids are 404, not 500 ───────────────────────────────────────────────
+#
+# Found by deploying to hardware: an album or track id that is well-formed but
+# no longer resolves produced a 500 on three guest-reachable endpoints. The
+# realistic trigger is ordinary -- a guest's page still holds ids from before
+# the operator removed something and rescanned. Plex answers the lookup with
+# HTTP 404 and the resulting transport error escaped uncaught.
+
+async def test_queue_add_with_a_stale_track_id_is_404_not_500(client, mock_deps):
+    """The worst of the three: an UNAUTHENTICATED write path. The track branch
+    wrapped only QueueLockError, so the not-found signal escaped."""
+    _, plex = mock_deps
+    plex.get_track = AsyncMock(side_effect=KeyError("Track t-gone not found"))
+    resp = client.post("/api/queue", json={"track_id": "t-gone"})
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "Track not found"
+
+
+async def test_queue_add_with_a_stale_album_id_is_404_not_500(client, mock_deps):
+    _, plex = mock_deps
+    plex.get_album = AsyncMock(side_effect=KeyError("Album a-gone not found"))
+    resp = client.post("/api/queue", json={"album_id": "a-gone"})
+    assert resp.status_code == 404, resp.text
+
+
+async def test_album_drill_with_a_stale_id_is_404_not_500(client, mock_deps):
+    """Regression guard rather than proof of the fix: this endpoint already
+    caught KeyError, so it passed before. What changed is that the Plex
+    adapter now RAISES KeyError for an upstream 404 instead of a transport
+    error -- tests/test_plex_client.py is where that is proven."""
+    _, plex = mock_deps
+    plex.get_album = AsyncMock(side_effect=KeyError("Album a-gone not found"))
+    resp = client.get("/api/browse/albums/a-gone/tracks")
+    assert resp.status_code == 404, resp.text

@@ -5619,3 +5619,18 @@ async def test_deferred_appearance_key_still_broadcasts(
     assert "AppearanceChangedEvent" in sent, (
         "%s is an appearance default; it must still broadcast." % key
     )
+
+
+# ── stale ids are 404, not 500 (admin parity) ────────────────────────────────
+
+async def test_admin_queue_add_with_a_stale_track_id_is_404_not_500(
+        client, mock_state, mock_session):
+    """Parity with the guest endpoint's track branch. The admin path did not
+    wrap the lookup at all, so a stale id produced a 500 here too."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    plex = MagicMock()
+    plex.get_track = AsyncMock(side_effect=KeyError("Track t-gone not found"))
+    with patch("app.state.get_plex_client", AsyncMock(return_value=plex)),          patch("app.api.guest._require_playable", AsyncMock(return_value=None)):
+        resp = client.post("/admin/queue", json={"track_id": "t-gone"})
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "Track not found"
