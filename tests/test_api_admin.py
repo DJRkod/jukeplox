@@ -5153,6 +5153,91 @@ def test_memory_probe_is_off_by_default(client, probe_clean):
     assert body["snapshots"] == []
 
 
+# ── flow diagnostics (#68 U1 skip-latency probe) ─────────────────────────────
+
+
+def test_flow_diagnostics_requires_auth(anon_client, mock_session):
+    """It exposes the encode clock and the device position. Those are internals,
+    and the route is the probe's only way to reach them — so it sits behind
+    require_admin like the rest of /admin/diagnostics."""
+    assert anon_client.get("/admin/diagnostics/flow").status_code == 401
+
+
+def test_flow_diagnostics_reports_no_session_without_erroring(client, monkeypatch):
+    """Per-track mode, or a backend with no flow at all. The route must answer
+    rather than 500 — the probe calls it BEFORE it knows which path is live,
+    and uses the answer to refuse."""
+    from app import state as app_state
+
+    class _Bare:
+        pass
+
+    monkeypatch.setattr(app_state.output_router, "effective_backend",
+                        lambda: _Bare(), raising=False)
+    body = client.get("/admin/diagnostics/flow").json()
+    assert body["gapless_flow_active"] is False
+    assert body["flow"] is None
+
+
+def test_flow_diagnostics_surfaces_the_backend_snapshot(client, monkeypatch):
+    from app import state as app_state
+
+    snap = {"session": "ab12", "encode_format": "flac",
+            "device_time_known": True, "encode_clock_ms": 34_800,
+            "device_stream_ms": 30_600, "held_offset_ms": 30_600,
+            "heard_track_id": "t-old", "total_lead_ms": 4_200,
+            "out_buffer_bytes_lower_bound": 900_000,
+            "out_buffer_cap_bytes": 1_764_000}
+
+    class _Flowing:
+        def flow_debug_snapshot(self):
+            return dict(snap)
+
+    monkeypatch.setattr(app_state.output_router, "effective_backend",
+                        lambda: _Flowing(), raising=False)
+    body = client.get("/admin/diagnostics/flow").json()
+    assert body["flow"]["total_lead_ms"] == 4_200
+    # The lead is the ENCODE clock minus the DEVICE position, not the
+    # out-buffer figure — that one is a lower bound on one of four buffers.
+    assert (body["flow"]["encode_clock_ms"]
+            - body["flow"]["device_stream_ms"]) == 4_200
+    assert body["flow"]["heard_track_id"] == "t-old"
+
+
+def test_flow_diagnostics_never_returns_a_full_session_id(client, monkeypatch):
+    """The flow session id IS the stream route's bearer credential (that route
+    carries no is_authorized_stream_key check by design). Logging it in full was
+    already a defect once; this route must not reintroduce it by another door."""
+    from app import state as app_state
+
+    class _Flowing:
+        def flow_debug_snapshot(self):
+            return {"session": "ab12", "device_time_known": True,
+                    "total_lead_ms": 1}
+
+    monkeypatch.setattr(app_state.output_router, "effective_backend",
+                        lambda: _Flowing(), raising=False)
+    body = client.get("/admin/diagnostics/flow").json()
+    assert len(body["flow"]["session"]) <= 4
+    assert "session_id" not in body["flow"]
+
+
+def test_flow_diagnostics_degrades_when_the_backend_read_raises(client, monkeypatch):
+    """Never raises — the same contract session_snapshot_admin states. A
+    diagnostics route that 500s during an outage is useless exactly when it is
+    needed."""
+    from app import state as app_state
+
+    class _Angry:
+        def flow_debug_snapshot(self):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(app_state.output_router, "effective_backend",
+                        lambda: _Angry(), raising=False)
+    body = client.get("/admin/diagnostics/flow").json()
+    assert body["flow"] is None
+
+
 def test_memory_probe_start_snapshot_diff_happy_path(client, probe_clean):
     assert client.post("/admin/diagnostics/memory/start", json={}).json()["tracing"]
     assert client.post(

@@ -15,6 +15,7 @@ import collections
 import functools
 import json
 import mimetypes
+import os
 import re
 import threading
 import time
@@ -127,7 +128,19 @@ FLOW_STREAM_TYPE = "BUFFERED"
 # pushes — which some receivers stop sending mid-stream. While pending counts
 # exist, the backend nudges the receiver with update_status this often.
 # Injectable per-instance for tests (``_flow_poll_interval_s``).
-FLOW_STATUS_POLL_S = 5.0
+FLOW_STATUS_POLL_S = float(os.environ.get("JP_FLOW_STATUS_POLL_S", "5.0"))
+#: 5.0 is the production default and should stay there: pychromecast 14 has no
+#: built-in media-status polling and flow mode disarms the duration watchdog, so
+#: this is a keepalive cadence, not a measurement one.
+#:
+#: The override exists because this interval is the REAL resolution floor for
+#: anything derived from device-reported time. ``_pos_snapshot_ms`` only moves
+#: when a status arrives, so a probe polling HTTP at 5 Hz still reads a device
+#: clock that steps once every 5 s -- which quantises skip-to-audible into 5 s
+#: buckets while its own achieved-interval guard reports a healthy 219 ms,
+#: because that guard measures the probe's cadence and not this one. Measured on
+#: the rig 2026-10-09 (#68 U2): six skips all landed at 15.9 s +/- 0.2 s while
+#: the buffered lead varied 22-40 s, and that decoupling was the tell.
 
 
 class _PendingCount(NamedTuple):
@@ -1444,8 +1457,13 @@ class ChromecastBackend(AttachGeneration):
                 return
             # The session ended/closed under us — fall through to a fresh one.
         await self._flow_teardown()
-        sess = flow.create_flow_session(metadata,
-                                        start_offset_ms=start_offset_ms)
+        sess = flow.create_flow_session(
+            metadata, start_offset_ms=start_offset_ms,
+            # Anchors the pacing budget to where the DEVICE actually is, not
+            # to the session's own clock. Without it the device keeps its
+            # whole startup offset as unplayed audio and a skip waits that
+            # out (#68).
+            device_time_fn=self._flow_device_time_s)
         sess.add_boundary_listener(functools.partial(self._flow_boundary, sess))
         sess.add_skip_listener(functools.partial(self._flow_skip, sess))
         sess.add_consumer_gone_listener(
@@ -2027,6 +2045,31 @@ class ChromecastBackend(AttachGeneration):
             return 0
         return max(0, stitch_ms - off + self._flow_track_starts.get(off, 0))
 
+    def _flow_device_time_s(self) -> tuple[float, float] | None:
+        """``(device_seconds, as_of_monotonic)`` — a TIMESTAMPED snapshot.
+
+        Deliberately NOT extrapolated here. The flow session needs a pacing
+        reference that advances with real time, and the first version of this
+        extrapolated locally, gated on ``self._is_playing``. That gate is the
+        defect: the flag drops on a BUFFERING status, extrapolation freezes,
+        and the reference stops advancing for a whole status interval
+        (``FLOW_STATUS_POLL_S`` = 5.0). The feed then stalls for that interval
+        while the device holds only ``FLOW_DEVICE_LEAD_S`` of audio, and the
+        gap is audible. Measured on the rig 2026-10-09 at a 1.0 s budget:
+        three holes of 3.3-4.3 s in every 30 s window of UNDISTURBED playback,
+        and 3 of 10 skips refusing because the line was silent at dispatch.
+
+        Handing the session the raw snapshot plus its age moves the
+        extrapolation to the one place that knows whether the stream is
+        actually paused, and removes this flag from the path entirely.
+
+        ``None`` before the first status of the current load — the caller must
+        fall back to the session clock rather than treat unknown as zero.
+        """
+        if self._pos_snapshot_at <= 0:
+            return None
+        return max(0.0, self._pos_snapshot_ms / 1000.0), self._pos_snapshot_at
+
     def _flow_capture_position_ms(self) -> int:
         """The flow-mode held position (loop): DEVICE-reported position
         mapped through the stitch timeline (R7) — never the encode clock,
@@ -2067,6 +2110,107 @@ class ChromecastBackend(AttachGeneration):
         if not self._in_flow_mode:
             return None
         return self._flow_capture_position_ms()
+
+    def flow_debug_snapshot(self) -> dict | None:
+        """Read-only flow instrumentation for the #68 skip-latency probe (U1).
+
+        Duck-typed, never a Protocol change (the convention app/state.py's
+        arming block states outright): no other backend implements this, and
+        ``session_events.flow_diagnostics`` degrades to None rather than
+        erroring. Per-track mode returns None.
+
+        The decomposition the probe needs is NOT ``buffered_unsent_bytes``
+        alone. That property reports only the Python out-buffer deque, while
+        audio also sits in the encoder's stdin pipe, ffmpeg's internal
+        buffering, and its stdout pipe — so reading it as "the server-held
+        share" hands the device roughly a second of audio that is actually
+        ours, and biases the #68 plan's gate condition 3 toward building the
+        expensive fix. The honest total is the gap between the ENCODE clock and
+        the DEVICE-reported position: both are reported here and
+        ``total_lead_ms`` is their difference. The out-buffer figure rides
+        along explicitly labelled a lower bound, unconverted — it holds
+        ENCODED bytes while ``out_buffer_cap_bytes`` is computed at PCM rate,
+        so a bytes->ms conversion is wrong by the FLAC compression ratio.
+
+        ``device_time_known`` is load-bearing: with no device report,
+        ``held_offset_from_device_time`` falls back to the documented estimate
+        (encode clock minus the run-ahead), which would make ``total_lead_ms``
+        a restatement of ``FLOW_RUN_AHEAD_S`` rather than a measurement. The
+        probe refuses on that flag instead of recording a synthetic number.
+
+        ``session`` is the TRUNCATED handle only. The full id is the flow
+        route's capability credential — that route carries no
+        ``is_authorized_stream_key`` check by design — and emitting it in full
+        was a defect already fixed once in this file.
+        """
+        sess = self._flow_session
+        if sess is None:
+            return None
+        known = self._pos_snapshot_at > 0
+        # EXTRAPOLATE, exactly as get_position does. _flow_poll_fire stops the
+        # status-poll chain once _flow_pending_counts drains -- that chain
+        # exists to stop pending counts starving, not to maintain a clock --
+        # and pychromecast 14 polls nothing on its own, so between boundaries
+        # this snapshot freezes while the encode clock keeps advancing. Reading
+        # it raw made total_lead_ms grow one ms per ms of staleness: measured on
+        # the rig 2026-10-09, the snapshot sat at 15,387 ms for 100 s while the
+        # reported lead climbed 36,683 -> 101,699 ms in lockstep with wall time,
+        # and every figure derived from it inflated with it.
+        #
+        # Gated on _is_playing for the same reason get_position gates it: a
+        # paused device is genuinely not advancing, and extrapolating there
+        # would invent position. device_time_age_ms rides alongside so a
+        # consumer can see how far this is extrapolating and refuse when the
+        # assumption of uninterrupted playback stops being safe.
+        if known:
+            dev_ms = self._pos_snapshot_ms
+            if self._is_playing:
+                dev_ms += int((time.monotonic() - self._pos_snapshot_at) * 1000)
+            device_s = dev_ms / 1000.0
+        else:
+            dev_ms = None
+            device_s = None
+        encode_ms = int(sess.position_ms)
+        elapsed_ms = int(sess.elapsed_ms)
+        held_ms = int(sess.held_offset_from_device_time(device_s))
+        return {
+            "session": str(sess.session_id)[:4],
+            "encode_format": sess.encode_format,
+            "device_time_known": known,
+            "encode_clock_ms": encode_ms,
+            # The extrapolated value -- this is what held_offset_ms and
+            # total_lead_ms are actually computed from, so reporting the raw
+            # snapshot here would make the payload internally inconsistent.
+            "device_stream_ms": int(dev_ms) if known else None,
+            "held_offset_ms": held_ms,
+            # THE SPLIT. position_ms - held_ms is only the SUM of both shares,
+            # and reading the sum as either one gets the attribution exactly
+            # wrong: measured on the rig 2026-10-09, dropping the run-ahead
+            # from 10.0s to 2.0s moved skip-to-audible by only ~0.8s, because
+            # the encoder is paced by the DEVICE draining the stream (the
+            # out-buffer read 0 bytes at every dispatch) rather than by
+            # _pace. So almost all of it is the receiver's own buffer.
+            "session_elapsed_ms": elapsed_ms,
+            # Ours: the pacing lead, bounded by run_ahead_s.
+            "server_lead_ms": max(0, encode_ms - elapsed_ms),
+            # The receiver's: bounded by nothing on this side.
+            "device_lag_ms": (max(0, elapsed_ms - held_ms) if known else None),
+            # The ONE honest trigger for skip-to-audible, identical on both
+            # arms: which track the DEVICE is actually hearing right now. Now
+            # Playing cannot serve -- it follows the boundary clock and names
+            # the new track the instant the queue advances, which is exactly
+            # the stale-audio window this probe exists to measure.
+            "heard_track_id": getattr(sess.track_at(held_ms), "id", None),
+            # How stale the device clock is RIGHT NOW. Without this a consumer
+            # cannot tell a fast poll of a slow clock from a fast clock, and
+            # will report its own cadence as the measurement resolution.
+            "device_time_age_ms": (
+                int(max(0.0, (time.monotonic() - self._pos_snapshot_at)) * 1000)
+                if known else None),
+            "total_lead_ms": max(0, encode_ms - held_ms),
+            "out_buffer_bytes_lower_bound": int(sess.buffered_unsent_bytes),
+            "out_buffer_cap_bytes": int(sess.out_buffer_cap_bytes),
+        }
 
     def prime_resume_offset(self, position_ms: int) -> None:
         """Supervisor resume hook (U10, R7): the held position for the NEXT

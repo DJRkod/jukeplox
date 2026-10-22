@@ -17,6 +17,10 @@ tmp/
 correctness.json
 maintainability.json
 testing.json
+# tracemalloc / leak measurement snapshots — throwaway, were tracked by accident
+diff.json
+idle.json
+leak.json
 # Design mockups — kept locally for reference, not shipped to the release repo
 docs/mockups/
 

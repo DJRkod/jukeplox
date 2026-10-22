@@ -77,6 +77,7 @@ import asyncio
 import collections
 import inspect
 import logging
+import os
 import re
 import secrets
 import struct
@@ -97,7 +98,55 @@ FLOW_BYTES_PER_SECOND = FLOW_SAMPLE_RATE * FLOW_FRAME_BYTES
 
 # Bounded run-ahead: the encode clock may lead real-time playback by at most
 # this much audio. Doubles as the memory bound (out-buffer cap).
-FLOW_RUN_AHEAD_S = 10.0
+FLOW_RUN_AHEAD_S = float(os.environ.get("JP_FLOW_RUN_AHEAD_S", "10.0"))
+#: CORRECTION 2026-10-09: an earlier version of this comment claimed the #68
+#: skip delay was "almost entirely THIS constant". That was wrong, and the
+#: intervention falsified it -- dropping the value from 10.0 to 2.0 moved
+#: skip-to-audible by ~0.8 s, not the ~8 s the claim predicts.
+#:
+#: The reason is the reference clock below, not the budget. This bound is
+#: measured against ``_elapsed_s()``, the SESSION's own wall clock, which says
+#: nothing about where the device actually is. The device begins playing some
+#: seconds after the session starts producing audio and then plays at 1x
+#: forever, so that startup offset never closes; pacing against the session
+#: clock lets the device hold the entire offset as unplayed audio, on top of
+#: this budget. See ``_pacing_reference``.
+#:
+#: Still not to be lowered casually in production. It is the underrun cushion
+#: that absorbs decode stalls and source hiccups -- one rig run logged a real
+#: source truncation and resume mid-session -- and it doubles as the memory
+#: bound, since the out-buffer cap is derived from it.
+
+#: Run-ahead budget once the DEVICE's own playback position is known, which is
+#: the regime that decides skip latency. Deliberately a separate, much tighter
+#: value than FLOW_RUN_AHEAD_S above: at session start there is no device
+#: report and racing ahead is what makes playback start promptly, so the
+#: generous budget still governs there. Once the device is reporting, the audio
+#: it holds unplayed is what a skip has to wait out, and that is what this
+#: bounds. Tunable without a rebuild because the floor it can reach is set by
+#: the receiver's own internal pipeline, which is not ours to measure directly.
+FLOW_DEVICE_LEAD_S = float(os.environ.get("JP_FLOW_DEVICE_LEAD_S", "0"))
+#: DEFAULT 0 = OFF, on measured evidence. Anchoring roughly halves
+#: skip-to-audible -- an A/B/A on one build with only this value changed gave
+#: 5,255-5,987 ms anchored against 13,957 ms off, an effect four times its own
+#: replication noise -- but it cannot reach the 2.5 s target and it is not free:
+#:
+#: * The floor is the RECEIVER, not us. At a 3.0 s budget the diagnostics
+#:   showed the feed held to 2,699-3,441 ms with the server-side share at 0,
+#:   while the sound still arrived 4.6-7.6 s late. The WiiM reports a position
+#:   ahead of what is audible, and ~4 s of audio sits past that report where no
+#:   amount of pacing can reach it. Changing the budget from 3.0 to 1.0 moved
+#:   the median 0.26 s, which is the same statement from the other direction.
+#: * A shallower device buffer turns a hiccup into a hole. At a 1.0 s budget
+#:   the rig measured three holes of 3.3-4.3 s in every 30 s of UNDISTURBED
+#:   playback, against 0.0 ms with this set to 0. The reference clock only
+#:   refreshes every ``FLOW_STATUS_POLL_S`` (5.0 s), and a budget smaller than
+#:   that staleness cannot be made safe by any amount of cleverness in
+#:   ``_pacing_reference`` -- three attempts are documented there.
+#:
+#: Turning this on therefore means also shortening the status cadence, and
+#: proving the pair against the steady-state arm of
+#: ``tools/soak/skip_acoustic.py`` before it reaches anyone's party.
 
 # Consumer-disconnect grace: a new GET within this window re-binds the same
 # session; expiry notifies the consumer-gone hook (U10: outage-suspected).
@@ -836,6 +885,8 @@ class FlowSession:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         timer_factory: Callable[[float, Callable[[], None]], Any] | None = None,
         run_ahead_s: float = FLOW_RUN_AHEAD_S,
+        device_lead_s: float = FLOW_DEVICE_LEAD_S,
+        device_time_fn: Callable[[], float | None] | None = None,
         grace_s: float = FLOW_CONSUMER_GRACE_S,
         decode_stall_s: float = FLOW_DECODE_STALL_S,
         sample_rate: int = FLOW_SAMPLE_RATE,
@@ -853,6 +904,16 @@ class FlowSession:
         self._sleep = sleep
         self._timer_factory = timer_factory or _default_timer_factory
         self._run_ahead_s = run_ahead_s
+        self._device_lead_s = device_lead_s
+        #: Returns ``(device_seconds, as_of_monotonic)`` -- the device's
+        #: playback time into its current load and the clock reading it was
+        #: captured at -- or None when no report exists yet. A TIMESTAMPED
+        #: snapshot, not a pre-extrapolated value: the session extrapolates it
+        #: in ``_pacing_reference`` because only the session knows whether the
+        #: stream is paused, and a backend-side gate on that got it wrong.
+        self._device_time_fn = device_time_fn
+        #: Observability only -- which clock the last pacing decision used.
+        self._paced_against_device = False
         self._grace_s = grace_s
         self._decode_stall_s = decode_stall_s
         self._sample_rate = sample_rate
@@ -947,6 +1008,20 @@ class FlowSession:
         """Encode-clock position: milliseconds of audio fed to the encoder
         (leads heard audio by up to the run-ahead bound)."""
         return int(self._fed_bytes * 1000 // self._bytes_per_s)
+
+    @property
+    def elapsed_ms(self) -> int:
+        """Pause-aware wall-clock ms since this session started feeding.
+
+        Public because it is the ONLY way to split the audio downstream of a
+        splice into the part we hold and the part the receiver holds:
+        ``position_ms - elapsed_ms`` is our pacing lead (bounded by
+        ``run_ahead_s``), and ``elapsed_ms - device_position`` is the
+        receiver's own buffer, which nothing on this side bounds. Without
+        this, ``position_ms - device_position`` is only the SUM, and reading
+        the sum as either share gets the attribution wrong -- measured on the
+        rig 2026-10-09, it put 99% on the wrong side of the boundary."""
+        return int(max(0.0, self._elapsed_s()) * 1000)
 
     @property
     def buffered_unsent_bytes(self) -> int:
@@ -1341,21 +1416,95 @@ class FlowSession:
                 raise FlowDecodeError(
                     f"stalled — no PCM for {self._decode_stall_s:.1f}s")
 
+    def _pacing_reference(self) -> tuple[float, float, bool]:
+        """``(reference_s, budget_s, anchored)`` for the next pacing decision.
+
+        Two regimes, and the difference between them is the whole of #68:
+
+        * **No device report** (session start, socket lost, device anchoring
+          disabled) → the session's own wall clock with the generous
+          ``run_ahead_s`` budget. Racing ahead here is what makes playback
+          start promptly, and there is no device position to be tight against.
+        * **Device reporting** → the device's own playback position on the
+          stitch timeline, with the tight ``device_lead_s`` budget. The audio
+          the device holds unplayed is exactly what a skip has to wait out, and
+          referencing the session clock never bounded it: the device starts
+          late, plays at 1x, and so keeps that startup offset forever.
+
+        Two clamps, both deliberately asymmetric. The reference can never
+        exceed the session clock, so a bogus-high device report cannot let the
+        feed run away; and it is floored at zero. A bogus-LOW report is allowed
+        to stall the feed, because stalling only makes the device's buffer
+        shallower while it keeps playing what it already holds, whereas the
+        opposite error hands it more stale audio.
+        """
+        elapsed = self._elapsed_s()
+        if self._device_lead_s <= 0 or self._device_time_fn is None:
+            return elapsed, self._run_ahead_s, False
+        try:
+            report = self._device_time_fn()
+        except Exception:
+            # A pacing decision must never be the thing that kills the stream.
+            _log.debug("Flow: device clock unavailable for pacing",
+                       exc_info=True)
+            return elapsed, self._run_ahead_s, False
+        if report is None:
+            return elapsed, self._run_ahead_s, False
+        device_s, as_of = report
+        # Extrapolate HERE, where the pause state actually lives. The backend
+        # used to do it gated on its own is-playing flag, and that flag drops
+        # on a transient status: the reference then froze for a whole status
+        # interval, the feed stalled with it, and the device ran dry. Measured
+        # as 3.3-4.3 s holes in undisturbed playback.
+        if self._paused_at is None:
+            device_s = float(device_s) + max(0.0, self._clock() - as_of)
+        played_s = (self._device_epoch_offset_ms / 1000.0) + float(device_s)
+        # NO high-water mark. Two versions tried to stop a stale status from
+        # dragging the reference backward, and both made things worse:
+        #
+        # * A fixed floor carries the defect it was added to prevent -- once
+        #   set above the device's true position it pins the reference, and a
+        #   pinned reference is a frozen one.
+        # * A floor that advances with the clock makes the reference follow
+        #   real time rather than the device, which defeats anchoring whenever
+        #   real time outpaces the device.
+        # * A floor with a bounded hold degrades PERMANENTLY. Extrapolating
+        #   from a snapshot always overshoots, because the snapshot is always
+        #   somewhat stale; so every fresh status corrects downward, every
+        #   correction reads as a backward drag, the hold expires, and the
+        #   fallback sticks. Measured on the rig: the anchored arm landed at
+        #   22,338 ms against 22,534 ms unanchored, with 7 of 10 skips
+        #   refusing. Indistinguishable from doing nothing.
+        #
+        # So the reference is simply the extrapolated device position, clamped.
+        # A downward correction is then bounded by the status staleness rather
+        # than by a whole status interval, which is survivable as long as the
+        # budget exceeds it -- and that is a statement about
+        # ``FLOW_STATUS_POLL_S``, not about a ratchet.
+        return max(0.0, min(played_s, elapsed)), self._device_lead_s, True
+
     async def _pace(self, next_chunk_bytes: int, gen: int) -> None:
         """Bounded run-ahead: block until feeding ``next_chunk_bytes`` keeps
-        the encode clock within ``run_ahead_s`` of the (pause-aware) playback
-        clock. Driven entirely by the injectable clock/sleep — tests use
-        fakes, production sleeps are at most ~one chunk duration."""
+        the encode clock within the budget of the reference playback clock
+        (see ``_pacing_reference``). Driven entirely by the injectable
+        clock/sleep — tests use fakes, production sleeps are at most ~one
+        chunk duration."""
         while not self._closed and self._gen == gen:
             if not self._resume_evt.is_set():
                 await self._resume_evt.wait()
                 continue
+            reference_s, budget_s, anchored = self._pacing_reference()
+            self._paced_against_device = anchored
             lead_s = ((self._fed_bytes + next_chunk_bytes) / self._bytes_per_s
-                      - self._elapsed_s())
-            excess = lead_s - self._run_ahead_s
+                      - reference_s)
+            excess = lead_s - budget_s
             if excess <= 0:
                 return
-            await self._sleep(excess)
+            # Capped per iteration so a large excess re-reads the reference
+            # clock rather than committing to one long sleep. The device clock
+            # advances while we wait, and a single sleep sized to a stale
+            # reading is how a feed oversleeps and starves the device.
+            await self._sleep(min(excess, 0.5))
 
     def _elapsed_s(self) -> float:
         if self._started_at is None:

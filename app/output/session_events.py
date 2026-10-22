@@ -52,6 +52,36 @@ def session_snapshot() -> dict:
     }
 
 
+def flow_diagnostics() -> dict:
+    """Read-only flow-session instrumentation for the #68 skip-latency probe.
+
+    Duck-typed on the effective backend exactly as ``arm_next`` and
+    ``capture_held_position_ms`` are, so this is safe to call whatever output
+    is selected: a backend without the hook reports ``flow: None``. Never
+    raises — every field whose source is unavailable degrades to None, the same
+    contract ``session_snapshot_admin`` states.
+
+    Carries the truncated session handle only, for the same reason
+    ``session_snapshot`` carries liveness and never the id.
+    """
+    from app import state
+    from app.output.flow import current_flow_session
+    snap: dict = {"gapless_flow_active": current_flow_session() is not None,
+                  "flow": None}
+    try:
+        backend = state.output_router.effective_backend()
+    except Exception:
+        return snap
+    reader = getattr(backend, "flow_debug_snapshot", None)
+    if not callable(reader):
+        return snap
+    try:
+        snap["flow"] = reader()
+    except Exception:
+        snap["flow"] = None
+    return snap
+
+
 async def session_snapshot_admin() -> dict:
     """Admin-rich session snapshot (R20): the lean truth plus outage detail —
     reason, device, attempt count, next-retry countdown, resume-window

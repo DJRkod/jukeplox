@@ -403,3 +403,54 @@ def _track_row():
     return {"identity": "seed-t", "title": "Seed", "title_base": "seed",
             "artist": "Seed", "artist_base_key": "seed", "album_identity": "seed-al",
             "duration_ms": 1000}
+
+
+async def test_a_track_only_crawl_failure_is_logged_and_names_the_crawl(db, caplog):
+    """The shape that emptied the validation rig on 2026-10-10.
+
+    Artists and albums crawl fine, TRACKS raise. The catalog is then rebuilt
+    with zero tracks -- and ``any_section_ok`` is already satisfied by the
+    artists, so the don't-wipe guard never fires. Before this, ``_safe``
+    returned None with no log at all and the only evidence anywhere was the
+    row counts: 104,064 tracks to 0, silently. The surrounding tests have
+    claimed "surfaces as a WARNING" since 2026-08 while nothing was logged.
+    """
+    import logging
+
+    class _TracksFailSource:
+        source_id = "m1"
+        source_type = "plex"
+
+        async def get_libraries(self):
+            return [Library(key="m1:1", title="M", type="artist",
+                            server_name="Plex")]
+
+        async def get_artists(self, key):
+            return [_artist("m1:ar")]
+
+        async def get_albums(self, key):
+            return [_album("m1:al")]
+
+        async def get_tracks(self, key):
+            raise RuntimeError("track page parse blew up")
+
+    with caplog.at_level(logging.WARNING, logger="app.catalog.scan"):
+        ok = await scan.scan_and_replace(_FakeRegistry([_TracksFailSource()]))
+
+    assert ok is True                      # artists succeeded, so the crawl ran
+    assert await store.get_all_tracks() == []   # and the catalog lost its tracks
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("failed, contributing nothing" in m for m in msgs), (
+        "a swallowed crawl failure must be logged, or the next person "
+        "re-derives it from row counts: %r" % msgs
+    )
+    assert any("tracks in m1:1" in m for m in msgs), (
+        "the log must name WHICH crawl was lost -- 'a section failed' does not "
+        "distinguish losing every track from losing one artist: %r" % msgs
+    )
+    assert any(r.exc_info for r in caplog.records
+               if "contributing nothing" in r.getMessage()), (
+        "the traceback is the diagnostic; without exc_info the log says that "
+        "something failed but never what"
+    )

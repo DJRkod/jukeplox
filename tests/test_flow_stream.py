@@ -1694,3 +1694,277 @@ async def test_flow_source_refuses_a_206_with_no_content_range(monkeypatch):
 
     assert b"".join(written) == b"AAAA"
     assert dec._source_failed is True
+
+
+# ── pacing: anchoring the budget to the DEVICE rather than the session ───────
+#
+# These cover the #68 fix. The session clock says when the session started
+# producing audio; the device starts playing some seconds later and then plays
+# at 1x, so that offset never closes. Pacing against the session clock lets the
+# device hold the whole offset as unplayed audio, and a skip has to wait it out.
+
+
+def _ref_session(flow_factory, **over):
+    """An unstarted session, for direct _pacing_reference assertions."""
+    a = trk("a")
+    session, _env = flow_factory(a, [], {"a": make_pcm(BPS // FRAME, 1)},
+                                 start=False, **over)
+    return session
+
+
+async def test_without_a_device_clock_the_reference_is_the_session_clock(flow_factory):
+    """The pre-2026-10-09 behaviour, preserved. This is the regime at session
+    start, where racing ahead is what makes playback begin promptly."""
+    mc = ManualClock()
+    session = _ref_session(flow_factory, run_ahead_s=7.0, clock=mc,
+                           sleep=mc.sleep)
+    session._started_at = mc()
+    mc.advance(4.0)
+    reference, budget, anchored = session._pacing_reference()
+    assert anchored is False
+    assert budget == 7.0
+    assert abs(reference - 4.0) < 1e-6
+
+
+async def test_a_reporting_device_becomes_the_reference_with_the_tight_budget(flow_factory):
+    mc = ManualClock()
+    session = _ref_session(flow_factory, run_ahead_s=10.0, device_lead_s=2.0,
+                           device_time_fn=lambda: (3.0, mc()), clock=mc, sleep=mc.sleep)
+    session._started_at = mc()
+    mc.advance(12.0)
+    reference, budget, anchored = session._pacing_reference()
+    assert anchored is True
+    assert budget == 2.0
+    # The device has played 3 s; the session has been running 12 s. Pacing must
+    # follow the device, otherwise the 9 s difference stays in its buffer.
+    assert abs(reference - 3.0) < 1e-6
+
+
+async def test_the_device_epoch_offset_is_included_in_the_mapping(flow_factory):
+    """device_time_fn reports seconds into the device's LOAD; the pacing clock
+    lives on the stitch timeline. Dropping the offset would under-report the
+    device's progress and stall the feed for the length of the offset."""
+    mc = ManualClock()
+    session = _ref_session(flow_factory, device_lead_s=2.0,
+                           device_time_fn=lambda: (4.0, mc()), clock=mc,
+                           sleep=mc.sleep)
+    session._started_at = mc()
+    session._device_epoch_offset_ms = 30_000
+    mc.advance(100.0)
+    reference, _budget, anchored = session._pacing_reference()
+    assert anchored is True
+    assert abs(reference - 34.0) < 1e-6
+
+
+async def test_a_bogus_high_device_report_cannot_let_the_feed_run_away(flow_factory):
+    """Clamped to the session clock. A device claiming to be further along than
+    the session has produced would otherwise license unbounded run-ahead --
+    the exact failure the budget exists to prevent."""
+    mc = ManualClock()
+    session = _ref_session(flow_factory, device_lead_s=2.0,
+                           device_time_fn=lambda: (9999.0, mc()), clock=mc,
+                           sleep=mc.sleep)
+    session._started_at = mc()
+    mc.advance(5.0)
+    reference, _budget, _anchored = session._pacing_reference()
+    assert abs(reference - 5.0) < 1e-6
+
+
+async def test_a_negative_device_report_is_floored_at_zero(flow_factory):
+    mc = ManualClock()
+    session = _ref_session(flow_factory, device_lead_s=2.0,
+                           device_time_fn=lambda: (-50.0, mc()), clock=mc,
+                           sleep=mc.sleep)
+    session._started_at = mc()
+    mc.advance(5.0)
+    reference, _budget, _anchored = session._pacing_reference()
+    assert reference == 0.0
+
+
+async def test_an_unknown_device_position_falls_back_rather_than_reading_as_zero(flow_factory):
+    """None means "no status yet", not "the device is at 0:00". Treating it as
+    zero would stall the feed before the device has anything to play, and
+    playback would never start."""
+    mc = ManualClock()
+    session = _ref_session(flow_factory, run_ahead_s=8.0, device_lead_s=2.0,
+                           device_time_fn=lambda: None, clock=mc,
+                           sleep=mc.sleep)
+    session._started_at = mc()
+    mc.advance(6.0)
+    reference, budget, anchored = session._pacing_reference()
+    assert anchored is False
+    assert budget == 8.0
+    assert abs(reference - 6.0) < 1e-6
+
+
+async def test_a_raising_device_clock_falls_back_instead_of_killing_the_stream(flow_factory):
+    def boom():
+        raise RuntimeError("socket gone")
+
+    mc = ManualClock()
+    session = _ref_session(flow_factory, run_ahead_s=8.0, device_lead_s=2.0,
+                           device_time_fn=boom, clock=mc, sleep=mc.sleep)
+    session._started_at = mc()
+    mc.advance(6.0)
+    reference, budget, anchored = session._pacing_reference()
+    assert anchored is False
+    assert budget == 8.0
+    assert abs(reference - 6.0) < 1e-6
+
+
+async def test_a_non_positive_device_lead_disables_anchoring_entirely(flow_factory):
+    """The escape hatch. Anchoring makes the device's buffer shallower, and a
+    shallow buffer is what turns network jitter into a dropout -- so there has
+    to be a way back to the old behaviour without a rebuild."""
+    mc = ManualClock()
+    calls = []
+
+    def dev():
+        calls.append(1)
+        return (1.0, mc())
+
+    session = _ref_session(flow_factory, run_ahead_s=8.0, device_lead_s=0.0,
+                           device_time_fn=dev, clock=mc, sleep=mc.sleep)
+    session._started_at = mc()
+    mc.advance(6.0)
+    _reference, budget, anchored = session._pacing_reference()
+    assert anchored is False
+    assert budget == 8.0
+    assert calls == []   # not even consulted
+
+
+async def test_device_anchoring_actually_restrains_the_feed(flow_factory):
+    """The whole point, end to end: with the session clock far ahead and the
+    device stuck near zero, the encoder must stay within device_lead_s of the
+    DEVICE -- not of the session."""
+    mc = ManualClock()
+    a = trk("a")
+    device_s = [0.0]
+    session, _env = flow_factory(
+        a, [], {"a": make_pcm(BPS * 30 // FRAME, 1)},
+        run_ahead_s=100.0,            # the session clock must not be the bound
+        device_lead_s=1.0,
+        device_time_fn=lambda: (device_s[0], mc()),
+        clock=mc, sleep=mc.sleep)
+    await settle()
+
+    mc.advance(20.0)
+    await settle(400)
+    fed = session._fed_bytes
+    # At most ~1 s of audio despite 20 s of session time and a 100 s budget.
+    assert fed <= 2 * BPS, fed
+
+    # The device plays on; the feed is allowed to follow it, and only it.
+    device_s[0] = 10.0
+    mc.advance(0.6)        # release the parked pacing sleep
+    await settle(400)
+    fed2 = session._fed_bytes
+    assert fed2 > fed
+    assert fed2 <= 12 * BPS, fed2
+    await session.close()
+
+
+async def test_without_anchoring_the_same_setup_runs_far_ahead(flow_factory):
+    """The control for the test above. Without it, that assertion could pass
+    because of some unrelated limit rather than because anchoring works."""
+    mc = ManualClock()
+    a = trk("a")
+    session, _env = flow_factory(
+        a, [], {"a": make_pcm(BPS * 30 // FRAME, 1)},
+        run_ahead_s=100.0, device_lead_s=0.0, clock=mc, sleep=mc.sleep)
+    await settle(400)
+    mc.advance(20.0)
+    await settle(400)
+    assert session._fed_bytes > 5 * BPS, session._fed_bytes
+    await session.close()
+
+
+# ── pacing: the two dropout mechanisms, both measured on hardware ────────────
+#
+# The first version of device anchoring took skip-to-audible from ~14 s to
+# ~5.3 s and put three holes of 3.3-4.3 s into every 30 s of UNDISTURBED
+# playback. Both causes are below, and each test fails if its guard is removed.
+async def test_the_reference_advances_with_real_time_between_reports(flow_factory):
+    """The reference must not freeze between status pushes. It did, because the
+    backend extrapolated behind its own is-playing flag and that flag drops on
+    a transient status; the feed stalled for a whole status interval while the
+    device held only the lead. This is the shape of the measured 3.3-4.3 s
+    holes."""
+    mc = ManualClock()
+    report = [(5.0, 0.0)]          # one report, never updated again
+    session = _ref_session(flow_factory, device_lead_s=2.0,
+                           device_time_fn=lambda: report[0], clock=mc,
+                           sleep=mc.sleep)
+    # Far enough ahead that the clamp to elapsed cannot be what advances the
+    # reference. Without this the test passed with extrapolation removed --
+    # it was measuring the clamp, not the thing it is named for.
+    session._started_at = mc() - 300.0
+    mc.advance(1.0)
+    a, _b, _c = session._pacing_reference()
+    mc.advance(4.0)
+    b, _b2, _c2 = session._pacing_reference()
+    assert b - a > 3.9, (a, b)
+
+
+async def test_a_paused_stream_does_not_extrapolate_the_device_forward(flow_factory):
+    """While the stitcher is paused the device is not playing, so pretending it
+    advanced would let the feed run ahead by the length of the pause."""
+    mc = ManualClock()
+    report = [(5.0, 0.0)]
+    session = _ref_session(flow_factory, device_lead_s=2.0,
+                           device_time_fn=lambda: report[0], clock=mc,
+                           sleep=mc.sleep)
+    session._started_at = mc() - 50.0
+    session._paused_at = mc()
+    mc.advance(20.0)
+    ref, _b, anchored = session._pacing_reference()
+    assert anchored is True
+    assert abs(ref - 5.0) < 1e-6
+
+
+async def test_a_frozen_reference_would_starve_the_feed(flow_factory):
+    """The control for the test above it: with extrapolation suppressed, the
+    feed genuinely stops. Without this, the advancing-reference test could pass
+    for reasons unrelated to extrapolation."""
+    mc = ManualClock()
+    a = trk("a")
+    session, _env = flow_factory(
+        a, [], {"a": make_pcm(BPS * 30 // FRAME, 1)},
+        run_ahead_s=100.0, device_lead_s=1.0,
+        device_time_fn=lambda: (0.0, 0.0),   # pinned, and pause blocks drift
+        clock=mc, sleep=mc.sleep)
+    session.pause()
+    await settle(200)
+    mc.advance(20.0)
+    await settle(200)
+    # Nothing beyond the first chunk: the reference never moved.
+    assert session._fed_bytes <= 2 * BPS, session._fed_bytes
+    await session.close()
+
+
+async def test_a_fresh_lower_report_is_followed_rather_than_ratcheted(flow_factory):
+    """Deliberate, and the opposite of three earlier attempts.
+
+    Extrapolating from a snapshot always overshoots a little, because the
+    snapshot is always somewhat stale, so every fresh status corrects downward.
+    Three versions tried to refuse those corrections with a high-water mark; the
+    bounded-hold one degraded permanently and measured 22,338 ms anchored
+    against 22,534 ms unanchored on the rig -- indistinguishable from doing
+    nothing. The reference now simply follows the device, and the downward step
+    is bounded by the status staleness instead of by a whole status interval.
+    """
+    mc = ManualClock()
+    report = [(10.0, 0.0)]
+    session = _ref_session(flow_factory, device_lead_s=3.0,
+                           device_time_fn=lambda: report[0], clock=mc,
+                           sleep=mc.sleep)
+    session._started_at = mc() - 300.0
+    mc.advance(30.0)
+    drifted, _b, _a = session._pacing_reference()
+    assert abs(drifted - 40.0) < 1e-6
+
+    report[0] = (34.0, mc())          # the device was really at 34 s
+    corrected, _b, anchored = session._pacing_reference()
+    assert anchored is True
+    assert abs(corrected - 34.0) < 1e-6
+    assert corrected < drifted
