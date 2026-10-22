@@ -3,3 +3,7 @@
 *.bash  text eol=lf
 *.bats  text eol=lf
 install.sh text eol=lf
+
+# Characterization baselines are byte-compared across machines — pin LF so a
+# Windows checkout does not rewrite every line and bury a real behaviour diff.
+tests/fixtures/characterization/** text eol=lf

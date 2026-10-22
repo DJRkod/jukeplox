@@ -2441,6 +2441,18 @@ class FakeFlowSession:
         self.ended_listeners = []
         self.position_ms = 10 ** 9          # encode clock far ahead
         self.boundaries_ms = [(0, first)]   # (offset_ms, track), stitch order
+        # Consumed by ChromecastBackend.flow_debug_snapshot (#68 U1). Defaults
+        # are inert for every pre-existing test; the probe tests drive them.
+        # encode_format matters because the out-buffer figure is encoded bytes
+        # against a PCM-rate cap, so only "wav" makes a bytes->ms conversion
+        # honest -- the snapshot reports the format so a reader cannot forget.
+        self.encode_format = "flac"
+        self.buffered_unsent_bytes = 0
+        self.out_buffer_cap_bytes = 1_764_000
+        # Pause-aware wall clock since the session started feeding. Settable
+        # because it is what splits the lead into our pacing share and the
+        # receiver's buffer; tests that care about the split set it.
+        self.elapsed_ms = 0
 
     @property
     def url_path(self):
@@ -3865,6 +3877,118 @@ async def test_flow_toggle_off_real_engine_clean_teardown(
         assert backend._flow_session is None
         assert sess.closed is True
         assert [r for r in caplog.records if r.levelno >= _logging.ERROR] == []
+
+
+# ── flow_debug_snapshot: the device clock goes stale by design (#68) ─────────
+#
+# _flow_poll_fire stops the status-poll chain once _flow_pending_counts drains,
+# because that chain exists to stop pending counts starving -- not to maintain a
+# clock. pychromecast 14 polls nothing on its own, so between boundaries
+# _pos_snapshot_ms freezes while the encode clock keeps advancing. Measured on
+# the rig 2026-10-09: the snapshot sat at 15,387 ms for 100 s while
+# device_time_age_ms reached 89,708 ms and the reported lead climbed 36,683 ->
+# 101,699 ms in lockstep with wall time.
+#
+# get_position already compensates by extrapolating; flow_debug_snapshot must
+# too, or every figure derived from it inflates by its own staleness.
+
+
+async def test_flow_debug_lead_does_not_inflate_as_the_snapshot_ages(
+        flow_env, fresh_supervisor):
+    """The regression. Age the snapshot and advance the encode clock by the
+    same amount -- exactly what wall time does on the rig -- and the lead must
+    stay put. Without extrapolation it grows one ms per ms of staleness."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    await _flow_play(sup, backend, _ftrack("t1"))
+    sess = backend._flow_session
+    sess.position_ms = 40_000
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=10.0))
+    await _drain()
+
+    before = backend.flow_debug_snapshot()
+    assert before["total_lead_ms"] == 30_000
+
+    # 20s pass: the device played 20s more, the encoder fed 20s more, but no
+    # status arrived because the ledger is empty and nothing polls.
+    backend._pos_snapshot_at -= 20.0
+    sess.position_ms = 60_000
+
+    after = backend.flow_debug_snapshot()
+    assert after["total_lead_ms"] == 30_000, (
+        "lead inflated to %s -- the snapshot was read raw instead of "
+        "extrapolated" % after["total_lead_ms"])
+    assert after["device_time_age_ms"] >= 20_000
+
+
+async def test_flow_debug_does_not_extrapolate_while_not_playing(
+        flow_env, fresh_supervisor):
+    """A paused device really is not advancing, so extrapolating would invent
+    position. Mirrors get_position, which gates its extrapolation on
+    _is_playing for the same reason."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    await _flow_play(sup, backend, _ftrack("t1"))
+    sess = backend._flow_session
+    sess.position_ms = 40_000
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=10.0))
+    await _drain()
+
+    backend._is_playing = False
+    backend._pos_snapshot_at -= 20.0
+    snap = backend.flow_debug_snapshot()
+    # device_stream_ms stays the reported 10s; no invented progress.
+    assert snap["device_stream_ms"] == 10_000
+    assert snap["held_offset_ms"] == 10_000
+
+
+async def test_flow_debug_reports_device_clock_age(flow_env, fresh_supervisor):
+    """The field a consumer needs to decide whether to trust the figures at
+    all. Extrapolation assumes uninterrupted playback, so a consumer must be
+    able to see how far it is extrapolating."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    await _flow_play(sup, backend, _ftrack("t1"))
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=1.0))
+    await _drain()
+    fresh = backend.flow_debug_snapshot()
+    assert fresh["device_time_age_ms"] < 2_000
+    backend._pos_snapshot_at -= 45.0
+    assert backend.flow_debug_snapshot()["device_time_age_ms"] >= 45_000
+
+
+async def test_flow_debug_splits_our_pacing_lead_from_the_device_buffer(
+        flow_env, fresh_supervisor):
+    """The attribution that was wrong. position_ms - held_ms is only the SUM;
+    reading it as the server-held share put 99% on the wrong side. On the rig,
+    dropping run_ahead 10.0s -> 2.0s moved skip-to-audible by only ~0.8s,
+    because the encoder is paced by the device draining the stream rather than
+    by _pace -- so almost all of the delay is the receiver's own buffer."""
+    from app.output.chromecast import ChromecastBackend
+    sup, timers, rec = fresh_supervisor
+    backend = ChromecastBackend()
+    backend._cast = _make_cc()
+    await _flow_play(sup, backend, _ftrack("t1"))
+    sess = backend._flow_session
+    # 60s of session: the encoder is 2s ahead of wall clock (our pacing lead),
+    # and the device is 9s behind wall clock (its own buffer).
+    sess.position_ms = 62_000
+    sess.elapsed_ms = 60_000
+    backend._listener.new_media_status(_pstatus("PLAYING", current_time=51.0))
+    await _drain()
+
+    snap = backend.flow_debug_snapshot()
+    assert snap["server_lead_ms"] == 2_000, "our share is the pacing lead"
+    assert snap["device_lag_ms"] == 9_000, "the receiver's share"
+    # And the old figure is their SUM -- correct as a total, useless as either.
+    assert snap["total_lead_ms"] == 11_000
+    assert snap["server_lead_ms"] + snap["device_lag_ms"] == snap["total_lead_ms"]
 
 
 # ── FakeFlowSession ↔ FlowSession attribute parity (2026-07-12 review C10) ────

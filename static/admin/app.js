@@ -921,8 +921,21 @@ function _setApplyDisabled(disabled, title) {
 function updateConnectionHint() {
   const sel = document.getElementById('connection-select');
   const hintEl = document.getElementById('output-device-hint');
+  // The Chromecast gapless warning rides this function deliberately: it is
+  // already called on every device change, every connection change, and at the
+  // end of updateConnectionSelect, which is exactly when the answer can change.
+  // Keeping it here also avoids a new top-level declaration in this per-page
+  // file, which the static-discipline allowlist would reject.
+  const opt = sel && sel.selectedOptions[0];
+  const castWarn = document.getElementById('gapless-cast-warning');
+  if (castWarn) {
+    // Shown whether or not gapless is ticked — it informs the decision rather
+    // than reporting it. Gapless on Cast is one endless stitched stream, so a
+    // skip has nothing to cut to and waits out the speaker's buffer (#68).
+    const isCast = !!(opt && opt.dataset.backend === 'chromecast');
+    castWarn.style.display = isCast ? '' : 'none';
+  }
   if (!hintEl) return;
-  const opt = sel.selectedOptions[0];
   const hint = opt && opt.dataset.hint;
   if (hint) {
     hintEl.textContent = hint;

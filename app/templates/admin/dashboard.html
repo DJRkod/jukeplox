@@ -802,6 +802,29 @@
           <button type="button" class="info-i" title="Off by default. When on, the next track is prepared before the current one ends so supported outputs transition without silence. The output picker's via list shows each protocol's gapless capability.">&#9432;</button>
         </div>
       </div>
+      <!-- Chromecast gapless trade-off (2026-10-10, issue #68). Shown whenever
+           the selected connection is Chromecast, whether or not the box is
+           ticked — the point is to inform the decision before it is made.
+           Gapless on Cast is one endless stitched stream, so a skip or a seek
+           has nothing to cut to and the rejected track keeps playing until the
+           speaker's own buffer drains. Measured acoustically on a WiiM Pro at
+           10-22 s.
+           Copy is deliberately one clause: the cause, the magnitude and the
+           "turn it off instead" advice were all written and then cut on
+           request. Do not re-add them here -- the detail lives in
+           docs/brainstorms/2026-10-08-cast-gapless-skip-latency-requirements.md
+           and the info-i button beside the checkbox is the place for more.
+           Toggled from admin/app.js::updateConnectionHint, which
+           already runs on every device and connection change.
+           display:none rather than [hidden]: the surrounding rows toggle
+           style.display, and an author display rule of equal specificity beats
+           [hidden] (the 2026-08-12 radio-tab fix). -->
+      <div id="gapless-cast-warning" class="panel-row" style="display:none">
+        <label></label>
+        <div style="color:var(--accent);font-size:.85rem;line-height:1.35">
+          &#9888; On Chromecast, gapless makes <strong>skip and seek slow</strong>
+        </div>
+      </div>
     </section>
 
     <!-- Optional integrations (server-fed multi-room backends — 2026-08-11 plan U9).

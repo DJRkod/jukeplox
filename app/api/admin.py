@@ -2723,6 +2723,20 @@ class MemorySnapshotRequest(BaseModel):
     collect: bool = False
 
 
+@router.get("/diagnostics/flow")
+async def flow_diagnostics_probe():
+    """Read-only flow-session instrumentation for the #68 skip-latency probe.
+
+    Exists because the measurement needs the ENCODE clock against the
+    DEVICE-reported position, and neither is reachable over HTTP otherwise —
+    ``/api/playback/position`` already reports device-derived TRACK position,
+    but not the lead that the stale-audio window is made of. Truncated session
+    handle only; the full id is the flow route's capability credential.
+    """
+    from app.output import session_events
+    return session_events.flow_diagnostics()
+
+
 @router.get("/diagnostics/memory")
 async def memory_probe_status():
     """Whether tracing is on, and which snapshots are held."""

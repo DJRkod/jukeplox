@@ -200,12 +200,24 @@ def build_catalog(sources: list[dict]) -> dict:
 
 # ── I/O orchestration ─────────────────────────────────────────────────────────
 
-async def _safe(coro):
+async def _safe(coro, what: str = "section crawl"):
     """Await ``coro``, returning ``None`` on any error (a failed section just
-    contributes nothing rather than aborting the crawl)."""
+    contributes nothing rather than aborting the crawl).
+
+    The log line is load-bearing. "Contributes nothing" is a big consequence
+    for one swallowed exception: a source whose TRACK crawl fails while its
+    artist and album crawls succeed rebuilds the catalog with zero tracks, and
+    ``any_section_ok`` is already satisfied by the artists, so the don't-wipe
+    guard never fires. That happened on the validation rig on 2026-10-10 -- the
+    catalog dropped from 104,064 tracks to 0 and the only evidence anywhere was
+    the row counts themselves. Without this line the next person re-derives
+    that from scratch.
+    """
     try:
         return await coro
     except Exception:
+        _log.warning("Catalog scan: %s failed, contributing nothing", what,
+                     exc_info=True)
         return None
 
 
@@ -238,7 +250,8 @@ async def scan_and_replace(registry, enabled_section_keys: set | None = None) ->
     crawled: list[dict] = []
     any_section_ok = False
     for idx, src in enumerate(sources):
-        libs = await _safe(src.get_libraries())
+        libs = await _safe(src.get_libraries(),
+                           "%s get_libraries" % src.source_id)
         if libs is None:
             continue
         if enabled_section_keys is not None:
@@ -246,9 +259,12 @@ async def scan_and_replace(registry, enabled_section_keys: set | None = None) ->
         artists, albums, tracks, server_name = [], [], [], ""
         for lib in libs:
             server_name = getattr(lib, "server_name", "") or server_name
-            a = await _safe(src.get_artists(lib.key))
-            al = await _safe(src.get_albums(lib.key))
-            tr = await _safe(src.get_tracks(lib.key))
+            a = await _safe(src.get_artists(lib.key),
+                            "%s artists in %s" % (src.source_id, lib.key))
+            al = await _safe(src.get_albums(lib.key),
+                             "%s albums in %s" % (src.source_id, lib.key))
+            tr = await _safe(src.get_tracks(lib.key),
+                             "%s tracks in %s" % (src.source_id, lib.key))
             if a is not None:
                 artists.extend(a)
                 any_section_ok = True

@@ -3689,6 +3689,71 @@ def test_save_collector_unguarded_reads_are_enumerated():
     )
 
 
+# ── Chromecast gapless warning (2026-10-10, issue #68) ───────────────────────
+
+def test_gapless_cast_warning_present_and_hidden_by_default():
+    """The Setup page warns, next to the Gapless checkbox, that Cast skip and
+    seek are slow -- measured acoustically at 10-22 s on a WiiM Pro. Hidden
+    until the selected connection is Chromecast."""
+    tmpl = ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    assert 'id="gapless-cast-warning"' in tmpl, (
+        "dashboard.html must render #gapless-cast-warning beside the Gapless "
+        "checkbox"
+    )
+    warn_at = tmpl.index('id="gapless-cast-warning"')
+    gapless_at = tmpl.index('id="gapless-enabled"')
+    assert warn_at > gapless_at, (
+        "the warning belongs immediately AFTER the Gapless checkbox -- it is "
+        "about that decision, and placing it elsewhere orphans it"
+    )
+    # Starts hidden. display:none rather than [hidden]: sibling rows toggle
+    # style.display, and an author display rule of equal specificity beats
+    # [hidden] (the 2026-08-12 radio-tab fix).
+    frag = tmpl[warn_at:warn_at + 260]
+    assert "display:none" in frag, (
+        "#gapless-cast-warning must start hidden via style display:none, the "
+        "idiom the surrounding rows toggle"
+    )
+    for phrase in ("skip and seek", "Chromecast"):
+        assert phrase in tmpl[warn_at:warn_at + 700], (
+            f"the warning copy must name {phrase!r} so the admin knows what is "
+            f"slow and where"
+        )
+
+
+def test_gapless_cast_warning_is_toggled_on_the_chromecast_backend():
+    """Toggled from updateConnectionHint, which already runs on every device and
+    connection change and at the end of updateConnectionSelect -- the three
+    moments the answer can change. A warning wired to a narrower event would be
+    stale exactly when it matters."""
+    app_js = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    assert "gapless-cast-warning" in app_js, (
+        "admin/app.js must toggle #gapless-cast-warning"
+    )
+    hint_at = app_js.index("function updateConnectionHint()")
+    body = app_js[hint_at:hint_at + 1400]
+    assert "gapless-cast-warning" in body, (
+        "the toggle must live inside updateConnectionHint -- that is what is "
+        "already called on every change that can alter the answer"
+    )
+    assert "'chromecast'" in body, (
+        "the toggle must key on the chromecast backend of the SELECTED "
+        "connection"
+    )
+
+
+def test_gapless_cast_warning_does_not_depend_on_the_checkbox():
+    """It informs the decision rather than reporting it, so it must show
+    whenever Chromecast is selected -- including before the box is ticked. A
+    warning that only appears once gapless is already on arrives too late to
+    prevent the surprise it describes."""
+    app_js = (ROOT / "static/admin/app.js").read_text(encoding="utf-8")
+    hint_at = app_js.index("function updateConnectionHint()")
+    body = app_js[hint_at:hint_at + 1400]
+    assert "gapless-enabled" not in body, (
+        "updateConnectionHint must NOT gate the Cast warning on the Gapless "
+        "checkbox state"
+    )
 # -- The chunked render must not append to the LIVE column every frame --------
 # _RENDER_FRAME_BUDGET_MS bounds only the JS spent building cells. It does not
 # bound the layout each append provokes, and appending to an attached container
