@@ -1,8 +1,12 @@
 import asyncio
+import logging
+import sqlite3
 
 import aiosqlite
 
 from app.config import settings
+
+_log = logging.getLogger(__name__)
 
 _db: aiosqlite.Connection | None = None
 # Shared lock across all write-transactions on the connection.
@@ -14,15 +18,72 @@ _db: aiosqlite.Connection | None = None
 # on the empty-enabled fast path). INVARIANT: every explicit
 # BEGIN/BEGIN IMMEDIATE transaction on this connection holds this lock
 # (save_plex_servers, set_genre_cache, set_credit_cache,
-# set_browse_index, set_prepared_browse, catalog/store.replace_catalog), as do
-# the
+# set_browse_index, set_prepared_browse, clear_prepared_browse,
+# catalog/store.replace_catalog), as do the
 # crawl-scale implicit-transaction alias writers
 # (catalog/store.register_alias / repoint_alias) whose execute→commit
 # windows otherwise interleave with locked writers during identity
-# resolution. Low-frequency implicit writers (set_setting etc.) remain
-# unlocked — accepted residual risk until the isolation_level=None
-# rework.
+# resolution. The play-count writers (increment_play_count /
+# decrement_play_count) are ALSO locked as of 2026-10-21: they are NOT
+# low-frequency, and an unlocked implicit transaction open across their await
+# made a locked BEGIN IMMEDIATE nest — one operator-facing 500 in 25 minutes
+# of soak playback. set_play_track_meta is locked for the same reason:
+# state.record_play fires FOUR concurrent tasks per track start, not three,
+# and that fourth one was missed on the first pass. Still unlocked: genuinely
+# low-frequency implicit writers (set_setting etc.), accepted residual risk
+# until the isolation_level=None rework — and every explicit-BEGIN writer now
+# routes through _begin_immediate, so a collision with one of them retries
+# rather than raising.
 _write_tx_lock = asyncio.Lock()
+
+# Holding the lock is necessary but NOT sufficient: an unlocked implicit
+# writer can have a transaction open across its own execute->commit await,
+# and then a locked BEGIN IMMEDIATE still nests. The 2026-10-21 soak hit
+# exactly that -- one 500 on the operator rebuild in 25 minutes of playback,
+# because three unlocked increment_play_count tasks fire per track start.
+#
+# The per-track-start writers are now locked -- all FOUR of them: the three
+# increment_play_count tasks and set_play_track_meta, which fe217df missed and
+# 2026-10-21 verification caught. This retry is the second line of defence,
+# and as of 2026-10-21 EVERY explicit-BEGIN writer in the codebase goes through
+# it (test_every_explicit_begin_goes_through_the_retry_helper enforces that), so
+# a collision with one of the ~20 remaining unlocked implicit writers -- chiefly
+# set_setting, reached from too many places to lock without a re-entrancy audit
+# -- degrades to a brief retry instead of raising. A colliding implicit
+# transaction commits in milliseconds, so a short bounded backoff clears it.
+#
+# Deliberately bounded and deliberately loud on exhaustion: a silent
+# unbounded retry while holding the write lock would convert a visible 500
+# into a stall, and an unbounded loop is the shape that already burned a core
+# once in this project.
+_BEGIN_RETRIES = 4
+_BEGIN_BACKOFF_S = 0.05
+
+
+async def _begin_immediate(db, what: str) -> None:
+    """BEGIN IMMEDIATE, retrying a nested-transaction collision briefly.
+
+    Raises the original OperationalError if the window never clears, so a
+    caller that cannot proceed still fails rather than silently continuing
+    outside a transaction.
+    """
+    for attempt in range(_BEGIN_RETRIES):
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            if attempt:
+                _log.info("%s: BEGIN IMMEDIATE succeeded on attempt %d",
+                          what, attempt + 1)
+            return
+        except sqlite3.OperationalError as exc:
+            if "within a transaction" not in str(exc):
+                raise
+            if attempt == _BEGIN_RETRIES - 1:
+                _log.warning(
+                    "%s: BEGIN IMMEDIATE still colliding after %d attempts; "
+                    "an unlocked implicit writer is holding a transaction",
+                    what, _BEGIN_RETRIES)
+                raise
+            await asyncio.sleep(_BEGIN_BACKOFF_S * (attempt + 1))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -502,7 +563,9 @@ async def save_plex_servers(servers: list[dict]) -> None:
     from app.sources import secrets
     db = _conn()
     async with _write_tx_lock:
-        await db.execute("BEGIN")
+        # Promoted from a bare BEGIN: the DELETE below takes RESERVED anyway, so
+        # acquiring it at BEGIN is strictly earlier and avoids a lock upgrade.
+        await _begin_immediate(db, "save_plex_servers")
         try:
             await db.execute("DELETE FROM plex_servers")
             for s in servers:
@@ -818,27 +881,42 @@ async def load_history() -> list[dict]:
 # ── play counts ───────────────────────────────────────────────────────────────
 
 async def increment_play_count(entity_type: str, entity_id: str) -> None:
-    """Increment play count for a track, album, or artist. entity_type: 'track'|'album'|'artist'."""
+    """Increment play count for a track, album, or artist. entity_type: 'track'|'album'|'artist'.
+
+    Holds ``_write_tx_lock`` because ``state.py`` fires three of these as
+    concurrent tasks on every track start, and an unlocked implicit
+    transaction open across this await is what made a locked
+    ``BEGIN IMMEDIATE`` elsewhere nest and fail (2026-10-21 soak: one 500 on
+    the operator rebuild in 25 minutes of playback). Safe to lock: the only
+    callers are ``state.py`` fire-and-forget tasks, never a locked writer in
+    this module, so there is no re-entrancy deadlock.
+    """
     db = _conn()
-    await db.execute(
-        "INSERT INTO play_counts (entity_type, entity_id, count) VALUES (?, ?, 1) "
-        "ON CONFLICT(entity_type, entity_id) DO UPDATE SET count = count + 1",
-        (entity_type, entity_id),
-    )
-    await db.commit()
+    async with _write_tx_lock:
+        await db.execute(
+            "INSERT INTO play_counts (entity_type, entity_id, count) VALUES (?, ?, 1) "
+            "ON CONFLICT(entity_type, entity_id) DO UPDATE SET count = count + 1",
+            (entity_type, entity_id),
+        )
+        await db.commit()
 
 
 async def decrement_play_count(entity_type: str, entity_id: str) -> None:
     """Decrement a play count, floored at zero (never negative); a no-op when the
     row is absent. The inverse of one ``increment_play_count`` — used by
-    ``state.unrecord_play`` to roll back a single play (admin play-data curation)."""
+    ``state.unrecord_play`` to roll back a single play (admin play-data curation).
+
+    Holds ``_write_tx_lock`` for the same reason as ``increment_play_count``:
+    an unlocked implicit transaction open across this await is what makes a
+    locked ``BEGIN IMMEDIATE`` elsewhere nest and fail."""
     db = _conn()
-    await db.execute(
-        "UPDATE play_counts SET count = MAX(count - 1, 0) "
-        "WHERE entity_type = ? AND entity_id = ?",
-        (entity_type, entity_id),
-    )
-    await db.commit()
+    async with _write_tx_lock:
+        await db.execute(
+            "UPDATE play_counts SET count = MAX(count - 1, 0) "
+            "WHERE entity_type = ? AND entity_id = ?",
+            (entity_type, entity_id),
+        )
+        await db.commit()
 
 
 async def set_play_count(entity_type: str, entity_id: str, count: int) -> None:
@@ -868,14 +946,26 @@ async def delete_play_count(entity_type: str, entity_id: str) -> None:
 
 async def set_play_track_meta(track_id: str, metadata: dict) -> None:
     """Upsert display metadata for a counted track (most-played plan U1).
-    Fresh metadata wins — a re-played track self-corrects stale rows."""
+    Fresh metadata wins — a re-played track self-corrects stale rows.
+
+    Holds ``_write_tx_lock``. This is the FOURTH concurrent task
+    ``state.record_play`` fires per track start (alongside the three
+    ``increment_play_count`` calls), and it was missed by fe217df: an unlocked
+    implicit transaction open across this await is what let a locked
+    ``BEGIN IMMEDIATE`` elsewhere nest, so locking only the play-count writers
+    left the per-track-start window covered by the retry alone. Safe to lock:
+    every caller is a fire-and-forget task (``state.py``, ``api/guest.py``) or a
+    direct await from ``catalog/migrate.migrate_metadata``, which never holds
+    this lock — so there is no re-entrancy deadlock.
+    """
     db = _conn()
-    await db.execute(
-        "INSERT INTO play_track_meta (track_id, metadata_json) VALUES (?, ?) "
-        "ON CONFLICT(track_id) DO UPDATE SET metadata_json = excluded.metadata_json",
-        (track_id, _json.dumps(metadata)),
-    )
-    await db.commit()
+    async with _write_tx_lock:
+        await db.execute(
+            "INSERT INTO play_track_meta (track_id, metadata_json) VALUES (?, ?) "
+            "ON CONFLICT(track_id) DO UPDATE SET metadata_json = excluded.metadata_json",
+            (track_id, _json.dumps(metadata)),
+        )
+        await db.commit()
 
 
 async def delete_play_track_meta(track_id: str) -> None:
@@ -1274,7 +1364,7 @@ async def set_prepared_browse(facet: str, path: str, signature: str,
 
     db = _conn()
     async with _write_tx_lock:
-        await db.execute("BEGIN IMMEDIATE")
+        await _begin_immediate(db, "set_prepared_browse")
         try:
             await db.execute(
                 "INSERT INTO prepared_browse"
@@ -1303,7 +1393,7 @@ async def clear_prepared_browse() -> int:
     """
     db = _conn()
     async with _write_tx_lock:
-        await db.execute("BEGIN IMMEDIATE")
+        await _begin_immediate(db, "clear_prepared_browse")
         try:
             async with db.execute("SELECT COUNT(*) FROM prepared_browse") as cur:
                 n = (await cur.fetchone())[0]
@@ -1325,7 +1415,7 @@ async def set_genre_cache(genres: list[dict]) -> None:
     """Atomically replace the genre cache with a new merged list."""
     db = _conn()
     async with _write_tx_lock:
-        await db.execute("BEGIN IMMEDIATE")
+        await _begin_immediate(db, "set_genre_cache")
         try:
             await db.execute("DELETE FROM genre_cache")
             if genres:
@@ -1711,7 +1801,7 @@ async def set_credit_cache(rows: list[dict]) -> None:
     """Atomically replace the credit cache (genre_cache replace pattern)."""
     db = _conn()
     async with _write_tx_lock:
-        await db.execute("BEGIN IMMEDIATE")
+        await _begin_immediate(db, "set_credit_cache")
         try:
             await db.execute("DELETE FROM credit_cache")
             if rows:
@@ -1835,7 +1925,7 @@ async def set_browse_index(artists: list[dict], albums: list[dict]) -> None:
     """
     db = _conn()
     async with _write_tx_lock:
-        await db.execute("BEGIN IMMEDIATE")
+        await _begin_immediate(db, "set_browse_index")
         try:
             prior_counts: dict[str, int] = {}
             if albums and any(a.get("track_count") is None for a in albums):

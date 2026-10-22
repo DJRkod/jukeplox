@@ -63,7 +63,7 @@ async def replace_catalog(
     """
     db = database._conn()
     async with database._write_tx_lock:
-        await db.execute("BEGIN IMMEDIATE")
+        await database._begin_immediate(db, "replace_catalog")
         try:
             await db.execute("DELETE FROM catalog_artist")
             await db.execute("DELETE FROM catalog_album")

@@ -1,3 +1,6 @@
+import asyncio
+import sqlite3
+
 import pytest
 
 from app import database
@@ -1169,3 +1172,279 @@ async def test_write_does_not_block_a_reader_for_long(db):
     assert reader_s < 1.0, (
         "a reader waited %.3fs behind one prepared-answer write; the stored "
         "copy is meant to be small enough that this stays short" % reader_s)
+
+
+_BEGIN_COLLIDE_GRACE = 0.08
+
+# ── transaction-collision window (2026-10-21 soak finding) ──────────────────
+#
+# The soak hit `cannot start a transaction within a transaction` on
+# POST /admin/browse/prepared/rebuild -> 500, once in 25 minutes of concurrent
+# playback. Holding _write_tx_lock is necessary but not sufficient: an
+# UNLOCKED implicit writer can have a transaction open across its own
+# execute->commit await, and a locked BEGIN IMMEDIATE then nests anyway.
+#
+# The fix has two halves and they must be tested SEPARATELY, because the
+# retry masks the lock. A plain "run them concurrently and assert no error"
+# test passes whether or not the play-count writers hold the lock -- the retry
+# would absorb the collision -- so such a test is vacuous for the lock half.
+
+
+async def _open_implicit_transaction(conn):
+    """Leave a transaction open the way an unlocked writer does.
+
+    A DML statement in aiosqlite's default isolation mode opens a transaction
+    that stays open until commit/rollback. This is the window.
+    """
+    await conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('collision-probe', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+
+
+async def test_prepared_write_retries_through_a_foreign_open_transaction(db):
+    """The retry half. A prepared write that collides must still land."""
+    conn = database._conn()
+    await _open_implicit_transaction(conn)
+
+    task = asyncio.create_task(
+        database.set_prepared_browse("albums", "native", "sig-retry", b"gz", 7))
+    # Let it collide at least once before the window closes.
+    await asyncio.sleep(_BEGIN_COLLIDE_GRACE)
+    await conn.commit()
+    await task                      # must not raise
+
+    got = await database.get_prepared_browse("albums", "native")
+    assert got is not None and got["signature"] == "sig-retry", (
+        "the prepared write did not land after retrying through a collision")
+
+
+async def test_clear_prepared_retries_through_a_foreign_open_transaction(db):
+    """The operator-facing path -- this is the one that answered 500."""
+    await database.set_prepared_browse("albums", "native", "sig-x", b"gz", 7)
+    conn = database._conn()
+    await _open_implicit_transaction(conn)
+
+    task = asyncio.create_task(database.clear_prepared_browse())
+    await asyncio.sleep(_BEGIN_COLLIDE_GRACE)
+    await conn.commit()
+    dropped = await task            # must not raise
+
+    assert dropped == 1
+    assert await database.get_prepared_browse("albums", "native") is None
+
+
+async def test_begin_immediate_gives_up_rather_than_hanging(db):
+    """Bounded, and loud. An unbounded retry while holding the write lock
+    would turn a visible 500 into a stall, and this project has already
+    burned a core once on an unbounded retry loop."""
+    conn = database._conn()
+    await _open_implicit_transaction(conn)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="within a transaction"):
+            await database.set_prepared_browse("albums", "native", "s", b"g", 1)
+    finally:
+        await conn.rollback()
+
+
+async def test_begin_immediate_is_bounded_in_time(db):
+    """The retry budget must stay small enough that a caller fails fast."""
+    total = sum(database._BEGIN_BACKOFF_S * (i + 1)
+                for i in range(database._BEGIN_RETRIES - 1))
+    assert total < 1.0, (
+        "the BEGIN retry budget is %.2fs; it is held under _write_tx_lock, so "
+        "a long budget stalls every other writer" % total)
+
+
+async def test_play_count_writers_hold_the_write_lock(db):
+    """The lock half, isolated from the retry.
+
+    Instruments the lock itself rather than racing, because a race-based test
+    would be absorbed by the retry and pass either way. Mutation-checked:
+    removing `async with _write_tx_lock` from either writer fails this.
+    """
+    acquired = []
+    real = database._write_tx_lock
+
+    class Tracking:
+        async def __aenter__(self):
+            acquired.append(True)
+            return await real.__aenter__()
+
+        async def __aexit__(self, *a):
+            return await real.__aexit__(*a)
+
+    database._write_tx_lock = Tracking()
+    try:
+        await database.increment_play_count("track", "t-lock")
+        assert acquired, "increment_play_count did not take _write_tx_lock"
+        acquired.clear()
+        await database.decrement_play_count("track", "t-lock")
+        assert acquired, "decrement_play_count did not take _write_tx_lock"
+    finally:
+        database._write_tx_lock = real
+
+
+async def test_concurrent_play_counts_and_prepared_writes_all_succeed(db):
+    """End-to-end shape of the soak failure, as a regression guard.
+
+    state.py fires three increment_play_count tasks per track start; the
+    prepared answer writes on every library or policy change. This runs both
+    at once. It passes with either half of the fix in place, which is exactly
+    why the two tests above exist -- this one proves the combination works,
+    not which half is doing the work.
+    """
+    async def bump(i):
+        await database.increment_play_count("track", "t%d" % (i % 4))
+
+    async def store(i):
+        await database.set_prepared_browse(
+            "albums", "native", "sig-%d" % i, b"gz", 10 + i)
+
+    await asyncio.gather(*([bump(i) for i in range(24)]
+                           + [store(i) for i in range(8)]))
+
+    got = await database.get_prepared_browse("albums", "native")
+    assert got is not None, "no prepared row survived the concurrent run"
+
+
+# ── closing the two gaps fe217df left (2026-10-21) ─────────────────────────
+#
+# fe217df locked the three increment_play_count tasks and gave the two prepared
+# writers a bounded retry. Verifying it afterwards found two gaps, and nothing
+# in the suite covered either:
+#
+#   1. record_play fires FOUR concurrent tasks per track start. The fourth,
+#      set_play_track_meta, was still an unlocked implicit writer -- the exact
+#      shape increment_play_count had before the fix -- so the per-track-start
+#      window was covered by the retry alone.
+#   2. The retry is only reachable via _begin_immediate, and only the two
+#      prepared writers called it. Five other locked explicit-BEGIN writers
+#      issued a bare BEGIN and raised on first collision. set_browse_index was
+#      the dangerous one: every library refresh, and a silent failure mode.
+#
+# The structural test below is the load-bearing one. The behavioural tests
+# prove today's writers retry; the structural test is what stops the NEXT
+# writer from reintroducing the gap.
+
+
+async def test_per_track_start_writers_all_hold_the_write_lock(db):
+    """All FOUR tasks state.record_play fires per track start must be locked.
+
+    Locking three of four leaves the window open and covered only by the
+    retry, which is best-effort. Mutation-checked: unlocking any one of these
+    fails this test.
+    """
+    acquired = []
+    real = database._write_tx_lock
+
+    class Tracking:
+        async def __aenter__(self):
+            acquired.append(True)
+            return await real.__aenter__()
+
+        async def __aexit__(self, *a):
+            return await real.__aexit__(*a)
+
+    database._write_tx_lock = Tracking()
+    try:
+        for label, call in (
+            ("increment_play_count",
+             lambda: database.increment_play_count("track", "t-4")),
+            ("decrement_play_count",
+             lambda: database.decrement_play_count("track", "t-4")),
+            ("set_play_track_meta",
+             lambda: database.set_play_track_meta("t-4", {"title": "x"})),
+        ):
+            acquired.clear()
+            await call()
+            assert acquired, "%s did not take _write_tx_lock" % label
+    finally:
+        database._write_tx_lock = real
+
+
+def test_every_explicit_begin_goes_through_the_retry_helper():
+    """No explicit BEGIN may bypass _begin_immediate.
+
+    Derived rather than hand-listed, so a writer added later cannot quietly
+    reintroduce the gap. Five writers were bypassing the helper until
+    2026-10-21 (save_plex_servers, set_genre_cache, set_credit_cache,
+    set_browse_index, catalog/store.replace_catalog), and set_browse_index
+    runs on every library refresh with a silent failure mode.
+
+    Scope is decided by the ENCLOSING FUNCTION, via AST -- not by proximity.
+    A first version of this test looked backwards a fixed number of characters
+    for the string `_begin_immediate` and was therefore fooled by an unrelated
+    call a few lines above the offending BEGIN: it passed under mutation. A
+    structural guard that can be defeated by where code happens to sit is not
+    a guard.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(database.__file__).resolve().parent
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                f = node.func
+                if not (isinstance(f, ast.Attribute) and f.attr == "execute"):
+                    continue
+                if not node.args:
+                    continue
+                a0 = node.args[0]
+                if not (isinstance(a0, ast.Constant)
+                        and isinstance(a0.value, str)
+                        and a0.value.upper().startswith("BEGIN")):
+                    continue
+                # The helper's own BEGIN is the single legitimate occurrence.
+                if fn.name == "_begin_immediate":
+                    continue
+                offenders.append("%s:%d in %s()"
+                                 % (path.relative_to(root.parent),
+                                    node.lineno, fn.name))
+
+    assert offenders == [], (
+        "these sites issue an explicit BEGIN without the retry helper, so they "
+        "raise on the first collision with an unlocked implicit writer: %s"
+        % offenders)
+
+
+async def test_set_browse_index_retries_through_a_foreign_open_transaction(db):
+    """The highest-risk bypass: a library refresh, and a silent failure mode.
+
+    Before 2026-10-21 this raised on the first collision, failing a refresh and
+    leaving stale browse data with the suite green.
+    """
+    conn = database._conn()
+    await _open_implicit_transaction(conn)
+
+    albums = [_album_row("A:10", "OK Computer", "ok computer", "Radiohead",
+                         "radiohead", year=1997)]
+    task = asyncio.create_task(database.set_browse_index([], albums))
+    await asyncio.sleep(_BEGIN_COLLIDE_GRACE)
+    await conn.commit()
+    await task                      # must not raise
+
+    rows = await database.get_browse_albums()
+    assert [r["title"] for r in rows] == ["OK Computer"], (
+        "the browse-index refresh did not land after retrying a collision")
+
+
+async def test_set_genre_cache_retries_through_a_foreign_open_transaction(db):
+    """Representative of the remaining promoted writers."""
+    conn = database._conn()
+    await _open_implicit_transaction(conn)
+
+    task = asyncio.create_task(
+        database.set_genre_cache([{"name": "Jazz", "count": 3}]))
+    await asyncio.sleep(_BEGIN_COLLIDE_GRACE)
+    await conn.commit()
+    await task                      # must not raise
+
+    got = await database.get_genre_cache()
+    assert [(g["name"], g["count"]) for g in got] == [("Jazz", 3)]
