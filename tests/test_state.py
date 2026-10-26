@@ -5590,3 +5590,42 @@ async def test_a_failed_startup_load_leaves_nothing_published(monkeypatch):
                         AsyncMock(side_effect=RuntimeError("no db")))
     await state.load_prepared_answers()        # must not raise
     assert state.published_prepared_inputs() is None
+
+# --- path-backed (Local files) sources on a wildcard bind (VM lane, 2026-10-26) --
+
+def _local_files_client():
+    """A Local-source registry stand-in: resolve_stream() yields a PATH, so
+    stream_url() is "" — there is no upstream URL to fall back to."""
+    c = MagicMock()
+    c.stream_url = lambda k: ""
+    c.url_borne_auth_for = MagicMock(return_value=False)
+    return c
+
+
+def test_local_files_on_wildcard_bind_proxies_via_autodetected_base():
+    """BIND_HOST=0.0.0.0 + no STREAM_BASE_URL (the image's and the native
+    installer's defaults) must still yield a playable URL for a local file."""
+    import app.state as st
+    client = _local_files_client()
+    with _u5_settings(stream_base_url="", bind_host="0.0.0.0"), _u5_reset_lan_cache(),          patch.object(st, "_detect_primary_lan_ip", return_value="192.168.1.23"):
+        url = st._make_stream_url("local-abc:t1", client)
+    assert url == "http://192.168.1.23/api/stream?key=local-abc%3At1"
+
+
+def test_local_files_with_no_detectable_base_returns_empty_and_warns(caplog):
+    import logging
+    import app.state as st
+    client = _local_files_client()
+    with _u5_settings(stream_base_url="", bind_host="0.0.0.0"), _u5_reset_lan_cache(),          patch.object(st, "_detect_primary_lan_ip", side_effect=RuntimeError("no route")),          caplog.at_level(logging.WARNING, logger="app.state"):
+        url = st._make_stream_url("local-abc:t1", client)
+    assert url == ""
+    assert any("STREAM_BASE_URL" in r.getMessage() for r in caplog.records)
+
+
+def test_local_files_with_specific_bind_host_unchanged():
+    import app.state as st
+    client = _local_files_client()
+    with _u5_settings(stream_base_url="", bind_host="192.168.1.10"),          patch.object(st, "_detect_primary_lan_ip") as det:
+        url = st._make_stream_url("local-abc:t1", client)
+    assert url == "http://192.168.1.10/api/stream?key=local-abc%3At1"
+    det.assert_not_called()

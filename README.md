@@ -22,7 +22,8 @@ on Mac/Windows Docker Desktop.
   account, no password.
 - **Party-ready** — shared queue, now playing, search, genre and most-played browse,
   gapless playback.
-- **Self-hosted** — one Docker container on any Linux box (Raspberry Pi, NAS, or server).
+- **Self-hosted** — one Docker container on any Linux box (Raspberry Pi, NAS, or server),
+  or a native Debian 12 install for boxes that can't run Docker (32-bit x86 included).
 
 ## Screenshots
 
@@ -96,6 +97,14 @@ Two headless-ALSA gotchas on some hosts:
 - The container doesn't inherit the host's `/etc/asound.conf`. If your host defines a custom `default` PCM (softvol / dmix / a fixed rate), bind-mount it: `-v /etc/asound.conf:/etc/asound.conf:ro`.
 
 Then choose **System Audio** in Setup → Output.
+
+## No Docker? Native install on Debian 12
+
+For a box that can't run the image (a 32-bit x86 PC, for one), `install-native.sh` installs
+the same code natively on Debian 12: it compiles Python 3.12 and a few dependencies on the
+box (slow the first time), then runs Jukeplox as a systemd service. Steps, flags and limits
+(AirPlay is unavailable on 32-bit, [#90](https://github.com/DJRkod/jukeplox/issues/90)) are
+in [`INSTALL.md`](INSTALL.md#native-install-debian-12-no-docker).
 
 ## Multi-room output (Snapcast + Sendspin — optional)
 

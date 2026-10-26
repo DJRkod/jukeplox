@@ -26,14 +26,10 @@ import logging
 from pathlib import Path
 
 from app import _build_info
+from app.paths import STATIC_DIR
 
 _log = logging.getLogger(__name__)
 
-# app/assets.py → parents[1] is the repo root, where `static/` lives (mirrors
-# `app.mount("/static", StaticFiles(directory="static"))` under the image's
-# WORKDIR /app). Anchored to the file, NOT the process CWD, so the dev
-# fingerprint reads the real files regardless of where the app is launched.
-STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
 
 # Fallback when the static dir can't be read at all — never raise at import.
 _FALLBACK = "dev"

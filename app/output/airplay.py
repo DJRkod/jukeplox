@@ -152,6 +152,20 @@ def _cliraop_bin() -> str:
     return os.environ.get("JUKEPLOX_CLIRAOP_BIN", _CLIRAOP_BIN_DEFAULT)
 
 
+def missing_binaries_message() -> str:
+    """The one explanation for a missing cliap2/cliraop pair, shared by every
+    raise site. Names both remedies: the Docker/x86_64/aarch64 one (binaries
+    under /usr/local/bin or the JUKEPLOX_*_BIN overrides) and the fact that
+    no 32-bit build exists at all (public issue #90), so a native i386 install
+    is not told to install something it cannot."""
+    return (
+        "AirPlay binaries (cliap2/cliraop) are not available in this environment. "
+        "On x86_64/aarch64 install them at /usr/local/bin or set "
+        "JUKEPLOX_CLIAP2_BIN / JUKEPLOX_CLIRAOP_BIN; no 32-bit (i386) build "
+        "exists yet — AirPlay is unavailable on that architecture (see issue #90)."
+    )
+
+
 def _binaries_available() -> bool:
     """True only when both cliap2 and cliraop are present and executable.
 
@@ -905,7 +919,7 @@ class AirPlayBackend:
         """
         if not _binaries_available():
             raise DeviceNotReadyError(
-                "AirPlay binaries unavailable — cannot probe AP2 support"
+                "cannot probe AP2 support: " + missing_binaries_message()
             )
         lock = self._probe_locks.setdefault(device_id, asyncio.Lock())
         async with lock:
@@ -1125,11 +1139,7 @@ class AirPlayBackend:
         start_offset_ms: int = 0,
     ) -> None:
         if not _binaries_available():
-            raise DeviceNotReadyError(
-                "AirPlay binaries (cliap2/cliraop) are not available in this "
-                "environment — install them at /usr/local/bin or set "
-                "JUKEPLOX_CLIAP2_BIN / JUKEPLOX_CLIRAOP_BIN."
-            )
+            raise DeviceNotReadyError(missing_binaries_message())
         if self._device_id is None:
             raise DeviceNotReadyError(
                 "No AirPlay device selected — call set_device() first"

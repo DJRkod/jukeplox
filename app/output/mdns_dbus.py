@@ -162,7 +162,8 @@ def _discover_in_context(
         )
     except Exception as exc:
         _log.warning("mdns_dbus: cannot connect to system D-Bus — %s "
-                     "(is /run/dbus/system_bus_socket mounted in the container?)", exc)
+                     "(in Docker: is /run/dbus/system_bus_socket mounted? on a native "
+                     "install: is avahi-daemon or systemd-resolved running?)", exc)
         return None  # socket absent — callers use this to distinguish from "no devices"
 
     try:

@@ -39,7 +39,8 @@ def validate_plex_id(value: str | None) -> None:
     if value and (len(value) > 128 or not _ID_RE.match(value)):
         raise HTTPException(status_code=400, detail="Invalid resource ID")
 
-_templates = Jinja2Templates(directory="app/templates")
+from app.paths import TEMPLATES_DIR
+_templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 from app import assets as _assets
 from app.album_fold import resolved_track_counts
 _assets.register(_templates)  # `asset_v` global → build-derived cache-buster

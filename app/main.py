@@ -162,7 +162,12 @@ async def _release_output_backends() -> None:
 
 app = FastAPI(title="Jukeplox", lifespan=lifespan)
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+from app.paths import STATIC_DIR
+
+# Anchored on the package (app/paths.py), not the CWD: identical to the old
+# CWD-relative "static" under the image's WORKDIR /app, and correct when a
+# native install starts the service from any other directory.
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 from app.api.auth_routes import router as auth_router
 from app.api.admin import router as admin_router, admin_ws_router, page_router as admin_page_router

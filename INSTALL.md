@@ -5,8 +5,10 @@ A self-hosted party jukebox for your music — Plex, Jellyfin, Emby, an OpenSubs
 their phones; playback goes to a Chromecast/AirPlay/DLNA speaker or to speakers wired to the
 machine.
 
-**Linux + Docker only** (Mac/Windows Docker Desktop can't discover speakers). On
-**TrueNAS Scale**, use the Apps UI instead — see `TrueNAS-README.md`.
+**Linux only** (Mac/Windows Docker Desktop can't discover speakers): either the Docker
+image below, or a [native install on Debian 12](#native-install-debian-12-no-docker) for
+boxes that can't run Docker (32-bit x86 included). On **TrueNAS Scale**, use the Apps UI
+instead — see `TrueNAS-README.md`.
 
 ## Quick start
 
@@ -119,7 +121,56 @@ speakers play. Set `BIND_HOST` to the server's LAN IP so Sendspin advertises a
 reachable address. snapserver's control/web ports bind loopback; the client
 stream port (1704) is LAN-facing.
 
-## Settings (`-e NAME=value`)
+## Native install (Debian 12, no Docker)
+
+For a box that can't run the image — a 32-bit x86 PC is the validated case — the same code
+installs natively on a stock **Debian 12 (bookworm)**. Everything is compiled on the box
+(Python 3.12, a Rust toolchain, a few C extensions): expect the **first run to take an hour
+or more on old hardware**, with 2 GB RAM or a swap file. Re-runs are fast.
+
+### 1. Install
+
+As root, on a fresh Debian 12:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DJRkod/jukeplox/main/install-native.sh -o install-native.sh
+sh install-native.sh
+```
+
+It clones the public repo to `/opt/jukeplox/app`, builds into `/opt/jukeplox`, keeps your data
+in `/var/lib/jukeplox`, writes `/etc/jukeplox/env`, and starts the `jukeplox` systemd service
+as a dedicated `jukeplox` user. It listens on all interfaces (like the image) and prints your
+LAN address. Port 80 taken? `--port 8096` (it sets `STREAM_BASE_URL` to your LAN address for
+you — **casting fails silently if that address is wrong or later changes**, so give the box a
+static IP). `--bind-host <IP>` pins the listen address; that also needs a static IP. `--source <dir>`
+runs from a checkout you already have; the `jukeplox` user must be able to read it, so not
+under `/root` (the installer refuses before touching systemd). `--help` lists every flag.
+
+### 2. Set it up
+
+Open `http://<IP>/admin` and continue at [step 5](#5-set-it-up). **Attached speakers** work
+through ALSA with no extra flags — pick **System Audio** in Setup → Output. Desktop PulseAudio
+needs the service to run as your desktop user: install with `--run-as <your-user>` and set
+`PULSE_SERVER` in the env file.
+
+### 3. Configure, update, troubleshoot
+
+- **Settings** live in `/etc/jukeplox/env` (same names as the table below, one per line);
+  `systemctl restart jukeplox` applies them.
+- **Update:** `cd /opt/jukeplox/app && git pull && sh install-native.sh` — the badge at
+  `/api/version` shows the new `git_sha` with `image_tag: native`.
+- **Logs:** `journalctl -u jukeplox -f`.
+- The installer disables Debian's own `snapserver`/`snapclient` services: Jukeplox embeds its
+  own snapserver for the optional multi-room output.
+
+**Limits.** Validated on a 32-bit Debian 12 virtual machine (install, reboot, re-run, ALSA
+playback through a loopback card, Chromecast and DLNA to real devices, Snapcast); sign-off
+through a real 32-bit box's own sound card is still pending. **AirPlay is
+unavailable on 32-bit x86** — the vendored AirPlay binaries exist for x86_64/aarch64 only
+([#90](https://github.com/DJRkod/jukeplox/issues/90)); Chromecast, DLNA and attached speakers
+work. Other Debian releases and derivatives are untested.
+
+## Settings (`-e NAME=value`, or lines in `/etc/jukeplox/env` natively)
 
 | Variable | Default | What it's for |
 |---|---|---|

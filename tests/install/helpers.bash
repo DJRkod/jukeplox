@@ -10,6 +10,15 @@ setup_install_lib() {
   JUKEPLOX_INSTALL_LIB=1 . "$PROJECT_ROOT/install.sh"
 }
 
+# Same, for the native (non-Docker) installer. The two scripts share the
+# sourceable-library shape but are separate files, so each gets its own loader.
+setup_native_lib() {
+  PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
+  # shellcheck disable=SC1091
+  JUKEPLOX_INSTALL_LIB=1 . "$PROJECT_ROOT/install-native.sh"
+  parse_args; layout
+}
+
 # Prepend an empty stub dir to PATH. Pair with teardown_stub_bin.
 setup_stub_bin() {
   STUB_BIN="$(mktemp -d)"

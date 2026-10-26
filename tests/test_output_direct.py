@@ -502,6 +502,24 @@ async def test_source_error_still_advances(gst_mock, fresh_supervisor):
     assert outages == []
 
 
+async def test_source_error_is_logged_not_silent(gst_mock, fresh_supervisor, caplog):
+    """VM lane 2026-10-26: an 'Invalid URI ""' bus ERROR advanced the queue with
+    no log line, so an empty stream URL looked like a track that never started."""
+    import asyncio
+    import logging
+    from app.output.direct import DirectAudioBackend
+
+    async def advance():
+        pass
+
+    backend = DirectAudioBackend(advance_cb=advance)
+    await backend.play("http://url", make_track())
+    with caplog.at_level(logging.WARNING, logger="app.output.direct"):
+        backend._on_error(None, _error_msg("uridecodebin0", "gst-resource-error-quark"))
+        await asyncio.sleep(0.02)
+    assert any("GStreamer ERROR from uridecodebin0" in r.getMessage() for r in caplog.records)
+
+
 async def test_sink_nonresource_error_still_advances(gst_mock, fresh_supervisor):
     """Sink-originated but non-RESOURCE (e.g. a stream/format error surfacing
     at the sink) is NOT device-level by definition — advance."""

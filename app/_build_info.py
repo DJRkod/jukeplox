@@ -5,11 +5,13 @@ prove which version of the code it's actually executing.
 The values come from `JUKEPLOX_GIT_SHA`, `JUKEPLOX_BUILD_TIME`, and
 `JUKEPLOX_IMAGE_TAG` environment variables. The Dockerfile sets these
 from build ARGs; pass them on the build command line with
-`--build-arg GIT_SHA=$(git rev-parse --short HEAD)` etc.
+`--build-arg GIT_SHA=$(git rev-parse --short HEAD)` etc. A native
+(non-Docker) install sets the same three variables in its systemd env
+file, with `JUKEPLOX_IMAGE_TAG=native` and the checkout's sha.
 
-When running outside Docker (dev mode), the env vars are absent and
-the module reports "unknown" — that's the intended signal that this
-is a non-image build.
+In a plain dev checkout the env vars are absent and the module reports
+"unknown" — the signal that this is neither an image nor an installed
+native service.
 
 Surfaced via:
 - Startup log line (one INFO log on app boot, visible in `docker logs`)
