@@ -728,10 +728,11 @@ function _updateBackendBanner(status) {
   // per-backend "scan unavailable" note.
   if (status.discovery === 'unavailable') {
     msgEl.textContent = 'Chromecast & AirPlay discovery is unavailable — Jukeplox can’t '
-      + 'reach the network for mDNS. Run the container with --network host so it can '
+      + 'reach the network for mDNS. Docker: run the container with --network host so it can '
       + 'bind mDNS (UDP 5353); if a host avahi/Bonjour already owns 5353 (e.g. TrueNAS), '
-      + 'also mount /run/dbus/system_bus_socket so Jukeplox can use it. Then Retry '
-      + 'Discovery. (DLNA and System Audio are unaffected.)';
+      + 'also mount /run/dbus/system_bus_socket so Jukeplox can use it. Native install: make '
+      + 'sure avahi-daemon (or systemd-resolved with mDNS) is running so Jukeplox can fall back '
+      + 'to it. Then Retry Discovery. (DLNA and System Audio are unaffected.)';
     banner.style.display = '';
     return;
   }

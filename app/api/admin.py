@@ -37,7 +37,8 @@ from app.output.discovery import build_devices_snapshot, build_registry_snapshot
 from app.output.probe_runner import schedule_probes
 from app.queue.models import QueueEndBehavior
 
-_templates = Jinja2Templates(directory="app/templates")
+from app.paths import TEMPLATES_DIR
+_templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 from app import assets as _assets
 _assets.register(_templates)  # `asset_v` global → build-derived cache-buster
 

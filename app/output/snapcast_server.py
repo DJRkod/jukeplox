@@ -41,12 +41,13 @@ import os
 import socket
 from typing import Any, Awaitable, Callable
 
+from app.paths import CONFIG_DIR
+
 _log = logging.getLogger(__name__)
 
 # Debian's apt package installs snapserver to /usr/bin (NOT /usr/local/bin — that
 # is where the vendored airplay binaries live). Override via JUKEPLOX_SNAPSERVER_BIN.
 _SNAPSERVER_BIN_DEFAULT = "/usr/bin/snapserver"
-_STUB_CONF_DEFAULT = "/app/config/snapserver.conf"
 
 # Consecutive-restart cap: a permanently-broken snapserver (bad binary, repeated
 # OOM, fatal config) must not respawn forever. After this many consecutive failed
@@ -80,6 +81,17 @@ def snapserver_bin() -> str:
     """The snapserver binary path, overridable via ``JUKEPLOX_SNAPSERVER_BIN``
     for dev/test (mirrors airplay.py's ``JUKEPLOX_CLIAP2_BIN`` convention)."""
     return os.environ.get("JUKEPLOX_SNAPSERVER_BIN", _SNAPSERVER_BIN_DEFAULT)
+
+
+def snapserver_conf() -> str:
+    """The stub snapserver.conf path, overridable via ``JUKEPLOX_SNAPSERVER_CONF``.
+
+    The stub ships in the repo at ``config/snapserver.conf`` (COPYed to
+    ``/app/config`` in the image) and is resolved through ``app.paths`` so a
+    native install finds it wherever the checkout lives. Read at call time (the
+    supervisor resolves it on construction), so an override set after import
+    still takes effect."""
+    return os.environ.get("JUKEPLOX_SNAPSERVER_CONF", str(CONFIG_DIR / "snapserver.conf"))
 
 
 class SnapserverStartError(RuntimeError):
@@ -169,7 +181,7 @@ class SnapserverSupervisor:
         self,
         *,
         source_name: str,
-        config_path: str = _STUB_CONF_DEFAULT,
+        config_path: str | None = None,
         stream_port: int = DEFAULT_STREAM_PORT,
         control_port: int = DEFAULT_CONTROL_PORT,
         http_port: int = DEFAULT_HTTP_PORT,
@@ -188,7 +200,7 @@ class SnapserverSupervisor:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._source_name = source_name
-        self._config_path = config_path
+        self._config_path = config_path if config_path is not None else snapserver_conf()
         self._stream_port = stream_port
         self._control_port = control_port
         self._http_port = http_port

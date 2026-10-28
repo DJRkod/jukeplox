@@ -1698,6 +1698,9 @@ def _is_bridge_ip(ip: str) -> bool:
         return False
 
 
+_autodetect_warned: set[tuple[str, str]] = set()
+
+
 def resolved_device_base(context: str, *, reject_bridge: bool = False) -> str:
     """The device-reachable absolute base for anything this server streams to
     a LAN device.
@@ -1747,7 +1750,10 @@ def resolved_device_base(context: str, *, reject_bridge: bool = False) -> str:
             "Cast/DLNA device likely cannot reach it. Set STREAM_BASE_URL to "
             "this server's LAN address to guarantee playback.", ip, context,
         )
-    else:
+    elif (context, ip) not in _autodetect_warned:
+        # Once per context+address: the per-track callers (local files) would
+        # otherwise print this twice for every track dispatched.
+        _autodetect_warned.add((context, ip))
         _log.warning(
             "STREAM_BASE_URL is not set — auto-detected stream base http://%s "
             "for %s. If a LAN Cast/DLNA device can't reach this address, set "
@@ -1804,7 +1810,20 @@ def _make_stream_url(stream_key: str, client) -> str:
     base = _stream_url_base()
     if base:
         return _proxy_stream_url(stream_key, base)
-    return client.stream_url(stream_key)
+    raw = client.stream_url(stream_key)
+    if raw:
+        return raw
+    # A path-backed source (Local files) has no upstream URL at all: the ONLY
+    # way to play it is through /api/stream, so on a wildcard bind with no
+    # STREAM_BASE_URL the base must be auto-detected (VM lane 2026-10-26:
+    # every Local track dispatched as uri "" and was skipped silently). The
+    # same ladder Cast/Subsonic use; undetectable → "" as before, but say so.
+    try:
+        return _proxy_stream_url(stream_key, resolved_device_base("a local-files track"))
+    except RuntimeError as exc:
+        _log.warning("No stream base for a local-files track (%s): set STREAM_BASE_URL "
+                     "or BIND_HOST to this server's LAN address", exc)
+        return ""
 
 
 def record_play(track) -> None:

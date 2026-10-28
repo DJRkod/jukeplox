@@ -474,7 +474,11 @@ class DirectAudioBackend:
                                              backend=self)
             return
         # Track-level (source/decode chain): skip the dead media — the
-        # advance-on-ERROR party-stall posture, preserved by R15.
+        # advance-on-ERROR party-stall posture, preserved by R15. Say so:
+        # a silent skip reads as "the track just never started".
+        _log.warning("GStreamer ERROR from %s: %s — skipping the track (%s)",
+                     getattr(getattr(message, "src", None), "get_name", lambda: "?")(),
+                     err, debug)
         if self._advance_cb and self._loop:
             asyncio.run_coroutine_threadsafe(self._advance_cb(), self._loop)
 
