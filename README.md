@@ -9,8 +9,10 @@ Point it at a **Plex**, **Jellyfin**, or **Emby** server, an **OpenSubsonic** se
 (Navidrome, gonic, Ampache, Nextcloud Music, LMS/Lyrion), a **local folder** of audio
 files, or any mix — Jukeplox merges them into one library.
 
-**Linux only** — Docker host networking (required for speaker discovery) isn't available
-on Mac/Windows Docker Desktop.
+**Runs on Linux, two ways:** the Docker image (x86-64 and arm64 — a Raspberry Pi, a NAS,
+TrueNAS Scale, any server), or a [native install on Debian 12](#native-install-on-debian-12-no-docker)
+that needs no Docker and also covers 32-bit x86 PCs. Mac/Windows aren't supported: Docker
+Desktop there can't discover speakers.
 
 ## Features
 
@@ -23,7 +25,7 @@ on Mac/Windows Docker Desktop.
 - **Party-ready** — shared queue, now playing, search, genre and most-played browse,
   gapless playback.
 - **Self-hosted** — one Docker container on any Linux box (Raspberry Pi, NAS, or server),
-  or a native Debian 12 install for boxes that can't run Docker (32-bit x86 included).
+  or a native systemd service on Debian 12 — no Docker needed, 32-bit x86 included.
 
 ## Screenshots
 
@@ -53,6 +55,16 @@ Installs Docker if needed, starts Jukeplox, and opens the browser. Run it as you
 user (needs `curl`). Then set an admin password, connect Plex, and pick a speaker.
 
 _Prefer to read it first?_ Download the script (the URL above) with `curl -fsSLO`, skim it, then run `sh install.sh`.
+
+**Debian 12 without Docker** (32-bit x86 included) — as root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DJRkod/jukeplox/main/install-native.sh -o install-native.sh
+sh install-native.sh
+```
+
+The first run compiles Python and a few dependencies on the box (slow on old hardware); then
+Jukeplox runs as a systemd service. Details: [Native install on Debian 12](#native-install-on-debian-12-no-docker).
 
 **You need:** a Linux host · at least one music source — a Plex server (+ account), a
 Jellyfin server, or a folder of audio files · a Chromecast/AirPlay/DLNA speaker, or
@@ -98,13 +110,15 @@ Two headless-ALSA gotchas on some hosts:
 
 Then choose **System Audio** in Setup → Output.
 
-## No Docker? Native install on Debian 12
+## Native install on Debian 12 (no Docker)
 
-For a box that can't run the image (a 32-bit x86 PC, for one), `install-native.sh` installs
-the same code natively on Debian 12: it compiles Python 3.12 and a few dependencies on the
-box (slow the first time), then runs Jukeplox as a systemd service. Steps, flags and limits
-(AirPlay is unavailable on 32-bit, [#90](https://github.com/DJRkod/jukeplox/issues/90)) are
-in [`INSTALL.md`](INSTALL.md#native-install-debian-12-no-docker).
+Debian 12 (bookworm) is a supported platform in its own right, Docker or not.
+`install-native.sh` installs the same code, from the same tree as the image, natively: it
+compiles Python 3.12 and a few dependencies on the box (slow the first time), then runs
+Jukeplox as a hardened systemd service under its own user. It is validated on 32-bit x86,
+where the image cannot run at all. Steps, flags and limits (AirPlay is unavailable on 32-bit,
+[#90](https://github.com/DJRkod/jukeplox/issues/90)) are in
+[`INSTALL.md`](INSTALL.md#native-install-debian-12-no-docker).
 
 ## Multi-room output (Snapcast + Sendspin — optional)
 
@@ -302,6 +316,9 @@ Data in the volume is kept; **run-flags are not** — re-run with the exact flag
 (`docker inspect jukeplox` first to recover them). Build info at `/api/version` — check
 the `git_sha` (the `image_tag` may show an internal release-train name; that's expected).
 
+Native install: `cd /opt/jukeplox/app && git pull && sh install-native.sh` — data and
+`/etc/jukeplox/env` are kept, and `/api/version` shows the new `git_sha` with `image_tag: native`.
+
 ## Notes
 
 - **Security:** host networking exposes the admin port on all interfaces. Run on a trusted
@@ -309,6 +326,7 @@ the `git_sha` (the `image_tag` may show an internal release-train name; that's e
   Reporting a vulnerability: [`SECURITY.md`](SECURITY.md).
 - **Contributing / issues:** [`CONTRIBUTING.md`](CONTRIBUTING.md) (this is an LLM-maintained project).
 - **TrueNAS Scale:** install via the Apps UI — see `TrueNAS-README.md`.
+- **Debian 12 without Docker:** [`INSTALL.md`](INSTALL.md#native-install-debian-12-no-docker).
 - **Step-by-step walkthrough:** `INSTALL.md`.
 
 ## License

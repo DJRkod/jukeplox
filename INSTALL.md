@@ -5,10 +5,11 @@ A self-hosted party jukebox for your music — Plex, Jellyfin, Emby, an OpenSubs
 their phones; playback goes to a Chromecast/AirPlay/DLNA speaker or to speakers wired to the
 machine.
 
-**Linux only** (Mac/Windows Docker Desktop can't discover speakers): either the Docker
-image below, or a [native install on Debian 12](#native-install-debian-12-no-docker) for
-boxes that can't run Docker (32-bit x86 included). On **TrueNAS Scale**, use the Apps UI
-instead — see `TrueNAS-README.md`.
+**Linux only** (Mac/Windows Docker Desktop can't discover speakers). Two supported ways to
+run it: the **Docker image** below (x86-64 and arm64), or a
+**[native install on Debian 12](#native-install-debian-12-no-docker)** with no Docker at
+all — the route for 32-bit x86 PCs, or for anyone who prefers a plain systemd service. On
+**TrueNAS Scale**, use the Apps UI instead — see `TrueNAS-README.md`.
 
 ## Quick start
 
@@ -123,8 +124,10 @@ stream port (1704) is LAN-facing.
 
 ## Native install (Debian 12, no Docker)
 
-For a box that can't run the image — a 32-bit x86 PC is the validated case — the same code
-installs natively on a stock **Debian 12 (bookworm)**. Everything is compiled on the box
+**Debian 12 (bookworm)** is supported without Docker: the same code, from the same tree as
+the image, installs natively as a systemd service. It is the route for a 32-bit x86 PC (the
+validated case, where the image cannot run) and for anyone who would rather not run Docker.
+Everything is compiled on the box
 (Python 3.12, a Rust toolchain, a few C extensions): expect the **first run to take an hour
 or more on old hardware**, with 2 GB RAM or a swap file. Re-runs are fast.
 
@@ -192,6 +195,9 @@ docker rm -f jukeplox
 Data is kept; **run-flags aren't** — `docker inspect jukeplox` first to recover them.
 Confirm the build via the `git_sha` at `http://<IP>/api/version` (the `image_tag` field
 may show an internal release-train name rather than `latest` — that's expected).
+
+**Native install:** `cd /opt/jukeplox/app && git pull && sh install-native.sh` — your data
+and `/etc/jukeplox/env` are kept; `/api/version` shows the new `git_sha` with `image_tag: native`.
 
 ## Troubleshooting
 
