@@ -309,11 +309,31 @@
     } catch (_) { /* no rules is a valid state; sort falls back to plain */ }
   }
 
+  // Leading punctuation / symbols / whitespace are skipped when a letter or
+  // digit follows, so "…And You Will Know Us by the Trail of Dead" keys under A
+  // and '"Weird Al" Yankovic' under W instead of collating before 'a' into the
+  // '#' bucket (2026-10-28 plan 001). A name with no letter or digit anywhere
+  // ("!!!", "†††") never matches and keeps its place in '#'. Digits are \p{N},
+  // so "10,000 Maniacs" stays in '#' too. Matches Plex's generated titleSort
+  // for the ellipsis / article / all-symbol cases; symbol-prefixed names like
+  // "*shels" deliberately file under their letter where Plex keeps them first.
+  const _LEADING_NON_ALNUM = /^[^\p{L}\p{N}]+(?=[\p{L}\p{N}])/u;
+
+  // Three steps, in this order: pattern-rule normalization (lowercase + admin
+  // rules) on the RAW name, then skip leading punctuation, then strip a leading
+  // English article. Rules run first so they see exactly the text the server's
+  // normalize() sees (app/normalize.py mirrors them on raw titles): a rule whose
+  // member or canonical is itself punctuation-led ("…And You Will Know Us…"
+  // grouped with "Trail of Dead", or "$uicideboy$" with "Suicideboys") keeps
+  // matching, and the skip then files the merged key under its letter.
+  // The signature line below is a test-harness needle (call-count injection in
+  // tests/test_frontend_regressions.py) -- keep it byte-identical.
   function sortKey(name) {
-    const s = (name || '').replace(/^(?:the |a |an )\b/i, '').trim();
     // Normalizing here covers BOTH applySort ordering and
     // computeBuckets rail bucketing (one hook, plan U5).
-    return _normalizeName(s || (name || ''));
+    const norm = _normalizeName(name || '');
+    const s = norm.replace(_LEADING_NON_ALNUM, '').replace(/^(?:the |a |an )\b/i, '').trim();
+    return s || norm;
   }
 
   // Key ONCE per item, then sort the keys — decorate-sort-undecorate.
@@ -5207,6 +5227,11 @@
   // Test-only hook (no runtime caller): exposes the pure sort→dimension→bucket
   // pipeline so tests/test_frontend_regressions.py can verify rail bucketing in
   // a real JS engine. See plan 2026-06-22-002.
+  // Test-only hook: installs admin pattern rules without a fetch, so the node
+  // vm harnesses can exercise sortKey with rules loaded (2026-10-28 plan 001).
+  window.__jpSetPatternRules = function (rules) {
+    _patternRulesCompiled = _compilePatternRules(rules);
+  };
   window.__jpComputeBuckets = function (items, sort, nameField, alpha) {
     const dim = resolveRailDimension('artists', sort) || resolveRailDimension('albums', sort);
     const sorted = applySort(items, sort, nameField);
