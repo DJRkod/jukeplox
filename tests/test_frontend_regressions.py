@@ -3875,6 +3875,7 @@ _SORT_NODE_HARNESS = (
     "const f=ctx.window.__jpApplySort;"
     "if(typeof f!=='function'){console.error('no __jpApplySort hook');process.exit(2);}"
     "const spec=JSON.parse(process.argv[1]);"
+    "if(spec.rules){ctx.window.__jpSetPatternRules(spec.rules);}"
     "const out={};"
     "for(const sort of spec.sorts){"
     "  const reads={title:0,artist:0};"
@@ -3899,12 +3900,14 @@ _SORT_NODE_HARNESS = (
 )
 
 
-def _run_apply_sort(rows, sorts):
-    """Run the REAL applySort in node. rows are [title, artist, year|None]."""
+def _run_apply_sort(rows, sorts, rules=None):
+    """Run the REAL applySort in node. rows are [title, artist, year|None].
+    `rules` (optional) installs admin pattern rules via the test hook; the vm
+    has no fetch, so without it sortKey runs rule-less."""
     node = shutil.which("node")
     if not node:
         pytest.skip("node not on PATH; applySort covered only structurally")
-    spec = json.dumps({"rows": rows, "sorts": sorts})
+    spec = json.dumps({"rows": rows, "sorts": sorts, "rules": rules})
     result = subprocess.run(
         [node, "-e", _SORT_NODE_HARNESS, spec],
         capture_output=True, encoding="utf-8", errors="replace", timeout=60,
@@ -4023,6 +4026,128 @@ def test_apply_sort_test_hook_is_exposed():
         f"{_SORT_KEY_NEEDLE!r}; that signature changed, so the call-count "
         "guard would no longer be measuring anything."
     )
+
+
+# -- sortKey skips leading punctuation (2026-10-28 plan 001) ------------------
+# "…And You Will Know Us by the Trail of Dead" and '"Weird Al" Yankovic' keyed
+# on their ellipsis / quote, which collate before "a": both sorted ahead of
+# every letter and sat in the '#' rail bucket. The key now skips a leading run
+# of non-letter, non-digit characters when a letter or digit follows (then the
+# article strip, then normalization), so they land under A and W. All-symbol
+# names ("!!!", "†††") have nothing to key on and stay in '#'. This matches
+# Plex's generated titleSort for the ellipsis / article / all-symbol cases and
+# deliberately diverges for symbol-prefixed names ("*shels" -> S, "$uicideboy$"
+# -> U), which Plex leaves at the head of the list.
+
+_PUNCT_TITLES = [
+    "…And You Will Know Us by the Trail of Dead", "And So I Watch You From Afar",
+    "Andain", "Aaa", "Âge|Total.",
+    "\"Weird Al\" Yankovic", "Weezer", "Wilco",
+    "!!!", "†††", "...", "10,000 Maniacs",
+    "(What's the Story) Morning Glory?", "Wha", "Who",
+    "Soft Cell", "…The Something", "Sonic Youth",
+    "*shels", "Shellac", "Sigur Rós",
+    "$uicideboy$", "U2",
+]
+
+
+def _before(order, *names):
+    idx = [order.index(n) for n in names]
+    assert idx == sorted(idx), (names, idx, order)
+
+
+def test_sort_key_skips_leading_punctuation_node_vm():
+    """Covers AE1-AE6, AE8, AE9: punctuation-led names sort under their first
+    letter; all-symbol and digit-led names keep their place ahead of A; display
+    strings are untouched; descending is the exact reverse (no equal keys)."""
+    rows = [[t, "", None] for t in _PUNCT_TITLES]
+    data = _run_apply_sort(rows, ["alpha_asc", "alpha_desc"])
+    asc = data["alpha_asc"]["order"]
+
+    # AE1 / AE2: the two reported artists land in the A and W runs.
+    _before(asc, "And So I Watch You From Afar",
+            "…And You Will Know Us by the Trail of Dead", "Andain")
+    _before(asc, "Weezer", "\"Weird Al\" Yankovic", "Wilco")
+    # AE3 / AE6: nothing to key on (or a digit) -> still ahead of every letter.
+    for t in ("!!!", "†††", "...", "10,000 Maniacs"):
+        _before(asc, t, "Aaa")
+    # AE4: albums use the same key.
+    _before(asc, "Wha", "(What's the Story) Morning Glory?", "Who")
+    # AE5: punctuation skip happens BEFORE the article strip ("something").
+    _before(asc, "Soft Cell", "…The Something", "Sonic Youth")
+    # AE9: symbol-prefixed names with letters inside file under their letter.
+    _before(asc, "Shellac", "*shels", "Sigur Rós")
+    _before(asc, "U2", "$uicideboy$")
+    # A diacritic first letter is a letter: not skipped, sorts among the A's.
+    _before(asc, "Aaa", "Âge|Total.", "Andain")
+    # AE8: the items come back with their original titles, punctuation intact.
+    assert sorted(asc) == sorted(_PUNCT_TITLES)
+    # No two fixture names share a key, so desc is the exact reverse.
+    assert data["alpha_desc"]["order"] == list(reversed(asc))
+
+
+def test_sort_key_rules_see_raw_name_before_punctuation_skip_node_vm():
+    """Pattern rules normalize the RAW name first, then the punctuation skip
+    runs. A rule whose member is punctuation-led (the workaround an admin would
+    have written for this very bug) therefore still matches, exactly as the
+    server's normalize() does on raw titles, and a rule whose CANONICAL is
+    symbol-led still merges both spellings under one letter. Review finding
+    (2026-10-28): with the skip first, both rules silently stopped matching on
+    the client while the server kept merging."""
+    rows = [[t, "", None] for t in [
+        "…And You Will Know Us by the Trail of Dead", "Tool", "Tribe Called Quest",
+        "$uicideboy$", "Suicideboys", "U2", "Underworld", "Aaa"]]
+    rules = [["Trail of Dead", "…And You Will Know Us by the Trail of Dead"],
+             ["$uicideboy$", "Suicideboys"]]
+    asc = _run_apply_sort(rows, ["alpha_asc"], rules)["alpha_asc"]["order"]
+    # Member punctuation-led: the ellipsis title keys "trail of dead" -> T run.
+    _before(asc, "Tool", "…And You Will Know Us by the Trail of Dead", "Tribe Called Quest")
+    # Canonical symbol-led: both spellings key "uicideboy$" -> adjacent, after U2.
+    _before(asc, "U2", "$uicideboy$", "Suicideboys", "Underworld")
+    assert abs(asc.index("$uicideboy$") - asc.index("Suicideboys")) == 1
+    # Rule-less control: without the rules, the ellipsis title is in the A run.
+    plain = _run_apply_sort(rows, ["alpha_asc"])["alpha_asc"]["order"]
+    _before(plain, "Aaa", "…And You Will Know Us by the Trail of Dead", "Tool")
+
+
+def test_rail_buckets_punctuation_led_names_node_vm():
+    """Covers AE1, AE2, AE3, AE7, AE9 on the rail: the bucket follows the sort
+    key, so the moved names sit in A / W / S / U while all-symbol names keep
+    '#', in both directions and monotonic with the list."""
+    titles = ["…And You Will Know Us by the Trail of Dead",
+              "And So I Watch You From Afar", "Andain", "Beck", "Bjork",
+              "\"Weird Al\" Yankovic", "Weezer", "Wilco", "!!!", "†††",
+              "*shels", "Shellac", "Sigur Rós", "$uicideboy$", "U2", "Underworld"]
+    data = _run_rail_buckets(titles, ["ABBA", "Beck", "Zappa"])
+    kbt = data["keyByTitle"]
+    assert kbt["…And You Will Know Us by the Trail of Dead"] == "A"
+    assert kbt["\"Weird Al\" Yankovic"] == "W"
+    assert kbt["*shels"] == "S" and kbt["$uicideboy$"] == "U"
+    assert kbt["!!!"] == "#" and kbt["†††"] == "#"
+    assert data["ascKeys"][0] == "#"
+    assert data["descKeyByTitle"] == kbt
+    # Monotonic in both directions.
+    for keys, sorted_titles, by in ((data["ascKeys"], data["ascSorted"], kbt),
+                                    (data["descKeys"], data["descSorted"], data["descKeyByTitle"])):
+        pos = {k: i for i, k in enumerate(keys)}
+        seq = [pos[by[t]] for t in sorted_titles]
+        assert seq == sorted(seq), (sorted_titles, seq)
+    # With no all-symbol names left, '#' disappears from the rail entirely.
+    data2 = _run_rail_buckets([t for t in titles if t not in ("!!!", "†††")],
+                              ["ABBA", "Beck", "Zappa"])
+    assert "#" not in data2["ascKeys"], data2["ascKeys"]
+
+
+def test_rail_international_punctuation_led_name_counts_toward_letter_node_vm():
+    """International mode: the ellipsis-led name counts toward "a" (three A
+    items at threshold 2) and no '#' bucket appears."""
+    titles = ["…And You Will Know Us by the Trail of Dead",
+              "And So I Watch You From Afar", "Andain", "Beck", "Bjork"]
+    data = _run_rail_intl(titles, 2)
+    assert data["ascKeys"] == ["a", "b"], data["ascKeys"]
+    assert data["keyByTitle"]["…And You Will Know Us by the Trail of Dead"] == "a"
+    assert data["countByKey"]["a"] == 3
+    _assert_intl_monotonic(data)
 # -- No render containment on list rows; no forced geometry in open() ---------
 # Measured on a Pixel 10 Pro XL (Chrome 155) against 11,451 albums, 2026-10-12.
 #
