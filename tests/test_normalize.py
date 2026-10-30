@@ -126,6 +126,17 @@ def test_default_rules_cover_user_examples():
     assert normalize("Sigur Rós", c) == normalize("sigur ros", c)
 
 
+def test_default_dash_rule_folds_unicode_hyphens():
+    """Plex/MusicBrainz tags carry U+2010 HYPHEN (and sometimes U+2011 /
+    U+2212). "K-os" (ASCII) and "k‐os" were two Browse artists because
+    the default dash rule only knew en/em dash (2026-10-30)."""
+    c = compile_rules(DEFAULT_PATTERN_RULES)
+    assert normalize("k‐os", c) == normalize("K-os", c) == "k-os"
+    assert normalize("The B‐52s", c) == "the b-52s"
+    assert normalize("non‑breaking", c) == "non-breaking"
+    assert normalize("minus−sign", c) == "minus-sign"
+
+
 def test_variants_never_replace_plain_ascii_letter():
     """Directional guard: 'etienne' must NOT explode into accented junk
     variants (every query contains common letters) — but the useful

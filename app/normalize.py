@@ -37,7 +37,10 @@ DEFAULT_PATTERN_RULES: list[list[str]] = [
     [" & ", " and "],
     ["'", "’", "`", "´"],          # ' ’ ` ´
     ['"', "“", "”"],                # " “ ”
-    ["-", "–", "—"],                # - – —
+    # - – — ‐ ‑ − : en/em dash plus U+2010 HYPHEN, U+2011 NB HYPHEN, U+2212
+    # MINUS. MusicBrainz-sourced tags use U+2010 ("k‐os", "The B‐52s"),
+    # which split them from ASCII-hyphen twins in Browse (2026-10-30).
+    ["-", "–", "—", "‐", "‑", "−"],
     ["...", "…"],                        # ... …
     ["ae", "æ"],                         # ae æ
     ["oe", "œ"],                         # oe œ
