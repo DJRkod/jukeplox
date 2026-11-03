@@ -536,7 +536,13 @@ async def test_encoder_reader_crash_closes_session(flow_factory):
             await asyncio.sleep(0)
 
     await asyncio.wait_for(_reaped(), 5)    # in-flight decoder reaped
-    assert session._encoder.closed
+    # The pump's own finally closes the decoder while close() is still
+    # waiting on the cancelled pump; the encoder close is the step after
+    # that wait, so observe it the same bounded way rather than racing it.
+    async def _encoder_closed():
+        while not session._encoder.closed:
+            await asyncio.sleep(0)
+    await asyncio.wait_for(_encoder_closed(), 5)
 
 
 # ── decode stall → watchdog skip, never a frozen stream ───────────────────────

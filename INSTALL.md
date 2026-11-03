@@ -154,17 +154,22 @@ under `/root` (the installer refuses before touching systemd). `--help` lists ev
 Open `http://<IP>/admin` and continue at [step 5](#5-set-it-up). **Attached speakers** work
 through ALSA with no extra flags — pick **System Audio** in Setup → Output. Desktop PulseAudio
 needs the service to run as your desktop user: install with `--run-as <your-user>` and set
-`PULSE_SERVER` in the env file.
+`PULSE_SERVER` in the env file. Re-running with a different `--run-as` re-owns the data
+directory (database included) to the new user, so the service can still open it.
 
 ### 3. Configure, update, troubleshoot
 
 - **Settings** live in `/etc/jukeplox/env` (same names as the table below, one per line);
   `systemctl restart jukeplox` applies them.
 - **Update:** `cd /opt/jukeplox/app && git pull && sh install-native.sh` — the badge at
-  `/api/version` shows the new `git_sha` with `image_tag: native`.
+  `/api/version` shows the new `git_sha` with `image_tag: native`. After a `--source` or
+  `--prefix` install the installer prints the exact re-run command instead, and a flagless
+  re-run keeps the recorded layout (it is stored in `/etc/jukeplox/env`).
 - **Logs:** `journalctl -u jukeplox -f`.
-- The installer disables Debian's own `snapserver`/`snapclient` services: Jukeplox embeds its
-  own snapserver for the optional multi-room output.
+- The installer masks Debian's own `snapserver` service, because Jukeplox embeds its own for
+  the optional multi-room output, and says so. `snapclient` is left alone; if it is running it
+  holds the default ALSA device, so System Audio output fails until it is stopped (the
+  installer prints a hint when it sees one).
 
 **Limits.** Validated on a 32-bit Debian 12 virtual machine (install, reboot, re-run, ALSA
 playback through a loopback card, Chromecast and DLNA to real devices, Snapcast); sign-off
@@ -198,6 +203,7 @@ may show an internal release-train name rather than `latest` — that's expected
 
 **Native install:** `cd /opt/jukeplox/app && git pull && sh install-native.sh` — your data
 and `/etc/jukeplox/env` are kept; `/api/version` shows the new `git_sha` with `image_tag: native`.
+A `--source` or `--prefix` install prints its own re-run command at the end of every install.
 
 ## Troubleshooting
 

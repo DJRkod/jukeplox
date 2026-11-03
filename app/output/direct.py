@@ -14,6 +14,7 @@ import threading
 from typing import Any
 
 from app.output.base import AdvanceCallback, DeviceNotReadyError, OutputDevice
+from app.output.flow import _redact
 from app.output.radio_endless import (
     RadioFailedHook,
     RadioTitleHook,
@@ -455,7 +456,7 @@ class DirectAudioBackend:
             # dead sink is a device failure even for radio, and reconnecting the
             # source would not fix it.
             _log.warning("Radio: source ERROR on endless stream (%s) — "
-                         "reconnecting, not advancing", err)
+                         "reconnecting, not advancing", _redact(err))
             self._radio_reconnect_on_loop()
             return
         if self._is_sink_resource_error(message, err):
@@ -463,7 +464,7 @@ class DirectAudioBackend:
             # advance). Same GLib-thread → loop hop as the EOS path.
             _log.warning(
                 "GStreamer audio-sink RESOURCE error: %s — reporting "
-                "outage-suspected (not advancing)", err,
+                "outage-suspected (not advancing)", _redact(err),
             )
             from app.output import session
             # R6: name the reporter. A deferred switch away from Direct leaves
@@ -475,10 +476,13 @@ class DirectAudioBackend:
             return
         # Track-level (source/decode chain): skip the dead media — the
         # advance-on-ERROR party-stall posture, preserved by R15. Say so:
-        # a silent skip reads as "the track just never started".
+        # a silent skip reads as "the track just never started". Both the
+        # GError and playbin's debug string can carry the failing URI, which
+        # on a native default install is the Plex part URL with its token;
+        # the flow module's URL-query scrub applies here too.
         _log.warning("GStreamer ERROR from %s: %s — skipping the track (%s)",
                      getattr(getattr(message, "src", None), "get_name", lambda: "?")(),
-                     err, debug)
+                     _redact(err), _redact(debug))
         if self._advance_cb and self._loop:
             asyncio.run_coroutine_threadsafe(self._advance_cb(), self._loop)
 

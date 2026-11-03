@@ -4644,6 +4644,15 @@ def _u5_settings(stream_base_url="", bind_host="0.0.0.0"):
         settings.stream_base_url, settings.bind_host = old_base, old_bind
 
 
+@pytest.fixture(autouse=True)
+def _u5_reset_autodetect_warned(monkeypatch):
+    """Both stream-base warnings are deduped through this module-level set
+    (R12), so any test asserting on them would otherwise pass or fail by
+    test order."""
+    import app.state as st
+    monkeypatch.setattr(st, "_autodetect_warned", set())
+
+
 @_u5_contextlib.contextmanager
 def _u5_reset_lan_cache():
     """Reset the module-level LAN-IP detection cache around a test so a mocked
@@ -5612,14 +5621,90 @@ def test_local_files_on_wildcard_bind_proxies_via_autodetected_base():
     assert url == "http://192.168.1.23/api/stream?key=local-abc%3At1"
 
 
-def test_local_files_with_no_detectable_base_returns_empty_and_warns(caplog):
+_LOOPBACK_URL = "http://127.0.0.1/api/stream?key=local-abc%3At1"
+
+
+def test_local_files_with_no_detectable_base_falls_back_to_loopback_and_warns(
+        caplog, monkeypatch):
+    """R11 / AE8: an offline box (no default route) still plays a Local-files
+    track on the Direct backend, because the consumer is this process. The
+    URL is the loopback proxy, and the warning still says LAN detect failed."""
     import logging
     import app.state as st
+    monkeypatch.delenv("PORT", raising=False)
     client = _local_files_client()
-    with _u5_settings(stream_base_url="", bind_host="0.0.0.0"), _u5_reset_lan_cache(),          patch.object(st, "_detect_primary_lan_ip", side_effect=RuntimeError("no route")),          caplog.at_level(logging.WARNING, logger="app.state"):
+    with _u5_settings(stream_base_url="", bind_host="0.0.0.0"), _u5_reset_lan_cache(), \
+         patch.object(st, "_detect_primary_lan_ip", side_effect=RuntimeError("no route")), \
+         caplog.at_level(logging.WARNING, logger="app.state"):
         url = st._make_stream_url("local-abc:t1", client)
-    assert url == ""
-    assert any("STREAM_BASE_URL" in r.getMessage() for r in caplog.records)
+    assert url == _LOOPBACK_URL
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "STREAM_BASE_URL" in warnings[0]
+    assert "loopback" in warnings[0]
+    assert "no route" in warnings[0]
+
+
+def test_local_files_loopback_fallback_carries_listen_port(caplog, monkeypatch):
+    import logging
+    import app.state as st
+    monkeypatch.setenv("PORT", "8099")
+    client = _local_files_client()
+    with _u5_settings(stream_base_url="", bind_host="0.0.0.0"), _u5_reset_lan_cache(), \
+         patch.object(st, "_detect_primary_lan_ip", side_effect=RuntimeError("no route")), \
+         caplog.at_level(logging.WARNING, logger="app.state"):
+        url = st._make_stream_url("local-abc:t1", client)
+    assert url == "http://127.0.0.1:8099/api/stream?key=local-abc%3At1"
+
+
+def test_local_files_loopback_warning_once_but_detect_retried(caplog, monkeypatch):
+    """The warning is deduped (an offline box must not log it per track); the
+    detection is NOT cached (lan-ip-detect-cached-failure-permanently)."""
+    import logging
+    import app.state as st
+    monkeypatch.delenv("PORT", raising=False)
+    client = _local_files_client()
+    det = MagicMock(side_effect=RuntimeError("no route"))
+    with _u5_settings(stream_base_url="", bind_host="0.0.0.0"), _u5_reset_lan_cache(), \
+         patch.object(st, "_detect_primary_lan_ip", det), \
+         caplog.at_level(logging.WARNING, logger="app.state"):
+        u1 = st._make_stream_url("local-abc:t1", client)
+        u2 = st._make_stream_url("local-abc:t1", client)
+    assert u1 == u2 == _LOOPBACK_URL
+    assert det.call_count == 2
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+
+
+def test_local_files_bridge_ip_warns_once_per_context_and_ip(caplog, monkeypatch):
+    """R12 / AE9: the bridge-IP warning joins the existing once-per-(context, ip)
+    dedupe; both tracks still get the bridge base."""
+    import logging
+    import app.state as st
+    monkeypatch.delenv("PORT", raising=False)
+    client = _local_files_client()
+    with _u5_settings(stream_base_url="", bind_host="0.0.0.0"), _u5_reset_lan_cache(), \
+         patch.object(st, "_detect_primary_lan_ip", MagicMock(return_value="172.17.0.2")), \
+         caplog.at_level(logging.WARNING, logger="app.state"):
+        u1 = st._make_stream_url("local-abc:t1", client)
+        u2 = st._make_stream_url("local-abc:t2", client)
+    assert u1 == "http://172.17.0.2/api/stream?key=local-abc%3At1"
+    assert u2 == "http://172.17.0.2/api/stream?key=local-abc%3At2"
+    bridge = [r for r in caplog.records if "container/bridge IP" in r.getMessage()]
+    assert len(bridge) == 1
+    # The i386 lane greps the server log for this token to report which base
+    # the playback check used (tools/native/lane-inside.sh).
+    assert "auto-detected" in bridge[0].getMessage()
+
+
+def test_bridge_ip_reject_still_raises_every_call():
+    """The dedupe suppresses log lines only; reject_bridge is a hard refusal."""
+    import app.state as st
+    with _u5_settings(stream_base_url="", bind_host="0.0.0.0"), _u5_reset_lan_cache(), \
+         patch.object(st, "_detect_primary_lan_ip", MagicMock(return_value="172.17.0.2")):
+        for _ in range(2):
+            with pytest.raises(RuntimeError) as exc:
+                st.resolved_device_base("the Cast flow stream", reject_bridge=True)
+            assert "STREAM_BASE_URL" in str(exc.value)
 
 
 def test_local_files_with_specific_bind_host_unchanged():

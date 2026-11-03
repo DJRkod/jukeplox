@@ -104,18 +104,35 @@ async def test_direct_resume_seek_without_pipeline_is_noop(gst_mock):
     mock_pipeline.seek_simple.assert_not_called()
 
 
-async def test_direct_set_volume(gst_mock):
+def _stub_volume_store(monkeypatch) -> dict[str, str]:
+    """set_volume persists under vol:direct:<device>; these tests never open a
+    database, so capture the write instead (same shape as the AirPlay test).
+    Found by the i386 lane once it stopped swallowing suite failures (2026-11)."""
+    from app import database
+    persisted: dict[str, str] = {}
+
+    async def _fake_set_setting(key, value):
+        persisted[key] = value
+
+    monkeypatch.setattr(database, "set_setting", _fake_set_setting)
+    return persisted
+
+
+async def test_direct_set_volume(gst_mock, monkeypatch):
     from app.output.direct import DirectAudioBackend
     mock_gst, mock_pipeline = gst_mock
+    persisted = _stub_volume_store(monkeypatch)
     backend = DirectAudioBackend()
     await backend.play("http://url", make_track())
     await backend.set_volume(0.5)
     assert await backend.get_volume() == 0.5
     mock_pipeline.set_property.assert_any_call("volume", 0.5)
+    assert persisted == {"vol:direct:default": "0.5"}
 
 
-async def test_direct_volume_clamped(gst_mock):
+async def test_direct_volume_clamped(gst_mock, monkeypatch):
     from app.output.direct import DirectAudioBackend
+    _stub_volume_store(monkeypatch)
     backend = DirectAudioBackend()
     await backend.set_volume(2.0)
     assert await backend.get_volume() == 1.0
@@ -518,6 +535,104 @@ async def test_source_error_is_logged_not_silent(gst_mock, fresh_supervisor, cap
         backend._on_error(None, _error_msg("uridecodebin0", "gst-resource-error-quark"))
         await asyncio.sleep(0.02)
     assert any("GStreamer ERROR from uridecodebin0" in r.getMessage() for r in caplog.records)
+
+
+_TOKENED = "http://plex:32400/library/parts/1/p.flac?X-Plex-Token=secret"
+
+
+def _tokened_error_msg(src_name, domain, err_text, debug):
+    """Like _error_msg, but the GError stringifies to ``err_text`` (a GError
+    message can embed the failing URI) and carries the given debug string."""
+    msg = _error_msg(src_name, domain)
+    err, _ = msg.parse_error.return_value
+    err.__str__ = lambda self: err_text
+    msg.parse_error.return_value = (err, debug)
+    return msg
+
+
+async def test_track_error_redacts_token_in_debug(gst_mock, fresh_supervisor, caplog):
+    """R10 / AE7: on a native default install the playbin debug string carries
+    the Plex part URL verbatim, token included. The log line must not."""
+    import asyncio
+    import logging
+    from app.output.direct import DirectAudioBackend
+
+    async def advance():
+        pass
+
+    backend = DirectAudioBackend(advance_cb=advance)
+    await backend.play("http://url", make_track())
+    with caplog.at_level(logging.WARNING, logger="app.output.direct"):
+        backend._on_error(None, _tokened_error_msg(
+            "uridecodebin0", "gst-resource-error-quark", "Could not open resource",
+            f"open {_TOKENED} failed"))
+        await asyncio.sleep(0.02)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("GStreamer ERROR from" in m and "<redacted>" in m for m in msgs)
+    assert not any("secret" in m for m in msgs)
+
+
+async def test_track_error_redacts_token_in_err_message(gst_mock, fresh_supervisor, caplog):
+    import asyncio
+    import logging
+    from app.output.direct import DirectAudioBackend
+
+    async def advance():
+        pass
+
+    backend = DirectAudioBackend(advance_cb=advance)
+    await backend.play("http://url", make_track())
+    with caplog.at_level(logging.WARNING, logger="app.output.direct"):
+        backend._on_error(None, _tokened_error_msg(
+            "souphttpsrc0", "gst-resource-error-quark", f"Could not open {_TOKENED}",
+            "debug info"))
+        await asyncio.sleep(0.02)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("GStreamer ERROR from" in m for m in msgs)
+    assert not any("secret" in m for m in msgs)
+
+
+async def test_sink_resource_error_redacts_token_and_still_reports_outage(
+        gst_mock, fresh_supervisor, caplog):
+    import asyncio
+    import logging
+    from app.output.direct import DirectAudioBackend
+    sup, timers, rec = fresh_supervisor
+    outages = []
+    sup.add_outage_listener(lambda token, track, reason: outages.append(reason))
+
+    backend = DirectAudioBackend(advance_cb=None)
+    await backend.play("http://url", make_track())
+    with caplog.at_level(logging.WARNING, logger="app.output.direct"):
+        backend._on_error(None, _tokened_error_msg(
+            "audio-sink", "gst-resource-error-quark", f"Device busy while playing {_TOKENED}",
+            "debug info"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert outages == ["sink_error"]
+    assert any("outage-suspected" in m for m in msgs)
+    assert not any("secret" in m for m in msgs)
+
+
+async def test_radio_source_error_redacts_token(gst_mock, fresh_supervisor, caplog):
+    """The radio-mode reconnect warning logs the GError too; same rule."""
+    import asyncio
+    import logging
+    from app.output.direct import DirectAudioBackend
+
+    backend = DirectAudioBackend(advance_cb=None)
+    await backend.play("http://url", make_track())
+    backend._radio_mode = True
+    backend._loop = None  # reconnect hop is a no-op without a loop
+    with caplog.at_level(logging.WARNING, logger="app.output.direct"):
+        backend._on_error(None, _tokened_error_msg(
+            "souphttpsrc0", "gst-resource-error-quark", f"Could not read {_TOKENED}",
+            "debug info"))
+        await asyncio.sleep(0)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("Radio: source ERROR" in m for m in msgs)
+    assert not any("secret" in m for m in msgs)
 
 
 async def test_sink_nonresource_error_still_advances(gst_mock, fresh_supervisor):

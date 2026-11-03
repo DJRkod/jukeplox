@@ -97,8 +97,11 @@ PREFLIGHT_PKGS="curl ca-certificates git"
 # Every variable the env file knows. Superset of the Dockerfile's ENV block
 # (parity-tested as containment): the rest are `-e` flags in Docker.
 # shellcheck disable=SC2034  # read by tests/test_native_parity.py and the bats suite
-ENV_TEMPLATE_VARS="DATA_DIR BIND_HOST PORT LOG_LEVEL STREAM_BASE_URL PULSE_SERVER JUKEPLOX_CLIAP2_BIN JUKEPLOX_CLIRAOP_BIN JUKEPLOX_SNAPSERVER_BIN JUKEPLOX_SNAPSERVER_CONF JUKEPLOX_GIT_SHA JUKEPLOX_BUILD_TIME JUKEPLOX_IMAGE_TAG"
+ENV_TEMPLATE_VARS="DATA_DIR BIND_HOST PORT LOG_LEVEL STREAM_BASE_URL PULSE_SERVER JUKEPLOX_CLIAP2_BIN JUKEPLOX_CLIRAOP_BIN JUKEPLOX_SNAPSERVER_BIN JUKEPLOX_SNAPSERVER_CONF JUKEPLOX_GIT_SHA JUKEPLOX_BUILD_TIME JUKEPLOX_IMAGE_TAG JUKEPLOX_INSTALL_PREFIX JUKEPLOX_INSTALL_SOURCE"
 BADGE_VARS="JUKEPLOX_GIT_SHA JUKEPLOX_BUILD_TIME JUKEPLOX_IMAGE_TAG"
+# The lines render_env owns and rewrites on every run: the badge trio plus the
+# install layout, which a flagless re-run reads back (see layout).
+REWRITTEN_VARS="$BADGE_VARS JUKEPLOX_INSTALL_PREFIX JUKEPLOX_INSTALL_SOURCE"
 
 # ── layout (overridable by flags) ─────────────────────────────────────────────
 REPO_URL="${JUKEPLOX_REPO_URL:-https://github.com/DJRkod/jukeplox.git}"
@@ -112,10 +115,19 @@ CACHE_DIR="/var/cache/jukeplox"       # systemd CacheDirectory=jukeplox
 MIN_FREE_MB=3072                      # CPython + Rust + venv builds under the prefix
 MIN_RAM_MB=2048                       # Rust/numpy compiles below this tend to OOM
 HEALTH_TRIES="${JUKEPLOX_HEALTH_TRIES:-60}"
+# Every download goes through fetch: a stalled mirror fails the install instead
+# of hanging it. --retry-all-errors matters because -f turns an HTTP error into a
+# non-retried failure without it (Bookworm's curl 7.88 supports it).
+FETCH_CONNECT_TIMEOUT=20   # seconds to establish the connection
+FETCH_MAX_TIME=600         # seconds for the whole transfer (the Python tarball is ~27 MB)
+FETCH_RETRIES=3
 
 # ── options (set by parse_args) ───────────────────────────────────────────────
 OPT_SOURCE=""          # --source DIR: use an existing checkout as-is
+OPT_SOURCE_SET=0         # 1 when --source was passed (even empty: --source= switches back to a managed clone)
 OPT_PREFIX="$DEFAULT_PREFIX"
+OPT_PREFIX_SET=0         # 1 when --prefix was passed (a re-run otherwise keeps the recorded prefix)
+OPT_SOURCE_ADOPTED=0     # 1 when layout took --source from the previous install, not the command line
 OPT_DATA_DIR="$DEFAULT_DATA_DIR"
 OPT_PORT="80"
 OPT_BIND_HOST=""       # empty → detected LAN address
@@ -127,6 +139,11 @@ OPT_YES=0
 
 # ── small helpers ─────────────────────────────────────────────────────────────
 die() { printf 'Error: %s\n' "$1" >&2; exit 1; }
+# Bounded download.  $1 url  $2 destination file
+fetch() {
+  curl -fsSL --connect-timeout "$FETCH_CONNECT_TIMEOUT" --max-time "$FETCH_MAX_TIME" \
+       --retry "$FETCH_RETRIES" --retry-all-errors -o "$2" "$1"
+}
 # Build scratch dirs are registered here and removed on ANY exit (a failed CPython
 # build otherwise leaves hundreds of MB under /tmp on a small 32-bit disk).
 _TMPDIRS=""
@@ -164,10 +181,10 @@ EOF
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --source)     OPT_SOURCE="$2"; shift 2 ;;
-      --source=*)   OPT_SOURCE="${1#*=}"; shift ;;
-      --prefix)     OPT_PREFIX="$2"; shift 2 ;;
-      --prefix=*)   OPT_PREFIX="${1#*=}"; shift ;;
+      --source)     OPT_SOURCE="$2"; OPT_SOURCE_SET=1; shift 2 ;;
+      --source=*)   OPT_SOURCE="${1#*=}"; OPT_SOURCE_SET=1; shift ;;
+      --prefix)     OPT_PREFIX="$2"; OPT_PREFIX_SET=1; shift 2 ;;
+      --prefix=*)   OPT_PREFIX="${1#*=}"; OPT_PREFIX_SET=1; shift ;;
       --data-dir)   OPT_DATA_DIR="$2"; shift 2 ;;
       --data-dir=*) OPT_DATA_DIR="${1#*=}"; shift ;;
       --port)       OPT_PORT="$2"; shift 2 ;;
@@ -197,12 +214,44 @@ confirm() {
 
 # Derived layout paths; call after parse_args.
 layout() {
+  ENV_FILE="$ENV_DIR/env"
+  # A re-run finds the previous install's layout in the env file, the one path
+  # that does not move with the prefix, so a flagless `sh install-native.sh`
+  # after a --source or --prefix install stays in place instead of cloning into
+  # the default prefix and re-homing the service (R7). Explicit flags win and are
+  # recorded in turn; a mismatch is announced, not refused.
+  _rec_prefix=""; _rec_source=""
+  if [ -f "$ENV_FILE" ]; then
+    _rec="$(cat "$ENV_FILE")"
+    _rec_prefix="$(env_value JUKEPLOX_INSTALL_PREFIX "$_rec")"
+    _rec_source="$(env_value JUKEPLOX_INSTALL_SOURCE "$_rec")"
+  fi
+  # An install made before the layout was recorded has only the unit to go by:
+  # ExecStart names the venv (prefix/venv) and WorkingDirectory the checkout.
+  # Without this, the first flagless upgrade of such a box would re-home it.
+  if [ -z "$_rec_prefix" ] && [ -f "$UNIT_PATH" ]; then
+    _rec_prefix="$(recorded_layout_from_unit prefix "$(cat "$UNIT_PATH")")"
+    _rec_source="$(recorded_layout_from_unit source "$(cat "$UNIT_PATH")")"
+  fi
+  if [ -n "$_rec_prefix" ]; then
+    if [ "$OPT_PREFIX_SET" -eq 0 ]; then OPT_PREFIX="$_rec_prefix"
+    elif [ "$OPT_PREFIX" != "$_rec_prefix" ]; then
+      info "Note: --prefix ${OPT_PREFIX} differs from the recorded install prefix ${_rec_prefix}; using the flag and recording it"
+    fi
+  fi
+  if [ -n "$_rec_source" ]; then
+    if [ "$OPT_SOURCE_SET" -eq 0 ]; then OPT_SOURCE="$_rec_source"; OPT_SOURCE_ADOPTED=1
+    elif [ -z "$OPT_SOURCE" ]; then
+      info "Note: --source= given; switching from the recorded source checkout ${_rec_source} to a managed clone under ${OPT_PREFIX}"
+    elif [ "$OPT_SOURCE" != "$_rec_source" ]; then
+      info "Note: --source ${OPT_SOURCE} differs from the recorded source checkout ${_rec_source}; using the flag and recording it"
+    fi
+  fi
   APP_DIR="${OPT_SOURCE:-$OPT_PREFIX/app}"
   PY_PREFIX="$OPT_PREFIX/python"
   PY_BIN="$PY_PREFIX/bin/python3.12"
   VENV_DIR="$OPT_PREFIX/venv"
   RUST_HOME="$OPT_PREFIX/rust"
-  ENV_FILE="$ENV_DIR/env"
 }
 
 # ── preflight (pure checks print verdicts; wrappers act) ──────────────────────
@@ -324,16 +373,19 @@ install_packages() {
   install_airplay_binaries "$ARCH"
 }
 
-# Debian starts snapserver.service and snapclient.service the moment apt installs
-# them. The distro snapserver would then hold 1704/1705/1780, which the embedded
-# supervisor needs, and the distro snapclient would open the default ALSA device.
-# The image never had this problem — it has no init system.
+# Debian starts snapserver.service the moment apt installs it, and it would then
+# hold 1704/1705/1780, which the embedded supervisor needs; the image never had
+# this problem — it has no init system. Only snapserver conflicts, so a box that
+# is itself a Snapcast zone keeps its snapclient. A running snapclient does hold
+# the default ALSA device the Direct backend needs, so say so (R9).
 disable_distro_snapcast() {
   command -v systemctl >/dev/null 2>&1 || return 0
-  for _u in snapserver.service snapclient.service; do
-    systemctl disable --now "$_u" >/dev/null 2>&1 || true
-    systemctl mask "$_u" >/dev/null 2>&1 || true
-  done
+  systemctl disable --now snapserver.service >/dev/null 2>&1 || true
+  systemctl mask snapserver.service >/dev/null 2>&1 || true
+  info "Masked Debian's snapserver.service: Jukeplox embeds its own snapserver on ports 1704/1705/1780"
+  if systemctl is-active --quiet snapclient 2>/dev/null; then
+    info "Note: snapclient is running and holds the default ALSA device; stop it (systemctl disable --now snapclient) before using System Audio output"
+  fi
 }
 
 # Pure: prints "src dst" pairs for the vendored AirPlay binaries, or nothing.
@@ -371,7 +423,12 @@ ensure_checkout() {
   if [ -n "$OPT_SOURCE" ]; then
     # --source is used as-is: no clone, fetch, fast-forward, dirty or divergence
     # check. Both validation lanes run from a mounted or copied tree.
-    [ -d "$OPT_SOURCE/app" ] || die "--source ${OPT_SOURCE} does not look like a Jukeplox checkout"
+    if [ ! -d "$OPT_SOURCE/app" ]; then
+      if [ "$OPT_SOURCE_ADOPTED" -eq 1 ]; then
+        die "recorded source checkout ${OPT_SOURCE} (from the previous install) does not look like a Jukeplox checkout; pass --source <dir> or --source= to switch to a managed clone"
+      fi
+      die "--source ${OPT_SOURCE} does not look like a Jukeplox checkout"
+    fi
     info "Using source checkout ${OPT_SOURCE} as-is"
     return 0
   fi
@@ -430,7 +487,7 @@ ensure_python() {
   _t0="$(now_s)"
   scratch_dir; _tmp="$SCRATCH"
   info "Downloading Python ${PY_VERSION} ..."
-  curl -fsSL "${PY_URL_BASE}/${PY_VERSION}/Python-${PY_VERSION}.tgz" -o "$_tmp/py.tgz" || die "Python download failed"
+  fetch "${PY_URL_BASE}/${PY_VERSION}/Python-${PY_VERSION}.tgz" "$_tmp/py.tgz" || die "Python download failed"
   verify_checksum "$_tmp/py.tgz" "$PY_SHA256"
   tar -xzf "$_tmp/py.tgz" -C "$_tmp"
   info "Building Python ${PY_VERSION} (plain configure$([ "$OPT_OPTIMIZE" -eq 1 ] && printf ' + PGO/LTO'))... this is the slow step"
@@ -465,7 +522,7 @@ ensure_rust() {
   _t0="$(now_s)"; _triple="$(rust_triple "$ARCH")"; _sha="$(rustup_sha256_for "$ARCH")"
   scratch_dir; _tmp="$SCRATCH"
   info "Downloading rustup ${RUSTUP_VERSION} (${_triple}) ..."
-  curl -fsSL "${RUSTUP_URL_BASE}/${RUSTUP_VERSION}/${_triple}/rustup-init" -o "$_tmp/rustup-init" || die "rustup download failed"
+  fetch "${RUSTUP_URL_BASE}/${RUSTUP_VERSION}/${_triple}/rustup-init" "$_tmp/rustup-init" || die "rustup download failed"
   verify_checksum "$_tmp/rustup-init" "$_sha"
   chmod 0755 "$_tmp/rustup-init"
   "$_tmp/rustup-init" -y -q --no-modify-path --profile minimal --default-toolchain stable >/dev/null || die "rustup install failed"
@@ -499,7 +556,7 @@ ensure_venv() {
   if [ ! -x "$_pip" ]; then
     if ! "$VENV_DIR/bin/python" -m ensurepip --upgrade >/dev/null 2>&1; then
       scratch_dir; _gp="$SCRATCH/get-pip.py"
-      curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$_gp" || die "pip bootstrap download failed (ensurepip unavailable and get-pip.py unreachable)"
+      fetch https://bootstrap.pypa.io/get-pip.py "$_gp" || die "pip bootstrap download failed (ensurepip unavailable and get-pip.py unreachable)"
       "$VENV_DIR/bin/python" "$_gp" >/dev/null || die "pip bootstrap failed"
     fi
     _fresh_venv=1
@@ -520,11 +577,13 @@ ensure_venv() {
 #   $1 existing file contents ("" on first install)  $2 data_dir
 #   $3 bind_host ("" = wildcard 0.0.0.0, the image's default; an explicit --bind-host pins it)
 #   $4 port  $5 app_dir  $6 sha  $7 build_time  $8 detected LAN address (for STREAM_BASE_URL)
+#   $9 install prefix  $10 source checkout ("" for a managed clone)
 render_env() {
   _existing="$1"; _data="$2"; _bind="${3:-0.0.0.0}"; _port="$4"; _app="$5"; _sha="$6"; _time="$7"; _lan="${8:-}"
+  _prefix="${9:-$DEFAULT_PREFIX}"; _source="${10:-}"
   if [ -n "$_existing" ]; then
-    # Keep every line that is not one of ours; rewrite only the badge trio.
-    printf '%s\n' "$_existing" | grep -Ev "^($(printf '%s' "$BADGE_VARS" | tr ' ' '|'))="
+    # Keep every line that is not one of ours; rewrite only the badge trio and the layout.
+    printf '%s\n' "$_existing" | grep -Ev "^($(printf '%s' "$REWRITTEN_VARS" | tr ' ' '|'))="
   else
     cat <<EOF
 # Jukeplox native install — the one supported configuration surface.
@@ -561,7 +620,32 @@ EOF
 JUKEPLOX_GIT_SHA=${_sha}
 JUKEPLOX_BUILD_TIME=${_time}
 JUKEPLOX_IMAGE_TAG=native
+JUKEPLOX_INSTALL_PREFIX=${_prefix}
+JUKEPLOX_INSTALL_SOURCE=${_source}
 EOF
+}
+
+# Pure: the copy-paste update command for this install's layout (R7).
+#   $1 app_dir  $2 source checkout ("" for a managed clone)  $3 prefix  $4 default prefix
+update_hint() {
+  _cmd="cd $1 && git pull && sh install-native.sh"
+  if [ -n "$2" ]; then _cmd="$_cmd --source $2"; fi
+  if [ "$3" != "$4" ]; then _cmd="$_cmd --prefix $3"; fi
+  printf '%s\n' "$_cmd"
+}
+
+# Pure: the install layout implied by a rendered unit, for installs that predate the
+# env-file record.  $1 prefix|source  $2 unit contents.  Prints "" when not derivable;
+# "source" prints "" when the checkout is the managed clone under the prefix.
+recorded_layout_from_unit() {
+  _rl_venv="$(printf '%s\n' "$2" | sed -n 's|^ExecStart=\(.*\)/bin/uvicorn .*|\1|p' | head -n1)"
+  _rl_prefix=""; [ -n "$_rl_venv" ] && _rl_prefix="$(dirname "$_rl_venv")"
+  case "$1" in
+    prefix) printf '%s\n' "$_rl_prefix" ;;
+    source)
+      _rl_wd="$(printf '%s\n' "$2" | sed -n 's/^WorkingDirectory=//p' | head -n1)"
+      if [ -n "$_rl_prefix" ] && [ -n "$_rl_wd" ] && [ "$_rl_wd" != "$_rl_prefix/app" ]; then printf '%s\n' "$_rl_wd"; else printf '\n'; fi ;;
+  esac
 }
 
 # Pure: the effective value of NAME in env-file CONTENT (last uncommented assignment), or "".
@@ -623,9 +707,29 @@ app_access_verdict() {   # $1 user  $2 app_dir -> ok | denied
   fi
 }
 
+# Pure: "refuse" for a data directory the installer must never re-own
+# (the root filesystem and the system trees under it), else "ok".
+data_dir_verdict() {
+  case "$1" in
+    ""|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/cache|/var/log) printf 'refuse\n' ;;
+    *) printf 'ok\n' ;;
+  esac
+}
+
 ensure_dirs() {   # $1 user  $2 data_dir
+  [ "$(data_dir_verdict "$2")" = "ok" ] || die "refusing to use '$2' as the data directory"
+  _owner_before="$(stat -c %U "$2" 2>/dev/null || true)"
   # install -d applies the mode to an existing directory too, so a re-run re-tightens it.
   install -d -m 0750 -o "$1" -g "$1" "$2"
+  # A re-run with a different --run-as must hand the database (0600, old user)
+  # to the new service user or the unit crash-loops (R5), and a first install
+  # over pre-existing data must adopt it. Recurse only when ownership actually
+  # has to change, so a steady-state re-run never walks a shared tree (review
+  # 2026-11-03 #1): the directory was someone else's, or holds entries that are.
+  if [ "$_owner_before" != "$1" ] || find "$2" -maxdepth 1 ! -user "$1" -print -quit 2>/dev/null | grep -q .; then
+    info "Re-owning ${2} to ${1} (the service must be able to open its database)"
+    chown -R "$1:$1" "$2"
+  fi
   install -d -m 0750 -o root -g "$1" "$ENV_DIR"
 }
 
@@ -651,13 +755,19 @@ install_service() {   # $1 user  $2 data_dir  $3 app_dir  $4 unit contents  $5 e
   fi
 }
 
-wait_version() {   # $1 url  $2 tries → prints the reported git_sha, or fails
-  _tries="$2"
+wait_version() {   # $1 url  $2 tries  $3 expected sha: prints the sha once the service reports it; else prints the last sha seen and fails
+  _tries="$2"; _last=""
   while [ "$_tries" -gt 0 ]; do
     _json="$(curl -fsS --max-time 3 "$1/api/version" 2>/dev/null || true)"
-    if [ -n "$_json" ]; then printf '%s\n' "$_json" | sed -n 's/.*"git_sha": *"\([^"]*\)".*/\1/p'; return 0; fi
+    if [ -n "$_json" ]; then
+      _last="$(printf '%s\n' "$_json" | sed -n 's/.*"git_sha": *"\([^"]*\)".*/\1/p')"
+      # Any other sha is the previous process still draining through the restart
+      # (or a stray listener on the port): not healthy yet, keep polling (R6).
+      if [ "$_last" = "$3" ]; then printf '%s\n' "$_last"; return 0; fi
+    fi
     _tries=$((_tries - 1)); sleep 1
   done
+  printf '%s\n' "$_last"
   return 1
 }
 
@@ -696,7 +806,7 @@ main() {
   # A re-run honours what the box already has: the env file's values win over flag
   # defaults, and the unit's User= wins unless --run-as was passed explicitly.
   _existing=""; [ -f "$ENV_FILE" ] && _existing="$(cat "$ENV_FILE")"
-  _env="$(render_env "$_existing" "$OPT_DATA_DIR" "$OPT_BIND_HOST" "$OPT_PORT" "$APP_DIR" "$_sha" "$(utc_now)" "$_lan")"
+  _env="$(render_env "$_existing" "$OPT_DATA_DIR" "$OPT_BIND_HOST" "$OPT_PORT" "$APP_DIR" "$_sha" "$(utc_now)" "$_lan" "$OPT_PREFIX" "$OPT_SOURCE")"
   _eff_port="$(env_value PORT "$_env")"; _eff_port="${_eff_port:-$OPT_PORT}"
   _eff_bind="$(env_value BIND_HOST "$_env")"; _eff_bind="${_eff_bind:-0.0.0.0}"
   _eff_data="$(env_value DATA_DIR "$_env")"; _eff_data="${_eff_data:-$OPT_DATA_DIR}"
@@ -711,14 +821,14 @@ main() {
   # Probe where the service actually listens; show the address people will type.
   case "$_eff_bind" in 0.0.0.0|::) _probe="127.0.0.1"; _show="$_lan" ;; *) _probe="$_eff_bind"; _show="$_eff_bind" ;; esac
   _url="http://${_probe}:${_eff_port}"
-  if _got="$(wait_version "$_url" "$HEALTH_TRIES")"; then
+  if _got="$(wait_version "$_url" "$HEALTH_TRIES" "$_sha")" && systemctl is-active --quiet jukeplox; then
     info ""
     info "Jukeplox is running (build ${_got}, native):"
     info "  Admin   : http://${_show}:${_eff_port}/admin   (set a password, connect a source, pick a speaker)"
     info "  Config  : ${ENV_FILE}      Data: ${_eff_data}      Logs: journalctl -u jukeplox -f"
-    info "  Update  : cd ${APP_DIR} && git pull && sh install-native.sh"
+    info "  Update  : $(update_hint "$APP_DIR" "$OPT_SOURCE" "$OPT_PREFIX" "$DEFAULT_PREFIX")"
   else
-    info "Service did not answer at ${_url}/api/version. Last log lines:"
+    info "Service did not report build ${_sha} at ${_url}/api/version on an active unit (last answer: ${_got:-none}). Last log lines:"
     journalctl -u jukeplox -n 30 --no-pager >&2 || true
     die "install finished but the service is not healthy"
   fi

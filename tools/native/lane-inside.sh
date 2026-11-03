@@ -18,7 +18,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Copy the read-only mount so `pip install -e` can write its egg-link metadata.
 rm -rf /opt/jukeplox/src && cp -r /src /opt/jukeplox/src
 step installer sh /opt/jukeplox/src/install-native.sh --source /opt/jukeplox/src --no-service --yes \
-  && record "AE1 installer: PASS" || { record "AE1 installer: FAIL"; printf "$RESULTS"; exit 1; }
+  && record "AE1 installer: PASS" || { record "AE1 installer: FAIL"; printf '%b' "$RESULTS"; exit 1; }
 
 PY=/opt/jukeplox/venv/bin/python
 "$PY" -c 'import sys,platform; assert sys.version_info[:2]==(3,12), sys.version; print("python", platform.python_version(), platform.machine(), "32-bit" if sys.maxsize < 2**32 else "64-bit")'
@@ -39,9 +39,13 @@ mkdir -p /tmp/jpdata /tmp/elsewhere
 cat > /etc/asound.conf <<'EOF'
 pcm.!default { type null }
 EOF
-( cd /tmp/elsewhere && DATA_DIR=/tmp/jpdata BIND_HOST=127.0.0.1 PORT=8099 JUKEPLOX_GIT_SHA=lane JUKEPLOX_BUILD_TIME=now JUKEPLOX_IMAGE_TAG=native \
-    /opt/jukeplox/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099 >/tmp/uvicorn.log 2>&1 & echo $! > /tmp/uvicorn.pid )
-for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8099/api/version >/dev/null 2>&1 && break; sleep 1; done
+# The installed default: wildcard bind and no STREAM_BASE_URL, so a Local-files
+# track has to go through the stream-base auto-detect (R2). A loopback bind
+# would hand the app a ready-made base and never exercise that path. The
+# probes below still talk to 127.0.0.1; only the server side is the default.
+( cd /tmp/elsewhere && DATA_DIR=/tmp/jpdata BIND_HOST=0.0.0.0 PORT=8099 JUKEPLOX_GIT_SHA=lane JUKEPLOX_BUILD_TIME=now JUKEPLOX_IMAGE_TAG=native \
+    /opt/jukeplox/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8099 >/tmp/uvicorn.log 2>&1 & echo $! > /tmp/uvicorn.pid )
+for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8099/api/version >/dev/null 2>&1 && break; sleep 1; done
 ae4=PASS
 for p in / /static/shared.js /api/version; do
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8099$p"); [ "$code" = "200" ] || { ae4="FAIL ($p -> $code)"; }
@@ -67,17 +71,32 @@ if "$PY" /opt/jukeplox/src/tools/native/lane-play.py --base http://127.0.0.1:809
 else
   ae5=FAIL
 fi
-record "AE5 Direct backend to ALSA null PCM (confirmed start + EOS advance; pacing is the VM lane's job): $ae5"
+# Which stream base the server settled on. "auto-detected" is the shared token of
+# both auto-detect warnings (plain LAN IP and container/bridge IP); the bridge one
+# is the expected answer on Docker's default network. Loopback means detection
+# raised (no default route) and the R11 fallback carried the track instead.
+if grep -q "auto-detected" /tmp/uvicorn.log; then base=autodetect
+elif grep -q "streaming over loopback" /tmp/uvicorn.log; then base=loopback
+else base=none; fi
+# The wildcard bind exists to exercise auto-detect; a run the loopback fallback
+# carried would otherwise stay green with that path broken. A host with no
+# default route (--network none) opts out explicitly.
+case "$base" in
+  autodetect) ;;
+  *) [ "${JP_LANE_ALLOW_LOOPBACK:-0}" = 1 ] || ae5="FAIL (stream base=$base; expected auto-detect on the bridge network, JP_LANE_ALLOW_LOOPBACK=1 opts out)" ;;
+esac
+record "AE5 Direct backend to ALSA null PCM (confirmed start + EOS advance; pacing is the VM lane's job): $ae5 base=$base"
 kill "$(cat /tmp/uvicorn.pid)" 2>/dev/null || true
 mkdir -p /opt/jukeplox/lane-logs && cp /tmp/uvicorn.log /opt/jukeplox/lane-logs/uvicorn.log
-[ "$ae5" = PASS ] || { say "uvicorn log tail (AE5 failed):"; grep -iE "error|warn|direct|alsa|gst|play|queue" /tmp/uvicorn.log | tail -40 | cut -c1-240; }
+case "$ae5" in PASS*) ;; *) say "uvicorn log tail (AE5 failed):"; grep -iE "error|warn|direct|alsa|gst|play|queue" /tmp/uvicorn.log | tail -40 | cut -c1-240 ;; esac
 
 # ── 5. per-file suite under the compiled interpreter ──────────────────────────
 if [ "${JP_LANE_SKIP_SUITE:-0}" != "1" ]; then
   cd /opt/jukeplox/src
   pass=0; fail=0; failed=""
-  LOGS=/opt/jukeplox/lane-logs; rm -rf "$LOGS"; mkdir -p "$LOGS"
-  for f in tests/test_*.py; do
+  LOGS=/opt/jukeplox/lane-logs; mkdir -p "$LOGS"; rm -f "$LOGS"/test_*.log   # keep uvicorn.log from the playback check
+  # shellcheck disable=SC2086  # JP_LANE_TESTS is a space-separated list; the default is a glob
+  for f in ${JP_LANE_TESTS:-tests/test_*.py}; do
     name=$(basename "$f" .py)
     if timeout 400 "$PY" -m pytest "$f" -q -p no:cacheprovider --no-header >"$LOGS/$name.log" 2>&1; then
       pass=$((pass+1)); rm -f "$LOGS/$name.log"
@@ -87,7 +106,10 @@ if [ "${JP_LANE_SKIP_SUITE:-0}" != "1" ]; then
 ' ';')"
     fi
   done
-  record "suite: ${pass} files passed, ${fail} failed${failed:+:$failed} (logs kept in volume: /opt/jukeplox/lane-logs)"
+  # Upper-case FAIL: the exit gate below keys on that token (the lower-case
+  # "failed" let a red suite exit 0 until 2026-11).
+  if [ "$fail" -eq 0 ]; then record "suite: ${pass} files passed, 0 failed: PASS"
+  else record "suite: ${pass} files passed, ${fail} FAIL:${failed} (logs kept in volume: /opt/jukeplox/lane-logs)"; fi
 fi
 
 say "DONE in $(( $(date +%s) - t0 ))s"

@@ -102,10 +102,47 @@ teardown() { teardown_stub_bin; }
   log="$BATS_TEST_TMPDIR/install.log"
   make_stub install 'echo "install $*" >> '"$log"
   make_stub chmod 'echo "chmod $*" >> '"$log"
+  make_stub chown 'echo "chown $*" >> '"$log"
   ENV_DIR=/etc/jukeplox
   ensure_dirs jukeplox /var/lib/jukeplox
   grep -q "install -d -m 0750 -o jukeplox -g jukeplox /var/lib/jukeplox" "$log"
   grep -q "install -d -m 0750 -o root -g jukeplox /etc/jukeplox" "$log"
+}
+
+@test "R5 (review #4): ensure_dirs re-owns the data directory recursively, after creating it" {
+  log="$BATS_TEST_TMPDIR/install.log"
+  make_stub install 'echo "install $*" >> '"$log"
+  make_stub chown 'echo "chown $*" >> '"$log"
+  ENV_DIR=/etc/jukeplox
+  ensure_dirs media /var/lib/jukeplox
+  grep -q "chown -R media:media /var/lib/jukeplox" "$log"
+  d="$(grep -n 'install -d -m 0750 -o media' "$log" | cut -d: -f1)"
+  c="$(grep -n 'chown -R media:media' "$log" | cut -d: -f1)"
+  [ "$d" -lt "$c" ]
+}
+
+@test "R5: ensure_dirs refuses to re-own /, an empty path, or a system tree" {
+  make_stub install 'true'
+  make_stub chown 'echo "chown $*" >> '"$BATS_TEST_TMPDIR/chown.log"
+  ENV_DIR=/etc/jukeplox
+  for d in / "" /var/lib /home /etc /usr; do
+    run ensure_dirs media "$d"
+    [ "$status" -ne 0 ]
+  done
+  [ ! -f "$BATS_TEST_TMPDIR/chown.log" ]
+  [ "$(data_dir_verdict /var/lib/jukeplox)" = "ok" ]
+  [ "$(data_dir_verdict /srv/music/jp)" = "ok" ]
+}
+
+@test "R5 (review #1): ensure_dirs does not recurse when the data directory is already the user's" {
+  log="$BATS_TEST_TMPDIR/install.log"
+  make_stub install 'echo "install $*" >> '"$log"
+  make_stub chown 'echo "chown $*" >> '"$log"
+  ENV_DIR=/etc/jukeplox
+  d="$BATS_TEST_TMPDIR/data"; mkdir -p "$d"; : > "$d/jukeplox.db"
+  ensure_dirs "$(id -un)" "$d"
+  grep -q "install -d -m 0750" "$log"
+  if grep -q "^chown" "$log"; then return 1; fi
 }
 
 @test "U3: write_env installs the file 0640 root:user and backs up the previous one" {
@@ -124,6 +161,7 @@ teardown() { teardown_stub_bin; }
   make_stub useradd 'echo "useradd $*" >> '"$log"
   make_stub install 'echo "install $*" >> '"$log"
   make_stub chmod 'true'
+  make_stub chown 'true'
   make_stub systemctl 'echo "systemctl $*" >> '"$log"
   ENV_DIR="$BATS_TEST_TMPDIR/etc"; ENV_FILE="$ENV_DIR/env"; UNIT_PATH="$BATS_TEST_TMPDIR/jukeplox.service"; mkdir -p "$ENV_DIR"
   install_service jukeplox /var/lib/jukeplox /opt/jukeplox/app "[Unit]" "X=1"
@@ -165,6 +203,7 @@ teardown() { teardown_stub_bin; }
   make_stub useradd 'echo "useradd $*" >> '"$log"
   make_stub install 'true'
   make_stub chmod 'true'
+  make_stub chown 'true'
   make_stub systemctl 'echo "systemctl $*" >> '"$log"'; case "$1" in is-enabled) exit 0;; esac'
   ENV_DIR="$BATS_TEST_TMPDIR/etc"; ENV_FILE="$ENV_DIR/env"; UNIT_PATH="$BATS_TEST_TMPDIR/jukeplox.service"; mkdir -p "$ENV_DIR"
   install_service jukeplox /var/lib/jukeplox /opt/jukeplox/app "[Unit]" "X=1"
@@ -174,8 +213,42 @@ teardown() { teardown_stub_bin; }
 
 @test "U3: wait_version returns the reported sha, fails when never healthy" {
   make_stub curl 'echo "{\"git_sha\": \"abc1234\", \"build_time\": \"t\", \"image_tag\": \"native\"}"'
-  [ "$(wait_version http://x 2)" = "abc1234" ]
+  [ "$(wait_version http://x 2 abc1234)" = "abc1234" ]
   make_stub curl 'exit 1'
-  run wait_version http://x 1
+  run wait_version http://x 1 abc1234
   [ "$status" -ne 0 ]
+}
+
+@test "R6 (AE4, review #5): wait_version does not accept a stale process reporting another sha" {
+  make_stub curl 'echo "{\"git_sha\": \"old0000\", \"build_time\": \"t\", \"image_tag\": \"native\"}"'
+  run wait_version http://x 2 abc1234
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"old0000"* ]]   # the stale sha is named, not hidden
+}
+
+@test "R6: wait_version keeps polling through a restart drain until the new sha answers" {
+  n="$BATS_TEST_TMPDIR/n"; echo 0 > "$n"
+  make_stub curl 'c=$(cat '"$n"'); c=$((c+1)); echo $c > '"$n"'; if [ $c -le 2 ]; then echo "{\"git_sha\": \"old0000\"}"; else echo "{\"git_sha\": \"abc1234\"}"; fi'
+  [ "$(wait_version http://x 5 abc1234)" = "abc1234" ]
+  [ "$(cat "$n")" = "3" ]
+}
+
+@test "R7 (AE5, review #6): update_hint reproduces --source and --prefix; flagless for the default layout" {
+  [ "$(update_hint /opt/jukeplox/app "" /opt/jukeplox /opt/jukeplox)" = "cd /opt/jukeplox/app && git pull && sh install-native.sh" ]
+  [ "$(update_hint /home/me/jukeplox /home/me/jukeplox /srv/jp /opt/jukeplox)" = "cd /home/me/jukeplox && git pull && sh install-native.sh --source /home/me/jukeplox --prefix /srv/jp" ]
+  [ "$(update_hint /srv/jp/app "" /srv/jp /opt/jukeplox)" = "cd /srv/jp/app && git pull && sh install-native.sh --prefix /srv/jp" ]
+}
+
+@test "R7: render_env records the install layout and rewrites it on every run" {
+  out="$(render_env "" /d 10.0.0.2 80 /srv/jp/app sha t 10.0.0.2 /srv/jp "")"
+  assert_line_eq "$out" "JUKEPLOX_INSTALL_PREFIX=/srv/jp"
+  assert_line_eq "$out" "JUKEPLOX_INSTALL_SOURCE="
+  existing="$(printf 'MY_EXTRA=1\nJUKEPLOX_INSTALL_PREFIX=/old\nJUKEPLOX_INSTALL_SOURCE=/old/src\nJUKEPLOX_GIT_SHA=old0000\n')"
+  out="$(render_env "$existing" /d 10.0.0.2 80 /home/me/jukeplox new1111 now 10.0.0.2 /srv/jp /home/me/jukeplox)"
+  assert_line_eq "$out" "MY_EXTRA=1"
+  assert_line_eq "$out" "JUKEPLOX_INSTALL_PREFIX=/srv/jp"
+  assert_line_eq "$out" "JUKEPLOX_INSTALL_SOURCE=/home/me/jukeplox"
+  refute_line_eq "$out" "JUKEPLOX_INSTALL_PREFIX=/old"
+  refute_line_eq "$out" "JUKEPLOX_INSTALL_SOURCE=/old/src"
+  [ "$(printf '%s\n' "$out" | grep -c '^JUKEPLOX_INSTALL_PREFIX=')" -eq 1 ]
 }

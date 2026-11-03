@@ -43,4 +43,6 @@ docker run --name "$NAME" --platform "$PLATFORM" \
   -v "${VOLUME}:/opt/jukeplox" \
   -v "$(host_path "$ROOT"):/src:ro" \
   -e JP_LANE_SKIP_SUITE="${JP_LANE_SKIP_SUITE:-0}" \
+  -e JP_LANE_TESTS="${JP_LANE_TESTS:-}" \
+  -e JP_LANE_ALLOW_LOOPBACK="${JP_LANE_ALLOW_LOOPBACK:-0}" \
   "$IMAGE" linux32 sh /src/tools/native/lane-inside.sh
