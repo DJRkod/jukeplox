@@ -40,6 +40,66 @@ teardown() { teardown_stub_bin; }
   [ "$APP_DIR" = "/src" ]
 }
 
+@test "R7 (review #6): a flagless re-run adopts the --source and --prefix recorded in the env file" {
+  ENV_DIR="$BATS_TEST_TMPDIR/etc"; mkdir -p "$ENV_DIR"
+  printf 'PORT=80\nJUKEPLOX_INSTALL_PREFIX=/srv/jp\nJUKEPLOX_INSTALL_SOURCE=/home/me/jukeplox\n' > "$ENV_DIR/env"
+  parse_args; layout
+  [ "$APP_DIR" = "/home/me/jukeplox" ]
+  [ "$VENV_DIR" = "/srv/jp/venv" ]
+  [ "$OPT_PREFIX" = "/srv/jp" ]
+  [ "$OPT_SOURCE" = "/home/me/jukeplox" ]
+}
+
+@test "R7: an explicit flag wins over the recorded layout and the mismatch is announced" {
+  ENV_DIR="$BATS_TEST_TMPDIR/etc"; mkdir -p "$ENV_DIR"
+  printf 'JUKEPLOX_INSTALL_PREFIX=/srv/jp\nJUKEPLOX_INSTALL_SOURCE=\n' > "$ENV_DIR/env"
+  parse_args --prefix /other; layout 2> "$BATS_TEST_TMPDIR/err"
+  [ "$APP_DIR" = "/other/app" ]
+  [ "$VENV_DIR" = "/other/venv" ]
+  grep -q "/srv/jp" "$BATS_TEST_TMPDIR/err"
+}
+
+@test "R7 (review): --source= clears a recorded source and announces the switch to a managed clone" {
+  ENV_DIR="$BATS_TEST_TMPDIR/etc"; mkdir -p "$ENV_DIR"
+  printf 'JUKEPLOX_INSTALL_PREFIX=/srv/jp\nJUKEPLOX_INSTALL_SOURCE=/home/me/jukeplox\n' > "$ENV_DIR/env"
+  parse_args --source=; layout 2> "$BATS_TEST_TMPDIR/err"
+  [ "$APP_DIR" = "/srv/jp/app" ]
+  [ -z "$OPT_SOURCE" ]
+  grep -q "managed clone" "$BATS_TEST_TMPDIR/err"
+}
+
+@test "R7 (review): an install that predates the layout record is read back from its unit" {
+  ENV_DIR="$BATS_TEST_TMPDIR/etc"; mkdir -p "$ENV_DIR"
+  printf 'PORT=80\nJUKEPLOX_GIT_SHA=old0000\n' > "$ENV_DIR/env"   # written by the previous installer: no JUKEPLOX_INSTALL_* lines
+  UNIT_PATH="$BATS_TEST_TMPDIR/jukeplox.service"
+  render_unit jukeplox /home/me/jukeplox /srv/jp/venv "$ENV_DIR/env" > "$UNIT_PATH"
+  parse_args; layout
+  [ "$APP_DIR" = "/home/me/jukeplox" ]
+  [ "$VENV_DIR" = "/srv/jp/venv" ]
+  [ "$OPT_PREFIX" = "/srv/jp" ]
+  render_unit jukeplox /opt/jukeplox/app /opt/jukeplox/venv "$ENV_DIR/env" > "$UNIT_PATH"
+  OPT_SOURCE=""; OPT_SOURCE_SET=0; OPT_PREFIX="$DEFAULT_PREFIX"; OPT_PREFIX_SET=0; layout
+  [ "$APP_DIR" = "/opt/jukeplox/app" ]   # a managed clone under the prefix is not a --source
+  [ -z "$OPT_SOURCE" ]
+}
+
+@test "R7 (review): an adopted source that is no longer a checkout dies naming the record, not a flag" {
+  ENV_DIR="$BATS_TEST_TMPDIR/etc"; mkdir -p "$ENV_DIR"
+  printf 'JUKEPLOX_INSTALL_PREFIX=/opt/jukeplox\nJUKEPLOX_INSTALL_SOURCE=%s/gone\n' "$BATS_TEST_TMPDIR" > "$ENV_DIR/env"
+  parse_args; layout
+  run ensure_checkout
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"recorded source checkout"* ]]
+  [[ "$output" == *"--source="* ]]
+}
+
+@test "R7: no env file and no flags is the default layout, silently" {
+  ENV_DIR="$BATS_TEST_TMPDIR/etc"
+  parse_args; layout 2> "$BATS_TEST_TMPDIR/err"
+  [ "$APP_DIR" = "/opt/jukeplox/app" ]
+  [ ! -s "$BATS_TEST_TMPDIR/err" ]
+}
+
 @test "U2: os_verdict warns (not dies) on Debian 13 and non-Debian, ok on 12" {
   printf 'ID=debian\nVERSION_ID="12"\n' > "$BATS_TEST_TMPDIR/os12"
   printf 'ID=debian\nVERSION_ID="13"\n' > "$BATS_TEST_TMPDIR/os13"

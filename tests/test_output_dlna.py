@@ -1652,10 +1652,13 @@ async def test_set_device_tears_down_previous_notify_server(dlna_mock):
          patch("app.database.get_setting", AsyncMock(return_value=None)):
         await backend.set_device("dev-1")
         assert backend._notify_server is first_notify
-
         await backend.set_device("dev-2")
-
-    # Previous notify server stopped before the new one was started
+        # The outgoing renderer is released in the background (2026-08-20
+        # review F3) and every await in this attach is an AsyncMock, which
+        # never yields the loop; give the release task its turn.
+        for _ in range(10):
+            await asyncio.sleep(0)
+    # Previous notify server stopped; the new one started
     first_notify.async_stop_server.assert_awaited_once()
     second_notify.async_start_server.assert_awaited_once()
     assert backend._notify_server is second_notify
@@ -3038,16 +3041,22 @@ async def test_set_device_drops_the_outgoing_refs_before_its_first_await(
             backend.set_device("dev-2"))
         for _ in range(4):
             await asyncio.sleep(0)
-
-        assert backend._dmr is None, "outgoing ref still readable mid-teardown"
-        assert backend._notify_server is None
-        assert backend._requester is None
-        assert backend._dlna_session is None
+        # The outgoing refs are gone from the backend: either still None
+        # (mid-attach) or already the new renderer's, never the old ones.
+        assert backend._dmr is not old_dmr, "outgoing ref still readable mid-teardown"
+        assert backend._notify_server is not old_notify
+        assert backend._requester is not old_requester
+        assert backend._dlna_session is not old_session
+        # The attach does not wait for the old renderer's UNSUBSCRIBE
+        # (2026-08-20 review F3): it completes while the gate is still closed.
+        await asyncio.wait_for(task, 5)
+        assert not gate.is_set()
 
         gate.set()
-        await task
+        for _ in range(10):
+            await asyncio.sleep(0)
 
-    # The captured locals were still torn down, all four of them.
+    # The captured locals were still torn down, all four of them, once.
     old_dmr.async_unsubscribe_services.assert_awaited_once()
     old_notify.async_stop_server.assert_awaited_once()
     # NOT requester.close(): AiohttpSessionRequester borrows the session

@@ -1739,21 +1739,25 @@ def resolved_device_base(context: str, *, reject_bridge: bool = False) -> str:
     # IP is the worst case, but any auto-detected interface can be wrong on a
     # multi-homed host). Always recommend STREAM_BASE_URL; call out the bridge
     # case explicitly.
+    if reject_bridge and _is_bridge_ip(ip):
+        raise RuntimeError(
+            f"auto-detected a container/bridge IP ({ip}) for {context}; a "
+            "LAN device almost certainly cannot reach it. Set "
+            "STREAM_BASE_URL to this server's LAN address.")
+    # Once per context+address for BOTH warnings: the per-track callers (local
+    # files) would otherwise print one of them twice for every track dispatched.
+    # The refusal above stays outside the guard: the dedupe suppresses log
+    # lines only, never a decision.
+    if (context, ip) in _autodetect_warned:
+        return _host_to_base(ip)
+    _autodetect_warned.add((context, ip))
     if _is_bridge_ip(ip):
-        if reject_bridge:
-            raise RuntimeError(
-                f"auto-detected a container/bridge IP ({ip}) for {context}; a "
-                "LAN device almost certainly cannot reach it. Set "
-                "STREAM_BASE_URL to this server's LAN address.")
         _log.warning(
             "Stream base auto-detected a container/bridge IP %s for %s — a LAN "
             "Cast/DLNA device likely cannot reach it. Set STREAM_BASE_URL to "
             "this server's LAN address to guarantee playback.", ip, context,
         )
-    elif (context, ip) not in _autodetect_warned:
-        # Once per context+address: the per-track callers (local files) would
-        # otherwise print this twice for every track dispatched.
-        _autodetect_warned.add((context, ip))
+    else:
         _log.warning(
             "STREAM_BASE_URL is not set — auto-detected stream base http://%s "
             "for %s. If a LAN Cast/DLNA device can't reach this address, set "
@@ -1817,13 +1821,24 @@ def _make_stream_url(stream_key: str, client) -> str:
     # way to play it is through /api/stream, so on a wildcard bind with no
     # STREAM_BASE_URL the base must be auto-detected (VM lane 2026-10-26:
     # every Local track dispatched as uri "" and was skipped silently). The
-    # same ladder Cast/Subsonic use; undetectable → "" as before, but say so.
+    # same ladder Cast/Subsonic use. When detection raises (no default route:
+    # an offline box) fall back to loopback: the Direct backend is this very
+    # process, so 127.0.0.1 plays the track that "" would have skipped, and a
+    # LAN device was getting nothing either way (R11). Detection is retried
+    # on every track (never cached, lan-ip-detect-cached-failure-permanently);
+    # only the warning is deduped, so an offline box does not log it per track.
+    ctx = "a local-files track"
     try:
-        return _proxy_stream_url(stream_key, resolved_device_base("a local-files track"))
+        return _proxy_stream_url(stream_key, resolved_device_base(ctx))
     except RuntimeError as exc:
-        _log.warning("No stream base for a local-files track (%s): set STREAM_BASE_URL "
-                     "or BIND_HOST to this server's LAN address", exc)
-        return ""
+        if (ctx, "loopback") not in _autodetect_warned:
+            _autodetect_warned.add((ctx, "loopback"))
+            _log.warning(
+                "LAN detect failed for a local-files track (%s): streaming over "
+                "loopback, so only this machine's Direct backend can play it. "
+                "Set STREAM_BASE_URL to this server's LAN address for Cast/DLNA.",
+                exc)
+        return _proxy_stream_url(stream_key, _host_to_base("127.0.0.1"))
 
 
 def record_play(track) -> None:

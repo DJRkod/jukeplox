@@ -318,6 +318,7 @@ the `git_sha` (the `image_tag` may show an internal release-train name; that's e
 
 Native install: `cd /opt/jukeplox/app && git pull && sh install-native.sh` — data and
 `/etc/jukeplox/env` are kept, and `/api/version` shows the new `git_sha` with `image_tag: native`.
+A `--source` or `--prefix` install prints its own re-run command at the end of every install.
 
 ## Notes
 

@@ -14,8 +14,12 @@ setup_install_lib() {
 # sourceable-library shape but are separate files, so each gets its own loader.
 setup_native_lib() {
   PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
+  # Isolate the install surfaces: layout() reads the env file and unit of a
+  # previous install, so on a box with a real native install the suite would
+  # otherwise adopt that layout (or fail on the 0640 root-owned env file).
   # shellcheck disable=SC1091
-  JUKEPLOX_INSTALL_LIB=1 . "$PROJECT_ROOT/install-native.sh"
+  JUKEPLOX_ENV_DIR="$BATS_TEST_TMPDIR/etc" JUKEPLOX_UNIT_PATH="$BATS_TEST_TMPDIR/jukeplox.service" \
+    JUKEPLOX_INSTALL_LIB=1 . "$PROJECT_ROOT/install-native.sh"
   parse_args; layout
 }
 

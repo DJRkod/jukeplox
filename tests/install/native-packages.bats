@@ -72,14 +72,41 @@ teardown() { teardown_stub_bin; }
   [ "$(venv_verdict 3.12.15 3.12.15)" = "reuse" ]
 }
 
-@test "U2: disable_distro_snapcast disables and masks both distro units" {
+@test "R9 (AE6, review #8): disable_distro_snapcast masks snapserver only, leaves snapclient, and says so" {
   log="$BATS_TEST_TMPDIR/sysctl.log"
-  make_stub systemctl 'echo "systemctl $*" >> '"$log"
-  disable_distro_snapcast
+  make_stub systemctl 'echo "systemctl $*" >> '"$log"'; case "$1" in is-active) exit 3;; esac'
+  run disable_distro_snapcast
+  [ "$status" -eq 0 ]
   grep -q "disable --now snapserver.service" "$log"
-  grep -q "disable --now snapclient.service" "$log"
   grep -q "mask snapserver.service" "$log"
-  grep -q "mask snapclient.service" "$log"
+  if grep -q "snapclient.service" "$log"; then return 1; fi
+  [[ "$output" == *"snapserver"* ]]
+  [[ "$output" != *"ALSA"* ]]
+}
+
+@test "R9: a running snapclient earns a hint that it holds the default ALSA device" {
+  make_stub systemctl 'case "$1" in is-active) exit 0;; esac'
+  run disable_distro_snapcast
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"snapclient"* ]]
+  [[ "$output" == *"ALSA"* ]]
+}
+
+@test "R8 (review #7): fetch bounds every download with connect timeout, max time and retries" {
+  log="$BATS_TEST_TMPDIR/curl.log"
+  make_stub curl 'echo "curl $*" >> '"$log"
+  fetch https://example.invalid/x.tgz "$BATS_TEST_TMPDIR/x.tgz"
+  grep -q -- "--connect-timeout" "$log"
+  grep -q -- "--max-time" "$log"
+  grep -q -- "--retry " "$log"
+  grep -q -- "--retry-all-errors" "$log"
+  grep -q -- "-o $BATS_TEST_TMPDIR/x.tgz https://example.invalid/x.tgz" "$log"
+}
+
+@test "R8: fetch fails when curl gives up (exit 28, operation timeout)" {
+  make_stub curl 'exit 28'
+  run fetch https://example.invalid/x.tgz "$BATS_TEST_TMPDIR/x.tgz"
+  [ "$status" -ne 0 ]
 }
 
 @test "U2: PyGObject pin matches the Dockerfile's" {

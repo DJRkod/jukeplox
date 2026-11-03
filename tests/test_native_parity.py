@@ -229,3 +229,37 @@ def test_installer_is_lf_and_sourceable():
     raw = (_ROOT / "install-native.sh").read_bytes()
     assert b"\r\n" not in raw, "install-native.sh must be LF (CRLF shebang does not execute)"
     assert b'JUKEPLOX_INSTALL_LIB' in raw
+
+
+def _sh_function_body(src: str, name: str) -> str:
+    """The lines of a POSIX-sh function ``name() {`` ... ``}`` (closing brace at column 0)."""
+    m = re.search(rf"^{name}\(\) \{{.*?^\}}", src, re.M | re.S)
+    assert m, f"{name}() not found"
+    return m.group(0)
+
+
+def test_every_installer_download_goes_through_fetch():
+    """R8 (review #7): a stalled mirror must fail the install, not hang it. Every
+    non-comment curl invocation is either inside fetch() (which carries the
+    timeouts and retries) or the health probe's own --max-time 3."""
+    s = _read("install-native.sh")
+    fetch_body = _sh_function_body(s, "fetch")
+    for flag in ("--connect-timeout", "--max-time", "--retry ", "--retry-all-errors"):
+        assert flag in fetch_body, flag
+    outside = s.replace(fetch_body, "")
+    bare = [ln for ln in outside.splitlines()
+            if re.search(r"\bcurl\s+-", ln) and not ln.lstrip().startswith("#")
+            and "--max-time 3" not in ln]
+    assert bare == [], bare
+    for site in ("py.tgz", "rustup-init", "get-pip.py"):
+        assert re.search(rf"^\s*fetch .*{re.escape(site)}", s, re.M), site
+
+
+def test_update_command_is_rendered_only_by_update_hint():
+    """R7 (review #6): the banner's update command comes from the pure update_hint,
+    which carries --source/--prefix, so a copy-paste re-run keeps the layout."""
+    s = _read("install-native.sh")
+    hint_body = _sh_function_body(s, "update_hint")
+    assert "git pull && sh install-native.sh" in hint_body
+    assert s.count("git pull && sh install-native.sh") == 1
+    assert re.search(r"^\s*info .*\$\(update_hint ", s, re.M)

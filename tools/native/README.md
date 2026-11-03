@@ -22,9 +22,13 @@ and inside it:
 5. synthesizes two sine tracks with ffmpeg, registers them as a Local source, selects
    the Direct backend and plays them to ALSA's software `null` PCM. The `null` PCM has
    no clock, so the proof is lifecycle, not pacing: both tracks reach the play history
-   AND the app log shows two confirmed starts with no decode or skip errors (AE5);
+   AND the app log shows two confirmed starts with no decode or skip errors (AE5). The
+   server binds `0.0.0.0` with no `STREAM_BASE_URL`, so the Local track goes through the
+   stream-base auto-detect; the check fails unless that path produced the base
+   (`JP_LANE_ALLOW_LOOPBACK=1` opts out on a host with no default route);
 6. runs the test suite per file under the compiled interpreter with the project's
-   hard timeout (`JP_LANE_SKIP_SUITE=1` skips this).
+   hard timeout (`JP_LANE_SKIP_SUITE=1` skips this; `JP_LANE_TESTS="tests/test_a.py tests/test_b.py"`
+   runs only the listed files, for a minutes-long check instead of the hour-long full suite).
 
 `/opt/jukeplox` (interpreter, Rust toolchain, venv) lives in the Docker volume
 `jukeplox-i386-opt`, so the first run pays the compiles and later runs skip them.
