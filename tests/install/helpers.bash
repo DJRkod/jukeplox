@@ -35,8 +35,11 @@ teardown_stub_bin() {
 }
 
 # make_stub NAME 'sh body' — install a fake executable on the stub PATH.
+# The shebang is the absolute /bin/sh on purpose: `#!/usr/bin/env sh` resolves
+# `sh` through PATH, and STUB_BIN is first on PATH, so a test that fakes `sh`
+# (or `env`) would make every stand-in re-exec itself forever (2026-11).
 make_stub() {
-  printf '#!/usr/bin/env sh\n%s\n' "$2" > "$STUB_BIN/$1"
+  printf '#!/bin/sh\n%s\n' "$2" > "$STUB_BIN/$1"
   chmod +x "$STUB_BIN/$1"
 }
 
