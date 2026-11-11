@@ -22,16 +22,27 @@ teardown() { teardown_stub_bin; }
   [ "$output" = "DOCKER ps" ]
 }
 
-@test "U3 (AE4): install_docker fetches the convenience script" {
-  marker="$(mktemp)"; rm -f "$marker"
-  make_stub curl "touch '$marker'; echo ''"
-  make_stub sudo 'exec "$@"'
-  make_stub sh 'cat >/dev/null'
-  make_stub systemctl 'exit 0'
+@test "U3 (AE4): install_docker fetches the convenience script and enables docker" {
+  marker="$BATS_TEST_TMPDIR/fetched"; log="$BATS_TEST_TMPDIR/calls.log"
+  # The fake curl records the fetch and hands back a harmless script body that
+  # the REAL shell runs through install_docker's pipe. `sh` itself is never
+  # faked: with STUB_BIN first on PATH that recursed forever (fixed 2026-11).
+  make_stub curl "touch '$marker'; echo 'exit 0'"
+  make_stub sudo 'exec "$@"'          # inert as root (the image); real sudo otherwise
+  make_stub systemctl 'echo "systemctl $*" >> '"'$log'"
   run install_docker
   [ "$status" -eq 0 ]
   [ -f "$marker" ]
-  rm -f "$marker"
+  grep -q "systemctl enable --now docker" "$log"
+}
+
+@test "U3 (AE4): install_docker really runs the fetched script (a failing script fails the install)" {
+  make_stub curl "echo 'exit 7'"
+  make_stub sudo 'exec "$@"'
+  make_stub systemctl 'exit 0'
+  run install_docker
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Docker install failed"* ]]
 }
 
 @test "U3: preflight passes when docker info succeeds (no sudo)" {
