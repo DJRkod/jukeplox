@@ -545,11 +545,11 @@ def _server_row(machine_id, name, **extra):
 
 
 async def test_plex_servers_owned_persisted(db):
-    await database.save_plex_servers([
+    await database.reconcile_plex_servers([
         _server_row("m1", "Zeta", owned=True),
         _server_row("m2", "Alpha", owned=False),
         _server_row("m3", "Mu"),  # no owned key (legacy caller) → NULL
-    ])
+    ], mark_missing=True)
     rows = {r["machine_id"]: r for r in await database.get_plex_servers()}
     assert rows["m1"]["owned"] == 1
     assert rows["m2"]["owned"] == 0
@@ -962,9 +962,9 @@ async def test_plex_servers_token_round_trips_and_sealed_at_rest(db):
     from pathlib import Path
     import aiosqlite
     from app.sources import secrets
-    await database.save_plex_servers([{
+    await database.reconcile_plex_servers([{
         "machine_id": "m1", "server_url": "http://x", "name": "Home", "owner": "me",
-        "token": "PLEX-SECRET-XYZ", "client_id": "c1", "owned": 1}])
+        "token": "PLEX-SECRET-XYZ", "client_id": "c1", "owned": 1}], mark_missing=True)
     # get_* opens the token back to plaintext for provider use.
     got = await database.get_plex_servers()
     assert got[0]["token"] == "PLEX-SECRET-XYZ"
@@ -1019,9 +1019,9 @@ async def test_plaintext_tokens_migrated_to_sealed_on_upgrade(db):
 
 
 async def test_seal_migration_is_idempotent(db):
-    await database.save_plex_servers([{
+    await database.reconcile_plex_servers([{
         "machine_id": "m1", "server_url": "http://x", "name": "Home", "owner": "me",
-        "token": "TOK", "client_id": "c1", "owned": 1}])
+        "token": "TOK", "client_id": "c1", "owned": 1}], mark_missing=True)
     conn = database._conn()
     async with conn.execute("SELECT token FROM plex_servers WHERE machine_id='m1'") as cur:
         first = (await cur.fetchone())[0]
@@ -1448,3 +1448,373 @@ async def test_set_genre_cache_retries_through_a_foreign_open_transaction(db):
 
     got = await database.get_genre_cache()
     assert [(g["name"], g["count"]) for g in got] == [("Jazz", 3)]
+
+
+# ── Plex source health (2026-11-21 plan U1): status columns, reconcile, ──────
+# seen set, tombstones, account token, chokepoint exclusion.
+
+def _health_row(machine_id, name="Srv", **extra):
+    row = {
+        "machine_id": machine_id, "server_url": f"http://{machine_id}.example:32400",
+        "name": name, "owner": "admin", "token": f"tok-{machine_id}",
+        "client_id": "cid", "owned": 1,
+    }
+    row.update(extra)
+    return row
+
+
+async def _raw_rows(table="plex_servers"):
+    async with database._conn().execute(f"SELECT * FROM {table}") as cur:
+        return {r[0]: dict(r) async for r in cur}
+
+
+async def test_health_columns_added_to_legacy_db_once(tmp_settings):
+    """Pre-existing plex_servers gains status/status_checked_at/missing_since
+    exactly once; a second init is a no-op (idempotent guarded ALTER)."""
+    import aiosqlite
+    async with aiosqlite.connect(tmp_settings.db_path) as conn:
+        await conn.execute(
+            "CREATE TABLE plex_servers ("
+            "machine_id TEXT PRIMARY KEY, server_url TEXT NOT NULL, "
+            "name TEXT NOT NULL, owner TEXT NOT NULL, token TEXT NOT NULL, "
+            "client_id TEXT NOT NULL, owned INTEGER)"
+        )
+        await conn.execute(
+            "INSERT INTO plex_servers VALUES ('m1','http://x','Home','me','T','c1',1)")
+        await conn.commit()
+    await database.init_db()
+    try:
+        await database.init_db()  # second run must not raise "duplicate column"
+        rows = await _raw_rows()
+        assert set(rows["m1"]) >= {"status", "status_checked_at", "missing_since"}
+        assert rows["m1"]["status"] == "unknown"
+        assert rows["m1"]["missing_since"] is None
+        async with database._conn().execute(
+            "SELECT name FROM sqlite_master WHERE type='table'") as cur:
+            names = {r["name"] async for r in cur}
+        assert {"plex_seen_libraries", "plex_removed_servers"} <= names
+    finally:
+        await database.close_db()
+
+
+async def test_fresh_db_rejects_invalid_status(db):
+    await database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)
+    with pytest.raises(sqlite3.IntegrityError):
+        await database._conn().execute(
+            "UPDATE plex_servers SET status = 'bogus' WHERE machine_id = 'm1'")
+
+
+async def test_reconcile_marks_missing_then_returns_to_usable(db):
+    await database.reconcile_plex_servers(
+        [_health_row("m1"), _health_row("m2")], mark_missing=True)
+    rows = await _raw_rows()
+    assert {r["status"] for r in rows.values()} == {"usable"}
+    assert all(r["status_checked_at"] for r in rows.values())
+
+    # Second reconcile: only m1 listed, with a rotated token.
+    await database.reconcile_plex_servers(
+        [_health_row("m1", token="tok-m1-new")], mark_missing=True)
+    rows = await _raw_rows()
+    assert set(rows) == {"m1", "m2"}  # never deletes
+    assert rows["m1"]["status"] == "usable" and rows["m1"]["missing_since"] is None
+    assert rows["m2"]["status"] == "no_longer_shared"
+    assert rows["m2"]["missing_since"] is not None
+    first_missing = rows["m2"]["missing_since"]
+    opened = {r["machine_id"]: r["token"]
+              for r in await database.get_plex_servers(include_vanished=True)}
+    assert opened["m1"] == "tok-m1-new"  # re-sealed
+    from app.sources import secrets
+    assert secrets.is_sealed(rows["m1"]["token"])
+
+    # Still missing on a third pass: missing_since is set once, not bumped.
+    await database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)
+    assert (await _raw_rows())["m2"]["missing_since"] == first_missing
+
+    # Fourth pass lists both: m2 returns to usable, missing_since cleared.
+    await database.reconcile_plex_servers(
+        [_health_row("m1"), _health_row("m2")], mark_missing=True)
+    rows = await _raw_rows()
+    assert rows["m2"]["status"] == "usable" and rows["m2"]["missing_since"] is None
+
+
+async def test_reconcile_returns_structured_diff(db):
+    r = await database.reconcile_plex_servers([_health_row("m1"), _health_row("m2")],
+                                              mark_missing=True)
+    assert sorted(r["added"]) == ["m1", "m2"] and r["vanished"] == [] and r["returned"] == []
+    r = await database.reconcile_plex_servers([_health_row("m1", token="n")],
+                                              mark_missing=True)
+    assert r["vanished"] == ["m2"] and r["changed_tokens"] == ["m1"] and r["added"] == []
+    r = await database.reconcile_plex_servers([_health_row("m1", token="n"), _health_row("m2")],
+                                              mark_missing=True)
+    assert r["returned"] == ["m2"] and r["changed_tokens"] == []  # same token back
+    for key in ("added", "returned", "vanished", "changed_tokens"):
+        assert all("tok" not in str(v) for v in r[key])  # no token values leak
+
+
+async def test_reconcile_mark_missing_false_touches_only_supplied(db):
+    await database.reconcile_plex_servers(
+        [_health_row("m1"), _health_row("m2")], mark_missing=True)
+    before = (await _raw_rows())["m2"]
+    await database.reconcile_plex_servers([_health_row("m1", name="Renamed")],
+                                          mark_missing=False)
+    rows = await _raw_rows()
+    assert rows["m2"] == before
+    assert rows["m1"]["name"] == "Renamed"
+
+
+async def test_reconcile_supplied_status_override_and_url_kept(db):
+    """A resource with no usable address is upserted with the saved URL kept and
+    status 'unreachable', never marked missing (KTD2)."""
+    await database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)
+    await database.reconcile_plex_servers(
+        [_health_row("m1", server_url="", status="unreachable")], mark_missing=True)
+    row = (await _raw_rows())["m1"]
+    assert row["server_url"] == "http://m1.example:32400"
+    assert row["status"] == "unreachable" and row["missing_since"] is None
+
+
+async def test_reconcile_empty_name_keeps_saved_and_tombstone_skipped(db):
+    await database.reconcile_plex_servers(
+        [_health_row("m1", name="Keep Me", owner="orig")], mark_missing=True)
+    await database.reconcile_plex_servers(
+        [_health_row("m1", name="", owner="")], mark_missing=True)
+    row = (await _raw_rows())["m1"]
+    assert row["name"] == "Keep Me" and row["owner"] == "orig"
+
+    await database.delete_plex_server("m1")
+    assert await database.get_plex_tombstones() == ["m1"]
+    r = await database.reconcile_plex_servers([_health_row("m1"), _health_row("m2")],
+                                              mark_missing=True)
+    assert set(await _raw_rows()) == {"m2"}
+    assert r["added"] == ["m2"]
+    # Invariant: tombstones and servers are disjoint.
+    assert not (set(await database.get_plex_tombstones()) & set(await _raw_rows()))
+    await database.clear_plex_tombstones()
+    assert await database.get_plex_tombstones() == []
+
+
+async def test_set_plex_server_status_maintains_missing_since_invariant(db):
+    await database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)
+    await database.set_plex_server_status("m1", "token_rejected")
+    row = (await _raw_rows())["m1"]
+    assert row["status"] == "token_rejected" and row["missing_since"] is None
+    assert row["status_checked_at"]
+    await database.set_plex_server_status("m1", "no_longer_shared")
+    row = (await _raw_rows())["m1"]
+    assert row["missing_since"] is not None
+    await database.set_plex_server_status("m1", "usable")
+    row = (await _raw_rows())["m1"]
+    assert row["status"] == "usable" and row["missing_since"] is None
+    with pytest.raises(ValueError):
+        await database.set_plex_server_status("m1", "bogus")
+
+
+async def test_get_plex_servers_hides_vanished_and_statuses_open_no_token(db, monkeypatch):
+    await database.reconcile_plex_servers(
+        [_health_row("m1"), _health_row("m2")], mark_missing=True)
+    await database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)
+    assert [s["machine_id"] for s in await database.get_plex_servers()] == ["m1"]
+    full = {s["machine_id"]: s for s in await database.get_plex_servers(include_vanished=True)}
+    assert set(full) == {"m1", "m2"}
+    assert full["m2"]["status"] == "no_longer_shared"
+
+    from app.sources import secrets
+    calls = []
+    monkeypatch.setattr(secrets, "open_secret",
+                        lambda v: calls.append(v) or v)
+    statuses = await database.get_plex_server_statuses()
+    assert statuses == {"m1": "usable", "m2": "no_longer_shared"}
+    assert calls == []
+
+
+async def test_effective_libraries_exclude_no_longer_shared_only(db, monkeypatch):
+    await database.reconcile_plex_servers(
+        [_health_row("m1"), _health_row("m2")], mark_missing=True)
+    await database.toggle_library("m1:1", "Music One", True)
+    await database.toggle_library("m2:1", "Music Two", True)
+    await database.toggle_library("3", "Legacy", True)          # prefix-less key
+    await database.toggle_library("jf-abc:9", "Jelly", True)   # no server status
+
+    await database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)
+    keys = {r["section_key"] for r in await database.get_effective_enabled_libraries()}
+    assert keys == {"m1:1", "3", "jf-abc:9"}
+    # The enabled_libraries row itself is untouched.
+    assert "m2:1" in {r["section_key"] for r in await database.get_enabled_libraries()}
+
+    await database.reconcile_plex_servers(
+        [_health_row("m1"), _health_row("m2")], mark_missing=True)
+    keys = {r["section_key"] for r in await database.get_effective_enabled_libraries()}
+    assert keys == {"m1:1", "m2:1", "3", "jf-abc:9"}
+
+    # A status read error fails open (list unfiltered), like the veto branch.
+    await database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)
+
+    async def boom():
+        raise RuntimeError("db gone")
+    monkeypatch.setattr(database, "get_plex_server_statuses", boom)
+    keys = {r["section_key"] for r in await database.get_effective_enabled_libraries()}
+    assert keys == {"m1:1", "m2:1", "3", "jf-abc:9"}
+
+
+async def test_delete_plex_server_removes_everything_and_tombstones(db):
+    await database.reconcile_plex_servers(
+        [_health_row("m_1"), _health_row("m_10")], mark_missing=True)
+    await database.toggle_library("m_1:1", "A", True)
+    await database.toggle_library("m_10:1", "B", True)
+    await database.add_plex_seen_libraries("m_1", ["1", "2"])
+    await database.add_plex_seen_libraries("m_10", ["1"])
+    await database.set_disabled_sources(["m_1", "m_10", "jf-x"])
+
+    await database.delete_plex_server("m_1")
+
+    assert set(await _raw_rows()) == {"m_10"}
+    assert {r["section_key"] for r in await database.get_enabled_libraries()} == {"m_10:1"}
+    assert await database.get_plex_seen_libraries("m_1") == []
+    assert await database.get_plex_seen_libraries("m_10") == ["1"]
+    assert await database.get_disabled_sources() == ["m_10", "jf-x"]
+    assert await database.get_plex_tombstones() == ["m_1"]
+    # Invariant: no library/seen row carries a tombstoned prefix.
+    for r in await database.get_enabled_libraries():
+        assert database.source_id_from_section_key(r["section_key"]) != "m_1"
+
+
+async def test_delete_plex_server_is_all_or_nothing(db, monkeypatch):
+    await database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)
+    await database.toggle_library("m1:1", "A", True)
+    await database.set_disabled_sources(["m1"])
+    conn = database._conn()
+    real_exec = conn.execute
+
+    def failing(sql, *a, **kw):
+        if "plex_removed_servers" in sql and sql.lstrip().upper().startswith("INSERT"):
+            raise RuntimeError("disk full")
+        return real_exec(sql, *a, **kw)
+    monkeypatch.setattr(conn, "execute", failing)
+    with pytest.raises(RuntimeError):
+        await database.delete_plex_server("m1")
+    monkeypatch.undo()
+    assert set(await _raw_rows()) == {"m1"}
+    assert {r["section_key"] for r in await database.get_enabled_libraries()} == {"m1:1"}
+    assert await database.get_disabled_sources() == ["m1"]
+    assert await database.get_plex_tombstones() == []
+
+
+async def test_seen_libraries_round_trip_and_idempotent(db):
+    assert await database.get_plex_seen_libraries("m1") == []
+    await database.add_plex_seen_libraries("m1", ["2", "1"])
+    await database.add_plex_seen_libraries("m1", ["1", "3"])  # no dupes, no error
+    assert await database.get_plex_seen_libraries("m1") == ["1", "2", "3"]
+    assert await database.get_plex_seen_libraries("m2") == []
+
+
+async def test_plex_account_token_sealed_round_trip_and_corrupt_reads_none(db):
+    from pathlib import Path
+    assert await database.get_plex_account_token() is None
+    await database.set_plex_account_token("ACCOUNT-SECRET-123")
+    assert await database.get_plex_account_token() == "ACCOUNT-SECRET-123"
+    assert b"ACCOUNT-SECRET-123" not in Path(db.db_path).read_bytes()
+    await database.set_setting("plex_account_token", "enc:fernet:garbage")
+    assert await database.get_plex_account_token() is None
+    await database.set_plex_account_token(None)
+    assert await database.get_plex_account_token() is None
+
+
+async def test_health_writers_hold_the_write_lock(db):
+    acquired = []
+    real = database._write_tx_lock
+
+    class Tracking:
+        async def __aenter__(self):
+            acquired.append(True)
+            return await real.__aenter__()
+
+        async def __aexit__(self, *a):
+            return await real.__aexit__(*a)
+
+    database._write_tx_lock = Tracking()
+    try:
+        for label, call in (
+            ("reconcile_plex_servers",
+             lambda: database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)),
+            # 2026-11-22 review #3: the single execute+commit writers too -- an
+            # unlocked implicit transaction open across their await is what
+            # nests into another task's BEGIN IMMEDIATE on the shared connection.
+            ("set_plex_server_status",
+             lambda: database.set_plex_server_status("m1", "token_rejected")),
+            ("add_plex_seen_libraries",
+             lambda: database.add_plex_seen_libraries("m1", ["m1:1"])),
+            ("mark_plex_seen_baseline_pending",
+             lambda: database.mark_plex_seen_baseline_pending(["m1"])),
+            ("clear_plex_tombstones", database.clear_plex_tombstones),
+            ("delete_plex_server", lambda: database.delete_plex_server("m1")),
+        ):
+            acquired.clear()
+            await call()
+            assert acquired, "%s did not take _write_tx_lock" % label
+    finally:
+        database._write_tx_lock = real
+
+
+async def test_status_write_during_reconcile_waits_for_the_lock_and_reconcile_commits_whole(db):
+    """2026-11-22 review #3: a fire-and-forget 401 status write issued while a
+    reconcile holds ``_write_tx_lock`` must WAIT, not interleave with the open
+    BEGIN IMMEDIATE block. Instrumented at ``_begin_immediate``: the status
+    task is launched right after BEGIN and given several loop turns; it must
+    still be pending when the reconcile commits, and both outcomes land --
+    the reconcile's row set whole, then the status on top of it. Mutation
+    checked: dropping the lock from set_plex_server_status fails the pending
+    assertion (the status UPDATE rides inside the reconcile's transaction)."""
+    await database.reconcile_plex_servers([_health_row("m1")], mark_missing=True)
+    real_begin = database._begin_immediate
+    launched = {}
+
+    async def spying_begin(conn, what):
+        await real_begin(conn, what)
+        task = asyncio.ensure_future(database.set_plex_server_status("m1", "token_rejected"))
+        launched["task"] = task
+        for _ in range(5):
+            await asyncio.sleep(0)
+        launched["pending_after_begin"] = not task.done()
+
+    database._begin_immediate = spying_begin
+    try:
+        result = await database.reconcile_plex_servers(
+            [_health_row("m1", name="Renamed"), _health_row("m2")], mark_missing=True)
+    finally:
+        database._begin_immediate = real_begin
+    assert launched["pending_after_begin"],         "set_plex_server_status ran inside the reconcile's open transaction"
+    await launched["task"]
+    rows = await _raw_rows()
+    assert result["added"] == ["m2"]
+    assert rows["m1"]["name"] == "Renamed" and rows["m2"]["status"] == "usable"
+    assert rows["m1"]["status"] == "token_rejected"   # the waited write landed after
+
+
+async def test_plex_status_migration_marks_pre_existing_servers_baseline_pending(db):
+    """Source-health U1 + 2026-11-22 review #9: a server saved before the status
+    columns existed gets a baseline marker, so its first usable probe records
+    its libraries without enabling any; the marker is not a library and the
+    first real key retires it."""
+    conn = database._conn()
+    await conn.execute("DROP TABLE plex_servers")
+    await conn.execute(
+        "CREATE TABLE plex_servers (machine_id TEXT PRIMARY KEY, server_url TEXT NOT NULL,"
+        " name TEXT NOT NULL, owner TEXT NOT NULL, token TEXT NOT NULL,"
+        " client_id TEXT NOT NULL, owned INTEGER)")
+    await conn.execute(
+        "INSERT INTO plex_servers (machine_id, server_url, name, owner, token, client_id, owned)"
+        " VALUES ('old', 'https://old.example.invalid:32400', 'Old', 'me', 't', 'cid', 1)")
+    await conn.commit()
+    await database._migrate_columns()
+    await conn.commit()
+
+    assert await database.plex_seen_baseline_pending("old")
+    assert await database.get_plex_seen_libraries("old") == []
+    assert not await database.plex_seen_baseline_pending("new")
+
+    await database.add_plex_seen_libraries("old", ["1", "2"])
+    assert await database.get_plex_seen_libraries("old") == ["1", "2"]
+    assert not await database.plex_seen_baseline_pending("old")
+    # Idempotent: a second migration pass never re-marks a recorded server.
+    await database._migrate_columns()
+    assert not await database.plex_seen_baseline_pending("old")

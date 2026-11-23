@@ -77,11 +77,12 @@ docker run -d --name jukeplox \
   --network host \
   --restart unless-stopped \
   -v jukeplox-data:/data \
+  -v /etc/localtime:/etc/localtime:ro \
   -e BIND_HOST=192.168.1.50 \
   djrkod/jukeplox:latest
 ```
 
-1. Replace `192.168.1.50` with your LAN IP (`hostname -I`). **Casting fails silently if `BIND_HOST` is wrong.**
+1. Replace `192.168.1.50` with your LAN IP (`hostname -I`). **Casting fails silently if `BIND_HOST` is wrong.** The `/etc/localtime` mount makes the container follow your clock, so the daily Plex sweep runs at the hour you set (the image itself is UTC; `-e TZ=Europe/London` works too).
 2. Open `http://<IP>` → set an admin password (**≥12 chars, no reset**) → add a source under **Setup → Libraries** (Plex, Jellyfin, or a local folder) → pick a speaker under **Setup → Output**.
 3. Share `http://<IP>` with guests.
 
@@ -167,6 +168,22 @@ Add sources under **Setup → Libraries**. Your own servers' music libraries swi
 start indexing on connect (untick any under **Edit libraries…**); a server *shared with
 you* stays off until you tick its libraries. **Rescan** rebuilds the catalog on demand
 (the catalog rebuilds on connect or a manual rescan, not on restart).
+
+**Plex servers look after themselves.** Plex hands out a separate access token for every
+server shared with you and reissues it whenever the owner changes the share, so a saved
+token can stop working without anything on your side changing. Jukeplox re-runs Plex
+discovery when a server rejects its token, at startup, and once a day at a quiet hour
+(set the hour under **Setup → Libraries**, next to the "Next sweep" line; it is read in
+the container's local time, see the `/etc/localtime` mount above). Each Plex row on the
+Sources list shows its last outcome: *checked HH:MM* when it is usable, *Token rejected,
+refresh pending*, *Unreachable at saved address*, *No longer shared with you*, or
+*Reconnect Plex to enable self-heal* when Jukeplox has no account login to refresh with
+(installs connected before this feature need one reconnect). A music library that newly
+appears on a server you own is switched on and indexed automatically; the rebuild waits
+until nothing has played for ten minutes, and the panel says so while it waits. A server
+that disappears from your Plex account keeps its row, marked *No longer shared with you*,
+and its music leaves browse and search at once; your library ticks are kept, so if the
+share comes back the music returns on its own. Use **Remove** on a marked row to forget it.
 
 - **Jellyfin** — **Connect Jellyfin** and sign in. Nothing to mount; it's reached over the
   network like Plex, and your password is never stored (only a token).

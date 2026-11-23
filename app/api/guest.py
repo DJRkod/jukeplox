@@ -1119,7 +1119,12 @@ async def browse_artist_albums(artist_id: str):
     if not client:
         raise HTTPException(status_code=503, detail="No media source configured")
     compiled = await _compiled_rules()
-    own, appears, artist_norm = await _assemble_artist_releases(artist_id, client, compiled)
+    try:
+        own, appears, artist_norm = await _assemble_artist_releases(artist_id, client, compiled)
+    except KeyError:
+        # The id's prefix names no registered source (a server plex.tv no
+        # longer shares -- health plan U5 / #44): not found, not a server fault.
+        raise HTTPException(status_code=404, detail="Artist not found")
     if artist_norm is None:
         raise HTTPException(status_code=404, detail="Artist not found")
     return own + appears
@@ -1170,6 +1175,19 @@ async def browse_artist_songs(artist_id: str):
     if not client:
         raise HTTPException(status_code=503, detail="No media source configured")
     compiled = await _compiled_rules()
+    try:
+        return await _assemble_artist_songs(artist_id, client, compiled)
+    except KeyError:
+        # The id's prefix names no registered source (a server plex.tv no
+        # longer shares -- health plan U5 / #44). The per-release children
+        # fetches are fail-soft, but the popularity lookup routes by the
+        # artist id itself and surfaces the registry's KeyError: 404, not 500.
+        raise HTTPException(status_code=404, detail="Artist not found")
+
+
+async def _assemble_artist_songs(artist_id: str, client, compiled) -> dict:
+    """Native-branch body of ``browse_artist_songs`` (split out so the route can
+    map a registry ``KeyError`` to 404 in one place -- U5 / #44)."""
     own, appears, artist_norm = await _assemble_artist_releases(artist_id, client, compiled)
     if artist_norm is None:
         raise HTTPException(status_code=404, detail="Artist not found")

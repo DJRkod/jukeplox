@@ -155,7 +155,7 @@ async def test_serve_transcoded_flac_returns_range_capable_file_response(tmp_pat
     flac = tmp_path / "out.flac"
     flac.write_bytes(b"fLaC" + b"\0" * 4096)
 
-    async def _fake_get_or_transcode(key, plex_url, headers=None):
+    async def _fake_get_or_transcode(key, plex_url, headers=None, on_status=None):
         return str(flac)
 
     monkeypatch.setattr(s, "_get_or_transcode", _fake_get_or_transcode)
@@ -163,6 +163,30 @@ async def test_serve_transcoded_flac_returns_range_capable_file_response(tmp_pat
     resp = await s._serve_transcoded_flac("k", "http://plex/x.ogg")
     assert isinstance(resp, FileResponse)
     assert resp.media_type == "audio/flac"
+
+
+async def test_transcode_failure_logs_key_and_exception_class_never_the_token(monkeypatch, caplog):
+    """2026-11-22 review: the transcode-failed warning used to print the Plex
+    URL (X-Plex-Token embedded) and the exception text (which httpx fills with
+    the URL too). It must log the stream key and the exception CLASS only --
+    the class-only rule of app/plex/health.py and app/sources/registry.py."""
+    from app.api import stream as s
+    from fastapi import HTTPException
+
+    url = "http://plex.test:32400/library/parts/1/f.ogg?X-Plex-Token=SECRET-TOKEN-123"
+
+    async def _boom(key, plex_url, headers=None, on_status=None):
+        raise RuntimeError(f"upstream failed for {plex_url}")
+
+    monkeypatch.setattr(s, "_get_or_transcode", _boom)
+    caplog.set_level(logging.DEBUG, logger="app.api.stream")
+    with pytest.raises(HTTPException) as ei:
+        await s._serve_transcoded_flac("k1", url)
+    assert ei.value.status_code == 502
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "X-Plex-Token" not in text and "SECRET-TOKEN-123" not in text, text
+    assert "plex.test" not in text, text
+    assert "k1" in text and "RuntimeError" in text
 
 
 async def test_get_or_transcode_caches_one_transcode_per_key(tmp_path, monkeypatch):
@@ -174,7 +198,7 @@ async def test_get_or_transcode_caches_one_transcode_per_key(tmp_path, monkeypat
     s._TRANSCODE_CACHE.clear()
     calls = {"n": 0}
 
-    async def _fake_fetch(plex_url, headers=None):
+    async def _fake_fetch(plex_url, headers=None, on_status=None):
         calls["n"] += 1
         p = tmp_path / f"f{calls['n']}.flac"
         p.write_bytes(b"fLaC")
@@ -204,7 +228,7 @@ async def test_get_or_transcode_coalesces_same_key_parallelizes_distinct(tmp_pat
     inflight = {"n": 0, "peak": 0}
     calls = {"n": 0}
 
-    async def _fake_fetch(plex_url, headers=None):
+    async def _fake_fetch(plex_url, headers=None, on_status=None):
         calls["n"] += 1
         inflight["n"] += 1
         inflight["peak"] = max(inflight["peak"], inflight["n"])
@@ -240,7 +264,7 @@ async def test_get_or_transcode_evicts_and_unlinks_lru(tmp_path, monkeypatch):
     monkeypatch.setattr(s, "_TRANSCODE_CACHE_MAX", 2)
     seq = {"n": 0}
 
-    async def _fake_fetch(plex_url, headers=None):
+    async def _fake_fetch(plex_url, headers=None, on_status=None):
         p = tmp_path / f"{seq['n']}.flac"
         seq["n"] += 1
         p.write_bytes(b"fLaC")
@@ -265,7 +289,7 @@ async def test_get_or_transcode_evicts_and_unlinks_lru(tmp_path, monkeypatch):
 def _stream_fake_fetch(tmp_path):
     seq = {"n": 0}
 
-    async def _fake_fetch(plex_url, headers=None):
+    async def _fake_fetch(plex_url, headers=None, on_status=None):
         p = tmp_path / f"{seq['n']}.flac"
         seq["n"] += 1
         p.write_bytes(b"fLaC")
@@ -1069,3 +1093,147 @@ async def test_truncated_upstream_never_yields_a_short_cached_transcode(tmp_path
     # killed-ffmpeg path can leave a zero-byte stub that the host cannot unlink
     # while the handle is open — verified absent on Linux, where it ships.
     assert not (_stubs() - before), "rejected transcode left its temp file behind"
+
+
+# ── U3 (2026-11-21 plex source health): upstream 401 reaches the health hook ──
+# The proxy uses its own httpx client with the token in the URL and sees only a
+# status integer. A Plex upstream 401 fires health.on_server_401 with the key's
+# machine id; a non-Plex prefix never does.
+
+_B_FLAC = "http://plex-b.example.invalid:32400/library/parts/1/2/file.flac"
+_B_OGG = "http://plex-b.example.invalid:32400/library/parts/9/1/file.ogg"
+
+
+def _plex_reg(url: str, source_type="plex"):
+    from unittest.mock import MagicMock
+    from app.sources.base import StreamTarget
+    reg = MagicMock()
+    reg.resolve_stream = MagicMock(return_value=StreamTarget(url=url))
+    reg.source_type_for = MagicMock(return_value=source_type)
+    return reg
+
+
+def test_proxy_plex_upstream_401_calls_hook_with_key_machine_id():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi.testclient import TestClient
+    import respx
+    from app.main import app
+    url = _B_FLAC + "?X-Plex-Token=t"
+    hook = MagicMock()
+    with respx.mock(assert_all_called=False) as rx, \
+         patch("app.state.is_authorized_stream_key", return_value=True), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=_plex_reg(url))), \
+         patch("app.plex.health.on_server_401", hook):
+        rx.get(url__startswith=_B_FLAC).mock(return_value=httpx.Response(401, content=b""))
+        r = TestClient(app).get("/api/stream", params={"key": "B:/library/parts/1/2/file.flac"})
+    assert r.status_code == 401
+    hook.assert_called_once_with("B")
+
+
+def test_proxy_jellyfin_upstream_401_does_not_call_hook():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi.testclient import TestClient
+    import respx
+    from app.main import app
+    url = "http://jf.example.invalid:8096/Audio/1/stream.flac"
+    hook = MagicMock()
+    with respx.mock(assert_all_called=False) as rx, \
+         patch("app.state.is_authorized_stream_key", return_value=True), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=_plex_reg(url, "jellyfin"))), \
+         patch("app.plex.health.on_server_401", hook):
+        rx.get(url).mock(return_value=httpx.Response(401, content=b""))
+        r = TestClient(app).get("/api/stream", params={"key": "JF:1"})
+    assert r.status_code == 401
+    hook.assert_not_called()
+
+
+def test_proxy_plex_upstream_200_does_not_call_hook():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi.testclient import TestClient
+    import respx
+    from app.main import app
+    hook = MagicMock()
+    with respx.mock(assert_all_called=False) as rx, \
+         patch("app.state.is_authorized_stream_key", return_value=True), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=_plex_reg(_B_FLAC))), \
+         patch("app.plex.health.on_server_401", hook):
+        rx.get(_B_FLAC).mock(return_value=httpx.Response(
+            200, content=b"fLaC", headers={"content-type": "audio/flac"}))
+        r = TestClient(app).get("/api/stream", params={"key": "B:/library/parts/1/2/file.flac"})
+    assert r.status_code == 200 and r.content == b"fLaC"
+    hook.assert_not_called()
+
+
+async def test_passthrough_resume_401_reports_status():
+    """The reopen path sees the upstream status too: a token revoked mid-track
+    surfaces on the resume request."""
+    from app.api import stream as s
+    first = _ByteResp([b"x" * 10], {"content-length": "20", "content-type": "audio/flac"},
+                      raise_after=True)
+    denied = _ByteResp([b""], {})
+    denied.status_code = 401
+    client = _ResumeClient([denied])
+    seen: list[int] = []
+    resp = s._stream_passthrough(first, client, "http://plex/file.flac", {}, on_status=seen.append)
+    await _drain(resp)
+    assert 401 in seen
+
+
+async def test_fetch_and_transcode_401_reports_status_once(monkeypatch):
+    """An Ogg source: the transcode fetch opens the upstream itself, so its
+    status must be observed here — nothing else in the chain sees it."""
+    from unittest.mock import AsyncMock
+    import respx
+    from app.api import stream as s
+    url = _B_OGG + "?X-Plex-Token=t"
+    seen: list[int] = []
+    monkeypatch.setattr(s, "_transcode_to_flac_file", AsyncMock(return_value="/tmp/x.flac"))
+    with respx.mock(assert_all_called=False) as rx:
+        rx.get(url__startswith=_B_OGG).mock(return_value=httpx.Response(401, content=b""))
+        await s._fetch_and_transcode(url, {}, on_status=seen.append)
+    assert seen == [401]
+
+
+def test_proxy_ogg_upstream_401_calls_hook_once(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi.testclient import TestClient
+    import respx
+    from app.main import app
+    from app.api import stream as s
+    flac = tmp_path / "out.flac"
+    flac.write_bytes(b"fLaC")
+    url = _B_OGG + "?X-Plex-Token=t"
+    key = "B:/library/parts/9/1/file.ogg-u3"
+    hook = MagicMock()
+    monkeypatch.setattr(s, "_transcode_to_flac_file", AsyncMock(return_value=str(flac)))
+    s._TRANSCODE_CACHE.pop(key, None)
+    try:
+        with respx.mock(assert_all_called=False) as rx, \
+             patch("app.state.is_authorized_stream_key", return_value=True), \
+             patch("app.state.get_plex_client", AsyncMock(return_value=_plex_reg(url))), \
+             patch("app.plex.health.on_server_401", hook):
+            rx.get(url__startswith=_B_OGG).mock(return_value=httpx.Response(401, content=b""))
+            r = TestClient(app).get("/api/stream", params={"key": key})
+    finally:
+        s._TRANSCODE_CACHE.pop(key, None)
+    assert r.status_code == 200
+    hook.assert_called_once_with("B")
+
+
+def test_proxy_unknown_source_prefix_returns_404_not_500():
+    """Health plan U5 / #44: a stream key whose prefix names no registered source
+    (a server plex.tv stopped sharing mid-party, still sitting in a guest's
+    queue) makes the registry raise ``KeyError``. The proxy maps that to 404 --
+    the track is gone, not a server fault -- instead of an unhandled 500."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    reg = MagicMock()
+    reg.resolve_stream = MagicMock(side_effect=KeyError("machine-gone"))
+
+    with patch("app.state.is_authorized_stream_key", return_value=True), \
+         patch("app.state.get_plex_client", AsyncMock(return_value=reg)):
+        r = TestClient(app).get("/api/stream", params={"key": "machine-gone:part"})
+    assert r.status_code == 404
+    assert "machine-gone" not in r.text  # no key echo; a fixed, neutral detail

@@ -15,7 +15,8 @@ from app.output import hold  # the hold flag's home since the session decomposit
 from app.plex.models import Library, Track, Album, Artist
 from app.queue.models import QueueEndBehavior
 
-from tests.conftest import make_track, make_album, make_artist
+from tests.conftest import (make_track, make_album, make_artist,
+                            make_vanished_source_registry, make_sourced_track)
 
 
 # ── Auth guard ────────────────────────────────────────────────────────────────
@@ -50,12 +51,20 @@ def test_sources_endpoints_require_auth(anon_client, mock_session):
 
 def test_scan_status_returns_snapshot(client, mock_state):
     # U15: the admin scan badge reads the shared scan_status snapshot.
+    from datetime import datetime as _dt
     snap = {"sources": 1, "scanning": True, "scanned": False, "empty": True}
     with patch("app.state.scan_status", AsyncMock(return_value=snap)), \
-         patch("app.state.grouping_degraded_libraries", return_value=[]):
+         patch("app.state.grouping_degraded_libraries", return_value=[]), \
+         patch("app.plex.health.account_status", "ok"), \
+         patch("app.plex.health.pending_rebuild_since", AsyncMock(return_value=None)), \
+         patch("app.plex.health.projected_next_refresh_at",
+               AsyncMock(return_value=_dt(2026, 11, 23, 4, 0))):
         resp = client.get("/admin/scan-status")
     assert resp.status_code == 200
-    assert resp.json() == {**snap, "grouping_degraded_libraries": []}
+    # Plex source-health fields (2026-11-21 plan U6) ride on the same payload.
+    assert resp.json() == {**snap, "grouping_degraded_libraries": [],
+                           "account_status": "ok", "rebuild_pending": None,
+                           "next_refresh_at": "2026-11-23T04:00"}
 
 
 def test_admin_scan_status_names_libraries_with_degraded_grouping(client, mock_state):
@@ -76,7 +85,8 @@ def test_admin_scan_status_names_libraries_with_degraded_grouping(client, mock_s
 
 def test_list_sources_combines_plex_and_jellyfin(client, mock_state):
     with patch("app.api.admin.database.get_plex_servers",
-               AsyncMock(return_value=[{"machine_id": "m1", "name": "Home Plex"}])), \
+               AsyncMock(return_value=[{"machine_id": "m1", "name": "Home Plex", "status": "usable",
+                                        "status_checked_at": "2026-11-22T04:02:00+00:00"}])), \
          patch("app.api.admin.database.get_jellyfin_sources",
                AsyncMock(return_value=[{"source_id": "jf-1", "name": "Den Jelly"}])), \
          patch("app.api.admin.database.get_subsonic_sources", AsyncMock(return_value=[])), \
@@ -86,8 +96,10 @@ def test_list_sources_combines_plex_and_jellyfin(client, mock_state):
         resp = client.get("/admin/sources")
     assert resp.status_code == 200
     srcs = resp.json()["sources"]
-    assert {"source_id": "m1", "type": "plex", "name": "Home Plex", "enabled": True} in srcs
-    assert {"source_id": "jf-1", "type": "jellyfin", "name": "Den Jelly", "enabled": True} in srcs
+    assert {"source_id": "m1", "type": "plex", "name": "Home Plex", "enabled": True,
+            "status": "usable", "status_checked_at": "2026-11-22T04:02:00+00:00"} in srcs
+    assert {"source_id": "jf-1", "type": "jellyfin", "name": "Den Jelly", "enabled": True,
+            "status": None, "status_checked_at": None} in srcs
 
 
 def test_connect_jellyfin_success_saves_token_only_and_scans(client, mock_state):
@@ -1052,9 +1064,11 @@ def test_list_sources_includes_subsonic_and_emby(client, mock_state):
     assert resp.status_code == 200
     srcs = {s["source_id"]: s for s in resp.json()["sources"]}
     assert srcs["subsonic-1"] == {"source_id": "subsonic-1", "type": "subsonic",
-                                  "name": "Navidrome", "enabled": True}
+                                  "name": "Navidrome", "enabled": True,
+                                  "status": None, "status_checked_at": None}
     assert srcs["emby-1"] == {"source_id": "emby-1", "type": "emby",
-                              "name": "Living Room", "enabled": False}
+                              "name": "Living Room", "enabled": False,
+                              "status": None, "status_checked_at": None}
 
 
 def test_sources_new_endpoints_require_auth(anon_client, mock_session):
@@ -1083,7 +1097,8 @@ def test_list_sources_includes_local(client, mock_state):
                AsyncMock(return_value=[{"source_id": "local-abc", "name": "Vinyl Rips"}])):
         resp = client.get("/admin/sources")
     assert resp.status_code == 200
-    assert {"source_id": "local-abc", "type": "local", "name": "Vinyl Rips", "enabled": True} in resp.json()["sources"]
+    assert {"source_id": "local-abc", "type": "local", "name": "Vinyl Rips", "enabled": True,
+            "status": None, "status_checked_at": None} in resp.json()["sources"]
 
 
 def test_connect_local_success_saves_and_scans(client, mock_state, tmp_path):
@@ -1295,122 +1310,48 @@ def test_list_sources_fails_open_when_veto_unreadable(client, mock_state):
         resp = client.get("/admin/sources")
     assert resp.status_code == 200
     assert resp.json()["sources"] == [{"source_id": "jf-1", "type": "jellyfin",
-                                       "name": "Den", "enabled": True}]
+                                       "name": "Den", "enabled": True,
+                                       "status": None, "status_checked_at": None}]
 
 
-def test_plex_poll_clears_veto_only_for_newly_added_server(client, mock_state):
-    # A reconnect that adds server B must clear B's veto but leave a deliberately-
-    # disabled, already-connected server A vetoed (ce-code-review 2026-07-28).
-    setv = AsyncMock()
-    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
-         patch("app.api.admin.database.get_plex_servers",
-               AsyncMock(side_effect=[[{"machine_id": "A"}], [{"machine_id": "A"}, {"machine_id": "B"}]])), \
-         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=["A", "B"])), \
-         patch("app.api.admin.database.set_disabled_sources", setv), \
-         patch("app.api.admin._enable_new_source_libraries", AsyncMock()), \
-         patch("app.state.trigger_catalog_refresh", MagicMock()), \
-         patch("app.state.invalidate_plex_client", MagicMock()):
-        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
-    assert resp.status_code == 200
-    setv.assert_awaited_once_with(["A"])   # B (newly added) cleared; A (already-connected) kept
-
-
-def test_plex_poll_does_not_clear_veto_of_already_connected_server(client, mock_state):
-    # Re-auth with NO new server must not touch an existing server's veto (no over-clear).
-    setv = AsyncMock()
-    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
-         patch("app.api.admin.database.get_plex_servers",
-               AsyncMock(side_effect=[[{"machine_id": "A"}], [{"machine_id": "A"}]])), \
-         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=["A"])), \
-         patch("app.api.admin.database.set_disabled_sources", setv), \
-         patch("app.api.admin._enable_new_source_libraries", AsyncMock()), \
-         patch("app.state.trigger_catalog_refresh", MagicMock()), \
-         patch("app.state.invalidate_plex_client", MagicMock()):
-        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
-    assert resp.status_code == 200
-    setv.assert_not_awaited()   # A stays vetoed — no over-clear on re-auth
-
-
-def test_plex_poll_seeds_new_owned_server_libraries_and_scans(client, mock_state):
-    # Fresh-install audit F1 (2026-08-06): a NEWLY connected OWNED Plex server's
-    # libraries seed enabled-by-default — a single-library server rendered no
-    # per-library control, so without seeding a doc-following fresh install
-    # dead-ended with a permanently empty catalog. A crawl also kicks off without
-    # a manual Rescan, matching the Jellyfin/local connect handlers.
+def test_plex_poll_reports_the_reconcile_result_not_a_table_diff(client, mock_state):
+    """Source-health plan U2 / KTD1: the poll consumes the connect-origin
+    reconcile result. Veto clear, owned-library seeding and the fresh-install
+    crawl now live inside health.reconcile (tests/test_plex_health.py); the
+    route neither diffs get_plex_servers() before/after nor seeds itself."""
+    from app.plex import health
+    outcome = health.ReconcileResult(added=["B"], returned=["R"], new_libraries=["A:9"])
+    gps = AsyncMock(return_value=[{"machine_id": "A"}])
     seed = AsyncMock()
-    trig = MagicMock()
-    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
-         patch("app.api.admin.database.get_plex_servers",
-               AsyncMock(side_effect=[[], [{"machine_id": "B", "owned": 1}]])), \
-         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
-         patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
+    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=outcome)), \
+         patch("app.api.admin.database.get_plex_servers", gps), \
          patch("app.api.admin._enable_new_source_libraries", seed), \
-         patch("app.state.trigger_catalog_refresh", trig), \
+         patch("app.state.trigger_catalog_refresh", MagicMock()) as trig, \
          patch("app.state.invalidate_plex_client", MagicMock()):
         resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
     assert resp.status_code == 200
-    seed.assert_awaited_once_with("B")
-    trig.assert_called_once()
-
-
-def test_plex_poll_never_seeds_shared_server_libraries(client, mock_state):
-    # Owned-only seeding policy (2026-08-06): a friend's shared library must not
-    # auto-crawl into the party catalog. Shared (owned=0) and legacy (owned=NULL)
-    # servers stay opt-in via the always-rendered Libraries drill-in.
-    seed = AsyncMock()
-    trig = MagicMock()
-    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
-         patch("app.api.admin.database.get_plex_servers",
-               AsyncMock(side_effect=[[], [{"machine_id": "S", "owned": 0},
-                                           {"machine_id": "L", "owned": None}]])), \
-         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
-         patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
-         patch("app.api.admin._enable_new_source_libraries", seed), \
-         patch("app.state.trigger_catalog_refresh", trig), \
-         patch("app.state.invalidate_plex_client", MagicMock()):
-        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
-    assert resp.status_code == 200
-    seed.assert_not_awaited()
-    trig.assert_not_called()   # nothing seeded → no auto-crawl
-
-
-def test_plex_poll_mixed_batch_seeds_only_the_owned_server(client, mock_state):
-    # One connect adding an owned NAS + a shared server: only the owned one
-    # seeds; the crawl fires once.
-    seed = AsyncMock()
-    trig = MagicMock()
-    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
-         patch("app.api.admin.database.get_plex_servers",
-               AsyncMock(side_effect=[[], [{"machine_id": "OWN", "owned": 1},
-                                           {"machine_id": "SHARED", "owned": 0}]])), \
-         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
-         patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
-         patch("app.api.admin._enable_new_source_libraries", seed), \
-         patch("app.state.trigger_catalog_refresh", trig), \
-         patch("app.state.invalidate_plex_client", MagicMock()):
-        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
-    assert resp.status_code == 200
-    seed.assert_awaited_once_with("OWN")
-    trig.assert_called_once()
-
-
-def test_plex_poll_reauth_never_reseeds_libraries(client, mock_state):
-    # A RE-auth (no new machine_id) must never overwrite a remembered per-library
-    # selection: no seeding, no auto-crawl (fresh-install audit F1 scope guard).
-    seed = AsyncMock()
-    trig = MagicMock()
-    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=True)), \
-         patch("app.api.admin.database.get_plex_servers",
-               AsyncMock(side_effect=[[{"machine_id": "A"}], [{"machine_id": "A"}]])), \
-         patch("app.api.admin.database.get_disabled_sources", AsyncMock(return_value=[])), \
-         patch("app.api.admin.database.set_disabled_sources", AsyncMock()), \
-         patch("app.api.admin._enable_new_source_libraries", seed), \
-         patch("app.state.trigger_catalog_refresh", trig), \
-         patch("app.state.invalidate_plex_client", MagicMock()):
-        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
-    assert resp.status_code == 200
+    assert resp.json() == {"resolved": True, "added": ["B"], "returned": ["R"],
+                           "vanished": [], "new_libraries": ["A:9"]}
+    gps.assert_not_awaited()
     seed.assert_not_awaited()
     trig.assert_not_called()
+
+
+def test_plex_poll_unresolved_pin(client, mock_state):
+    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=None)):
+        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
+    assert resp.status_code == 200
+    assert resp.json() == {"resolved": False}
+
+
+def test_plex_poll_response_carries_no_token(client, mock_state):
+    from app.plex import health
+    outcome = health.ReconcileResult(added=["B"], changed_tokens=["A"])
+    with patch("app.api.admin.plex_oauth.complete_flow", AsyncMock(return_value=outcome)):
+        resp = client.get("/admin/plex/connect/poll/123?client_id=cid")
+    body = resp.json()
+    assert "changed_tokens" not in body  # ids only ever leave as counts elsewhere
+    assert set(body) == {"resolved", "added", "returned", "vanished", "new_libraries"}
 
 
 # ── Surprise Me settings (2026-06-17 plan U3) ────────────────────────────────
@@ -2112,6 +2053,73 @@ async def test_playback_skip_stops_when_queue_empty(client, mock_state):
     assert resp.status_code == 200
     or_.stop.assert_awaited_once()
     or_.play.assert_not_awaited()
+
+
+def _no_errors(caplog):
+    import logging
+    return not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def _vanished_warnings(caplog, logger_name):
+    """WARNING records from ``logger_name`` that name the dead prefix and
+    leak neither the key body nor a URL."""
+    import logging
+    recs = [r for r in caplog.records
+            if r.name == logger_name and r.levelno == logging.WARNING]
+    for r in recs:
+        msg = r.getMessage()
+        assert "machine-gone" in msg
+        assert "part1" not in msg and "http" not in msg, msg
+    return recs
+
+
+async def test_playback_skip_skips_item_whose_prefix_has_no_source(client, mock_state, caplog):
+    """2026-11-22 review #4, mirror of tests/test_state.py::
+    test_do_advance_skips_item_whose_prefix_has_no_source for the Skip button:
+    the next queued track's server vanished, so its URL build raises KeyError
+    from the registry. Skip must behave like _do_advance -- skip past the dead
+    item (R22 notice), play the survivor, 200 -- never a 500."""
+    import logging
+    qe, or_ = mock_state
+    gone = make_sourced_track("machine-gone", 1, "Gone Song")
+    live = make_sourced_track("machine-live", 2, "Live Song")
+    await qe.append(gone, bypass_lock=True)
+    await qe.append(live, bypass_lock=True)
+    skipped = AsyncMock()
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=make_vanished_source_registry())), \
+         patch("app.state._stream_url_base", lambda: ""), \
+         patch("app.state._emit_track_skipped", skipped), \
+         caplog.at_level(logging.WARNING):
+        resp = client.post("/admin/playback/skip")
+    assert resp.status_code == 200
+    or_.play.assert_awaited_once()
+    assert or_.play.await_args.args[0] == "http://plex-live.test/machine-live:part2"
+    assert or_.play.await_args.args[1] is live
+    or_.stop.assert_not_awaited()
+    skipped.assert_awaited_once()
+    assert skipped.await_args.args[0] is gone
+    assert qe.state.current is not None and qe.state.current.track is live
+    assert _vanished_warnings(caplog, "app.playback_control")
+    assert _no_errors(caplog), "a vanished-source key is a skip, never an error"
+
+
+async def test_playback_skip_dead_item_draining_queue_stops_like_empty_queue(client, mock_state):
+    """The only queued item is unroutable: skipping past it empties the queue,
+    so Skip takes the empty-queue path (stop(), 200) -- nothing is dispatched
+    and nothing raises."""
+    qe, or_ = mock_state
+    gone = make_sourced_track("machine-gone", 1, "Gone Song")
+    await qe.append(gone, bypass_lock=True)
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=make_vanished_source_registry())), \
+         patch("app.state._stream_url_base", lambda: ""), \
+         patch("app.state._emit_track_skipped", AsyncMock()):
+        resp = client.post("/admin/playback/skip")
+    assert resp.status_code == 200
+    or_.play.assert_not_awaited()
+    or_.stop.assert_awaited_once()
+    assert qe.queue == []
 
 
 async def test_playback_skip_counts_via_confirmed_start_chokepoint(client, mock_state, fresh_supervisor):
@@ -3830,6 +3838,35 @@ def test_no_audio_persists_ap1_and_restarts_via_cliraop(client, mock_state):
     assert len(broadcasts) == 1
     assert broadcasts[0].device_id == "d1"
     assert broadcasts[0].protocol == "ap1"
+
+
+def test_no_audio_current_track_source_vanished_is_502_not_500(client, mock_state, caplog):
+    """2026-11-22 review #4: the current track's source vanished since it was
+    dispatched -- the URL build raises KeyError. The restart must answer 502
+    with a prefix-only warning (no key body, no URL), never an unhandled
+    KeyError, and must not announce a protocol flip that did not play."""
+    import logging
+    qe, or_ = mock_state
+    or_.active = _make_airplay_backend("d1")
+    from app.queue.models import QueueItem
+    qe._current = QueueItem(track=make_sourced_track("machine-gone", 1, "Gone Song"))
+    broadcasts: list = []
+
+    async def _broadcast(event):
+        broadcasts.append(event)
+
+    with patch("app.database.set_setting", AsyncMock()), \
+         patch("app.events.bus.manager.broadcast_to_admins", side_effect=_broadcast), \
+         patch("app.state.get_plex_client",
+               AsyncMock(return_value=make_vanished_source_registry())), \
+         patch("app.state._stream_url_base", lambda: ""), \
+         caplog.at_level(logging.WARNING):
+        resp = client.post("/admin/playback/no-audio")
+    assert resp.status_code == 502
+    or_.play.assert_not_awaited()
+    assert broadcasts == []
+    assert _vanished_warnings(caplog, "app.api.admin")
+    assert _no_errors(caplog)
 
 
 def test_no_audio_returns_400_when_active_backend_not_airplay(client, mock_state):
@@ -5629,6 +5666,7 @@ _COMMIT_ON_CHANGE = [
     ("surprise_me_source_mode", "plex"),
     ("surprise_me_diversity", "artist"),
     ("volume_orientation", "vertical"),
+    ("plex_refresh_hour", 2),
 ]
 
 
@@ -5823,3 +5861,204 @@ async def test_forced_rebuild_drops_stored_and_in_memory_answers(
 
 async def test_forced_rebuild_requires_auth(anon_client, mock_session):
     assert anon_client.post("/admin/browse/prepared/rebuild").status_code == 401
+
+
+# ── Plex source health on the Sources panel (2026-11-21 plan U6) ─────────────
+# The admin payload names each Plex server's status and check time, the panel
+# carries the account state / deferred-rebuild flag / next sweep time, the
+# sweep hour is validated, and a vanished server can be removed (KTD10).
+
+_SOURCES_EMPTY_PATCHES = (
+    ("app.api.admin.database.get_plex_config", None),
+    ("app.api.admin.database.get_jellyfin_sources", []),
+    ("app.api.admin.database.get_subsonic_sources", []),
+    ("app.api.admin.database.get_emby_sources", []),
+    ("app.api.admin.database.get_local_sources", []),
+    ("app.api.admin.database.get_disabled_sources", []),
+)
+
+_SCAN_SNAP_IDLE = {"sources": 1, "scanning": False, "scanned": True, "empty": False,
+                   "refresh_failed": False, "grouping_degraded": False}
+
+
+def test_list_sources_reads_vanished_rows_and_carries_plex_status(client, mock_state):
+    """Every Plex entry carries `status` + `status_checked_at` (KTD2) and the
+    read includes vanished rows so a no-longer-shared server is NAMED on the
+    list instead of silently disappearing (R2/R3)."""
+    rows = [
+        {"machine_id": "m1", "name": "Home", "status": "token_rejected",
+         "status_checked_at": "2026-11-22T04:02:00+00:00", "token": "never-shown"},
+        {"machine_id": "m2", "name": "Gone", "status": "no_longer_shared",
+         "status_checked_at": "2026-11-20T04:00:00+00:00",
+         "missing_since": "2026-11-20T04:00:00+00:00", "token": "never-shown"},
+    ]
+    gps = AsyncMock(return_value=rows)
+    with contextlib.ExitStack() as es:
+        es.enter_context(patch("app.api.admin.database.get_plex_servers", gps))
+        for target, val in _SOURCES_EMPTY_PATCHES:
+            es.enter_context(patch(target, AsyncMock(return_value=val)))
+        resp = client.get("/admin/sources")
+    assert resp.status_code == 200
+    gps.assert_awaited_once_with(include_vanished=True)
+    srcs = {s["source_id"]: s for s in resp.json()["sources"]}
+    assert srcs["m1"]["status"] == "token_rejected"
+    assert srcs["m1"]["status_checked_at"] == "2026-11-22T04:02:00+00:00"
+    assert srcs["m2"]["status"] == "no_longer_shared"
+    assert "never-shown" not in resp.text          # no token value in the payload
+    assert "missing_since" not in srcs["m2"]       # the entry shape is the documented one
+
+
+def test_list_sources_legacy_plex_config_entry_reads_unknown(client, mock_state):
+    """A legacy single-server install has no server row (KTD11): its one
+    synthetic entry reads status 'unknown' with no check time."""
+    with contextlib.ExitStack() as es:
+        es.enter_context(patch("app.api.admin.database.get_plex_servers", AsyncMock(return_value=[])))
+        for target, val in _SOURCES_EMPTY_PATCHES:
+            if target.endswith("get_plex_config"):
+                val = {"server_url": "http://example.invalid", "token": "x"}
+            es.enter_context(patch(target, AsyncMock(return_value=val)))
+        resp = client.get("/admin/sources")
+    [entry] = resp.json()["sources"]
+    assert entry["type"] == "plex" and entry["status"] == "unknown"
+    assert entry["status_checked_at"] is None
+
+
+def test_scan_status_carries_plex_health_fields(client, mock_state):
+    """`account_status`, `rebuild_pending` (ISO or null) and `next_refresh_at`
+    (ISO local) ride on the scan-status payload the Sources panel already polls."""
+    from datetime import datetime as _dt
+    with patch("app.state.scan_status", AsyncMock(return_value=dict(_SCAN_SNAP_IDLE))), \
+         patch("app.state.grouping_degraded_libraries", return_value=[]), \
+         patch("app.plex.health.account_status", "account_rejected"), \
+         patch("app.plex.health.pending_rebuild_since",
+               AsyncMock(return_value="2026-11-22T01:00:00+00:00")), \
+         patch("app.plex.health.projected_next_refresh_at",
+               AsyncMock(return_value=_dt(2026, 11, 23, 4, 0))):
+        resp = client.get("/admin/scan-status")
+    body = resp.json()
+    assert body["account_status"] == "account_rejected"
+    assert body["rebuild_pending"] == "2026-11-22T01:00:00+00:00"
+    assert body["next_refresh_at"] == "2026-11-23T04:00"
+    assert body["scanned"] is True                 # the existing snapshot is intact
+
+
+def test_scan_status_plex_health_fields_null_when_idle(client, mock_state):
+    from datetime import datetime as _dt
+    with patch("app.state.scan_status", AsyncMock(return_value=dict(_SCAN_SNAP_IDLE))), \
+         patch("app.state.grouping_degraded_libraries", return_value=[]), \
+         patch("app.plex.health.account_status", "ok"), \
+         patch("app.plex.health.pending_rebuild_since", AsyncMock(return_value=None)), \
+         patch("app.plex.health.projected_next_refresh_at",
+               AsyncMock(return_value=_dt(2026, 11, 23, 4, 0))):
+        body = client.get("/admin/scan-status").json()
+    assert body["account_status"] == "ok"
+    assert body["rebuild_pending"] is None
+
+
+def test_remove_plex_server_409_unless_no_longer_shared(client, mock_state):
+    """R18/KTD10: only a server Plex no longer shares can be removed here; a
+    live server stays (Plex disconnect is the path for those). Nothing is
+    deleted and the registry is not invalidated on the refusal."""
+    dele = AsyncMock()
+    with patch("app.api.admin.database.get_plex_server_statuses",
+               AsyncMock(return_value={"m1": "usable"})), \
+         patch("app.api.admin.database.delete_plex_server", dele), \
+         patch("app.state.invalidate_plex_client", MagicMock()) as inv:
+        resp = client.delete("/admin/sources/plex/m1")
+    assert resp.status_code == 409
+    dele.assert_not_awaited()
+    inv.assert_not_called()
+
+
+def test_remove_plex_server_unknown_id_404(client, mock_state):
+    with patch("app.api.admin.database.get_plex_server_statuses",
+               AsyncMock(return_value={"m1": "usable"})), \
+         patch("app.api.admin.database.delete_plex_server", AsyncMock()) as dele:
+        resp = client.delete("/admin/sources/plex/nope")
+    assert resp.status_code == 404
+    dele.assert_not_awaited()
+
+
+def test_remove_plex_server_deletes_vanished_row_and_invalidates(client, mock_state):
+    """A no_longer_shared server is removed through U1's tombstoning delete
+    (row + libraries + veto + tombstone in one transaction, covered in
+    tests/test_database.py) and the registry is rebuilt. No catalog rescan:
+    the vanished branch of reconcile already dropped its tracks (KTD6)."""
+    dele = AsyncMock()
+    with patch("app.api.admin.database.get_plex_server_statuses",
+               AsyncMock(return_value={"m1": "usable", "m2": "no_longer_shared"})), \
+         patch("app.api.admin.database.delete_plex_server", dele), \
+         patch("app.state.invalidate_plex_client", MagicMock()) as inv, \
+         patch("app.state.trigger_catalog_refresh", MagicMock()) as scan:
+        resp = client.delete("/admin/sources/plex/m2")
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    dele.assert_awaited_once_with("m2")
+    inv.assert_called_once()
+    scan.assert_not_called()
+
+
+def test_remove_plex_server_requires_auth(anon_client, mock_session):
+    assert anon_client.delete("/admin/sources/plex/m1").status_code == 401
+
+
+@pytest.mark.parametrize("bad", [24, -1, "abc"])
+def test_settings_rejects_plex_refresh_hour_outside_0_23(client, mock_state, bad):
+    """KTD7: the sweep hour must be an int 0..23; anything else is a 422 that
+    writes nothing, so the stored hour is unchanged."""
+    with patch("app.database.set_setting", AsyncMock()) as ss, \
+         patch("app.database.get_setting", AsyncMock(return_value="4")), \
+         patch("app.plex.health.reschedule_daily_loop", MagicMock()) as resched:
+        resp = client.post("/admin/settings", json={"plex_refresh_hour": bad})
+    assert resp.status_code == 422, resp.text
+    assert not ss.call_args_list
+    resched.assert_not_called()
+
+
+def test_settings_accepts_plex_refresh_hour_and_next_sweep_moves(client, mock_state):
+    """Saving 2 persists the string "2" under health.REFRESH_HOUR_KEY, re-arms
+    the sleeping daily loop so the change takes effect today, and the
+    scan-status `next_refresh_at` now lands on 02:00 (the projection is read
+    from the setting, so it moves without waiting for the loop's next wake)."""
+    from app.plex import health
+    stored = {}
+
+    async def fake_get(key, default=None):
+        return stored.get(key, default)
+
+    async def fake_set(key, value):
+        stored[key] = value
+
+    with patch("app.database.set_setting", AsyncMock(side_effect=fake_set)), \
+         patch("app.database.get_setting", AsyncMock(side_effect=fake_get)), \
+         patch("app.plex.health.reschedule_daily_loop", MagicMock()) as resched, \
+         patch("app.state.scan_status", AsyncMock(return_value=dict(_SCAN_SNAP_IDLE))), \
+         patch("app.state.grouping_degraded_libraries", return_value=[]):
+        before = client.get("/admin/scan-status").json()["next_refresh_at"]
+        assert before.endswith("T04:00")                 # default hour 4
+        resp = client.post("/admin/settings", json={"plex_refresh_hour": 2})
+        assert resp.status_code == 200, resp.text
+        after = client.get("/admin/scan-status").json()["next_refresh_at"]
+        echoed = client.get("/admin/settings").json()["plex_refresh_hour"]
+    assert stored == {health.REFRESH_HOUR_KEY: "2"}
+    resched.assert_called_once()
+    assert after.endswith("T02:00") and after != before
+    assert echoed == 2
+
+
+def test_get_settings_echoes_default_plex_refresh_hour(client, mock_state):
+    with patch("app.database.get_setting", AsyncMock(return_value=None)):
+        assert client.get("/admin/settings").json()["plex_refresh_hour"] == 4
+
+
+async def test_plex_rescan_clears_the_pending_rebuild_flag_before_the_crawl(client, mock_state):
+    """2026-11-22 review #10: a manual rescan IS the crawl the deferred-rebuild
+    flag was waiting for; left set, the idle runner would fire a second one."""
+    from app.plex import health as plex_health
+    plex = _make_plex_client()
+    delete_setting = AsyncMock()
+    with patch("app.state.get_plex_client", AsyncMock(return_value=plex)), \
+         patch("app.database.delete_setting", delete_setting), \
+         patch("app.database.get_enabled_libraries", AsyncMock(return_value=[{"section_key": "1"}])):
+        resp = client.post("/admin/plex/rescan")
+    assert resp.status_code == 200
+    delete_setting.assert_awaited_once_with(plex_health.PENDING_KEY)

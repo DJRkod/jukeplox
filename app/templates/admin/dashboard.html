@@ -265,6 +265,15 @@
       color: var(--text); cursor: pointer; }
     .lib-child.greyed { opacity: .45; }
     .src-err { font-size: .8rem; color: var(--danger); padding: 0 0 .5rem .2rem; }
+    /* Plex server health line under a source row (plex-source-health U6). Wraps
+       freely at phone width; the danger colour marks a server needing attention. */
+    .src-status { font-size: .78rem; color: #666; padding: 0 0 .45rem .2rem; overflow-wrap: anywhere; }
+    .src-status.warn { color: var(--danger); }
+    .plex-health { font-size: .82rem; margin-top: .4rem; }
+    .plex-health > div > div { padding: .1rem 0; }
+    .plex-health-hour { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-top: .35rem; }
+    #libraries select { background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: .3rem .5rem; font-size: .85rem; max-width: 100%; }
     /* iOS-style whole-source switch — amber accent from the existing palette. */
     .switch { position: relative; width: 38px; height: 22px; flex-shrink: 0; }
     .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
@@ -852,6 +861,19 @@
         off; expand one to choose which of its libraries are in the jukebox.</p>
       <div id="sources-list"><p style="color:#555;font-size:.85rem">Loading…</p></div>
       <div id="sources-scan-status" class="muted" style="font-size:.82rem;margin-top:.4rem;display:none"></div>
+      <!-- Plex source health (2026-11-21 plan U6): account / rebuild-pending /
+           next-sweep lines + the daily sweep hour (local time; commits on change).
+           Shown by renderSourceScanStatus only while a Plex source is connected. -->
+      <div id="plex-health-status" class="muted plex-health" style="display:none">
+        <div id="plex-health-lines"></div>
+        <label class="plex-health-hour">
+          <span>Daily Plex sweep at</span>
+          <select id="plex-refresh-hour" aria-label="Daily Plex sweep hour (local time)">
+            {% for h in range(24) %}<option value="{{ h }}">{{ '%02d' % h }}:00</option>{% endfor %}
+          </select>
+          <span>local time</span>
+        </label>
+      </div>
       <div style="margin-top:.75rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" id="btn-connect-plex">Connect Plex</button>
         <button class="btn btn-primary btn-sm" id="btn-connect-jellyfin-toggle">Connect Jellyfin</button>

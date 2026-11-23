@@ -99,6 +99,49 @@ async def replace_catalog(
             raise
 
 
+# ── write: drop one source's content (2026-11-21 Plex source health U1) ──────
+
+async def delete_catalog_source(source_id: str) -> None:
+    """Remove everything ONE source holds, in one transaction, without a crawl.
+
+    A server plex.tv no longer lists must disappear from browse immediately
+    (KTD6). Holds are matched on ``source_id`` exactly, and compound identities
+    (``"{source_id}:{key}"``) by a LENGTH-BOUNDED substring compare — never
+    ``LIKE``, because a machine id may contain ``_``. An entity another source
+    still holds survives with only this source's hold removed; an entity whose
+    last hold went is deleted from its content table. The alias table is left
+    alone (identity durability: a returning server reuses its identities).
+    """
+    db = database._conn()
+    bind = (len(source_id) + 1, source_id + ":")
+    async with database._write_tx_lock:
+        await database._begin_immediate(db, "delete_catalog_source")
+        try:
+            for table, etype in (("catalog_track", "track"), ("catalog_album", "album"),
+                                 ("catalog_artist", "artist")):
+                # "No hold from any OTHER source" — this source's own holds are
+                # still present here and must not count as a survivor.
+                no_other_hold = (f"NOT EXISTS (SELECT 1 FROM catalog_holds h "
+                                 f"WHERE h.entity_type = ? AND h.identity = {table}.identity "
+                                 f"AND h.source_id <> ?)")
+                # Entities this source held, now orphaned (scoped to those
+                # identities so an unrelated hold-less legacy row is never touched).
+                await db.execute(
+                    f"DELETE FROM {table} WHERE identity IN "
+                    f"(SELECT identity FROM catalog_holds WHERE source_id = ? AND entity_type = ?) "
+                    f"AND {no_other_hold}",
+                    (source_id, etype, etype, source_id))
+                # Entities minted from this source's compound key with no hold left.
+                await db.execute(
+                    f"DELETE FROM {table} WHERE substr(identity, 1, ?) = ? AND {no_other_hold}",
+                    (*bind, etype, source_id))
+            await db.execute("DELETE FROM catalog_holds WHERE source_id = ?", (source_id,))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+
 # ── read: artists ────────────────────────────────────────────────────────────
 
 async def get_artists() -> list[dict]:
@@ -270,6 +313,16 @@ async def get_identities_held_by_source(
         (source_id, entity_type),
     ) as cur:
         return [row["identity"] async for row in cur]
+
+
+async def source_ids_with_holds() -> set[str]:
+    """Every ``source_id`` that still holds at least one catalog entity. The
+    Plex health sweep compares this against ``no_longer_shared`` servers so a
+    vanished server whose purge failed is purged again next sweep (2026-11-22
+    review #8)."""
+    async with database._conn().execute(
+        "SELECT DISTINCT source_id FROM catalog_holds") as cur:
+        return {row["source_id"] async for row in cur}
 
 
 # ── durable identity alias (find-or-create lookup; logic lives in U7) ─────────

@@ -16,6 +16,7 @@ splitting on the first ":".
 
 import asyncio
 import json
+import logging
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -24,6 +25,31 @@ from typing import Any
 import httpx
 
 from app.plex.models import Album, Artist, Library, SearchResults, Track
+
+_log = logging.getLogger(__name__)
+
+# ── auth-failed hook (2026-11-21 plex source health, U3 / KTD4) ───────────────
+# The client is the one place every Plex request passes through, so a 401 is
+# observed here — but this package is a leaf (no database, no state import), so
+# the observation leaves through a module-level callback the health module
+# installs at lifespan startup (the ``set_radio_failed_hook`` pattern). Default
+# is a no-op: with nothing installed a 401 behaves exactly as before.
+
+
+def _noop_auth_failed(machine_id: str) -> None:
+    return None
+
+
+_auth_failed_hook = _noop_auth_failed
+
+
+def set_auth_failed_hook(cb) -> None:
+    """Install ``cb(machine_id)`` to be called, synchronously and before the
+    ``PlexAuthError`` is raised, whenever a Plex server answers 401. ``None``
+    restores the no-op. The callback must not raise; if it does, the error is
+    swallowed so it can never mask the auth failure itself."""
+    global _auth_failed_hook
+    _auth_failed_hook = cb if cb is not None else _noop_auth_failed
 
 _TYPO_TABLE = str.maketrans({
     '‘': "'",  # left single quotation mark
@@ -162,13 +188,18 @@ class PlexClient:
     def _url(self, path: str) -> str:
         return f"{self.server_url}{path}"
 
-    @staticmethod
-    def _check_status(resp) -> None:
-        """Shared status contract for _get and _get_raw so the two paths can't
-        drift: a 401 becomes a typed PlexAuthError (drives the auth re-prompt),
-        any other 4xx/5xx raises via raise_for_status."""
+    def _check_status(self, resp) -> None:
+        """Shared status contract for _get, _get_raw and fetch_art so the paths
+        can't drift: a 401 fires the module auth-failed hook with this server's
+        machine id, then becomes a typed PlexAuthError (drives the auth
+        re-prompt); any other 4xx/5xx raises via raise_for_status."""
         if resp.status_code == 401:
             from app.plex.auth import PlexAuthError
+            try:
+                _auth_failed_hook(self.machine_id)
+            except Exception:  # noqa: BLE001 — a hook bug must never mask the 401
+                _log.warning(
+                    "auth-failed hook raised for %s", self.machine_id, exc_info=True)
             raise PlexAuthError("Plex token rejected (401)")
         resp.raise_for_status()
 
@@ -924,6 +955,7 @@ class PlexClient:
         deep-jump reveal stall (2026-06-25 — full-DOM + content-visibility renders
         the destination band synchronously on arrival). Resize is best-effort:
         any transcoder failure falls back to the full image so art never breaks."""
+        from app.plex.auth import PlexAuthError
         bare_path = self._strip(thumb_path) or thumb_path
         if width:
             try:
@@ -934,23 +966,34 @@ class PlexClient:
                                 "upscale": 0, "url": bare_path},
                         headers=self._headers(),
                     )
-                resp.raise_for_status()
+                self._check_status(resp)
                 return resp.content, resp.headers.get("content-type", "image/jpeg")
+            except PlexAuthError:
+                # A rejected token is not a transcoder hiccup: the hook has
+                # already fired, and a full-size retry would spend a second
+                # request with the same dead token (U3 / KTD4).
+                raise
             except Exception:
-                import logging
-                logging.getLogger(__name__).warning(
+                _log.warning(
                     "art transcode (w=%s) failed for %s; serving full size",
                     width, bare_path[:80], exc_info=True)
                 # fall through to the full-size fetch below
         async with self._sem:
             resp = await self._http.get(self._url(bare_path), headers=self._headers())
-        resp.raise_for_status()
+        self._check_status(resp)
         content_type = resp.headers.get("content-type", "image/jpeg")
         return resp.content, content_type
 
 
 class MultiPlexClient:
-    """Routes Plex API calls across multiple servers using compound keys."""
+    """Routes Plex API calls across multiple servers using compound keys.
+
+    Legacy aggregate, superseded by ``app.sources.registry.SourceRegistry``;
+    nothing in ``app/`` constructs it any more and only ``tests/test_plex_client.py``
+    exercises ``get_libraries``. Its ``_route`` still falls back to the first
+    client for an unknown machine id -- the behaviour issue #44 removed from the
+    registry -- and is deliberately left as-is: it is test-only dead code, not a
+    production route, and aligning it would only lend it false currency."""
 
     def __init__(self, clients: list[PlexClient]) -> None:
         self._clients = clients
@@ -992,14 +1035,13 @@ class MultiPlexClient:
         four debugging rounds precisely because nothing logged. Legs now run
         in parallel (cost = slowest leg, not the sum) and a failed leg WARNs
         with the server name and elapsed time; healthy legs always land."""
-        import logging
 
         async def _one(c) -> list[Library]:
             t0 = time.monotonic()
             try:
                 return await c.get_libraries()
             except Exception as exc:
-                logging.getLogger(__name__).warning(
+                _log.warning(
                     "get_libraries failed for server %r after %.1fs: %s",
                     getattr(c, "server_name", "?") or "?",
                     time.monotonic() - t0, exc,

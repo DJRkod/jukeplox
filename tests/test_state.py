@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -5714,3 +5715,298 @@ def test_local_files_with_specific_bind_host_unchanged():
         url = st._make_stream_url("local-abc:t1", client)
     assert url == "http://192.168.1.10/api/stream?key=local-abc%3At1"
     det.assert_not_called()
+
+
+# ── playback idle stamp (2026-11-21 plan U4, KTD5) ───────────────────────────
+# "Idle is a stamp, not a predicate": every engine transition and every radio
+# transition re-evaluates it; stopped-and-staying-stopped never re-stamps.
+
+@pytest.fixture
+def idle_env(monkeypatch):
+    import app.state as st
+    qe = st.queue_engine
+    saved = (qe._is_playing, qe._is_paused, st.playback_idle_since)
+    clock = [5000.0]
+    monkeypatch.setattr(st, "_idle_clock", lambda: clock[0])
+    monkeypatch.setattr(st, "radio_active", lambda: False)
+    qe._is_playing = False
+    qe._is_paused = False
+    st.playback_idle_since = None
+    yield SimpleNamespace(st=st, qe=qe, clock=clock)
+    qe._is_playing, qe._is_paused, st.playback_idle_since = saved
+
+
+def test_idle_stamp_playing_to_stopped_sets_then_stopped_to_playing_clears(idle_env):
+    st, qe, clock = idle_env.st, idle_env.qe, idle_env.clock
+    qe._is_playing = True
+    st._update_idle_stamp()
+    assert st.playback_idle_since is None and st.playback_idle_for() is None
+    qe._is_playing = False
+    st._update_idle_stamp()
+    assert st.playback_idle_since == 5000.0
+    clock[0] += 120
+    # A second idle transition (e.g. queue_changed while stopped) keeps the
+    # ORIGINAL stamp — idle-for keeps counting from the first stop.
+    st._update_idle_stamp()
+    assert st.playback_idle_for() == 120
+    qe._is_playing = True
+    st._update_idle_stamp()
+    assert st.playback_idle_since is None and st.playback_idle_for() is None
+
+
+def test_idle_stamp_pause_does_not_set_it(idle_env):
+    st, qe = idle_env.st, idle_env.qe
+    qe._is_playing = True
+    st._update_idle_stamp()
+    qe._is_playing = False
+    qe._is_paused = True            # engine.pause(): playing False, paused True
+    st._update_idle_stamp()
+    assert st.playback_idle_since is None
+    qe._is_paused = False           # stop() clears both
+    st._update_idle_stamp()
+    assert st.playback_idle_since == 5000.0
+
+
+def test_idle_stamp_radio_active_counts_as_not_idle(idle_env, monkeypatch):
+    st = idle_env.st
+    monkeypatch.setattr(st, "radio_active", lambda: True)
+    st._update_idle_stamp()
+    assert st.playback_idle_since is None
+
+
+def test_idle_stamp_set_by_radio_stop_when_queue_idle(idle_env, monkeypatch):
+    """state observes the session (the existing coupling direction): the radio
+    state listener re-evaluates the stamp, so a stop → idle flip with nothing
+    held in the queue stamps idle without any engine event."""
+    st = idle_env.st
+    active = [True]
+    monkeypatch.setattr(st, "radio_active", lambda: active[0])
+    monkeypatch.setattr(st, "_broadcast_radio_state", lambda: None)
+    st._register_radio_listeners()
+    st.radio_session._notify_state()          # start → connecting/playing
+    assert st.playback_idle_since is None
+    active[0] = False
+    st.radio_session._notify_state()          # stop → idle
+    assert st.playback_idle_since == 5000.0
+    st.radio_session.remove_state_listener(st._update_idle_stamp)
+
+
+# ── Vanished Plex server: never contacted, never routed (health plan U5 / #44) ─
+
+
+def _u5_servers():
+    """Two saved servers; no real hostnames or tokens."""
+    return [
+        {"machine_id": "machine-live", "server_url": "http://plex-live.test:32400",
+         "name": "Live", "owner": "me", "token": "t-live", "client_id": "cid", "owned": 1},
+        {"machine_id": "machine-gone", "server_url": "http://plex-gone.test:32400",
+         "name": "Gone", "owner": "friend", "token": "t-gone", "client_id": "cid", "owned": 0},
+    ]
+
+
+async def _u5_db_with_vanished(tmp_path, monkeypatch):
+    """Real DB: both servers saved, then a listing that omits the second marks it
+    ``no_longer_shared``."""
+    database = await _curation_db(tmp_path, monkeypatch)
+    live, gone = _u5_servers()
+    await database.reconcile_plex_servers([live, gone], mark_missing=False)
+    res = await database.reconcile_plex_servers([live], mark_missing=True)
+    assert res["vanished"] == ["machine-gone"]
+    return database
+
+
+async def test_get_plex_client_builds_no_client_for_vanished_row(tmp_path, monkeypatch):
+    """KTD6: the registry built from two rows, one ``no_longer_shared``, holds ONE
+    source and constructs a PlexClient only for the live server -- a client that
+    is never built can never send the vanished server a request."""
+    import app.state as st
+    import app.database as db
+    from app.plex.client import PlexClient
+    database = await _u5_db_with_vanished(tmp_path, monkeypatch)
+    built: list[str] = []
+
+    def _fake_init(self, **kw):
+        built.append(kw.get("machine_id", ""))
+        self.machine_id = kw.get("machine_id", "")
+        self.server_url = kw.get("server_url", "")
+
+    st.invalidate_plex_client()
+    try:
+        with patch.object(db, "get_jellyfin_sources", AsyncMock(return_value=[])), \
+             patch.object(db, "get_subsonic_sources", AsyncMock(return_value=[])), \
+             patch.object(db, "get_emby_sources", AsyncMock(return_value=[])), \
+             patch.object(db, "get_local_sources", AsyncMock(return_value=[])), \
+             patch.object(PlexClient, "__init__", _fake_init):
+            reg = await st.get_plex_client()
+        assert reg is not None
+        assert [s.source_id for s in reg.sources] == ["machine-live"]
+        assert built == ["machine-live"]
+        # The vanished server's keys route nowhere (#44), a live key routes.
+        with pytest.raises(KeyError):
+            reg._route("machine-gone:123")
+        assert reg._route("machine-live:123").source_id == "machine-live"
+        # The admin list still sees the row: hidden, not deleted (R16).
+        full = {r["machine_id"]: r["status"]
+                for r in await database.get_plex_servers(include_vanished=True)}
+        assert full == {"machine-live": "usable", "machine-gone": "no_longer_shared"}
+    finally:
+        st.invalidate_plex_client()
+        await database.close_db()
+
+
+def _u5_registry():
+    """A real SourceRegistry over one fake source so routing is the production
+    code path: a machine-gone key raises KeyError, a machine-live key plays."""
+    from app.sources.base import StreamTarget
+    from app.sources.registry import SourceRegistry
+    src = MagicMock()
+    src.source_id = "machine-live"
+    src.source_type = "plex"
+    src.url_borne_auth = False
+    src.resolve_stream = MagicMock(
+        side_effect=lambda k: StreamTarget(url=f"http://plex-live.test/{k}"))
+    return SourceRegistry([src])
+
+
+async def test_do_advance_skips_item_whose_prefix_has_no_source(fresh_supervisor, caplog):
+    """A queued track from a server that vanished mid-party: its stream URL build
+    raises KeyError from the registry. That is a skip to the next item (R22
+    notification), not an unhandled task exception -- and the surviving item
+    plays. Before U5 the URL build sat outside the holder try and the KeyError
+    escaped _do_advance."""
+    import logging
+    import app.state as state
+    from app.models import Track
+    from app.queue.engine import QueueEngine
+    sup, timers, rec = fresh_supervisor
+    qe = QueueEngine()
+    play = AsyncMock(return_value=None)
+    skipped = AsyncMock()
+    gone = Track(id="machine-gone:1", title="Gone Song", artist="Act", album="Rec",
+                 duration_ms=1000, stream_key="machine-gone:part1")
+    live = Track(id="machine-live:2", title="Live Song", artist="Act", album="Rec",
+                 duration_ms=1000, stream_key="machine-live:part2")
+    with patch.object(state, "queue_engine", qe), \
+         patch("app.queue.engine.database.save_queue", AsyncMock()), \
+         patch("app.queue.engine.database.save_history", AsyncMock()), \
+         patch.object(state, "output_router", _u2_router(play)), \
+         patch.object(state, "get_plex_client", AsyncMock(return_value=_u5_registry())), \
+         patch.object(state, "_emit_track_skipped", skipped), \
+         patch.object(state, "_stream_url_base", lambda: ""), \
+         patch("app.events.bus.manager.broadcast_to_admins", AsyncMock()), \
+         caplog.at_level(logging.WARNING, logger="app.state"):
+        await qe.append(gone)
+        await qe.append(live)
+        await state._do_advance()   # must not raise
+
+    assert play.await_count == 1
+    assert play.await_args.args[0] == "http://plex-live.test/machine-live:part2"
+    assert play.await_args.args[1] is live
+    skipped.assert_awaited_once()
+    assert skipped.await_args.args[0] is gone
+    assert qe.state.current is not None and qe.state.current.track is live
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], \
+        "a vanished-source key is a skip, never an error-level task exception"
+    assert sup.current_token() is not None   # the live dispatch was reported
+
+
+async def test_enabled_libraries_hide_vanished_server_until_it_returns(tmp_path, monkeypatch):
+    """AE7 at the state layer: the vanished server's sections leave the enabled
+    set with their ``enabled_libraries`` rows untouched; once its status is
+    usable again and the registry is invalidated they are back -- no re-tick."""
+    import app.state as st
+    from app.api import guest
+    from app.models import Library
+    database = await _u5_db_with_vanished(tmp_path, monkeypatch)
+    await database.toggle_library("machine-live:1", "Live Music", True)
+    await database.toggle_library("machine-gone:2", "Gone Music", True)
+    rows_before = await database.get_enabled_libraries()
+    assert {r["section_key"] for r in rows_before} == {"machine-live:1", "machine-gone:2"}
+
+    reg = MagicMock()
+    reg.get_libraries = AsyncMock(return_value=[
+        Library(key="machine-live:1", title="Live Music", type="artist", server_name="Live"),
+        Library(key="machine-gone:2", title="Gone Music", type="artist", server_name="Gone"),
+    ])
+    st.invalidate_plex_client()
+    try:
+        with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)):
+            assert {l.key for l in await guest.enabled_libraries()} == {"machine-live:1"}
+            # plex.tv lists the server again -> reconcile returns it to usable.
+            live, gone = _u5_servers()
+            res = await database.reconcile_plex_servers([live, gone], mark_missing=True)
+            assert res["returned"] == ["machine-gone"]
+            # Hidden until the registry is invalidated (the cache is the registry's).
+            assert {l.key for l in await guest.enabled_libraries()} == {"machine-live:1"}
+            st.invalidate_plex_client()
+            assert {l.key for l in await guest.enabled_libraries()} == {
+                "machine-live:1", "machine-gone:2"}
+        assert await database.get_enabled_libraries() == rows_before
+    finally:
+        st.invalidate_plex_client()
+        await database.close_db()
+
+
+async def test_guest_scan_status_key_set_unchanged_under_plex_health_failures(
+        tmp_path, monkeypatch):
+    """AE8 (plan 2026-11-21 U7): with servers in every failed health state and
+    the account login rejected, the guest payload gains no key and carries no
+    server name, URL, status word, or exception text — booleans and ints only."""
+    import app.state as st
+    from app.plex import health
+    health.reset_state()
+    health.account_status = "account_rejected"
+    health._server_401_at["plex-gone.example.invalid"] = 1.0
+    st._browse_counts_degraded = {"A:1": "ServerA: Lib A:1"}
+    try:
+        with patch("app.state.get_plex_client", AsyncMock(return_value=None)), \
+             patch("app.catalog.store.is_empty", AsyncMock(return_value=True)), \
+             patch("app.database.get_setting", AsyncMock(return_value=None)):
+            status = await st.scan_status()
+        assert set(status) == {"sources", "scanning", "scanned", "empty",
+                               "refresh_failed", "grouping_degraded"}
+        assert all(isinstance(v, (bool, int)) for v in status.values())
+        blob = repr(status)
+        for forbidden in ("example.invalid", "token_rejected", "no_longer_shared",
+                          "account_rejected", "ServerA", "http"):
+            assert forbidden not in blob
+    finally:
+        st._browse_counts_degraded = {}
+        health.reset_state()
+
+
+async def test_catalog_refresh_reruns_when_the_source_set_changes_mid_crawl():
+    """2026-11-22 review #2: a crawl snapshots the registry at start; a Plex
+    server vanishing (invalidate_plex_client bumps the enabled-libraries
+    generation) while it runs means replace_catalog wrote the dead source
+    back — so the crawl re-triggers itself. An unmoved generation does not."""
+    import app.state as st
+    from app.api import guest as guest_api
+    reg = MagicMock(); reg.sources = [MagicMock()]
+
+    async def moving_scan(registry, keys):
+        guest_api._enabled_libs_gen += 1
+        return True
+
+    retrigger = MagicMock()
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)), \
+         patch("app.database.get_effective_enabled_libraries",
+               AsyncMock(return_value=[{"section_key": "A:1"}])), \
+         patch("app.catalog.scan.scan_and_replace", AsyncMock(side_effect=moving_scan)), \
+         patch.object(st, "stamp_cache", AsyncMock()), \
+         patch.object(st, "revalidate_plex_queue", AsyncMock()), \
+         patch.object(st, "trigger_catalog_refresh", retrigger):
+        await st._refresh_catalog()
+    retrigger.assert_called_once_with()
+    assert st._catalog_refresh_running is False
+
+    retrigger.reset_mock()
+    with patch.object(st, "get_plex_client", AsyncMock(return_value=reg)), \
+         patch("app.database.get_effective_enabled_libraries",
+               AsyncMock(return_value=[{"section_key": "A:1"}])), \
+         patch("app.catalog.scan.scan_and_replace", AsyncMock(return_value=True)), \
+         patch.object(st, "stamp_cache", AsyncMock()), \
+         patch.object(st, "revalidate_plex_queue", AsyncMock()), \
+         patch.object(st, "trigger_catalog_refresh", retrigger):
+        await st._refresh_catalog()
+    retrigger.assert_not_called()

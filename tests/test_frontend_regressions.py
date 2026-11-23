@@ -3150,6 +3150,7 @@ COMMIT_ON_CHANGE = [
     ("surprise-source-mode", "surprise_me_source_mode"),
     ("surprise-diversity", "surprise_me_diversity"),
     ("volume-orientation", "volume_orientation"),
+    ("plex-refresh-hour", "plex_refresh_hour"),
 ]
 
 # Deferred: the value is incomplete mid-edit (numbers, Closing Time texts),

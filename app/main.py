@@ -66,6 +66,13 @@ async def lifespan(app: FastAPI):
     # in-path Plex-listing block. Fire-and-forget + single-flighted.
     from app.api.guest import warm_enabled_libraries
     warm_enabled_libraries()
+    # Plex source health (2026-11-21 plan U3): register the client's 401 hook
+    # now that state exists, then schedule the startup refresh WITHOUT awaiting
+    # it — plex.tv must never gate boot. The daily sweep starts at the end of
+    # startup, once every collaborator it may touch exists.
+    from app.plex import health as plex_health
+    plex_health.install_hooks()
+    plex_health.request_refresh("startup")
     # Live device discovery (2026-06-11 plan U2): start the watcher AFTER
     # state.setup() so the backend singletons its register_resolved hooks
     # feed already exist. Fail-soft — a broken watcher must never take the
@@ -102,7 +109,15 @@ async def lifespan(app: FastAPI):
     except Exception:
         logging.getLogger("app.main").debug(
             "idle re-attach reconcile after watcher start failed", exc_info=True)
+    plex_health.start_daily_loop()
+    # U4: a rebuild deferred by the previous process (plex_rebuild_pending)
+    # is picked up here; with no flag the runner exits on its first check.
+    plex_health.ensure_rebuild_runner()
     yield
+    # Health first: nothing it owns (daily loop, U4's rebuild runner, an
+    # in-flight refresh) may still be writing while the backends and the DB
+    # go away. Bounded wait; never raises.
+    await plex_health.shutdown()
     try:
         from app.output.watcher import stop_watcher
         await stop_watcher()

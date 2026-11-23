@@ -4,6 +4,9 @@ services:
     network_mode: host        # REQUIRED: mDNS (Chromecast/AirPlay) + SSDP (DLNA)
     volumes:
       - ./data:/data
+      # The image is UTC. Following the host clock makes the daily Plex sweep
+      # (Setup → Libraries → sweep hour) fire at the hour you actually set.
+      - /etc/localtime:/etc/localtime:ro
       # Lets Jukeplox use the host's avahi over D-Bus when a host mDNS daemon
       # already owns UDP 5353 (e.g. TrueNAS) — the automatic fallback for
       # discovery. Harmless on hosts without avahi. One-time; survives reboots.

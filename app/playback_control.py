@@ -29,6 +29,13 @@ from app import state
 
 _log = logging.getLogger(__name__)
 
+
+def _key_prefix(stream_key) -> str:
+    """The source prefix of a compound stream key, for log lines: never the key
+    body and never a URL (a Plex URL carries its token)."""
+    key = stream_key or ""
+    return key.split(":", 1)[0] if ":" in key else "<none>"
+
 async def playback_pause():
     from app.output import session as output_session
     if output_session.output_hold_active():
@@ -134,7 +141,33 @@ async def playback_skip():
         if next_item:
             client = await state.get_plex_client()
             if client:
-                url = state._make_stream_url(next_item.track.stream_key, client)
+                # 2026-11-22 review #4: a queued track whose source vanished
+                # (plex.tv stopped sharing the server -- health plan U5 / #44)
+                # makes the URL build raise KeyError from the registry. That is
+                # a skip past the dead item, exactly as state._do_advance
+                # treats it, not a 500 on the Skip button. Bounded like
+                # _do_advance's consecutive-failure loop.
+                url = None
+                for _ in range(state._MAX_CONSECUTIVE_FAILURES):
+                    try:
+                        url = state._make_stream_url(next_item.track.stream_key, client)
+                        break
+                    except KeyError:
+                        _log.warning(
+                            "playback_skip: source prefix %s of %r names no registered "
+                            "source; skipping to the next item",
+                            _key_prefix(next_item.track.stream_key), next_item.track.title)
+                        await state._emit_track_skipped(next_item.track)
+                        next_item = await state.queue_engine.advance()
+                        if not next_item:
+                            break
+                if not next_item:
+                    # The dead item(s) drained the queue: nothing left to play.
+                    await state.output_router.stop()
+                elif url is None:
+                    _log.error("playback_skip: gave up after %d consecutive unroutable items",
+                               state._MAX_CONSECUTIVE_FAILURES)
+            if client and next_item and url is not None:
                 try:
                     # A track you skip forward to and listen to is a real play,
                     # so it counts — via the output-session supervisor's
@@ -209,10 +242,36 @@ async def playback_previous():
         client = await state.get_plex_client()
         if not client:
             raise HTTPException(status_code=409, detail="No media source available")
+        # 2026-11-22 review #4: resolve the history head's URL BEFORE skip_back()
+        # mutates (the same before-mutation principle as the client gate). A
+        # head whose source vanished (KeyError from the registry, health plan
+        # U5 / #44) is unplayable from any screen: drop it from history, flash
+        # the R22 skip notice, and go back to the item before it -- the
+        # closest analogue of state._do_advance skipping a dead item. Bounded
+        # like its consecutive-failure loop.
+        url = None
+        for _ in range(state._MAX_CONSECUTIVE_FAILURES):
+            history = state.queue_engine.history
+            if not history:
+                raise HTTPException(status_code=409, detail="No history to skip back to")
+            head = history[0]
+            try:
+                url = state._make_stream_url(head.track.stream_key, client)
+                break
+            except KeyError:
+                _log.warning(
+                    "playback_previous: source prefix %s of %r names no registered "
+                    "source; dropping it from history and going back further",
+                    _key_prefix(head.track.stream_key), head.track.title)
+                await state._emit_track_skipped(head.track)
+                await state.queue_engine.remove_history_entry(head.track_id, head.added_at)
+        if url is None:
+            _log.error("playback_previous: gave up after %d consecutive unroutable history items",
+                       state._MAX_CONSECUTIVE_FAILURES)
+            raise HTTPException(status_code=409, detail="No playable history to skip back to")
         prev_item = await state.queue_engine.skip_back()
         if prev_item is None:
             raise HTTPException(status_code=409, detail="No history to skip back to")
-        url = state._make_stream_url(prev_item.track.stream_key, client)
         try:
             # A replay is a real play, so it counts — via the supervisor's
             # confirmed-start chokepoint (2026-07-11 plan U1), shared with

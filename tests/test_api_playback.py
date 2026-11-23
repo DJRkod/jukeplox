@@ -10,7 +10,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from tests.conftest import make_track
+from tests.conftest import make_track, make_vanished_source_registry, make_sourced_track
 
 
 # ── playback/previous (Skip Back) ─────────────────────────────────────────────
@@ -80,6 +80,70 @@ async def test_playback_previous_play_failure_502(client, mock_state):
         resp = client.post("/admin/playback/previous")
     assert resp.status_code == 502
     assert qe.state.current is None            # set_stopped() reconciled state
+
+
+async def test_playback_previous_skips_history_head_whose_prefix_has_no_source(client, mock_state, caplog):
+    """2026-11-22 review #4, mirror of tests/test_state.py::
+    test_do_advance_skips_item_whose_prefix_has_no_source for Skip Back: the
+    most recent history item's server vanished, so its URL build raises
+    KeyError from the registry. Back must drop the dead item (R22 notice) and
+    replay the item before it -- 200, the interrupted track at queue front --
+    never a 500 and never a stranded engine."""
+    import logging
+    qe, or_ = mock_state
+    live = make_sourced_track("machine-live", 2, "Live Song")
+    gone = make_sourced_track("machine-gone", 1, "Gone Song")
+    await qe.set_playing(live)
+    await qe.advance()                       # live -> history
+    await qe.set_playing(gone)
+    await qe.advance()                       # gone -> history head (most recent)
+    await qe.set_playing(make_track("t2"))   # t2 is the interrupted track
+    skipped = AsyncMock()
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=make_vanished_source_registry())), \
+         patch("app.state._stream_url_base", lambda: ""), \
+         patch("app.state._emit_track_skipped", skipped), \
+         caplog.at_level(logging.WARNING):
+        resp = client.post("/admin/playback/previous")
+    assert resp.status_code == 200
+    or_.play.assert_awaited_once()
+    assert or_.play.await_args.args[0] == "http://plex-live.test/machine-live:part2"
+    assert or_.play.await_args.args[1] is live
+    or_.stop.assert_not_awaited()
+    skipped.assert_awaited_once()
+    assert skipped.await_args.args[0] is gone
+    assert qe.state.current.track is live
+    assert qe.queue[0].track_id == "t2"
+    assert all(h.track_id != gone.id for h in qe.history), "the dead item must leave history"
+    warns = [r for r in caplog.records
+             if r.name == "app.playback_control" and r.levelno == logging.WARNING]
+    assert warns
+    for r in warns:
+        msg = r.getMessage()
+        assert "machine-gone" in msg and "part1" not in msg and "http" not in msg, msg
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_playback_previous_only_dead_history_409_engine_not_stranded(client, mock_state):
+    """Every history item is unroutable: Back drops them and answers 409 with
+    the interrupted track still current and the queue untouched (the
+    before-mutation rule), rather than skip_back()-ing onto a track nothing
+    can play."""
+    qe, or_ = mock_state
+    gone = make_sourced_track("machine-gone", 1, "Gone Song")
+    await qe.set_playing(gone)
+    await qe.advance()
+    await qe.set_playing(make_track("t2"))
+    with patch("app.state.get_plex_client",
+               AsyncMock(return_value=make_vanished_source_registry())), \
+         patch("app.state._stream_url_base", lambda: ""), \
+         patch("app.state._emit_track_skipped", AsyncMock()):
+        resp = client.post("/admin/playback/previous")
+    assert resp.status_code == 409
+    or_.play.assert_not_awaited()
+    assert qe.state.current.track_id == "t2"
+    assert qe.queue == []
+    assert qe.history == []
 
 
 async def test_playback_previous_bumps_advance_generation(client, mock_state):

@@ -34,6 +34,7 @@ from app import playback_control
 from app.output import sendspin_adapter  # module-level is safe: no aiosendspin import
 from app.output.base import AttachSuperseded
 from app.output.discovery import build_devices_snapshot, build_registry_snapshot
+from app.plex import health as plex_health
 from app.output.probe_runner import schedule_probes
 from app.queue.models import QueueEndBehavior
 
@@ -146,6 +147,15 @@ async def plex_rescan():
     if not client:
         raise HTTPException(status_code=503, detail="No media source configured")
     client.invalidate_cache()
+    # A manual rescan IS the full crawl the deferred-rebuild flag was waiting
+    # for: clear it first so the idle runner does not fire a second one later
+    # (2026-11-22 review #10). Never cleared on crawl completion — a crawl that
+    # began before the flag was written did not see the new library.
+    try:
+        await database.delete_setting(plex_health.PENDING_KEY)
+    except Exception as e:  # noqa: BLE001 — hygiene; the rescan itself must still run
+        _log.warning("plex rescan: could not clear %s (%s)", plex_health.PENDING_KEY,
+                     type(e).__name__)
     state.trigger_genre_refresh()
     state.trigger_credit_refresh()
     state.trigger_browse_index_refresh()  # browse-index plan U6/R7
@@ -387,27 +397,40 @@ async def _reject_duplicate_source(
 async def list_sources():
     """Connected media sources for the Sources panel + the priority list (U14).
 
-    Each entry is ``{source_id, type, name, enabled}``. ``enabled`` is the
-    whole-source on/off switch (False when the source is in the disabled_sources
-    veto set, Libraries-panel U3). Plex servers come from ``plex_servers`` (or the
-    legacy single-server config); Jellyfin from ``jellyfin_sources``; local-files
-    directories from ``local_sources`` (U11)."""
+    Each entry is ``{source_id, type, name, enabled, status, status_checked_at}``.
+    ``enabled`` is the whole-source on/off switch (False when the source is in
+    the disabled_sources veto set, Libraries-panel U3). Plex servers come from
+    ``plex_servers`` (or the legacy single-server config); Jellyfin from
+    ``jellyfin_sources``; local-files directories from ``local_sources`` (U11).
+
+    ``status`` / ``status_checked_at`` are the Plex server-health columns
+    (2026-11-21 plan U6, KTD2): one of usable / token_rejected / unreachable /
+    no_longer_shared / unknown plus the ISO UTC time of the last check. The read
+    INCLUDES vanished (``no_longer_shared``) rows — the panel must name a server
+    Jukeplox can no longer use rather than drop it (R2/R3). Non-Plex entries carry
+    ``status: null`` so existing clients see the same shape they always did."""
     try:
         disabled = set(await database.get_disabled_sources())
     except Exception:
         disabled = set()   # veto read fails open (show enabled); source-list reads below surface errors normally
 
-    def _entry(source_id: str, type_: str, name: str) -> dict:
+    def _entry(source_id: str, type_: str, name: str, *,
+               status: str | None = None, status_checked_at: str | None = None) -> dict:
         return {"source_id": source_id, "type": type_, "name": name,
-                "enabled": source_id not in disabled}
+                "enabled": source_id not in disabled,
+                "status": status, "status_checked_at": status_checked_at}
 
     out: list[dict] = []
-    for s in await database.get_plex_servers():
-        out.append(_entry(s["machine_id"], "plex", s.get("name") or "Plex"))
+    for s in await database.get_plex_servers(include_vanished=True):
+        out.append(_entry(s["machine_id"], "plex", s.get("name") or "Plex",
+                          status=s.get("status") or "unknown",
+                          status_checked_at=s.get("status_checked_at")))
     if not out:
         cfg = await database.get_plex_config()
         if cfg:
-            out.append(_entry("", "plex", "Plex"))
+            # KTD11: a legacy single-server install has no machine id and is
+            # never probed — 'unknown' is the honest status.
+            out.append(_entry("", "plex", "Plex", status="unknown"))
     for j in await database.get_jellyfin_sources():
         out.append(_entry(j["source_id"], "jellyfin", j.get("name") or "Jellyfin"))
     for sub in await database.get_subsonic_sources():
@@ -434,7 +457,31 @@ async def scan_status():
     return {
         **await state.scan_status(),
         "grouping_degraded_libraries": state.grouping_degraded_libraries(),
+        **await _plex_health_fields(),
     }
+
+
+async def _plex_health_fields() -> dict:
+    """Plex source-health readouts for the Sources panel (2026-11-21 plan U6):
+    ``account_status`` (ok / account_rejected / missing / legacy), ``rebuild_pending``
+    (ISO UTC time the idle-deferred rebuild was requested, or null) and
+    ``next_refresh_at`` (ISO LOCAL time of the next daily sweep, minutes
+    precision, computed from the saved hour so it moves the moment the admin
+    saves a new one). No token, URL or exception text ever reaches the payload.
+
+    Fails open like the veto read in list_sources: the scan badge is the admin's
+    "is anything happening" readout and must not 500 because the health sidecar
+    could not be read — the nulls are the documented 'unknown' shape."""
+    out: dict = {"account_status": None, "rebuild_pending": None, "next_refresh_at": None}
+    try:
+        out["account_status"] = plex_health.account_status
+        out["rebuild_pending"] = await plex_health.pending_rebuild_since()
+        nxt = await plex_health.projected_next_refresh_at()
+        out["next_refresh_at"] = nxt.isoformat(timespec="minutes")
+    except Exception as e:  # noqa: BLE001 — class only; never the message
+        _log.warning("plex health read failed for the scan-status payload: %s",
+                     type(e).__name__)
+    return out
 
 
 async def _enable_new_source_libraries(source_id: str) -> None:
@@ -508,6 +555,29 @@ async def remove_jellyfin(source_id: str):
     await _clear_source_veto(source_id)   # don't leave an orphan veto entry (U3)
     state.invalidate_plex_client()
     state.trigger_catalog_refresh()
+    return {"ok": True}
+
+
+@router.delete("/sources/plex/{machine_id}")
+async def remove_plex_server(machine_id: str):
+    """Remove a Plex server Plex no longer shares with this account (2026-11-21
+    plan U6, R18/KTD10). 409 for any other status: a live server is dropped by
+    disconnecting Plex, never row by row, so an admin cannot tombstone a working
+    server from the Sources list. ``delete_plex_server`` takes the row, its
+    library selections, its veto entry and writes the tombstone in one
+    transaction; the registry is rebuilt. No catalog rescan — the vanished branch
+    of reconcile already dropped the server's tracks (KTD6)."""
+    statuses = await database.get_plex_server_statuses()
+    status = statuses.get(machine_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="unknown Plex server")
+    if status != "no_longer_shared":
+        raise HTTPException(
+            status_code=409,
+            detail="Only a server Plex no longer shares with you can be removed here; "
+                   "disconnect Plex to drop a live server.")
+    await database.delete_plex_server(machine_id)
+    state.invalidate_plex_client()
     return {"ok": True}
 
 
@@ -912,49 +982,25 @@ async def plex_connect_pin():
 
 @router.get("/plex/connect/poll/{pin_id}")
 async def plex_connect_poll(pin_id: int, client_id: str):
-    # Snapshot connected Plex machine_ids BEFORE the flow so we clear the veto ONLY for
-    # a server this connect NEWLY added — never silently re-enable an already-connected,
-    # deliberately-disabled co-owned Plex server on a re-auth (ce-code-review 2026-07-28).
-    try:
-        before = {s["machine_id"] for s in await database.get_plex_servers()}
-    except Exception:
-        before = set()
-    resolved = await plex_oauth.complete_flow(pin_id, client_id)
-    if resolved:
-        # A NEWLY (re)connected Plex server honors its default-ON switch: clear its veto
-        # so it can't come back invisible (U3). Plex has no panel Remove, so there is no
-        # Plex-disconnect veto path. Best-effort — a veto-store hiccup must not fail connect.
-        new_ids: set[str] = set()
-        owned_new_ids: set[str] = set()
-        try:
-            after_rows = await database.get_plex_servers()
-            after = {s["machine_id"] for s in after_rows}
-            new_ids = after - before
-            # owned is 1/0/NULL; NULL (legacy rows — discovery didn't say) counts
-            # as NOT owned: never auto-crawl a library we can't prove belongs to
-            # this account (owned-only seeding policy, 2026-08-06).
-            owned_new_ids = {s["machine_id"] for s in after_rows
-                             if s["machine_id"] in new_ids and s.get("owned")}
-            disabled = await database.get_disabled_sources()
-            remaining = [d for d in disabled if d not in new_ids]
-            if len(remaining) != len(disabled):
-                await database.set_disabled_sources(remaining)
-                state.invalidate_plex_client()  # veto set changed -> bump the SWR generation
-        except Exception:
-            _log.warning("plex-connect veto clear failed", exc_info=True)
-        # Seed a NEWLY connected OWNED server's libraries enabled-by-default, matching
-        # the non-Plex connects above. Without this, a fresh install whose server holds
-        # a single music library dead-ends: no enabled_libraries row is ever written and
-        # Rescan clears an already-empty catalog (fresh-install audit F1, 2026-08-06).
-        # Scoped to newly-added machine_ids so a RE-auth never overwrites a remembered
-        # per-library selection, and to OWNED servers so a friend's shared library is
-        # never auto-crawled into the party catalog — shared servers stay opt-in via
-        # the always-rendered Libraries drill-in.
-        for sid in owned_new_ids:
-            await _enable_new_source_libraries(sid)
-        if owned_new_ids:
-            state.trigger_catalog_refresh()  # crawl the new server without a manual Rescan
-    return {"resolved": resolved}
+    """Poll the PIN once. On resolution the response carries the connect-origin
+    reconcile result (source-health plan U2 / KTD1): ``added`` is the servers
+    this connect NEWLY connected (their veto cleared, owned libraries seeded —
+    all inside ``health.reconcile``), ``returned`` the servers plex.tv lists
+    again after a ``no_longer_shared`` spell (veto and selection untouched,
+    R12/R17), ``new_libraries`` the section keys first seen on already-known
+    servers. The table is no longer diffed before and after: under a
+    never-delete table a server that left and came back is never "new" to
+    such a diff. Machine ids and section keys only — never a token."""
+    outcome = await plex_oauth.complete_flow(pin_id, client_id)
+    if outcome is None:
+        return {"resolved": False}
+    return {
+        "resolved": True,
+        "added": list(outcome.added),
+        "returned": list(outcome.returned),
+        "vanished": list(outcome.vanished),
+        "new_libraries": list(outcome.new_libraries),
+    }
 
 
 # ── Output configuration ──────────────────────────────────────────────────────
@@ -2020,7 +2066,18 @@ async def playback_no_audio():
         client = await state.get_plex_client()
         if client is None:
             raise HTTPException(status_code=502, detail="No media source configured")
-        url = state._make_stream_url(current.track.stream_key, client)
+        try:
+            url = state._make_stream_url(current.track.stream_key, client)
+        except KeyError:
+            # 2026-11-22 review #4: the current track's source vanished since
+            # it was dispatched (health plan U5 / #44) -- a 502 with the
+            # prefix in the log, not an unhandled KeyError (no URL logged).
+            key = current.track.stream_key or ""
+            _log.warning("playback_no_audio: source prefix %s of the current track names "
+                         "no registered source; cannot restart",
+                         key.split(":", 1)[0] if ":" in key else "<none>")
+            raise HTTPException(status_code=502,
+                                detail="Current track's source is no longer available")
         try:
             await state.output_router.play(url, current.track)
         except Exception:
@@ -2122,6 +2179,9 @@ async def get_settings():
         "queue_end_length_limit": await database.get_queue_end_length_limit(),
         # Most Played leaderboard size (2026-06-23): rows /api/most-played returns.
         "most_played_display_limit": await database.get_most_played_display_limit(),
+        # Plex daily sweep hour (plex-source-health U6): hydrates the Sources
+        # panel's hour selector; unset reads the loop's default (4).
+        "plex_refresh_hour": await plex_health.configured_refresh_hour(),
         # Track ratings + tags (2026-06-26 plan U4): guest-visibility flags (default
         # off) + per-facet Browse toggles (default on). Hydrate the Setup checkboxes.
         "ratings_visible_to_guests": await database.get_ratings_visible_to_guests(),
@@ -2253,6 +2313,12 @@ class SettingsRequest(BaseModel):
     # surface is 1-2 admins) and no appearance broadcast (other open admin
     # devices pick it up on next load; the saving admin applies it live).
     volume_orientation: Literal['horizontal', 'vertical'] | None = None
+    # Plex daily sweep hour (2026-11-21 plex-source-health plan U6, KTD7): the
+    # local hour (0..23, default 4) the token/share reconcile runs. Commits on
+    # change from the Sources panel's selector. int → a non-numeric body is a
+    # Pydantic 422; the 0..23 range is enforced in update_settings. The loop
+    # re-reads the setting on every wake and is re-armed on save, so no restart.
+    plex_refresh_hour: int | None = None
 
 
 @router.post("/settings")
@@ -2314,6 +2380,13 @@ async def update_settings(body: SettingsRequest):
     if body.resume_window_minutes is not None and body.resume_window_minutes < 1:
         raise HTTPException(
             status_code=422, detail="resume_window_minutes must be >= 1"
+        )
+
+    # Plex daily sweep hour (plex-source-health U6, KTD7): a local hour 0..23.
+    # Out of range → 422 and the stored hour is untouched (atomic rule above).
+    if body.plex_refresh_hour is not None and not 0 <= body.plex_refresh_hour <= 23:
+        raise HTTPException(
+            status_code=422, detail="plex_refresh_hour must be an hour 0..23"
         )
 
     # ── apply (validated above; original order preserved) ────────────────────
@@ -2458,6 +2531,13 @@ async def update_settings(body: SettingsRequest):
     # broadcast by design (see SettingsRequest comment).
     if body.volume_orientation is not None:
         await database.set_setting("volume_orientation", body.volume_orientation)
+
+    # Plex daily sweep hour (plex-source-health U6): persist, then re-arm the
+    # sleeping loop so the first sweep lands on the NEW hour's next occurrence
+    # rather than after the old target wakes. No broadcast — admin-only chrome.
+    if body.plex_refresh_hour is not None:
+        await database.set_setting(plex_health.REFRESH_HOUR_KEY, str(body.plex_refresh_hour))
+        plex_health.reschedule_daily_loop()
 
     # On-deck pre-buffer (2026-06-21 plan U4): any change to a selection input
     # invalidates a buffered random pick so the next warm reflects the new

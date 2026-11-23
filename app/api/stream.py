@@ -53,6 +53,28 @@ def _needs_transcode(content_type: str, url: str = "") -> bool:
     return transcodes_to_flac(url)
 
 
+def _plex_401_reporter(key: str, registry):
+    """Build the ``on_status(code)`` callback the three upstream-open sites call
+    (2026-11-21 plex source health, U3 / KTD4). The proxy talks to the source
+    with its own httpx client — the token rides in the URL — so the Plex client's
+    ``_check_status`` never sees these 401s; this is the only observer. It fires
+    ``health.on_server_401`` with the machine id taken from the stream key's
+    prefix, and ONLY when the registry says that prefix is a Plex server: a
+    Jellyfin or Subsonic 401 must never be attributed to Plex. Any other status
+    is ignored, and a failure inside the hook never disturbs the stream."""
+    def _on_status(code: int) -> None:
+        if code != 401 or not key or ":" not in key:
+            return
+        try:
+            if getattr(registry, "source_type_for", lambda _k: None)(key) != "plex":
+                return
+            from app.plex import health
+            health.on_server_401(key.split(":", 1)[0])
+        except Exception:  # noqa: BLE001 — observation only; never break delivery
+            _log.debug("stream proxy: 401 report failed for %s", key, exc_info=True)
+    return _on_status
+
+
 @router.get("/api/stream")
 async def proxy_plex_stream(key: str, request: Request):
     if not state.is_authorized_stream_key(key):
@@ -65,7 +87,14 @@ async def proxy_plex_stream(key: str, request: Request):
     # that is either a remote URL (proxied over HTTP, with any auth headers the
     # provider needs injected server-side so no credential rides the URL to LAN
     # devices) or a local filesystem path (served range-aware from disk).
-    target = client.resolve_stream(key)
+    try:
+        target = client.resolve_stream(key)
+    except KeyError:
+        # The key's prefix names no registered source: the server plex.tv
+        # stopped sharing while this track sat in a queue (health plan U5 /
+        # #44). The registry refuses to route it to another server; to the
+        # device that is a track that no longer exists, not a server fault.
+        raise HTTPException(status_code=404, detail="Stream source unavailable")
     if getattr(target, "path", None):
         # Local-file source. The provider enforces path containment (U12); the
         # key already passed is_authorized_stream_key above.
@@ -79,6 +108,7 @@ async def proxy_plex_stream(key: str, request: Request):
         # empty-URL upstream fetch (which 502s with a misleading message).
         raise HTTPException(status_code=404, detail="Stream source unavailable")
     extra_headers = dict(getattr(target, "headers", None) or {})
+    on_status = _plex_401_reporter(key, client)
     _log.debug("stream proxy: key=%s", key)
 
     # OGG-family sources are transcoded to a cached, seekable FLAC and served
@@ -90,7 +120,7 @@ async def proxy_plex_stream(key: str, request: Request):
     # transcodes — the 2026-06-17 416-spam / repeated-transcode / mid-playback
     # ERROR.)
     if transcodes_to_flac(source_url):
-        return await _serve_transcoded_flac(key, source_url, extra_headers)
+        return await _serve_transcoded_flac(key, source_url, extra_headers, on_status)
 
     # Non-Ogg: open the upstream, forwarding Range for native byte-seeking.
     http_client = httpx.AsyncClient(
@@ -107,6 +137,7 @@ async def proxy_plex_stream(key: str, request: Request):
     except Exception:
         await http_client.aclose()
         raise HTTPException(status_code=502, detail="Stream source unavailable")
+    on_status(upstream_resp.status_code)
 
     content_type = upstream_resp.headers.get("content-type", "application/octet-stream")
     # Rare: an Ogg part served without an .ogg-family extension — the
@@ -114,9 +145,10 @@ async def proxy_plex_stream(key: str, request: Request):
     if content_type.lower().startswith("audio/ogg"):
         await upstream_resp.aclose()
         await http_client.aclose()
-        return await _serve_transcoded_flac(key, source_url, extra_headers)
+        return await _serve_transcoded_flac(key, source_url, extra_headers, on_status)
 
-    return _stream_passthrough(upstream_resp, http_client, source_url, extra_headers)
+    return _stream_passthrough(upstream_resp, http_client, source_url, extra_headers,
+                               on_status=on_status)
 
 
 # Bounded upstream reconnects per client stream on a mid-body truncation
@@ -139,6 +171,7 @@ def _stream_passthrough(
     http_client: httpx.AsyncClient,
     source_url: str,
     base_headers: dict,
+    on_status=None,
 ) -> StreamingResponse:
     resp_headers: dict[str, str] = {
         "Content-Type": plex_resp.headers.get("content-type", "application/octet-stream"),
@@ -191,11 +224,13 @@ def _stream_passthrough(
             try:
                 req = http_client.build_request("GET", source_url, headers=hdrs)
                 resp = await http_client.send(req, stream=True)
-                return True
             except Exception as exc:
                 _log.warning("stream proxy: resume request failed at byte %d: %r",
                              resume_at, exc)
                 return False
+            if on_status is not None:
+                on_status(resp.status_code)
+            return True
 
         try:
             while True:
@@ -541,7 +576,8 @@ def _pinned_keys() -> set[str]:
     return keys
 
 
-async def _fetch_and_transcode(plex_url: str, headers: dict | None = None) -> str:
+async def _fetch_and_transcode(plex_url: str, headers: dict | None = None,
+                               on_status=None) -> str:
     """Fetch the FULL upstream Ogg (no Range) and transcode it to a seekable
     temp FLAC file. The client's Range is never forwarded — FLAC byte offsets
     don't map to Ogg offsets, and a FLAC-coordinate Range 416s against the
@@ -557,6 +593,8 @@ async def _fetch_and_transcode(plex_url: str, headers: dict | None = None) -> st
     except Exception:
         await http_client.aclose()
         raise HTTPException(status_code=502, detail="Stream source unavailable")
+    if on_status is not None:
+        on_status(plex_resp.status_code)
     # The feeder may replace the response when it resumes, so the close below
     # has to target whichever one is live, not the one we opened.
     current = {"resp": plex_resp}
@@ -576,6 +614,8 @@ async def _fetch_and_transcode(plex_url: str, headers: dict | None = None) -> st
             _log.warning("stream proxy: transcode resume request failed at byte "
                          "%d: %r", offset, exc)
             return None
+        if on_status is not None:
+            on_status(resp.status_code)
         if resp.status_code != 206:
             # A 200 means the source ignored Range and restarted from zero.
             # Feeding that on would duplicate everything already sent to ffmpeg
@@ -600,7 +640,8 @@ async def _fetch_and_transcode(plex_url: str, headers: dict | None = None) -> st
         await http_client.aclose()
 
 
-async def _get_or_transcode(key: str, plex_url: str, headers: dict | None = None) -> str:
+async def _get_or_transcode(key: str, plex_url: str, headers: dict | None = None,
+                            on_status=None) -> str:
     """Return a cached transcoded FLAC path for *key*, transcoding once on miss.
 
     Concurrent requests for the SAME key coalesce onto one transcode (a per-key
@@ -619,7 +660,8 @@ async def _get_or_transcode(key: str, plex_url: str, headers: dict | None = None
             _TRANSCODE_CACHE.pop(key, None)
         task = _transcode_inflight.get(key)
         if task is None:
-            task = asyncio.ensure_future(_fetch_and_transcode(plex_url, headers))
+            task = asyncio.ensure_future(
+                _fetch_and_transcode(plex_url, headers, on_status=on_status))
             _transcode_inflight[key] = task
             task.add_done_callback(lambda _t, k=key: _transcode_inflight.pop(k, None))
 
@@ -649,18 +691,22 @@ async def _get_or_transcode(key: str, plex_url: str, headers: dict | None = None
     return new_path
 
 
-async def _serve_transcoded_flac(key: str, plex_url: str, headers: dict | None = None):
+async def _serve_transcoded_flac(key: str, plex_url: str, headers: dict | None = None,
+                                 on_status=None):
     """Serve the cached, seekable FLAC for *key* via a range-aware FileResponse
     (Content-Length + Accept-Ranges + 206). Transcodes once on cache miss."""
     try:
-        path = await _get_or_transcode(key, plex_url, headers)
+        path = await _get_or_transcode(key, plex_url, headers, on_status=on_status)
     except HTTPException:
         raise
     except FileNotFoundError:
-        _log.error("ffmpeg not found in PATH — cannot transcode %s", plex_url)
+        _log.error("ffmpeg not found in PATH — cannot transcode %s", key)
         raise HTTPException(status_code=502, detail="Transcoder unavailable")
     except Exception as exc:
-        _log.warning("stream proxy: transcode failed for %s: %s", plex_url, exc)
+        # Log the stream KEY and the exception CLASS only: ``plex_url`` carries
+        # X-Plex-Token and an httpx error's text can quote the URL (2026-11-22
+        # review; the class-only rule of app/plex/health.py and sources/registry.py).
+        _log.warning("stream proxy: transcode failed for %s: %s", key, type(exc).__name__)
         raise HTTPException(status_code=502, detail="Transcode failed")
     return FileResponse(path, media_type="audio/flac")
 
