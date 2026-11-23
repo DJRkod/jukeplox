@@ -19,6 +19,28 @@ def make_track(tid="t1") -> Track:
                  stream_key="/parts/1/f.flac")
 
 
+def make_vanished_source_registry():
+    """A real SourceRegistry over one fake ``machine-live`` source, so routing is
+    the production code path: a ``machine-gone:`` key raises KeyError (the
+    server vanished -- health plan U5 / #44), a ``machine-live:`` key resolves
+    to ``http://plex-live.test/<key>``. Mirrors tests/test_state.py's
+    ``_u5_registry`` for the transport routes (2026-11-22 review #4)."""
+    from app.sources.base import StreamTarget
+    from app.sources.registry import SourceRegistry
+    src = MagicMock()
+    src.source_id = "machine-live"
+    src.source_type = "plex"
+    src.url_borne_auth = False
+    src.resolve_stream = MagicMock(
+        side_effect=lambda k: StreamTarget(url=f"http://plex-live.test/{k}"))
+    return SourceRegistry([src])
+
+
+def make_sourced_track(machine_id: str, n: int, title: str) -> Track:
+    return Track(id=f"{machine_id}:{n}", title=title, artist="Act", album="Rec",
+                 duration_ms=1000, stream_key=f"{machine_id}:part{n}")
+
+
 def make_album(aid="a1") -> Album:
     return Album(id=aid, title="Album", artist="Artist A", year=2024)
 
@@ -117,6 +139,16 @@ def mock_state(mock_session):
     watcher_module._watcher = None
     probe_runner_module._probe_semaphore = None
 
+    # Plex source health (2026-11-21 plan U3): no test that builds the app may
+    # reach plex.tv or arm the daily sweep. Started by hand rather than as two
+    # more ``with`` items — the block below is at CPython's nested-block limit.
+    health_patches = patch.multiple(
+        "app.plex.health",
+        request_refresh=MagicMock(return_value=False),
+        start_daily_loop=MagicMock(),
+    )
+    health_patches.start()
+
     # Default probe_cache patches: admin tests don't exercise verdict
     # storage, so route the calls through AsyncMocks that never touch
     # the real settings store. Tests that DO want to assert on
@@ -144,6 +176,7 @@ def mock_state(mock_session):
 
     # Teardown mirror of the pre-test reset: a watcher a test installed
     # must not survive into tests that don't use this fixture.
+    health_patches.stop()
     watcher_module._watcher = None
     probe_runner_module._probe_semaphore = None
 

@@ -17,7 +17,7 @@ _db: aiosqlite.Connection | None = None
 # audit F2 2026-08-06, the browse-index and catalog refreshes colliding
 # on the empty-enabled fast path). INVARIANT: every explicit
 # BEGIN/BEGIN IMMEDIATE transaction on this connection holds this lock
-# (save_plex_servers, set_genre_cache, set_credit_cache,
+# (reconcile_plex_servers, delete_plex_server, set_genre_cache, set_credit_cache,
 # set_browse_index, set_prepared_browse, clear_prepared_browse,
 # catalog/store.replace_catalog), as do the
 # crawl-scale implicit-transaction alias writers
@@ -105,7 +105,34 @@ CREATE TABLE IF NOT EXISTS plex_servers (
     owner       TEXT NOT NULL,
     token       TEXT NOT NULL,
     client_id   TEXT NOT NULL,
-    owned       INTEGER          -- 1/0; NULL = unknown (pre-2026-06-11 rows)
+    owned       INTEGER,         -- 1/0; NULL = unknown (pre-2026-06-11 rows)
+    -- Source-health columns (2026-11-21 plan U1 / KTD2). The CHECK lives here
+    -- only: SQLite cannot add one by ALTER, so a migrated column carries just
+    -- the default. INVARIANT: missing_since is non-null exactly when status is
+    -- 'no_longer_shared'. Timestamps are ISO-8601 UTC text.
+    status            TEXT NOT NULL DEFAULT 'unknown'
+                      CHECK (status IN ('usable', 'token_rejected', 'unreachable',
+                                        'no_longer_shared', 'unknown')),
+    status_checked_at TEXT,
+    missing_since     TEXT
+);
+
+-- Per-server libraries already seen by the refresh (plan U1 / KTD9): a section
+-- absent from here is NEW. enabled_libraries only holds ticked rows, so it
+-- cannot tell "new" from "unticked".
+CREATE TABLE IF NOT EXISTS plex_seen_libraries (
+    machine_id    TEXT NOT NULL,
+    section_key   TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    PRIMARY KEY (machine_id, section_key)
+);
+
+-- Tombstones for admin-removed Plex servers (plan U1 / KTD10): the reconcile
+-- skips these so the next sweep does not re-add a removed server as "newly
+-- shared". A fresh connect clears them.
+CREATE TABLE IF NOT EXISTS plex_removed_servers (
+    machine_id TEXT PRIMARY KEY,
+    removed_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS jellyfin_sources (
@@ -431,6 +458,27 @@ async def _migrate_columns() -> None:
         # (server linked before this shipped) → ranks after known-owned,
         # alphabetical fallback. A re-link/re-save populates it.
         await _db.execute("ALTER TABLE plex_servers ADD COLUMN owned INTEGER")
+    if "status" not in cols:
+        # Source-health plan U1 (2026-11-21): default only — SQLite cannot ADD a
+        # CHECK constraint; the fresh-table CHECK in _SCHEMA guards new installs
+        # and set_plex_server_status validates in Python for both.
+        await _db.execute(
+            "ALTER TABLE plex_servers ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown'")
+        # Every server saved BEFORE this build gets a baseline marker (KTD9):
+        # its first usable probe records the libraries it already has without
+        # enabling any (an unticked owned library has no row and must stay
+        # off). The marker is what tells that row apart from a NEW server that
+        # happened to be unreachable the first time plex.tv listed it — which
+        # has no marker, so its owned libraries are enabled when it first
+        # answers (2026-11-22 review #9).
+        await _db.execute(
+            "INSERT OR IGNORE INTO plex_seen_libraries (machine_id, section_key, first_seen_at) "
+            "SELECT machine_id, ?, ? FROM plex_servers",
+            (PLEX_SEEN_BASELINE_MARKER, utc_now_iso()))
+    if "status_checked_at" not in cols:
+        await _db.execute("ALTER TABLE plex_servers ADD COLUMN status_checked_at TEXT")
+    if "missing_since" not in cols:
+        await _db.execute("ALTER TABLE plex_servers ADD COLUMN missing_since TEXT")
 
     async with _db.execute("PRAGMA table_info(browse_album_index)") as cur:
         album_cols = {row["name"] async for row in cur}
@@ -557,41 +605,292 @@ async def set_plex_config(server_url: str, token: str, client_id: str) -> None:
     await db.commit()
 
 
-# ── plex servers (multi-server support) ──────────────────────────────────────
+# ── plex servers (multi-server support + source health, 2026-11-21 plan U1) ──
 
-async def save_plex_servers(servers: list[dict]) -> None:
+PLEX_SERVER_STATUSES = frozenset(
+    {"usable", "token_rejected", "unreachable", "no_longer_shared", "unknown"})
+
+
+def utc_now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+async def reconcile_plex_servers(servers: list[dict], *, mark_missing: bool) -> dict:
+    """The ONE writer of the plex_servers table (KTD2): an upsert that never
+    deletes a row.
+
+    In a single ``BEGIN IMMEDIATE`` transaction under ``_write_tx_lock``:
+
+    1. upsert every supplied row by machine id, keeping the saved ``name`` /
+       ``owner`` / ``server_url`` when the incoming value is empty, sealing the
+       token at rest (R24), and setting status to the row's ``status`` key when
+       given (a resource with no usable address arrives as ``unreachable``) or
+       ``usable`` otherwise; a supplied row that was ``no_longer_shared``
+       returns to usable with ``missing_since`` cleared;
+    2. when ``mark_missing`` is set, mark every row NOT supplied
+       ``no_longer_shared`` with ``missing_since`` set once (never bumped);
+    3. tombstoned machine ids (``plex_removed_servers``) are skipped in SQL.
+
+    Returns ``{"added", "returned", "vanished", "changed_tokens"}`` as lists of
+    machine ids — never a token value. ``new_libraries`` is the caller's
+    (U2) business: libraries are not known here.
+    """
     from app.sources import secrets
     db = _conn()
+    now = utc_now_iso()
+    supplied = [s for s in servers if s.get("machine_id")]
+    supplied_ids = [s["machine_id"] for s in supplied]
+    result = {"added": [], "returned": [], "vanished": [], "changed_tokens": []}
     async with _write_tx_lock:
-        # Promoted from a bare BEGIN: the DELETE below takes RESERVED anyway, so
-        # acquiring it at BEGIN is strictly earlier and avoids a lock upgrade.
-        await _begin_immediate(db, "save_plex_servers")
+        await _begin_immediate(db, "reconcile_plex_servers")
         try:
-            await db.execute("DELETE FROM plex_servers")
-            for s in servers:
-                # owned: 1/0 when discovery supplied it, NULL when absent
-                # (legacy callers) — NULL means "unknown" to the rank logic.
+            async with db.execute(
+                "SELECT machine_id, token, status FROM plex_servers") as cur:
+                before = {r["machine_id"]: (r["token"], r["status"]) async for r in cur}
+            async with db.execute("SELECT machine_id FROM plex_removed_servers") as cur:
+                tombstoned = {r["machine_id"] async for r in cur}
+            for s in supplied:
+                mid = s["machine_id"]
+                if mid in tombstoned:
+                    continue
+                status = s.get("status") or "usable"
+                if status not in PLEX_SERVER_STATUSES or status == "no_longer_shared":
+                    raise ValueError("reconcile_plex_servers: bad status for a supplied row")
                 owned = s.get("owned")
+                prior = before.get(mid)
+                if prior is None:
+                    result["added"].append(mid)
+                else:
+                    if prior[1] == "no_longer_shared":
+                        result["returned"].append(mid)
+                    if secrets.open_secret(prior[0]) != (s.get("token") or ""):
+                        result["changed_tokens"].append(mid)
+                # Tombstone filter is ALSO in SQL so a row can never be inserted
+                # for a removed server even if the Python set above is stale.
                 await db.execute(
-                    "INSERT OR REPLACE INTO plex_servers (machine_id, server_url, name, owner, token, client_id, owned) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (s["machine_id"], s["server_url"], s["name"], s["owner"],
-                     secrets.seal(s["token"]), s["client_id"],  # U17: sealed at rest (R24)
-                     None if owned is None else int(bool(owned))),
+                    "INSERT INTO plex_servers (machine_id, server_url, name, owner, token, "
+                    "client_id, owned, status, status_checked_at, missing_since) "
+                    "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL "
+                    "WHERE NOT EXISTS (SELECT 1 FROM plex_removed_servers WHERE machine_id = ?) "
+                    "ON CONFLICT(machine_id) DO UPDATE SET "
+                    "server_url = CASE WHEN excluded.server_url = '' THEN plex_servers.server_url "
+                    "                  ELSE excluded.server_url END, "
+                    "name = CASE WHEN excluded.name = '' THEN plex_servers.name ELSE excluded.name END, "
+                    "owner = CASE WHEN excluded.owner = '' THEN plex_servers.owner ELSE excluded.owner END, "
+                    "token = excluded.token, client_id = excluded.client_id, "
+                    "owned = COALESCE(excluded.owned, plex_servers.owned), "
+                    "status = excluded.status, status_checked_at = excluded.status_checked_at, "
+                    "missing_since = NULL",
+                    (mid, s.get("server_url") or "", s.get("name") or "", s.get("owner") or "",
+                     secrets.seal(s.get("token") or "") or "", s.get("client_id") or "",
+                     None if owned is None else int(bool(owned)), status, now, mid),
                 )
+            if mark_missing:
+                placeholders = ",".join("?" * len(supplied_ids))
+                not_in = f" AND machine_id NOT IN ({placeholders})" if supplied_ids else ""
+                async with db.execute(
+                    "SELECT machine_id FROM plex_servers WHERE status != 'no_longer_shared'"
+                    + not_in, supplied_ids) as cur:
+                    result["vanished"] = sorted([r["machine_id"] async for r in cur])
+                await db.execute(
+                    "UPDATE plex_servers SET status = 'no_longer_shared', "
+                    "status_checked_at = ?, "
+                    "missing_since = COALESCE(missing_since, ?) "
+                    "WHERE 1=1" + not_in,
+                    [now, now, *supplied_ids],
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    return result
+
+
+async def set_plex_server_status(machine_id: str, status: str) -> None:
+    """Record one server's probe / 401 outcome, stamping ``status_checked_at`` and
+    maintaining the ``missing_since`` invariant (set once on entering
+    ``no_longer_shared``, cleared on leaving it). Validated in Python because a
+    migrated table has no CHECK."""
+    if status not in PLEX_SERVER_STATUSES:
+        raise ValueError(f"unknown plex server status {status!r}")
+    now = utc_now_iso()
+    db = _conn()
+    # Holds ``_write_tx_lock`` (2026-11-22 review #3): the 401 path fires this
+    # as a fire-and-forget task, and an unlocked implicit transaction open
+    # across the execute->commit await interleaves with a locked
+    # ``BEGIN IMMEDIATE`` block (reconcile / delete) on the one shared
+    # connection -- the play-count writers' lesson. No caller holds the lock.
+    async with _write_tx_lock:
+        if status == "no_longer_shared":
+            await db.execute(
+                "UPDATE plex_servers SET status = ?, status_checked_at = ?, "
+                "missing_since = COALESCE(missing_since, ?) WHERE machine_id = ?",
+                (status, now, now, machine_id))
+        else:
+            await db.execute(
+                "UPDATE plex_servers SET status = ?, status_checked_at = ?, "
+                "missing_since = NULL WHERE machine_id = ?",
+                (status, now, machine_id))
+        await db.commit()
+
+
+async def get_plex_servers(include_vanished: bool = False) -> list[dict]:
+    """Saved Plex servers with tokens opened for use. A ``no_longer_shared`` row
+    is excluded by default so no client is ever built for a vanished server
+    (KTD6); the admin list passes ``include_vanished=True``."""
+    from app.sources import secrets
+    sql = "SELECT * FROM plex_servers"
+    if not include_vanished:
+        sql += " WHERE status != 'no_longer_shared'"
+    async with _conn().execute(sql) as cur:
+        rows = [dict(row) async for row in cur]
+    for r in rows:
+        r["token"] = secrets.open_secret(r.get("token"))  # U17: opened for use
+    return rows
+
+
+async def get_plex_server_statuses() -> dict[str, str]:
+    """machine_id -> status for every saved server. Reads NO token column, so
+    it can sit on the guest read path (``get_effective_enabled_libraries``)
+    without opening a credential."""
+    async with _conn().execute("SELECT machine_id, status FROM plex_servers") as cur:
+        return {r["machine_id"]: r["status"] async for r in cur}
+
+
+async def get_plex_server_names() -> dict[str, str]:
+    """machine_id -> display name for every saved server, token column untouched
+    (log lines and admin text that name a server without opening a credential)."""
+    async with _conn().execute("SELECT machine_id, name FROM plex_servers") as cur:
+        return {r["machine_id"]: (r["name"] or "") async for r in cur}
+
+
+def _prefix_match_sql(column: str) -> str:
+    """``column`` is ``"{prefix}:..."`` — a length-bounded substring compare,
+    never LIKE: a machine id may contain ``_``, which LIKE treats as a wildcard.
+    Bind ``(len(prefix) + 1, prefix + ":")``."""
+    return f"substr({column}, 1, ?) = ?"
+
+
+async def delete_plex_server(machine_id: str) -> None:
+    """Admin removes a Plex server (KTD10): in ONE transaction delete the server
+    row, its ``enabled_libraries`` and ``plex_seen_libraries`` rows (library keys
+    by length-bounded prefix), drop it from the ``disabled_sources`` veto (the
+    settings row is rewritten inline — ``set_setting`` self-commits and so cannot
+    be called inside the transaction), and write the tombstone. All or nothing."""
+    db = _conn()
+    now = utc_now_iso()
+    bind = (len(machine_id) + 1, machine_id + ":")
+    async with _write_tx_lock:
+        await _begin_immediate(db, "delete_plex_server")
+        try:
+            await db.execute("DELETE FROM plex_servers WHERE machine_id = ?", (machine_id,))
+            await db.execute(
+                f"DELETE FROM enabled_libraries WHERE {_prefix_match_sql('section_key')}", bind)
+            await db.execute(
+                "DELETE FROM plex_seen_libraries WHERE machine_id = ?", (machine_id,))
+            async with db.execute(
+                "SELECT value FROM settings WHERE key = 'disabled_sources'") as cur:
+                row = await cur.fetchone()
+            if row is not None:
+                vetoed = _parse_disabled_sources(row["value"])
+                if machine_id in vetoed:
+                    await db.execute(
+                        "UPDATE settings SET value = ? WHERE key = 'disabled_sources'",
+                        (_json.dumps([v for v in vetoed if v != machine_id]),))
+            await db.execute(
+                "INSERT INTO plex_removed_servers (machine_id, removed_at) VALUES (?, ?) "
+                "ON CONFLICT(machine_id) DO UPDATE SET removed_at = excluded.removed_at",
+                (machine_id, now))
             await db.commit()
         except Exception:
             await db.rollback()
             raise
 
 
-async def get_plex_servers() -> list[dict]:
-    from app.sources import secrets
-    async with _conn().execute("SELECT * FROM plex_servers") as cur:
-        rows = [dict(row) async for row in cur]
-    for r in rows:
-        r["token"] = secrets.open_secret(r.get("token"))  # U17: opened for use
-    return rows
+async def get_plex_tombstones() -> list[str]:
+    async with _conn().execute(
+        "SELECT machine_id FROM plex_removed_servers ORDER BY machine_id") as cur:
+        return [r["machine_id"] async for r in cur]
+
+
+async def clear_plex_tombstones() -> None:
+    """A connect is the admin asking for the whole account again (KTD10).
+    Holds ``_write_tx_lock`` like every other implicit-transaction writer."""
+    db = _conn()
+    async with _write_tx_lock:
+        await db.execute("DELETE FROM plex_removed_servers")
+        await db.commit()
+
+
+# ``plex_seen_libraries`` row with this section key = "saved before the
+# source-health build; baseline pending" (KTD9). Written by the U1 migration
+# for every row that existed then, and by nothing else in production.
+PLEX_SEEN_BASELINE_MARKER = ""
+
+
+async def get_plex_seen_libraries(machine_id: str) -> list[str]:
+    """Section keys the refresh has recorded for a server — the baseline marker
+    is not a library and is never returned here."""
+    async with _conn().execute(
+        "SELECT section_key FROM plex_seen_libraries WHERE machine_id = ? AND section_key != ? "
+        "ORDER BY section_key", (machine_id, PLEX_SEEN_BASELINE_MARKER)) as cur:
+        return [r["section_key"] async for r in cur]
+
+
+async def plex_seen_baseline_pending(machine_id: str) -> bool:
+    """True while a pre-upgrade server still carries its baseline marker, i.e.
+    no usable probe has recorded its libraries yet."""
+    async with _conn().execute(
+        "SELECT 1 FROM plex_seen_libraries WHERE machine_id = ? AND section_key = ?",
+        (machine_id, PLEX_SEEN_BASELINE_MARKER)) as cur:
+        return await cur.fetchone() is not None
+
+
+async def mark_plex_seen_baseline_pending(machine_ids) -> None:
+    """Write the baseline marker for servers (what the U1 migration does for
+    every pre-existing row; tests use it to stage an upgraded install)."""
+    ids = [str(m) for m in machine_ids]
+    if not ids:
+        return
+    db = _conn()
+    now = utc_now_iso()
+    async with _write_tx_lock:
+        await db.executemany(
+            "INSERT OR IGNORE INTO plex_seen_libraries (machine_id, section_key, first_seen_at) "
+            "VALUES (?, ?, ?)",
+            [(m, PLEX_SEEN_BASELINE_MARKER, now) for m in ids])
+        await db.commit()
+
+
+async def add_plex_seen_libraries(machine_id: str, keys) -> None:
+    """Record libraries as seen (idempotent; ``first_seen_at`` is kept). The
+    first real key retires the server's baseline marker, if any."""
+    keys = [str(k) for k in keys if str(k) != PLEX_SEEN_BASELINE_MARKER]
+    if not keys:
+        return
+    db = _conn()
+    now = utc_now_iso()
+    async with _write_tx_lock:
+        await db.executemany(
+            "INSERT OR IGNORE INTO plex_seen_libraries (machine_id, section_key, first_seen_at) "
+            "VALUES (?, ?, ?)",
+            [(machine_id, k, now) for k in keys])
+        await db.execute(
+            "DELETE FROM plex_seen_libraries WHERE machine_id = ? AND section_key = ?",
+            (machine_id, PLEX_SEEN_BASELINE_MARKER))
+        await db.commit()
+
+
+async def get_plex_account_token() -> str | None:
+    """The sealed plex.tv account token captured at connect (KTD3). An absent,
+    empty, or unopenable value reads as ``None`` so the bootstrap path runs
+    instead of a plex.tv call with an empty token."""
+    return (await get_sealed_setting("plex_account_token")) or None
+
+
+async def set_plex_account_token(token: str | None) -> None:
+    await set_sealed_setting("plex_account_token", token)
 
 
 # ── jellyfin sources (multi-source plan U10) ─────────────────────────────────
@@ -764,10 +1063,20 @@ async def get_effective_enabled_libraries() -> list[dict]:
         # Veto set unreadable (e.g. DB error) -> fail open, serve all enabled, same
         # availability posture as get_enabled_libraries itself. A dead settings read
         # would break get_enabled_libraries too, so nothing is lost by not vetoing.
+        disabled = set()
+    # Source-health plan U1 / KTD6: a server plex.tv no longer lists is hidden
+    # at this same chokepoint. EXCLUSION only — legacy keys resolve to "" and
+    # Jellyfin/Subsonic/Emby/local keys have no server status; an inclusion
+    # filter would hide all of them. Reads no token. Fails open like the veto.
+    try:
+        statuses = await get_plex_server_statuses()
+        vanished = {m for m, st in statuses.items() if st == "no_longer_shared"}
+    except Exception:
+        vanished = set()
+    excluded = disabled | vanished
+    if not excluded:
         return rows
-    if not disabled:
-        return rows
-    return [r for r in rows if source_id_from_section_key(r["section_key"]) not in disabled]
+    return [r for r in rows if source_id_from_section_key(r["section_key"]) not in excluded]
 
 
 async def toggle_library(section_key: str, name: str, enabled: bool) -> None:
@@ -1497,7 +1806,12 @@ async def get_disabled_sources() -> list[str]:
     libraries is excluded from guest-visible content, regardless of the per-library
     enabled_libraries rows (which are left intact so the selection is remembered
     across an off->on toggle). Empty (the default) = all sources on."""
-    raw = await get_setting("disabled_sources")
+    return _parse_disabled_sources(await get_setting("disabled_sources"))
+
+
+def _parse_disabled_sources(raw: str | None) -> list[str]:
+    """The stored ``disabled_sources`` JSON as a list of source ids; anything
+    unset, malformed or not a list reads as the empty veto."""
     if not raw:
         return []
     try:

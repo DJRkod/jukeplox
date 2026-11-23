@@ -5566,3 +5566,50 @@ async def test_a_fresh_index_is_not_refreshed_on_a_prepared_hit(
 
     client.get("/api/browse/albums", headers={"accept-encoding": "gzip"})
     trig.assert_not_called()
+
+
+# ── Vanished-server keys: drill routes 404, never 500 (health plan U5 / #44) ──
+# The registry raises KeyError for a key whose prefix names no registered
+# source (a server plex.tv no longer shares). Every drill route that routes by
+# the client-supplied id must map that to 404 exactly as get_track does.
+
+
+def test_browse_album_tracks_unknown_prefix_returns_404(mock_deps):
+    _, plex = mock_deps
+    plex.get_album.side_effect = KeyError("machine-gone")
+    with patch("app.api.guest.enabled_libraries", AsyncMock(return_value=_two_libs())):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/albums/machine-gone:1/tracks")
+    assert resp.status_code == 404
+
+
+def test_browse_artist_albums_unknown_prefix_returns_404(mock_deps):
+    _, plex = mock_deps
+    plex.get_artists.side_effect = AsyncMock(
+        return_value=[Artist(id="machineA:42", title="Prince")])
+    with patch("app.api.guest.enabled_libraries", AsyncMock(return_value=_two_libs())):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/artists/machine-gone:42/albums")
+    assert resp.status_code == 404
+
+
+def test_browse_artist_songs_vanished_prefix_popular_lookup_returns_404(mock_deps):
+    """The one artist-drill call routed by the ARTIST id (not a library key) is
+    the popularity lookup; a stale index row for a vanished server reaches it and
+    the registry raises KeyError. 404, not 500."""
+    _, plex = mock_deps
+
+    async def fake_get_artists(section_key):
+        return [Artist(id="machine-gone:42", title="Prince")]
+
+    plex.get_artists.side_effect = fake_get_artists
+    plex.get_albums.side_effect = AsyncMock(return_value=[])
+    plex.get_artist_popular_tracks.side_effect = KeyError("machine-gone")
+    with patch("app.api.guest.enabled_libraries", AsyncMock(return_value=_two_libs())), \
+         patch("app.api.guest._appearances_for_norm", AsyncMock(return_value=[])):
+        from app.main import app
+        c = TestClient(app, raise_server_exceptions=True)
+        resp = c.get("/api/browse/artists/machine-gone:42/songs")
+    assert resp.status_code == 404

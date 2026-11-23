@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import socket
+import time
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -102,6 +103,40 @@ def radio_active() -> bool:
     return radio_session.is_active()
 
 
+# ── playback idle stamp (2026-11-21 plex-health plan U4, KTD5) ───────────────
+# "Idle is a stamp, not a predicate." ``playback_idle_since`` is the monotonic
+# time playback LAST became idle — nothing playing, no paused item (the engine's
+# distinct ``is_paused`` flag) and no radio station — or None while anything is
+# live. It is re-evaluated on every engine transition (the single engine-event
+# consumer in setup(); every transition reaches it through ``_emit``) and on
+# every radio transition (the session state listener), so radio stopping with
+# an empty queue stamps idle without an engine event. The deferred Plex
+# rebuild runner (``app.plex.health``) consumes ``playback_idle_for()``; the
+# existing ``is_playing`` flags say "now", this says "for how long".
+playback_idle_since: float | None = None
+_idle_clock = time.monotonic   # injectable for tests
+
+
+def playback_idle_for() -> float | None:
+    """Seconds since playback last became idle, or None while anything plays,
+    is paused, or a radio station is active."""
+    if playback_idle_since is None:
+        return None
+    return max(0.0, _idle_clock() - playback_idle_since)
+
+
+def _update_idle_stamp() -> None:
+    """Re-evaluate the idle stamp from the engine flags + radio. Sets the stamp
+    once on the live→idle edge (a repeated idle evaluation keeps the original
+    time) and clears it the moment anything starts."""
+    global playback_idle_since
+    st = queue_engine.state
+    if st.is_playing or st.is_paused or radio_active():
+        playback_idle_since = None
+    elif playback_idle_since is None:
+        playback_idle_since = _idle_clock()
+
+
 # ── RadioStateEvent broadcast wiring (radio plan U7) ──────────────────────────
 # The session is the single source of state/title truth; U7 broadcasts a
 # RadioStateEvent {station, status, live_title} via broadcast_to_all on EVERY
@@ -179,6 +214,9 @@ def _register_radio_listeners() -> None:
     listeners. Both a state transition and a title change emit a RadioStateEvent
     (DL-007 — the event carries the live_title)."""
     radio_session.add_state_listener(_broadcast_radio_state)
+    # U4 idle stamp: a radio start clears it, a stop with nothing to resume
+    # stamps it (the resume dispatch's engine events re-evaluate it anyway).
+    radio_session.add_state_listener(_update_idle_stamp)
     # A title change is a lighter event, but the simplest correct thing (per the
     # plan) is to re-broadcast the full RadioStateEvent with the new live_title.
     radio_session.add_title_listener(lambda _title: _broadcast_radio_state())
@@ -2236,7 +2274,19 @@ async def _play_with_fallback(item, client) -> bool:
     play_recorded = bool(getattr(item, "play_recorded", False))
     reachable: bool | None = None
     for key in _holder_keys(item.track):
-        url = _make_stream_url(key, client)
+        try:
+            url = _make_stream_url(key, client)
+        except KeyError:
+            # The key's prefix names no registered source: the server vanished
+            # (plex.tv stopped sharing it, health plan U5 / #44) after this
+            # track was queued. Not the device's fault -- no tie-breaker probe
+            # -- and not a holder that can be retried: on to the next holder,
+            # and the caller skips the item when none is left. Before U5 this
+            # call sat outside the try and the KeyError escaped the advance
+            # task instead of becoming a skip.
+            _log.warning("Holder %s for %r names no registered source; trying "
+                         "next holder", key, item.track.title)
+            continue
         try:
             await dispatch_play(url, item.track, play_recorded=play_recorded,
                                 holder_key=key)
@@ -2717,7 +2767,17 @@ _browse_counts_degraded: dict[str, str] = {}
 async def _refresh_catalog() -> None:
     global _catalog_refresh_running, _catalog_refresh_failed
     from app import database
+    from app.api import guest as _guest_api
     from app.catalog import scan
+    # Generation guard (docs/solutions/design-patterns/async-refresh-must-
+    # generation-guard-against-invalidation.md): the registry and enabled keys
+    # below are a snapshot of the source set at crawl start. If a source
+    # reconfiguration lands mid-crawl (invalidate_plex_client bumps the
+    # counter — a Plex server vanishing, a library toggled), replace_catalog
+    # has already written the OLD world back, so run again instead of trusting
+    # it (2026-11-22 review #2).
+    gen = _guest_api._enabled_libs_gen
+    rerun = False
     try:
         registry = await get_plex_client()
         if not registry:
@@ -2737,6 +2797,9 @@ async def _refresh_catalog() -> None:
         _catalog_refresh_failed = (
             not replaced and bool(getattr(registry, "sources", None) or [])
         )
+        if _guest_api._enabled_libs_gen != gen:
+            rerun = True
+            _log.info("Catalog refresh: source set changed during the crawl — running again")
         if replaced:
             await stamp_cache("catalog_computed_at")
             # R12 mid-session re-validation (2026-08-04-002 plexplayer plan
@@ -2761,6 +2824,8 @@ async def _refresh_catalog() -> None:
         # Catalog content is an input to the multi-source answer, and like the
         # credit crawl this lands after the response that triggered it.
         trigger_prepared_browse_rebuild()
+        if rerun:
+            trigger_catalog_refresh()
 
 
 def trigger_catalog_refresh() -> None:
@@ -3752,11 +3817,19 @@ async def setup() -> None:
             await manager.broadcast_to_all(
                 PlaybackStateEvent(is_playing=state.is_playing, is_paused=state.is_paused)
             )
+        # U4 idle stamp: every engine transition funnels through _emit → here.
+        # Evaluated AFTER the per-event work so a stop whose queue_changed
+        # auto-starts the next track is read with the engine's final flags.
+        _update_idle_stamp()
 
     queue_engine.add_callback(_on_event)
 
     # Restore queue from DB
     await queue_engine.load_from_db()
+    # Nothing plays at boot: start the idle clock now so a rebuild deferred
+    # across a restart (plex_rebuild_pending) still fires after ten quiet
+    # minutes on a box nobody touches.
+    _update_idle_stamp()
 
 
 # ── server-fed backends: dormant opt-in activation (2026-08-11 plan U2) ──────

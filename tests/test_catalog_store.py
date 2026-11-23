@@ -309,14 +309,15 @@ async def test_concurrent_explicit_writers_never_nest_transactions(db):
         )
 
 
-async def test_save_plex_servers_races_replace_catalog(db):
-    # The connect-time window: complete_flow saves servers while the
-    # connect-triggered catalog refresh writes.
+async def test_reconcile_plex_servers_races_replace_catalog(db):
+    # The connect-time window: complete_flow reconciles servers while the
+    # connect-triggered catalog refresh writes (ported from save_plex_servers,
+    # 2026-11-21 source-health U1: one upsert writer, never a DELETE-all).
     server = {"machine_id": "m1", "server_url": "http://192.168.1.50:32400",
               "name": "S", "owner": "o", "token": "t", "client_id": "c", "owned": 1}
     for _ in range(25):
         await asyncio.gather(
-            database.save_plex_servers([server]),
+            database.reconcile_plex_servers([server], mark_missing=True),
             store.replace_catalog([], [], [], []),
         )
     assert (await database.get_plex_servers())[0]["machine_id"] == "m1"
@@ -346,3 +347,80 @@ async def test_lock_released_after_writer_raises(db):
         await store.replace_catalog([None], [], [], [])
     await store.replace_catalog([_artist("ar1")], [], [], [])
     assert (await store.get_artist("ar1"))["identity"] == "ar1"
+
+
+# ── delete_catalog_source (2026-11-21 Plex source health plan U1) ────────────
+# A vanished server's content is dropped by source prefix in one transaction
+# without a re-crawl. A sibling source whose id shares a leading substring
+# ("m1" vs "m10") must be untouched, and an entity another source still holds
+# survives with only the vanished hold removed.
+
+async def _seed_two_sources():
+    await store.replace_catalog(
+        artists=[_artist("m1:a1", "Alpha"), _artist("m10:a1", "Beta"), _artist("shared-artist", "Both")],
+        albums=[_album("m1:al1", "A-Rec"), _album("m10:al1", "B-Rec"), _album("shared-album", "Both-Rec")],
+        tracks=[_track("m1:t1", "m1:al1"), _track("m10:t1", "m10:al1"),
+                _track("shared-track", "shared-album")],
+        holds=[
+            _hold("m1:a1", "m1", "a1", 0, "artist"), _hold("m10:a1", "m10", "a1", 1, "artist"),
+            _hold("shared-artist", "m1", "a9", 0, "artist"), _hold("shared-artist", "m10", "a9", 1, "artist"),
+            _hold("m1:al1", "m1", "al1", 0, "album"), _hold("m10:al1", "m10", "al1", 1, "album"),
+            _hold("shared-album", "m1", "al9", 0, "album"), _hold("shared-album", "m10", "al9", 1, "album"),
+            _hold("m1:t1", "m1", "t1", 0), _hold("m10:t1", "m10", "t1", 1),
+            _hold("shared-track", "m1", "t9", 0), _hold("shared-track", "m10", "t9", 1),
+        ],
+    )
+
+
+async def test_delete_catalog_source_drops_one_prefix_only(db):
+    await _seed_two_sources()
+    assert len(await store.get_all_tracks()) == 3
+
+    await store.delete_catalog_source("m1")
+
+    assert {a["identity"] for a in await store.get_artists()} == {"m10:a1", "shared-artist"}
+    assert {a["identity"] for a in await store.get_albums()} == {"m10:al1", "shared-album"}
+    assert {t["identity"] for t in await store.get_all_tracks()} == {"m10:t1", "shared-track"}
+    # The sibling's holds are intact; the shared entity lost only the m1 hold.
+    assert [h["source_id"] for h in await store.get_holds("track", "shared-track")] == ["m10"]
+    assert [h["source_id"] for h in await store.get_holds("track", "m10:t1")] == ["m10"]
+    assert await store.get_holds("track", "m1:t1") == []
+    assert await store.get_identities_held_by_source("m1", "track") == []
+
+
+async def test_delete_catalog_source_unknown_prefix_is_a_noop(db):
+    await _seed_two_sources()
+    await store.delete_catalog_source("m")  # leading substring of both, matches neither
+    assert len(await store.get_all_tracks()) == 3
+    assert len(await store.get_albums()) == 3
+    assert len(await store.get_artists()) == 3
+
+
+async def test_delete_catalog_source_holds_the_write_lock(db):
+    acquired = []
+    real = database._write_tx_lock
+
+    class Tracking:
+        async def __aenter__(self):
+            acquired.append(True)
+            return await real.__aenter__()
+
+        async def __aexit__(self, *a):
+            return await real.__aexit__(*a)
+
+    database._write_tx_lock = Tracking()
+    try:
+        await store.delete_catalog_source("m1")
+        assert acquired
+    finally:
+        database._write_tx_lock = real
+
+
+async def test_source_ids_with_holds_tracks_the_purge(db):
+    """2026-11-22 review #8: the health sweep uses this to find a vanished
+    server whose purge failed."""
+    assert await store.source_ids_with_holds() == set()
+    await _seed_two_sources()
+    assert await store.source_ids_with_holds() == {"m1", "m10"}
+    await store.delete_catalog_source("m1")
+    assert await store.source_ids_with_holds() == {"m10"}

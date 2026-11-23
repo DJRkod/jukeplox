@@ -1273,12 +1273,30 @@ function renderSourcesList(sources, libs) {
     e.textContent = msg;
   };
   const clearRowError = (block) => { const e = block.querySelector('.src-err'); if (e) e.remove(); };
+  // Plex server health line (2026-11-21 plex-source-health U6, KTD2). Fixed
+  // strings only — never a URL or token. 'usable' shows just the check time.
+  const hhmm = (iso) => {
+    const d = iso ? new Date(iso) : null;
+    return d && !isNaN(d) ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  };
+  const plexStatus = (src) => {
+    switch (src.status) {
+      case 'usable': { const t = hhmm(src.status_checked_at); return [t ? 'checked ' + t : 'Usable', false]; }
+      case 'token_rejected': return ['Token rejected, refresh pending', true];
+      case 'unreachable': return ['Unreachable at saved address', true];
+      case 'no_longer_shared': return ['No longer shared with you', true];
+      default: return ['Reconnect Plex to enable self-heal', false];
+    }
+  };
 
   sourcesList.innerHTML = '';
   sources.forEach((src, i) => {
     const sid = src.source_id;
     const srcLibs = bySource[sid] || [];
     let on = src.enabled !== false;
+    // A server Plex no longer shares is named, not hidden: switch greyed, Remove
+    // shown (R18) — its content is already excluded server-side (KTD6).
+    const vanished = src.type === 'plex' && src.status === 'no_longer_shared';
 
     const block = document.createElement('div');
     block.className = 'src-block';
@@ -1355,8 +1373,9 @@ function renderSourcesList(sources, libs) {
     controls.className = 'src-controls';
     if (i > 0) controls.appendChild(arrowBtn('up', sid));
     if (i < sources.length - 1) controls.appendChild(arrowBtn('down', sid));
-    // Plex disconnect stays in the Plex flow; only non-Plex sources are removable here.
-    if (src.type !== 'plex') {
+    // Plex disconnect stays in the Plex flow; a live Plex server is not removable
+    // here — only one Plex no longer shares (the server refuses otherwise, 409).
+    if (src.type !== 'plex' || vanished) {
       const rm = document.createElement('button');
       rm.className = 'icbtn rm';
       rm.textContent = 'Remove';
@@ -1370,6 +1389,7 @@ function renderSourcesList(sources, libs) {
     const swInput = document.createElement('input');
     swInput.type = 'checkbox';
     swInput.checked = on;
+    swInput.disabled = vanished;   // nothing to enable on a server you no longer have
     swInput.setAttribute('aria-label', 'Enable ' + (src.name || 'source'));
     const slider = document.createElement('span');
     slider.className = 'slider';
@@ -1401,6 +1421,13 @@ function renderSourcesList(sources, libs) {
     row.appendChild(controls);
     row.appendChild(sw);
     block.appendChild(row);
+    if (src.type === 'plex') {
+      const [text, warn] = plexStatus(src);
+      const st = document.createElement('div');
+      st.className = 'src-status' + (warn ? ' warn' : '');
+      st.textContent = text;
+      block.appendChild(st);
+    }
     if (srcLibs.length > 0) block.appendChild(children);
     sourcesList.appendChild(block);
   });
@@ -1482,6 +1509,28 @@ async function renderSourceScanStatus() {
   }
   el.textContent = msg;
   el.style.display = msg ? '' : 'none';
+  // Plex source-health readout (2026-11-21 plan U6): account state, a rebuild
+  // waiting for idle playback, and the next daily sweep. Shown only while a
+  // Plex source is connected (that is also when the hour selector means
+  // anything). Fixed strings; the sweep time is the server's own local HH:MM
+  // sliced from the ISO string, so a wrong container zone is visible as-is.
+  const hel = document.getElementById('plex-health-status');
+  if (hel) {
+    const hasPlex = (_currentSources || []).some(x => x.type === 'plex');
+    const lines = [];
+    if (s.account_status === 'account_rejected') lines.push('Plex rejected the saved login. Reconnect Plex.');
+    else if (s.account_status === 'legacy') lines.push('Legacy Plex connection; reconnect Plex to enable self-heal');
+    else if (s.account_status === 'missing') lines.push('Reconnect Plex to enable self-heal');
+    if (s.rebuild_pending) lines.push('Library rebuild waiting for idle playback');
+    if (typeof s.next_refresh_at === 'string' && s.next_refresh_at.length >= 16)
+      lines.push('Next sweep ' + s.next_refresh_at.slice(11, 16));
+    const lel = document.getElementById('plex-health-lines');
+    if (lel) {
+      lel.innerHTML = '';
+      lines.forEach(t => { const d = document.createElement('div'); d.textContent = t; lel.appendChild(d); });
+    }
+    hel.style.display = hasPlex ? '' : 'none';
+  }
   // Browse-index freshness line ("Indexing…" → "Indexed <time>"). 503s on a
   // non-Plex install, which is fine — the line just stays blank. `building`
   // catches the NATIVE browse-index rebuild that scan-status.scanning (catalog
@@ -2033,6 +2082,10 @@ async function loadSettings() {
     // flag. It lives by the Lock toggle, not the batched Save Settings form.
     const floodToggle = document.getElementById('flood-toggle');
     if (floodToggle) floodToggle.checked = !!s.flood_control;
+    // Plex daily sweep hour (plex-source-health U6): hydrate the Sources-panel
+    // selector; commits on change through the shared helper below.
+    const sweepHour = document.getElementById('plex-refresh-hour');
+    if (sweepHour && s.plex_refresh_hour != null) sweepHour.value = String(s.plex_refresh_hour);
     // Surprise Me (2026-06-17): master on/off (default on) + source mode.
     const surpriseEnabled = document.getElementById('surprise-enabled');
     if (surpriseEnabled) surpriseEnabled.checked = s.surprise_me_enabled !== false;
@@ -2258,6 +2311,10 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
   const SELECTS = [
     ['surprise-source-mode', 'surprise_me_source_mode', 'Surprise Me source'],
     ['surprise-diversity', 'surprise_me_diversity', 'Surprise Me diversity'],
+    // Plex daily sweep hour (2026-11-21 plex-source-health U6): lives on the
+    // Sources panel, not Settings; the value is final the instant it changes,
+    // it never starts playback, and the server does not broadcast it.
+    ['plex-refresh-hour', 'plex_refresh_hour', 'Daily Plex sweep hour'],
   ];
   // [radio group name, settings key, name used in a failure toast]
   const RADIO_GROUPS = [
@@ -2347,7 +2404,11 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
         [el], key, label,
         () => el.value,
         () => { if (prior.has(el)) el.value = prior.get(el); },
-        (v) => prior.set(el, v),
+        (v) => {
+          prior.set(el, v);
+          // The "Next sweep HH:MM" line reads the saved hour — refresh it now.
+          if (key === 'plex_refresh_hour') renderSourceScanStatus();
+        },
       ));
     });
   });

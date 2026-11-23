@@ -1844,3 +1844,103 @@ async def test_a_200_with_no_metadata_still_raises_keyerror():
         await client.get_album("srv:1")
     with pytest.raises(KeyError):
         await client.get_track("srv:1")
+
+
+# ── U3 (2026-11-21 plex source health): the 401 hook ──────────────────────────
+# _check_status is an instance method that knows its server; on 401 it calls the
+# module-level auth-failed hook with the machine id, then raises PlexAuthError
+# exactly as before. The client stays a leaf: the hook is the only way out.
+
+@pytest.fixture
+def auth_hook():
+    from app.plex import client as client_mod
+    calls: list[str] = []
+    client_mod.set_auth_failed_hook(calls.append)
+    try:
+        yield calls
+    finally:
+        client_mod.set_auth_failed_hook(None)
+
+
+def _client_b(**kw) -> PlexClient:
+    return PlexClient(server_url="http://plex-b.local:32400", token="tok-b",
+                      client_id="test-client", machine_id="B", **kw)
+
+
+async def test_401_calls_auth_failed_hook_with_machine_id_then_raises(respx_mock, auth_hook):
+    import httpx
+    respx_mock.get("http://plex-b.local:32400/library/sections").mock(
+        return_value=httpx.Response(401))
+    with pytest.raises(PlexAuthError):
+        await _client_b().get_libraries()
+    assert auth_hook == ["B"]
+
+
+async def test_401_with_hook_unset_still_raises_and_nothing_else_happens(respx_mock):
+    import httpx
+    from app.plex import client as client_mod
+    client_mod.set_auth_failed_hook(None)
+    respx_mock.get("http://plex-b.local:32400/library/sections").mock(
+        return_value=httpx.Response(401))
+    with pytest.raises(PlexAuthError):
+        await _client_b().get_libraries()
+
+
+async def test_hook_exception_never_masks_the_plex_auth_error(respx_mock):
+    import httpx
+    from app.plex import client as client_mod
+
+    def boom(_mid):
+        raise RuntimeError("hook bug")
+    client_mod.set_auth_failed_hook(boom)
+    try:
+        respx_mock.get("http://plex-b.local:32400/library/sections").mock(
+            return_value=httpx.Response(401))
+        with pytest.raises(PlexAuthError):
+            await _client_b().get_libraries()
+    finally:
+        client_mod.set_auth_failed_hook(None)
+
+
+async def test_non_401_error_does_not_call_hook(respx_mock, auth_hook):
+    import httpx
+    respx_mock.get("http://plex-b.local:32400/library/sections").mock(
+        return_value=httpx.Response(500))
+    with pytest.raises(httpx.HTTPStatusError):
+        await _client_b().get_libraries()
+    assert auth_hook == []
+
+
+async def test_fetch_art_transcode_401_calls_hook_once_and_does_not_retry_full_size(respx_mock, auth_hook):
+    """A 401 on the resize request is an auth failure, not a transcoder hiccup:
+    the fallback must not spend a second request with the same rejected token,
+    and the hook fires before the blanket fallback catch can swallow it."""
+    import httpx
+    respx_mock.get("http://plex-b.local:32400/photo/:/transcode").mock(
+        return_value=httpx.Response(401))
+    full = respx_mock.get("http://plex-b.local:32400/library/metadata/5/thumb/9").mock(
+        return_value=httpx.Response(200, content=b"full", headers={"content-type": "image/jpeg"}))
+    with pytest.raises(PlexAuthError):
+        await _client_b().fetch_art("/library/metadata/5/thumb/9", width=144)
+    assert auth_hook == ["B"]
+    assert not full.called
+
+
+async def test_fetch_art_transcode_404_falls_back_without_calling_hook(respx_mock, auth_hook):
+    import httpx
+    respx_mock.get("http://plex-b.local:32400/photo/:/transcode").mock(
+        return_value=httpx.Response(404))
+    respx_mock.get("http://plex-b.local:32400/library/metadata/5/thumb/9").mock(
+        return_value=httpx.Response(200, content=b"full", headers={"content-type": "image/jpeg"}))
+    data, _ct = await _client_b().fetch_art("/library/metadata/5/thumb/9", width=144)
+    assert data == b"full"
+    assert auth_hook == []
+
+
+async def test_fetch_art_full_size_401_calls_hook_once(respx_mock, auth_hook):
+    import httpx
+    respx_mock.get("http://plex-b.local:32400/library/metadata/5/thumb/9").mock(
+        return_value=httpx.Response(401))
+    with pytest.raises(PlexAuthError):
+        await _client_b().fetch_art("/library/metadata/5/thumb/9")
+    assert auth_hook == ["B"]

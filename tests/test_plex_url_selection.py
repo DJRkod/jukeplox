@@ -121,10 +121,99 @@ async def test_preferred_known_url_wins_over_fresh_local():
     assert await _reachable_url(conns, True, client, preferred=PINNED) == PINNED
 
 
-async def test_nothing_answers_falls_back_to_static_best():
+async def test_nothing_answers_is_a_typed_none_not_a_silent_pick():
+    # Source-health plan U2: when no candidate answers the probe says so
+    # (None) instead of handing back the static best pick as if it were
+    # reachable. discover_servers turns that into an "unreachable" outcome
+    # with the saved URL kept (below); the static pick is only for a server
+    # that was never saved.
     client = _client({})
-    assert await _reachable_url(CONNS, True, client) == _best_url(CONNS, owned=True)
-    assert await _reachable_url(CONNS, True, client) == LOCAL["uri"]  # never dropped
+    assert await _reachable_url(CONNS, True, client) is None
+    assert await _reachable_url(CONNS, False, client) is None
+
+
+async def test_shared_preferred_known_url_probes_first_and_wins():
+    # A shared server's pinned URL is probed first too (known_urls is passed
+    # for owned and shared alike).
+    out = _ordered_candidates(CONNS, owned=False, preferred=PINNED)
+    assert out[0] == (PINNED, False)
+    client = _client({PINNED: 200, REMOTE["uri"]: 200})
+    assert await _reachable_url(CONNS, False, client, preferred=PINNED) == PINNED
+
+
+# ── discover_servers: the typed outcome ──────────────────────────────────────
+
+PLEXTV = "https://plex.tv/api/v2/resources"
+PLEXTV_USER = "https://plex.tv/api/v2/user"
+
+
+def _resource(mid, conns, owned=True):
+    return {"provides": "server", "clientIdentifier": mid, "name": mid, "owned": owned,
+            "accessToken": f"tok-{mid}", "connections": conns}
+
+
+def _plextv(respx_mock, *resources):
+    import httpx
+    respx_mock.get(PLEXTV).mock(return_value=httpx.Response(200, json=list(resources)))
+    respx_mock.get(PLEXTV_USER).mock(return_value=httpx.Response(200, json={"title": "me"}))
+
+
+async def test_daily_refresh_keeps_the_pinned_owned_url_when_it_still_answers(respx_mock):
+    import httpx
+    from app.plex.auth import discover_servers
+    _plextv(respx_mock, _resource("A", CONNS))
+    for uri in (PINNED, LOCAL["uri"], REMOTE["uri"], RAW_URI, RELAY["uri"]):
+        respx_mock.get(f"{uri}/identity").mock(return_value=httpx.Response(200))
+    out = await discover_servers("acct", "cid", known_urls={"A": PINNED})
+    assert out[0]["server_url"] == PINNED
+    assert out[0]["probe"] == "reachable"
+
+
+async def test_refresh_falls_back_through_best_url_order_when_the_pinned_url_fails(respx_mock):
+    import httpx
+    from app.plex.auth import discover_servers
+    pinned = "http://192.168.1.77:32400"
+    _plextv(respx_mock, _resource("A", CONNS))
+    respx_mock.get(f"{pinned}/identity").mock(side_effect=httpx.ConnectError("down"))
+    respx_mock.get(f"{LOCAL['uri']}/identity").mock(side_effect=httpx.ConnectError("down"))
+    respx_mock.get(f"{REMOTE['uri']}/identity").mock(return_value=httpx.Response(200))
+    out = await discover_servers("acct", "cid", known_urls={"A": pinned})
+    assert out[0]["server_url"] == REMOTE["uri"]
+    assert out[0]["probe"] == "reachable"
+
+
+async def test_nothing_answers_keeps_saved_url_with_unreachable_outcome(respx_mock):
+    import httpx
+    from app.plex.auth import discover_servers
+    pinned = "http://192.168.1.77:32400"
+    _plextv(respx_mock, _resource("A", CONNS), _resource("S", [REMOTE], owned=False))
+    # Registered AFTER the plex.tv routes: respx matches in order, so this
+    # catch-all only swallows the /identity probes.
+    respx_mock.route(host__regex=r".*").mock(side_effect=httpx.ConnectError("down"))
+    out = {s["machine_id"]: s for s in await discover_servers(
+        "acct", "cid", known_urls={"A": pinned, "S": "https://s.example.invalid:32400"})}
+    assert out["A"] == dict(out["A"], server_url=pinned, probe="unreachable")
+    assert out["S"]["server_url"] == "https://s.example.invalid:32400"
+    assert out["S"]["probe"] == "unreachable"
+
+
+async def test_nothing_answers_and_never_saved_falls_back_to_static_pick(respx_mock):
+    import httpx
+    from app.plex.auth import discover_servers
+    _plextv(respx_mock, _resource("A", CONNS))
+    respx_mock.route(host__regex=r".*").mock(side_effect=httpx.ConnectError("down"))
+    out = await discover_servers("acct", "cid")
+    assert out[0]["server_url"] == _best_url(CONNS, owned=True)
+    assert out[0]["probe"] == "unreachable"
+
+
+async def test_empty_connections_resource_is_listed_not_dropped(respx_mock):
+    from app.plex.auth import discover_servers
+    _plextv(respx_mock, _resource("A", []))
+    out = await discover_servers("acct", "cid", known_urls={"A": PINNED})
+    assert out == [dict(out[0], server_url=PINNED, probe="unreachable")]
+    out = await discover_servers("acct", "cid")
+    assert out[0]["server_url"] == "" and out[0]["probe"] == "unreachable"
 
 
 # ── the characterized bridged-PMS shape (documented limit) ───────────────────
